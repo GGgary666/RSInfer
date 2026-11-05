@@ -1,0 +1,1336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSI-native 推理引擎 v0：单元、边与重载（讨论稿）</title>
+<style>
+:root{--bg:#f6f7f9;--ink:#1f2937;--muted:#6b7280;--line:#e5e7eb;--amber:#f59e0b}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;color:var(--ink);background:var(--bg)}
+header{padding:14px 24px 0;background:#fff;border-bottom:1px solid var(--line)}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:10px}
+.tabs{display:flex;gap:4px;flex-wrap:wrap}
+.tab{padding:8px 16px;border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;background:#f3f4f6;cursor:pointer;font-size:14px;user-select:none}
+.tab.on{background:var(--bg);font-weight:600}
+section{display:none;padding:14px 24px 40px}
+section.on{display:block}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em;background:#f1f5f9;padding:0 4px;border-radius:4px}
+
+/* ---------- toolbar ---------- */
+#toolbar{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin-bottom:10px;font-size:13px}
+#toolbar .grp{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#toolbar label{display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}
+.sw{display:inline-block;width:22px;height:0;border-top-width:3px;border-top-style:solid;vertical-align:middle}
+.bx{display:inline-block;width:20px;height:12px;border:1.6px solid #9ca3af;border-radius:3px;background:#fff;vertical-align:middle;margin-right:3px}
+.bx.state{background:#dcf2ee;border-color:#0f766e}
+.bx.core{background:#e5e7eb;border-color:#374151;border-width:2px}
+.bx.new{border-style:dashed;border-color:#b45309}
+button{font:inherit;font-size:13px;padding:4px 10px;border:1px solid #d1d5db;background:#fff;border-radius:6px;cursor:pointer}
+button:hover{background:#f9fafb}
+button:disabled{opacity:.4;cursor:default}
+select{font:inherit;font-size:13px;padding:3px 6px;border-radius:6px;border:1px solid #d1d5db}
+
+/* ---------- map ---------- */
+#mapView{display:flex;gap:14px;align-items:flex-start}
+#canvasBox{flex:1;min-width:0;overflow:hidden}
+#canvasScale{transform-origin:0 0;width:1340px}
+#canvas{position:relative;width:1340px;height:1030px}
+.lane{position:absolute;border:1.5px solid;border-radius:12px}
+.lane .lb{position:absolute;left:10px;top:3px;font-size:12.5px;font-weight:600;white-space:nowrap}
+.lane.frame{border-style:dashed;border-width:2px;background:transparent}
+.lane.sub{border-style:dashed;border-width:1.3px}
+.mod{position:absolute;width:176px;height:56px;border-radius:9px;background:#fff;border:1.6px solid #9ca3af;padding:6px 9px;cursor:pointer;z-index:3;box-shadow:0 1px 2px rgba(0,0,0,.06);transition:opacity .15s}
+.mod:hover{box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.mod .nm{font-size:13.5px;font-weight:600;line-height:1.25;white-space:nowrap}
+.mod .id{font-size:11px;color:#4b5563;font-family:ui-monospace,Menlo,monospace;margin-top:4px}
+.mod.state{background:#dcf2ee;border-color:#0f766e}
+.mod.core{background:#e5e7eb;border-color:#374151;border-width:2.2px}
+.mod.new{border-style:dashed}
+.mod.new:not(.state):not(.core){border-color:#b45309}
+.mod .tag{position:absolute;right:5px;top:4px;font-size:10px;padding:0 4px;border-radius:4px;background:#fef3c7;color:#92400e}
+.mod .tag.core{background:#374151;color:#fff}
+.mod .tag.split{background:#dbeafe;color:#1e40af}
+.mod.sel{outline:3px solid var(--amber);outline-offset:1px}
+.mod.nb{outline:2px solid #fcd34d}
+.mod.dim{opacity:.25}
+svg.layer{position:absolute;left:0;top:0;pointer-events:none}
+#edgeSvg{z-index:2}
+#labelSvg{z-index:5}
+#crossNote{position:absolute;left:1080px;top:932px;width:232px;font-size:11.5px;color:var(--muted);z-index:3;line-height:1.5}
+
+/* ---------- panel ---------- */
+#panel{width:400px;flex:none;background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px;position:sticky;top:10px;max-height:calc(100vh - 20px);overflow:auto;font-size:13.5px;line-height:1.65}
+#panel h3{margin:0 0 4px;font-size:17px}
+#panel h4{margin:12px 0 2px;font-size:13.5px;color:#374151}
+#panel ul,#panel ol{margin:2px 0;padding-left:20px}
+#panel li{margin:1px 0}
+#panel .meta{color:var(--muted);font-size:12.5px}
+#panel .one{background:#fffbeb;border-left:3px solid var(--amber);padding:6px 10px;margin:8px 0;border-radius:4px}
+#panel .elist li{cursor:pointer}
+#panel .elist li:hover{text-decoration:underline}
+.k{display:inline-block;font-size:11px;padding:0 5px;border-radius:4px;color:#fff;margin-right:4px;vertical-align:1px}
+#panel ol.steps li{padding:3px 4px;border-radius:5px;cursor:pointer}
+#panel ol.steps li.cur{background:#fef3c7;font-weight:600}
+#panel ol.steps li.past{color:#4b5563}
+#panel ol.steps li.fut{color:#9ca3af}
+.gloss dt{font-weight:600;margin-top:6px}
+.gloss dd{margin:0;color:#374151}
+#glossFull{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 28px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 16px 12px}
+
+/* ---------- docs ---------- */
+.doc{max-width:1220px;font-size:14px;line-height:1.75}
+.doc h2{font-size:18px;margin:22px 0 8px}
+.doc h3{font-size:15.5px;margin:18px 0 6px}
+table.t{border-collapse:collapse;width:100%;background:#fff;font-size:13px;line-height:1.6}
+table.t th,table.t td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left}
+table.t th{background:#f9fafb;white-space:nowrap}
+table.t td.grp{background:#f3f4f6;font-weight:600}
+table.t td.nw{white-space:nowrap}
+table.t ul{margin:0;padding-left:18px}
+.pill{display:inline-block;font-size:11.5px;padding:0 6px;border-radius:10px;border:1px solid #d1d5db;white-space:nowrap}
+.pill.plan{background:#f0fdf4;border-color:#86efac}
+.pill.split{background:#eff6ff;border-color:#93c5fd}
+.pill.new{background:#fffbeb;border-color:#fcd34d}
+.pill.logic{background:#fff}
+.pill.state{background:#dcf2ee;border-color:#5eb5a8}
+.pill.core{background:#e5e7eb;border-color:#6b7280}
+.pill.in{background:#dcfce7;border-color:#4ade80}
+.pill.act{background:#dbeafe;border-color:#60a5fa}
+.pill.fb{background:#fef3c7;border-color:#f59e0b}
+.pill.ext{background:#ffedd5;border-color:#fb923c}
+.pill.out{background:#fee2e2;border-color:#f87171}
+.note{background:#fff;border:1px solid var(--line);border-left:4px solid #60a5fa;border-radius:6px;padding:8px 12px;margin:10px 0}
+.note.warm{border-left-color:#f59e0b}
+.note.green{border-left-color:#10b981}
+.q{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:10px 0}
+.q h3{margin:0 0 4px}
+.q .rec{background:#f0fdf4;border-radius:6px;padding:4px 10px;margin-top:6px}
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:10px 0}
+.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.card h4{margin:0 0 4px;font-size:14.5px}
+.card.state{border-top:4px solid #0f766e}
+.card.logic{border-top:4px solid #9ca3af}
+.card.core{border-top:4px solid #374151}
+ol.ladder li{margin:4px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>RSI-native 推理引擎 v0：单元、边与重载（讨论稿）</h1>
+  <div class="sub">依据 v0-plan.md 第 4 节，借鉴 Cordis（deepseek-harness）的单元模型和 sglang / mini-sglang 的组件接口。框架本体只有少数几个模块，其余都是可以单独重载的单元。虚线框是建议新增的模块，标“拆”的是从 v0-plan 已有模块里拆出来的。<br><b>本页是真源：</b>发起人已通读并认可本页。同目录的 <code>v0-plan.md</code>、<code>discussion-summary.md</code> 依据本页更新，两者和本页冲突时以本页为准。v0 全部用 Python。<br><b>版本路线：</b>v0 = Qwen3.8-27B，单机；v0.1 = DS 1017，单机 DP8 + EP8，按思想实验一的路线在 v0 上演进出来；v0.2 = DS 1017，两机 DP16 + EP16，按思想实验二的路线演进出来。</div>
+  <div class="tabs">
+    <div class="tab on" data-tab="map">① 全景图</div>
+    <div class="tab" data-tab="list">② 单元清单</div>
+    <div class="tab" data-tab="units">③ 单元与重载</div>
+    <div class="tab" data-tab="edges">④ 边与组合规则</div>
+    <div class="tab" data-tab="ds">⑤ 思想实验一：v0 → v0.1（DS 1017）</div>
+    <div class="tab" data-tab="mn">⑥ 思想实验二：v0.1 → v0.2（两机 16 卡）</div>
+    <div class="tab" data-tab="qs">⑦ 决定与待讨论</div>
+  </div>
+</header>
+
+<!-- ================= ① 全景图 ================= -->
+<section id="sec-map" class="on">
+  <div id="toolbar">
+    <div class="grp" id="filters"><b>显示的边：</b></div>
+    <div class="grp"><b>框：</b><span><span class="bx"></span>逻辑单元</span><span><span class="bx state"></span>状态单元</span><span><span class="bx core"></span>框架本体</span><span><span class="bx new"></span>建议新增</span></div>
+    <div class="grp">
+      <b>场景演示：</b>
+      <select id="scnSel"><option value="">（选一个场景）</option></select>
+      <button id="prevBtn" disabled>上一步</button>
+      <button id="nextBtn" disabled>下一步</button>
+      <button id="exitBtn" disabled>退出场景</button>
+    </div>
+  </div>
+  <div id="mapView">
+    <div id="canvasBox">
+      <div id="canvasScale">
+        <div id="canvas">
+          <svg id="edgeSvg" class="layer" width="1340" height="1030"></svg>
+          <svg id="labelSvg" class="layer" width="1340" height="1030"></svg>
+        </div>
+      </div>
+    </div>
+    <aside id="panel"></aside>
+  </div>
+</section>
+
+<!-- ================= ② 单元清单 ================= -->
+<section id="sec-list">
+  <div class="doc">
+    <div class="note">
+      <b>和 v0-plan 4.3 模块表的差别：</b>
+      <ul style="margin:4px 0">
+        <li><b>粒度从“进程”变成“单元”。</b>每个模块都是单独装卸、单独重载的单元；进程只是装单元的容器。只有框架本体的代码改了，才需要重启引擎。</li>
+        <li><b>状态进程并进了 worker 进程。</b>持有显存的状态单元比逻辑单元活得长，所以改 worker 的代码不用重启进程，也就不需要跨进程共享显存。</li>
+        <li><span class="pill new">建议新增</span> <code>unit.runtime</code>（单元运行时）、<code>core.deps</code>、<code>core.worker</code>、<code>layers.*</code>、<code>moe.*</code>、<code>sched.reqs</code>（请求表）、<code>dist.groups</code>（通信组）。<span class="pill split">拆出</span> <code>core.state.alloc</code>（账本，放在调度宿主）、<code>core.state.weights</code>。</li>
+        <li><b>v0 不做任何安全和权限：</b>去掉策略钩子、控制端口限制、签名。留下的静态检查只是为了让重载能正确工作。</li>
+      </ul>
+    </div>
+    <div class="note warm"><b>“改代码”和“改内容”是两回事。</b>“改了它的代码之后”指改这个单元自己的实现；“改了它管的内容之后”指改配置值、换权重、扩 KV 池这类改动。改配置的值从来不重启引擎。</div>
+    <table class="t" id="modTable"></table>
+  </div>
+</section>
+
+<!-- ================= ③ 单元与重载 ================= -->
+<section id="sec-units">
+  <div class="doc">
+    <div class="note green"><b>一句话：</b>每个模块都是一个<b>单元</b>，单元是管理和重载的最小单位；进程只是装单元的容器。框架本身几乎不带领域概念，没有内建的“调度器”“KV cache”“TP”，这些全是单元。框架只负责把单元拼起来、换下来。</div>
+
+    <h2>1. 单元是什么（借鉴 Cordis）</h2>
+    <p>Cordis 是 deepseek-harness 底下的插件框架（源码在 <code>vendor/cordis</code>、<code>vendor/hmr</code>）。我们照它的做法定义单元：</p>
+    <ul>
+      <li><b>声明依赖和提供：</b>每个单元写明自己要用哪些服务、提供什么服务、读哪些配置。单元通过服务名找对方，不直接 import 别的单元的对象。</li>
+      <li><b>所有注册都可撤销：</b>注册 kernel、绑定策略、起线程、开 CUDA stream、<code>torch.library</code> 注册……每一项都返回一个撤销函数。卸载单元，就是把这些撤销函数倒着执行一遍。</li>
+      <li><b>依赖自动传播：</b>某个服务的提供者被换掉，依赖它的单元自动卸载，等新提供者就绪再自动装上。缺依赖的单元就停在“等待”状态，不报错。</li>
+      <li><b>代码重载：</b>文件改了，先按 import 图找出受影响的单元，清掉这些模块的缓存，重新 import，卸掉旧的、装上新的；中途出错就恢复缓存、装回旧的。</li>
+      <li><b>配置原地生效：</b>单元可以注册一个钩子，原地接受新配置；没有注册的话，就只重载这一个单元。</li>
+      <li><b>关键取舍：被重载的单元自己内存里的东西不保留。</b>要保住的东西必须放在状态单元里。</li>
+    </ul>
+
+    <h2>2. 三类模块</h2>
+    <div class="cards">
+      <div class="card logic"><h4>逻辑单元</h4>代码、策略、模型、kernel、调度逻辑、plan 编译……<br><b>重载：</b>便宜，自己内存里的东西丢掉也没关系。<br><b>多常改：</b>agent 绝大多数改动都落在这里。</div>
+      <div class="card state"><h4>状态单元</h4>显存（权重、KV、各种 state）、通信组、请求表、账本……<br><b>重载：</b>贵，会丢掉它持有的状态。v0 默认先排空再重建；提供迁移函数的可以不排空。<br><b>多常改：</b>很少改代码；它们管的内容（权重、容量）通过状态动作改。</div>
+      <div class="card core"><h4>框架本体</h4>单元运行时、变更事务、进程管家、节点代理、配置、进程间传输、平台，一共七个。<br><b>改了：</b>重启引擎。<br><b>多常改：</b>极少，要人评审。<br><b>语言：</b>v0 全部用 Python。节点代理、进程管家、变更事务是独立进程，只通过版本化消息交互，以后可以单独换成 Rust；其余四个和单元在同一个 Python 进程里，只能用 Python。</div>
+    </div>
+
+    <h2>3. 动作阶梯：从便宜到贵</h2>
+    <table class="t">
+      <tr><th>#</th><th>动作</th><th>什么时候用</th><th>例子</th></tr>
+      <tr><td>0</td><td>不动</td><td>改动不影响任何在跑的东西</td><td>新增一个还没人用的单元</td></tr>
+      <tr><td>1</td><td>原地接受新配置</td><td>单元注册了配置钩子，键是每步现读的</td><td>chunk 大小、EPLB 周期</td></tr>
+      <tr><td>2</td><td>重载单元</td><td>单元代码变了；依赖它的单元跟着重载</td><td>换一个策略、改调度逻辑、改 worker 主循环</td></tr>
+      <tr><td>3</td><td>重建派生产物</td><td>派生产物按值或按地址依赖了变化的东西</td><td>重录用到新 kernel 的 graph</td></tr>
+      <tr><td>4</td><td>状态动作</td><td>状态单元管的内容变了，由状态单元自己提供的动作处理</td><td>refit（换权重）、grow（扩 KV 池）、migrate（EPLB 搬专家）、invalidate（让 KV 失效）</td></tr>
+      <tr><td>5</td><td>重启进程</td><td>进程级的东西变了，卸不掉</td><td>native 扩展（.so）、并行拓扑变了、NVSHMEM 首次初始化、进程崩溃</td></tr>
+      <tr><td>6</td><td>重启引擎</td><td>框架本体变了，或者平台升级</td><td>单元运行时的代码、torch / CUDA 版本</td></tr>
+    </table>
+    <p>每次变更由 core.deps 推导出要做哪几级动作；只有会影响在途请求的动作才排空，而且只排空受影响的那部分请求。</p>
+
+    <h2>4. 让设计足够有表达力的七条原则</h2>
+    <p>⑤ 页的思想实验说明：能不能“只靠新增和替换单元”支持一个新模型，关键不在框架本体，而在<b>单元之间的接口</b>够不够通用。⑥ 页的思想实验又说明：要支持多台机器，<b>框架本体自己</b>也不能假设“都在一台机器上”（P7）。以下七条从 v0 开始就要成立：</p>
+    <table class="t">
+      <tr><th>原则</th><th>意思</th><th>落在哪</th></tr>
+      <tr><td class="nw"><b>P1 用数据描述</b></td><td>并行拓扑（mesh：有哪些维度、各多大）、进程拓扑（有哪些进程角色、各装哪些单元）、张量的格式和放置、每层的状态声明，都写成数据，由单元来解释，不在代码里假设。新模型、新并行方式大多只是新数据加新单元。</td><td>进程管家、通信组、权重存储、状态种类、模型规格</td></tr>
+      <tr><td class="nw"><b>P2 开放记录</b></td><td>跨单元传的记录（StepPlan、决策快照、StepResult）不是固定的结构体，由各单元各自贡献分段。新单元加自己的分段，不用改别人。</td><td>调度逻辑、worker 主循环、决策点</td></tr>
+      <tr><td class="nw"><b>P3 按 rank 索引</b></td><td>凡是和 rank 有关的接口都按 rank 索引。TP 只是“每个 rank 都一样”的特例。</td><td>StepPlan、账本（按调度域分）、决策快照</td></tr>
+      <tr><td class="nw"><b>P4 能力声明</b></td><td>单元声明自己支持哪些动作（refit、grow、migrate、原地接受配置）、能不能被录进 graph、需要什么平台能力、会不会改变 KV 数值。框架按声明推导动作，不在框架里写死一张表。</td><td>所有单元的清单</td></tr>
+      <tr><td class="nw"><b>P5 联合协议</b></td><td>几个单元一起决定的事（准入、前缀命中长度、分桶对齐），走“各自给出约束 → 机制合并”的流程，不由某一个单元说了算。</td><td>账本、分桶决策点</td></tr>
+      <tr><td class="nw"><b>P6 变更来源统一</b></td><td>agent 的 apply、配置、单元自己发起的改动（比如 EPLB）、运维操作，都是 change-set，走同一条流程。</td><td>core.change</td></tr>
+      <tr><td class="nw"><b>P7 位置透明</b></td><td>凡是跨进程的东西都不假设在同一台机器：拉起进程走节点代理，通道按两端是否同机选后端（共享内存或 TCP / RDMA），代码从本机按身份物化的快照目录加载，地址和路径来自拓扑数据，事务参与者按“机器 + 进程”寻址。单机只是多机的特例，就像 TP 只是“每个 rank 都一样”的特例。</td><td>框架本体：进程管家、节点代理、进程间传输、单元运行时、变更事务</td></tr>
+    </table>
+    <div class="note">P1–P6 主要约束单元之间的接口，以后违反了还能通过“扩展接口”补救；P7 约束的是框架本体，v0 不做的话，以后补就要改本体。所以 P7 在 v0 必须做对，哪怕 v0 只跑一台机器。</div>
+
+    <h2>5. 比 Cordis 多做的五件事</h2>
+    <ol>
+      <li><b>只在 epoch 边界换。</b>Cordis 随时可以卸载插件；我们必须等两步之间、worker 循环停下来再换。</li>
+      <li><b>多个进程一起换。</b>同一个 TP / EP 组的所有 rank 必须在同一个 epoch 换上同一批单元，所以还要两阶段提交。v0 做成同步的：所有相关进程停下 → 各自换 → 都成功才继续，有一个失败就全部回滚。</li>
+      <li><b>派生产物要登记依赖。</b>Cordis 只知道“某个提供者换了”。CUDA graph 这类派生产物依赖了什么、怎么依赖的（实时、按地址、按值），要由产物的主人登记给 core.deps，上游变了再通知它重建哪些。</li>
+      <li><b>卸载顺序关系到显存安全。</b>必须先卸用显存的一方（graph、plan），再卸持有显存的一方。Cordis 里多个异步撤销是并发执行的，我们改成按依赖反方向依次卸载。</li>
+      <li><b>跨机器。</b>Cordis 是单进程的；我们的单元分布在多个进程、以后还有多台机器上，所以要有节点代理、按身份分发代码、跨机通道（P7）。</li>
+    </ol>
+
+    <h2>6. 为了让重载可靠，单元要守的规矩</h2>
+    <p>这些规矩不是为了安全，而是为了让“卸掉再装上”不出错，由 core.manifest 静态检查：</p>
+    <ul>
+      <li>不许有模块级可变全局变量；要保住的东西放进状态单元。</li>
+      <li>所有注册都可撤销，包括 <code>torch.library</code>、线程、CUDA stream、CUDA graph。</li>
+      <li>通过服务名拿别的单元，不 import 别的单元的对象（否则重载后还拿着旧对象）。</li>
+      <li>只有 plan 单元能录 graph、能调用 torch.compile。</li>
+      <li>用到 native 扩展（.so）要在清单里声明，改了它就走“重启进程”。</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= ④ 边与组合规则 ================= -->
+<section id="sec-edges">
+  <div class="doc">
+    <h2>1. 名词小抄</h2>
+    <dl class="gloss" id="glossFull"></dl>
+
+    <h2>2. 边有六种</h2>
+    <table class="t">
+      <tr><th>种类</th><th>是什么</th><th>例子</th><th>改了一头，另一头要怎样</th><th>谁来检查</th></tr>
+      <tr><td class="nw"><span class="sw" style="border-top-color:#2563eb"></span> 每步数据流</td><td>服务时每一步都在流动的记录</td><td>新请求、StepPlan、StepResult、新 token</td><td>记录是开放的（P2），新单元加自己的分段不影响别人</td><td>记录的每个分段带版本</td></tr>
+      <tr><td class="nw"><span class="sw" style="border-top-color:#6b7280"></span> 接口调用</td><td>A 通过服务名调用 B</td><td>调度逻辑调决策点；层调 kernel 目录</td><td>B 被重载 → A 跟着重载（单元运行时自动处理）</td><td>import 图必须在清单声明的依赖之内</td></tr>
+      <tr><td class="nw"><span class="sw" style="border-top-color:#059669"></span> 状态共享</td><td>A 直接读写状态单元 B 持有的数据（同进程，按地址）</td><td>MoE 层读专家放置表；层读 KV</td><td>同地址改内容：无感；B 重建：A 跟着重载</td><td>状态单元给每个对象记版本和地址</td></tr>
+      <tr><td class="nw"><span class="sw" style="border-top:3px dashed #ea580c"></span> 派生</td><td>A 是由 B “生成”出来的产物</td><td>plan 和 graph 由模型代码、kernel 选择、状态布局、配置生成</td><td>看这条边的<b>绑定方式</b>（下一节）</td><td>录的时候自动登记，replay 前检查</td></tr>
+      <tr><td class="nw"><span class="sw" style="border-top:3px dashed #dc2626"></span> 变更控制</td><td>控制面让进程在 epoch 边界停下、执行动作、提交或撤回</td><td>prepare / commit / abort；重启进程</td><td>—（它本身就是“改”的通道）</td><td>两阶段提交</td></tr>
+      <tr><td class="nw"><span class="sw" style="border-top:3px dotted #7c3aed"></span> 声明 / 注册</td><td>一个单元把自己的需求或实现登记到另一个单元</td><td>模型声明每层要存什么；kernel 注册到目录</td><td>声明变了，目录里对应的条目更新，依赖它的派生产物可能要重建</td><td>清单校验</td></tr>
+    </table>
+
+    <h2>3. 派生边的“绑定方式”：决定改了以后要不要重建</h2>
+    <table class="t">
+      <tr><th>绑定方式</th><th>意思</th><th>例子</th><th>不用重建就能生效的改动</th><th>必须重建的改动</th></tr>
+      <tr><td><b>实时</b></td><td>每次执行都重新读一遍</td><td>eager 路径上的 kernel、调度参数、采样参数</td><td>任何改动，下一步就生效</td><td>无</td></tr>
+      <tr><td><b>按地址</b></td><td>graph 里记住了“去哪个地址读”</td><td>权重、KV 池、专家放置表、负载计数、通信 buffer</td><td>同一个地址、同样的 shape 和 dtype，只改里面的数（refit、EPLB、grow）</td><td>换了地址，或改了 shape / dtype → 重录</td></tr>
+      <tr><td><b>按值</b></td><td>录的那一刻的值被写死了</td><td>graph 里选中的 kernel、标量参数、代码走的分支、分桶大小、DeepEP 模式</td><td>无</td><td>任何改动 → 重录</td></tr>
+      <tr><td style="color:#9ca3af">编译器守卫</td><td style="color:#9ca3af">torch.compile 自己会检查、自动重编译</td><td style="color:#9ca3af">—</td><td colspan="2" style="color:#9ca3af">v0 不开 torch.compile，暂时没有这一种</td></tr>
+    </table>
+    <div class="note warm"><b>读配置的边也有绑定方式。</b>调度逻辑每步现读的键是“实时”，改了下一个 epoch 就生效；plan 单元编 plan 时读、录进 graph 的键是“按值”，改了要后台重录。改配置值的代价取决于这个键在哪里被读，而不是一律重启。见全景图的场景⑦。</div>
+
+    <h2>4. 组合规则</h2>
+    <table class="t">
+      <tr><th style="width:24%">规则</th><th>说明</th><th style="width:28%">借鉴</th></tr>
+      <tr><td>① 进程只是装单元的容器</td><td>进程之间只走三种通道：ZMQ（请求和控制消息）、共享内存（每步的记录）、RPC（变更事务）。显存不跨进程共享，因为状态单元和用它的逻辑单元在同一个进程。</td><td>mini-sglang 的 ZMQ + 消息 dataclass；sglang 的 ScheduleBatch → ModelWorkerBatch → ForwardBatch 三段表示</td></tr>
+      <tr><td>② 单元之间只认服务名</td><td>单元通过服务名找对方，不 import 对方的对象。这样重载一个单元时，依赖它的单元能被找出来一起重载，不会留着旧对象。</td><td>Cordis 的 Context / Service / inject</td></tr>
+      <tr><td>③ 调度 = 调度逻辑 + 插槽里的策略 + 状态单元</td><td>请求表和账本是状态单元；调度逻辑在固定位置调用决策点，策略只拿快照、只返回决定，由调度逻辑校验和执行。</td><td>mini-sglang 的 PrefillManager / DecodeManager 拆法；sglang 的 schedule_policy</td></tr>
+      <tr><td>④ 模型 = 层单元的组合；层只认 definition</td><td>层调用的是“算什么”（definition），具体用哪个 kernel（solution）在编 plan 时定下来。</td><td>mini-sglang 的 BaseOP；sglang 的 KernelSpec、BaseFusedOp</td></tr>
+      <tr><td>⑤ 一种状态 = 一个存储单元 + 一个记账插件</td><td>每层声明要存什么；worker 里的存储单元管显存和快照，调度宿主里的记账插件按同一份声明记账。</td><td>sglang <code>mem_cache/kv/decl.py</code>（lifetime × geometry）；mini-sglang 的 kvcache 接口</td></tr>
+      <tr><td>⑥ MoE 是五段流水线，每段可单独换</td><td>路由 → 查放置表 → dispatch → 专家计算 → combine。段与段之间靠约定好的数据格式对接。</td><td>sglang <code>token_dispatcher/base.py</code>、<code>moe_runner/base.py</code></td></tr>
+      <tr><td>⑦ graph 只能由 plan 单元录</td><td>录的时候把派生边登记给 core.deps，replay 前检查。</td><td>sglang <code>BaseCudaGraphBackend</code></td></tr>
+      <tr><td>⑧ 所有改动都走 core.change</td><td>agent 的 apply、启动、配置、EPLB 重排，都是 change-set：推导动作 → epoch 边界停下 → 执行 → 提交或撤回。</td><td>Cordis 的 HMR 回滚；v0-plan 4.7</td></tr>
+    </table>
+    <p>另有一条硬约束：<b>依赖只有一个方向</b>，RSI 平面 → 引擎。引擎不 import 任何 <code>rsi.*</code>，拆掉 RSI 平面后引擎照样能服务、能 apply。</p>
+
+    <h2>5. 图上所有的边</h2>
+    <table class="t" id="edgeTable"></table>
+  </div>
+</section>
+
+<!-- ================= ⑤ 思想实验 ================= -->
+<section id="sec-ds">
+  <div class="doc">
+    <div class="note"><b>设定：</b>v0 只支持 Qwen3.8-27B，有 TP；没有 EP、EPLB、DP attention、压缩 KV、跨层共享、量化权重、mHC、Engram。某天 DS 1017 发布了，agent 要在这个 v0 上一步步把它支持起来。每一步都是一次（或几次）apply，问的是：每一步改了什么、框架做了什么、是不是在包络内。<br><b>已决定：</b>v0 就只含 Qwen；v0.1 才含 DS 1017，就按这张表的路线从 v0 演进出来。</div>
+    <p>“包络”的五种结果：
+      <span class="pill in">包络内</span> 只新增或替换单元，接口不变；
+      <span class="pill act">已有动作</span> 用框架已有的动作（起新实例、重建 rank 进程）；
+      <span class="pill fb">退路</span> 要重启进程或引擎（native 库、平台升级）；
+      <span class="pill ext">扩展接口</span> 要改单元之间的接口，接口两边的单元在同一个 epoch 一起重载；
+      <span class="pill out">包络外</span> 要改框架本体。</p>
+    <table class="t" id="dsTable"></table>
+
+    <h2>结论</h2>
+    <ul id="dsSummary"></ul>
+
+    <h2>实验中发现的设计问题，以及改成了什么</h2>
+    <table class="t" id="dsFixes"></table>
+
+    <h2>只能重启的情况（Python 进程的本质限制，Cordis 也一样）</h2>
+    <ul>
+      <li>native 扩展（.so、pybind、CUDA C++）装进进程后卸不掉 → 重启用到它的 rank 进程。</li>
+      <li>torch / CUDA / 驱动升级 → 平台变化，重启引擎。</li>
+      <li>只能每进程初始化一次的库（NVSHMEM）第一次接入 → 重启 rank 进程。</li>
+      <li>框架本体的代码改了 → 重启引擎。</li>
+    </ul>
+    <div class="note green"><b>对 v0.1 的启发：</b>v0.1（DS 1017）就按这 16 步来做，每一步都 apply 到正在跑的引擎上。这样 v0.1 本身就是通用性验收：如果哪一步不得不改框架本体，就说明接口还不够通用，记进包络失效日志。</div>
+  </div>
+</section>
+
+<!-- ================= ⑥ 思想实验二 ================= -->
+<section id="sec-mn">
+  <div class="doc">
+    <div class="note"><b>设定：</b>v0.1 在一台 8 卡机器上跑 DS 1017（DP8 + EP8），所有进程都在这台机器上。v0.2 要跑两台机器、16 张卡（DP16 + EP16）。agent 照样一步步 apply，问的还是：每一步改了什么、框架做了什么、是不是在包络内。</div>
+    <table class="t" id="mnTable"></table>
+
+    <h2>结论</h2>
+    <ul id="mnSummary"></ul>
+
+    <h2>实验中发现的设计问题，以及改成了什么</h2>
+    <table class="t" id="mnFixes"></table>
+
+    <div class="note green"><b>v0 不用第二台机器也能测 P7：</b>在一台机器上起两个节点代理，假装成两台主机（主机 id 不同、强制走 TCP、各自一个快照目录），用假执行器把变更路径都跑一遍（启动、apply、两阶段提交、回滚、拓扑变化、“一台主机掉了”）。这样 CI 里就能守住 P7。</div>
+  </div>
+</section>
+
+<!-- ================= ⑥ 待讨论 ================= -->
+<section id="sec-qs">
+  <div class="doc" id="qsBox"></div>
+</section>
+
+<script>
+/* =====================================================================
+   数据：泳道（进程）、单元、边、场景、思想实验
+   ===================================================================== */
+const W = 176, H = 56;
+
+const LANES = [
+  {id:'front',  x:20,  y:20,  w:430, h:220, label:'前端进程',                         bg:'#eef4ff', bd:'#93b4f5', fg:'#1d4ed8'},
+  {id:'ctrl',   x:470, y:20,  w:610, h:220, label:'控制面进程（1 个）',               bg:'#fdf0f0', bd:'#f2a7a7', fg:'#b91c1c'},
+  {id:'rsi',    x:1100,y:20,  w:220, h:220, label:'RSI 平面（可拆卸）',               bg:'#f6effe', bd:'#c4a3f0', fg:'#6d28d9'},
+  {id:'sched',  x:20,  y:268, w:850, h:125, label:'调度宿主进程（1 个）',             bg:'#edf8f1', bd:'#8fd1a5', fg:'#15803d'},
+  {id:'rank',   x:10,  y:418, w:1320,h:480, label:'', frame:true, bd:'#9ca3af'},
+  {id:'worker', x:20,  y:448, w:1300,h:440, label:'worker 进程（每个 rank 1 个）：左边是逻辑单元，右边是状态单元', bg:'#f1f4f8', bd:'#9aa9bd', fg:'#334155'},
+  {id:'state',  x:910, y:478, w:400, h:372, label:'状态单元（活得比逻辑单元长）', sub:true, bg:'#e9f6f3', bd:'#80cbc0', fg:'#0f766e'},
+  {id:'cross',  x:20,  y:912, w:1300,h:100, label:'框架本体与横切（每个进程里都有一份）', bg:'#f3f3f3', bd:'#cfcfcf', fg:'#4b5563'},
+];
+const RANK_LABEL = '每个 rank 一组　（Qwen3.8 TP1 时只有 1 组；DS 1017 的 DP8 + EP8 有 8 组）';
+
+const PROC_NAME = {
+  front:'前端进程', ctrl:'控制面进程', rsi:'RSI 平面（独立进程，可拆卸）', sched:'调度宿主进程',
+  worker:'worker 进程（每个 rank 1 个）', state:'worker 进程（每个 rank 1 个）里的状态单元', cross:'每个进程里都有一份'
+};
+const REL_NAME = {plan:'v0-plan 4.3 已有', split:'从 v0-plan 已有模块里拆出来', new:'建议新增'};
+const KIND_NAME = {logic:'逻辑单元', state:'状态单元（重载会丢掉它持有的状态）', core:'框架本体（改了要重启引擎）'};
+const KIND_SHORT = {logic:'逻辑单元', state:'状态单元', core:'框架本体'};
+
+const MODS = [
+  /* ---------------- 前端 ---------------- */
+  {id:'frontend.http', nm:'OpenAI 接口', lane:'front', x:145, y:60, rel:'plan', kind:'logic',
+   one:'对外的门：接收 OpenAI 格式的请求，把结果流式返回。',
+   does:['提供 chat/completions、completions 和流式输出',
+         '每个响应都带系统身份（HTTP 头 <code>x-engine-identity</code>）；请求中途跨过版本切换的，在最后一个事件里列出经历过的全部身份',
+         '版本切换期间让新请求排队；排满了返回 503 + Retry-After'],
+   nodo:['不做分词','不知道任何模型细节'],
+   borrow:['mini-sglang <code>server/api_server.py</code>','sglang <code>entrypoints/</code> 里的 OpenAI 协议'],
+   change:'重载这个单元；其他进程不动。',
+   relNote:'v0-plan 4.14 是三个进程；这里建议 v0 先放在一个进程里，三个单元，慢了再拆。'},
+  {id:'frontend.tokenizer', nm:'分词', lane:'front', x:40, y:155, rel:'plan', kind:'logic',
+   one:'把文字变成 token id，交给调度宿主。',
+   does:['按模型选分词器：Qwen3.8 用 HF tokenizer + chat template；DS 1017 用 deepseek-recipe（Rust 实现，带 Python 绑定）','把（token id，采样参数）发给调度宿主'],
+   nodo:['不决定请求什么时候执行'],
+   borrow:['mini-sglang <code>tokenizer/</code>'],
+   change:'重载这个单元。'},
+  {id:'frontend.detok', nm:'反分词', lane:'front', x:250, y:155, rel:'plan', kind:'logic',
+   one:'把 token id 一点点变回文字，推给 HTTP 层。',
+   does:['增量解码（一个汉字可能被拆成多个 token，要等齐了再吐）','按请求把文字增量推给 HTTP 层'],
+   nodo:['不判断请求是否结束（调度宿主判断）'],
+   borrow:['mini-sglang <code>tokenizer/detokenize.py</code>','sglang <code>managers/incremental_detokenize.py</code>'],
+   change:'重载这个单元。'},
+
+  /* ---------------- 控制面 ---------------- */
+  {id:'core.api', nm:'控制接口', lane:'ctrl', x:490, y:60, rel:'plan', kind:'logic',
+   one:'引擎的“遥控器”：所有外部操作都从这里进来。',
+   does:['<code>serve</code> / <code>apply [--dry-run]</code> / <code>status</code> / <code>introspect</code> / <code>logs</code>',
+         '对外发布事件流（谱系服务订阅它，引擎不依赖谱系）'],
+   nodo:['不自己执行变更（交给 core.change）','v0 不做鉴权'],
+   borrow:[], change:'重载这个单元；控制端口短暂断开，客户端重试即可。'},
+  {id:'core.change', nm:'变更事务', lane:'ctrl', x:690, y:60, rel:'plan', kind:'core',
+   one:'变更的“总指挥”：所有改动都从它走一遍，失败就回滚。',
+   does:['不管改动从哪来（agent 的 apply、配置、单元自己发起的 EPLB 重排、运维操作），都是一个 change-set，走同一条流程',
+         '流程：静态检查 → 推导动作计划 → 准备 → 在 epoch 边界让相关进程停下 → 执行动作 → 提交 → 恢复服务；任何一步失败就整体回滚',
+         '两阶段提交的协调者：所有参与进程都准备好才一起生效',
+         '它不认识具体动作：重载单元、重录 graph、refit、搬专家……都由各单元声明和提供，它只按阶段调度',
+         '参与者按“机器 + 进程”寻址，可以跨机；apply 时先把 change-set 的内容按 hash 推到每台机器的节点代理',
+         '启动也当作一次变更（从“空”变到某个身份）'],
+   nodo:['不判断要动哪些东西（问 core.deps）','不执行具体动作（各单元自己执行）'],
+   borrow:['Cordis HMR 的回滚做法（恢复模块缓存、装回旧插件）'], change:'框架本体：重启引擎。'},
+  {id:'core.identity', nm:'系统身份', lane:'ctrl', x:890, y:60, rel:'plan', kind:'logic',
+   one:'给“当前这套系统”算一个身份证号。',
+   does:['对源码、清单、配置、依赖锁、权重清单、kernel 绑定、状态布局版本、拓扑数据、每台机器的平台信息算 hash；机器之间平台信息不一致就拒绝启动',
+         '保证 候选身份 = f(起点身份, change-set) 是确定的',
+         '给出两个身份之间的差异（change-set 就是这个差异）'],
+   nodo:['不存历史（历史在 rsi.lineage）'],
+   borrow:[], change:'重载这个单元。'},
+  {id:'core.manifest', nm:'清单与静态检查', lane:'ctrl', x:490, y:155, rel:'plan', kind:'logic',
+   one:'代码生效之前先查一遍，保证“卸掉再装上”不会出错。',
+   does:['读每个单元的清单：提供什么服务、依赖什么、读哪些配置、是逻辑单元还是状态单元、支持哪些动作、用到哪些 native 扩展',
+         '检查 import 图在清单声明的依赖之内',
+         '检查让重载可靠的规矩：没有模块级可变全局变量；注册都可撤销；graph 只在 plan 单元里录；不直接 import 别的单元的对象'],
+   nodo:['不做权限和安全检查（v0 不要）','不运行代码'],
+   borrow:['sglang 的 guardrail 测试思路（如 <code>test_global_config_read_ratchet.py</code>）','deepseek-harness 的 <code>verify-cordis-config</code>'],
+   change:'重载这个单元；下一次 apply 起用新规则。'},
+  {id:'core.deps', nm:'影响分析', lane:'ctrl', x:690, y:155, rel:'new', kind:'logic',
+   one:'回答“改了这个，哪些东西要跟着动、怎么动”。',
+   does:['代码层面：从 import 图和单元的依赖声明，算出要重载哪些单元（被改的单元 + 依赖它的单元）',
+         '派生产物层面：任何单元都可以登记派生产物（plan、graph、缓存的映射表、实测曲线……），以及它依赖了什么、怎么依赖的（实时 / 按地址 / 按值）；上游变了，就通知产物的主人重建哪些',
+         '状态层面：按各单元声明的能力，选出最便宜的状态动作（refit、grow、migrate、invalidate）',
+         '合成一份动作计划；<code>apply --dry-run</code> 返回的就是它'],
+   nodo:['不执行动作'],
+   borrow:['Cordis HMR 的 import 图分析（<code>analyzeChanges</code>）'],
+   change:'重载这个单元；依赖记录从各单元重新收集。',
+   relNote:'v0-plan 4.5 描述了这部分逻辑，但 4.3 的模块表里没有单独列出来。'},
+  {id:'core.supervisor', nm:'进程管家', lane:'ctrl', x:890, y:155, rel:'plan', kind:'core',
+   one:'按拓扑把进程拉起来、停下来、重启。',
+   does:['拓扑是数据：有哪些机器、有哪些进程角色、各几个、放在哪台机器、每个进程装哪些单元、每个 rank 在 mesh 里的位置',
+         '不自己 spawn 进程，而是让每台机器上的节点代理去拉；单机时节点代理就在本机',
+         '只在必须重启进程时出手：native 扩展变了、并行拓扑变了、进程或机器挂了',
+         '健康检查；进程挂了、整台机器掉了，都报告给 core.change'],
+   nodo:['不决定什么时候重启（由 core.change 决定）'],
+   borrow:[], change:'框架本体：重启引擎。',
+   data:'改拓扑（比如 TP2 → DP2 + EP2，或者以后加一个视觉编码进程）：只重建受影响的进程；控制面、前端、调度宿主不停，排队的请求不丢。'},
+
+  /* ---------------- RSI ---------------- */
+  {id:'rsi.lineage', nm:'谱系', lane:'rsi', x:1122, y:60, rel:'plan', kind:'logic',
+   one:'“族谱”：记录每个身份从哪来、评测结果怎样。',
+   does:['身份 DAG、分支、promote、merge','事件日志（谁改了什么、为什么改、证据）','发布导出'],
+   nodo:['不参与服务'],
+   borrow:[], change:'不影响引擎。'},
+  {id:'rsi.evalsvc', nm:'评测服务', lane:'rsi', x:1122, y:155, rel:'plan', kind:'logic',
+   one:'“考场”：只接受 patch，自己冷启动、自己打分。',
+   does:['收到（起点身份, patch, 套件）→ 校验（起点存在、静态检查；受保护路径待定）',
+         '物化候选 → 在启动时指定的 GPU 上冷启动起点和候选',
+         '跑套件：门禁 + 评分，性能默认成对测量',
+         '结果写进谱系'],
+   nodo:['不 import 引擎代码，只通过公开接口和命令行跟引擎打交道'],
+   borrow:[], change:'不影响引擎。'},
+
+  /* ---------------- 调度宿主 ---------------- */
+  {id:'core.sched', nm:'调度逻辑', lane:'sched', x:40, y:310, rel:'plan', kind:'logic',
+   one:'每一步决定“这一步跑什么”的执行者；“选谁”由策略说了算。',
+   does:['按调度域工作：每个 DP rank 是一个调度域；TP 组只有一个域',
+         '每步在固定位置调用决策点，校验决定（版本一致、容量够、有对应的 plan 分桶）',
+         '通过账本做联合准入',
+         '多 rank 同步推进：同一个 TP / EP 组的所有 rank 每步都要走，没有请求的 rank 跑空 batch',
+         '生成每步的 StepPlan：按 rank 索引的开放记录，各单元往里贡献自己的分段（attention 元数据、投机信息、Engram 需要的历史 token……）',
+         '标出 epoch 边界；框架内部的改动（比如 EPLB 重排）由它提交给 core.change'],
+   nodo:['不持有请求表和账本（它们是状态单元，调度逻辑重载时不动）','不碰 GPU'],
+   borrow:['mini-sglang <code>scheduler/</code> 的拆法：PrefillManager / DecodeManager / TableManager / CacheManager',
+           'sglang 的 <code>ForwardMode</code>（含 IDLE 空 batch）、<code>scheduler_components/dp_attn.py</code>'],
+   change:'重载这个单元：请求表和账本不动，在途请求接着跑；不重启进程，也不重放日志。'},
+  {id:'policies.*', nm:'决策点（策略）', lane:'sched', x:250, y:310, rel:'plan', kind:'logic',
+   one:'一组可以替换的“小脑”：每个决策点的每个策略各是一个单元。',
+   does:['决策点：准入与 DP 路由、排序、chunk 大小、抢占谁、投机验证长度、graph 分桶、缓存淘汰、EPLB 要不要重排 / 怎么重排',
+         '输入是只读快照，快照由各单元贡献字段（包括 mesh 的物理布局：哪些 rank 在同一台机器）；作用范围可以是一个调度域，也可以是整个组（比如分桶要在 EP 组内对齐）',
+         '默认实现都是最简单的：先来先服务、固定 chunk、抢占最新到达的、固定验证长度、LRU、EPLB 每 M 步一次 + DeepSeek 的 EPLB 算法'],
+   nodo:['不能直接改任何状态；给出的决定不合法会被调度逻辑拒绝'],
+   borrow:['sglang <code>eplb/eplb_algorithms/deepseek.py</code>（拷自 deepseek-ai/EPLB）','sglang <code>managers/schedule_policy.py</code>'],
+   change:'重载这一个策略单元，下一个 epoch 生效，不排空。',
+   data:'改策略的参数（比如 chunk 大小、EPLB 周期）：策略单元原地接受新配置，下一个 epoch 生效。'},
+  {id:'sched.reqs', nm:'请求表', lane:'sched', x:460, y:310, rel:'new', kind:'state',
+   one:'在途请求的“账面”：每个请求走到哪了、生成了什么。',
+   does:['请求状态（等待 / prefill / decode / 结束）、已生成的 token、采样参数','只追加的请求日志：进程崩溃后靠它恢复','调度逻辑每步读写它；调度逻辑重载时它不动'],
+   nodo:['不做调度决定'],
+   borrow:['mini-sglang 的 <code>Req</code> / <code>TableManager</code>'],
+   change:'状态单元：重载会丢掉在途请求的账面。v0 默认先排空再重载；提供迁移函数就可以不排空。'},
+  {id:'core.state.alloc', nm:'分配账本', lane:'sched', x:670, y:310, rel:'split', kind:'state',
+   one:'记账：哪些显存块空着、哪个请求占了哪些、哪些前缀能复用。',
+   does:['每个调度域一本账（DS 的每个 DP rank 一本；Qwen 的 TP 组只有一本）',
+         '每种状态一个记账插件，按状态声明里的分配单位记账（按 token 分页、每请求一个 slot……）',
+         '联合准入：一个请求要的几种状态必须一起分到',
+         '联合前缀匹配：每种状态给出自己能复用多长（含对齐和回退规则），账本取联合结果',
+         '不变量检查：空闲 + 占用 = 总数；没有重复分配；每个请求最后都会释放'],
+   nodo:['不持有显存，只记编号'],
+   borrow:['mini-sglang <code>kvcache/radix_cache.py</code>、<code>scheduler/cache.py</code> 的 <code>check_integrity</code>',
+           'sglang unified radix cache 的 Full / SWA / Mamba 组件模型'],
+   change:'状态单元：重载会让前缀缓存全部失效；v0 默认先排空再重载。',
+   relNote:'放在调度宿主里：调度逻辑每步都要用它，不用跨进程；调度逻辑重载时它作为状态单元不动。某个 worker 进程真的重启（显存没了）时，对应的账整本作废重建。'},
+
+  /* ---------------- worker：逻辑单元 ---------------- */
+  {id:'core.worker', nm:'每步执行循环', lane:'worker', x:40, y:500, rel:'new', kind:'logic',
+   one:'worker 进程的主循环：收指令、执行、回结果。',
+   does:['从共享内存收 StepPlan 里属于本 rank 的那份',
+         '按（阶段, 分桶, epoch）向 plan 单元取 plan 并执行，然后采样',
+         '把新 token 和各单元贡献的统计（比如 MoE 负载）回给调度宿主',
+         '在 epoch 边界停下来，配合执行重载和状态动作'],
+   nodo:['不编 plan、不录 graph'],
+   borrow:['mini-sglang <code>engine/engine.py</code> 的 <code>forward_batch</code>'],
+   change:'重载这个单元：显存、通信组、graph 都不动。'},
+  {id:'core.plan', nm:'plan 编译与 graph', lane:'worker', x:260, y:500, rel:'plan', kind:'logic',
+   one:'把“模型 + kernel 选择 + 状态布局 + 分桶”编成可执行的 plan，并负责录和放 CUDA graph。',
+   does:['每个（阶段, 分桶）一个 plan：从实际跟踪模型前向得到的有序算子、选好的 kernel、buffer。不假设每层都一样（DS 每层压缩比不同、mHC 有 4 路残差）',
+         '唯一允许录 CUDA graph 的单元：decode 默认录，prefill 走 eager',
+         '双缓冲：新 graph 在后台录，旧的继续服务，到 epoch 边界再换',
+         '录的时候记下依赖（用了哪些 kernel、读了哪些配置和运行时标志、记住了哪些显存地址），登记给 core.deps',
+         'replay 前检查这些依赖有没有变',
+         '预留 graph 存档后端的接口（以后可以接 Foundry，v0 只实现现场录）'],
+   nodo:['不决定这一步跑哪些请求'],
+   borrow:['sglang <code>model_executor/runner_backend/base_cuda_graph_backend.py</code> 的六个方法 + <code>ShapeKey</code>','mini-sglang <code>engine/graph.py</code>'],
+   change:'重载这个单元：它持有的 plan 和 graph 全部重建。'},
+  {id:'executors.*', nm:'执行后端', lane:'worker', x:480, y:500, rel:'plan', kind:'logic',
+   one:'真正把 plan 跑起来的那一层。',
+   does:['cuda：在 GPU 上执行或 replay','fake：只给 CI 用。按 shape 分配 buffer、按配置 sleep、在指定位置注入故障，不含任何模型语义'],
+   nodo:['fake 执行器不许加模型语义，否则就变回模拟器了'],
+   borrow:[], change:'重载这个单元。'},
+  {id:'models.*', nm:'模型', lane:'worker', x:480, y:600, rel:'plan', kind:'logic',
+   one:'每个模型的“装配图”：用哪些层、每层存什么状态、权重怎么对应。一个模型一个单元。',
+   does:['qwen38：64 层 = 48 层 GatedDeltaNet + 16 层 full attention',
+         'ds_v41_flash：压缩 attention、跨层借用 KV、MoE（384 个专家）、mHC、Engram、nextn',
+         '每层可以不一样；向状态种类声明每层要存什么；向权重存储声明权重名、格式和切分方式'],
+   nodo:['不直接调具体 kernel（经过 definition）','不自己录 graph'],
+   borrow:['Qwen3.8：HF modeling + vLLM + sglang <code>models/qwen3_5.py</code>','DS 1017：DeepInfer + sglang <code>models/deepseek_v4*.py</code>'],
+   change:'重载模型单元 → plan 单元收到通知 → 重建 plan、重录 graph；默认 KV 和前缀缓存失效、排空受影响的请求（模型可以声明“不改变 KV 数值”来避免）。'},
+  {id:'core.dist', nm:'通信逻辑', lane:'worker', x:700, y:600, rel:'plan', kind:'logic',
+   one:'rank 之间怎么说话。',
+   does:['all-reduce / all-gather / all-to-all 的调用逻辑','按 mesh 的维度名（tp、dp、ep……）找通信组，不写死“只有 TP”','EPLB 搬专家时用的点对点传输'],
+   nodo:['不持有通信组（dist.groups 持有）'],
+   borrow:['sglang <code>distributed/parallel_state.py</code>','mini-sglang <code>kernel/pynccl.py</code>'],
+   change:'重载这个单元：通信组不动。'},
+  {id:'layers.*', nm:'层', lane:'worker', x:40, y:710, rel:'new', kind:'logic',
+   one:'两个模型共用的零件库；一种层一个单元。',
+   does:['并行 linear、embedding / lm_head、norm、rope',
+         'attention 外壳 + 每种状态的 metadata builder（把 block table 等整理成 kernel 要的格式）',
+         'sampler：按请求固定随机种子，参照模式下结果和 batch 怎么拼无关'],
+   nodo:['只调 definition，不直接调具体 kernel','不持有权重（权重在状态单元里，层只拿视图）'],
+   borrow:['mini-sglang <code>layers/</code>（BaseOP：权重不归层对象自己持有）','mini-sglang <code>attention/base.py</code> 的五个方法'],
+   change:'同“模型”。'},
+  {id:'moe.*', nm:'MoE / EP 流水线', lane:'worker', x:700, y:710, rel:'new', kind:'logic',
+   one:'MoE 层的五段流水线，每段一个单元，也是 EP 的核心。',
+   does:['① 路由：每个 token 选 6 个专家',
+         '② 查放置表：逻辑专家 → 物理专家（有冗余副本时选一个）',
+         '③ dispatch：all-to-all，把 token 发到专家所在的 rank',
+         '④ 专家计算：grouped GEMM',
+         '⑤ combine：把结果收回来，按权重加起来',
+         '顺手记负载：每个专家收到多少 token，写进负载计数（给 EPLB 用）'],
+   nodo:['不决定专家放在哪（EPLB 策略决定）','不自己搬权重'],
+   borrow:['sglang <code>layers/moe/token_dispatcher/base.py</code>、<code>moe_runner/base.py</code>、<code>topk.py</code>',
+           'sglang <code>eplb/expert_location_dispatch.py</code>、<code>expert_distribution.py</code>'],
+   change:'重载对应的那一段；用到它的 graph 重录。'},
+  {id:'core.kernels', nm:'kernel 目录', lane:'worker', x:260, y:795, rel:'plan', kind:'logic',
+   one:'“算什么”和“怎么算”的对照表。',
+   does:['definition = 算什么：语义、PyTorch 参照实现（必须有）、容差、是否和 batch 拼法无关',
+         'solution = 怎么算：用哪个库、支持哪些 shape、能不能被录进 graph、是否需要进程级初始化、能不能跨机（比如 DeepEP 的机内版和跨机版）',
+         '按 definition + shape 选 solution：编 plan 时定死；eager 路径每次查',
+         '选不到合适的就退回参照实现，并在结果里标注'],
+   nodo:['不实现任何 kernel'],
+   borrow:['sglang <code>kernels/spec.py</code>（KernelSpec、CapabilityRequirement）、<code>kernels/fused_op.py</code> 的分发优先级','flashinfer-bench 的 Definition / Solution 格式'],
+   change:'重载这个单元 → 所有 kernel 单元重新注册、所有 plan 重建。它是所有 kernel 的提供者，很少改。'},
+  {id:'kernels.*', nm:'kernel 实现', lane:'worker', x:480, y:795, rel:'plan', kind:'logic',
+   one:'具体的 kernel；每个 solution 一个单元。',
+   does:['reference：PyTorch 写的参照实现，每个 definition 都必须有',
+         'solutions：flashinfer、FlashAttention、fla（GDN）、deep_gemm、DeepEP、FlashMLA、TileLang 等的包装'],
+   nodo:['不决定自己什么时候被选中'],
+   borrow:['作为依赖直接用：sgl_kernel、flashinfer、deep_gemm、deep_ep、fla'],
+   change:'Python / Triton / TileLang 写的：重载这个单元，eager 路径下一步就用新的，graph 里用到它的重录。native（.so）的：重启用到它的 rank 进程。'},
+
+  /* ---------------- worker：状态单元 ---------------- */
+  {id:'core.state.holder', nm:'显存持有者', lane:'state', x:1020, y:500, rel:'plan', kind:'state',
+   one:'“仓库”：显存的总持有者，活得比所有逻辑单元长。',
+   does:['按声明给权重、KV、每请求 state、专家放置表、负载计数、通信 buffer 分显存；也可以分 host 内存（DS 的 Engram 大表）',
+         'KV 池启动时预留一段虚拟地址，扩容时只映射新的物理显存（地址不变，graph 仍然有效）',
+         '执行 refit、grow'],
+   nodo:['不跑模型'],
+   borrow:[], change:'状态单元：重载 = 释放并重新分配所有显存，权重重新加载、KV 全部失效，要排空；进程不重启。',
+   data:'扩大 KV 池：grow，只映射新的物理显存，不排空，不重载任何单元，graph 仍然有效。',
+   relNote:'v0-plan 4.2 里它是单独的“状态进程”；现在并进 worker 进程，作为状态单元。'},
+  {id:'core.state.weights', nm:'权重存储', lane:'state', x:928, y:620, rel:'split', kind:'state',
+   one:'权重的加载、寻址、替换和搬迁。',
+   does:['逻辑张量 = 格式 + 放置。格式是插件（BF16、FP8 块量化 + scale、FP4……）；放置是数据（按 mesh 怎么切、专家放在哪些物理槽位，可以有冗余副本）',
+         '从 safetensors 加载，按逻辑名寻址，带版本；权重文件的路径按机器解析（本地盘或共享存储）',
+         'refit：布局不变，只换内容',
+         '搬迁：EPLB 时专家在槽位之间搬，槽位地址不变'],
+   nodo:['不决定专家放哪'],
+   borrow:['sglang <code>FusedMoE.weight_loader</code>（一个逻辑专家写进多个物理槽位）','sglang <code>eplb/expert_location_updater.py</code>'],
+   change:'状态单元：重载 = 重新加载权重。',
+   data:'换同一模型的新权重（shape 和布局不变）：原地 refit，排空受影响的请求，KV 和前缀缓存失效；plan、graph 都不动。EPLB 搬专家：同地址改内容，不重录，不排空。'},
+  {id:'dist.groups', nm:'通信组', lane:'state', x:1118, y:620, rel:'new', kind:'state',
+   one:'集合通信用的“线路”：NCCL 通信组、DeepEP buffer。',
+   does:['按 mesh 建通信组（TP 组、DP 组、EP 组）；mesh 带物理布局（每个 rank 在哪台机器、哪个 NVLink 域），rendezvous 地址来自拓扑数据','持有 DeepEP / NVSHMEM 的通信 buffer','这些东西建起来慢、容易卡死，所以做成状态单元，通信逻辑重载时不动'],
+   nodo:['不决定谁和谁一组（拓扑数据决定）'],
+   borrow:['sglang <code>distributed/parallel_state.py</code> 的 GroupCoordinator'],
+   change:'状态单元：重载 = 重建通信组，用到它的 graph 重录，在 epoch 边界停下来做。NVSHMEM 这类每进程只能初始化一次的，改了要重启 rank 进程。',
+   data:'改并行配置：重建 rank 进程。'},
+  {id:'core.state.kinds', nm:'状态种类', lane:'state', x:1118, y:730, rel:'plan', kind:'state',
+   one:'每一种“要存的东西”的存储规则；一种状态一个单元。',
+   does:['每层声明自己存的部分：寿命（整个请求 / 滑动窗口 / 每请求一个 slot）× 每项对应几个 token × 形状 × 放在哪（显存 / host）× 自有还是借用别的层的 × 快照对齐 × 分区',
+         'Qwen3.8：paged KV + GDN 的 recurrent / conv state',
+         'DS 1017：压缩 block KV、indexer K、每序列 state slot（分可持久和可丢弃两区）、nextn KV、Engram 大表；专家放置表和负载计数也登记成状态',
+         '每种实现 allocate / free / snapshot / invalidate（必须有），以及可选的 migrate / refit / grow，并声明自己支持哪些',
+         '同一份声明也交给账本，账本里的记账插件按它记账'],
+   nodo:['不记账（账本在调度宿主）'],
+   borrow:['sglang <code>mem_cache/kv/decl.py</code>（lifetime × geometry）和 <code>mem_cache/README.md</code> 的分层规则','mini-sglang <code>kvcache/base.py</code>'],
+   change:'状态单元：重载会让这种状态失效（有迁移函数就迁移）。'},
+
+  /* ---------------- 框架本体与横切 ---------------- */
+  {id:'core.context', nm:'配置与运行环境', lane:'cross', x:40, y:938, rel:'plan', kind:'core',
+   one:'每个进程里唯一的“配置入口”。',
+   does:['声明过的配置键的唯一读取路径；读没声明的键直接报错','运行时标志（如 DeepEP 模式）、资源租约（stream、buffer）','每次读取都会被记录，给依赖分析用'],
+   nodo:['环境变量 v0 不限制读取（v0-plan 第 29 条）'],
+   borrow:['sglang <code>runtime_context.py</code> 的分层（配置 / 运行时标志 / 资源 / 每次前向）'],
+   change:'框架本体：重启引擎（配置服务自己的实现变了，这种改动很少）。',
+   data:'改配置的值<b>不重启引擎</b>，要看这个键被谁、在什么时候读：<ul><li>每步现读的（chunk 大小、准入上限、EPLB 周期）→ 读它的单元原地接受新值，下一个 epoch 生效</li><li>编 plan 时读、被录进 graph 的（分桶列表、graph 最大 batch）→ 后台重录受影响的 graph</li><li>决定 KV 池大小的 → grow</li><li>决定拓扑的（TP、EP 大小）→ 只重建 rank 进程</li></ul>见场景⑦。'},
+  {id:'unit.runtime', nm:'单元运行时', lane:'cross', x:250, y:938, rel:'new', kind:'core',
+   one:'框架真正的“内核”：管单元的装、卸、依赖和重载。',
+   does:['单元的生命周期：等依赖 → 加载 → 运行 → 卸载',
+         '服务注册表：单元通过名字找服务，不直接 import 别的单元',
+         '可撤销注册：卸载时按相反顺序撤销',
+         '依赖传播：提供者换了，依赖它的单元自动重载',
+         '代码重载：清掉被改模块的缓存、重新 import、卸旧装新，失败回滚',
+         '代码从本机按身份物化的快照目录 import，不直接读 agent 的工作区（单机也这样，保证开发实例和评测实例加载的是同一份代码）',
+         '卸载顺序按依赖反方向，保证先卸用显存的，再卸持有显存的'],
+   nodo:['不认识任何领域概念（调度、KV、TP 都不认识）'],
+   borrow:['Cordis 的 Fiber / Service / effect / HMR（deepseek-harness <code>vendor/cordis/src/fiber.ts</code>、<code>vendor/hmr/src/index.ts</code>）'],
+   change:'框架本体：重启引擎。'},
+  {id:'core.ipc', nm:'进程间传输', lane:'cross', x:460, y:938, rel:'plan', kind:'core',
+   one:'进程之间传东西的管道。',
+   does:['ZMQ：请求和控制消息','每步的记录：两端在同一台机器走共享内存，跨机走 TCP 或 RDMA，按两端位置自动选','RPC：变更事务','地址来自拓扑数据，不写死 localhost','只管“怎么传”，记录里有什么由各单元自己定（带版本）'],
+   nodo:[], borrow:['mini-sglang <code>message/</code>、<code>utils/mp.py</code>'],
+   change:'框架本体：重启引擎。'},
+  {id:'core.nodeagent', nm:'节点代理', lane:'cross', x:1090, y:938, rel:'new', kind:'core', procText:'每台机器一个独立进程',
+   one:'每台机器一个：进程管家在这台机器上的“手”。',
+   does:['按进程管家的指令拉起、停止本机的进程','接收 change-set 的内容（按 hash），物化成本机的快照目录，进程从那里加载代码','提供本机进程之间的共享内存通道','上报本机的健康状况和平台信息（驱动、CUDA、网卡、NVSHMEM 版本）'],
+   nodo:['不做决定（听进程管家和变更事务的）'],
+   borrow:[], change:'框架本体：重启引擎。',
+   relNote:'单机时它就在本机，和控制面在同一台机器上；多机时每台机器起一个。v0 就按这个结构做（P7）。'},
+  {id:'platforms.*', nm:'平台', lane:'cross', x:670, y:938, rel:'plan', kind:'core',
+   one:'把硬件差异挡在这一层后面。',
+   does:['cuda_sm100：设备、VMM 分配器、stream 和 graph 的能力','fake：CI 用'],
+   nodo:[], borrow:['sglang <code>platforms/</code>'], change:'框架本体：重启引擎。'},
+  {id:'core.introspect', nm:'自省', lane:'cross', x:880, y:938, rel:'plan', kind:'logic',
+   one:'“仪表盘”：给 agent 和工具看引擎内部状态。',
+   does:['稳定的 schema：调度状态、KV 状态、plan 状态、算子调用（含 shape）、每个单元的状态（等待 / 运行 / 卸载）'],
+   nodo:[], borrow:['Cordis 的 fiber 状态枚举'], change:'重载这个单元。'},
+];
+
+const ETYPES = {
+  data:  {nm:'每步数据流', color:'#2563eb', dash:'',     w:2.2},
+  call:  {nm:'接口调用',   color:'#6b7280', dash:'',     w:1.4},
+  state: {nm:'状态共享',   color:'#059669', dash:'',     w:2.2},
+  derive:{nm:'派生',       color:'#ea580c', dash:'7 4',  w:2.0},
+  ctrl:  {nm:'变更控制',   color:'#dc2626', dash:'3 3',  w:1.8},
+  decl:  {nm:'声明 / 注册',color:'#7c3aed', dash:'1.5 4',w:2.4},
+};
+
+/* f: 起点, t: 终点, k: 种类, l: 说明, b: 弯曲程度(可选), via: 折线经过的点(可选) */
+const EDGES = [
+  /* 每步数据流 */
+  {f:'frontend.http', t:'frontend.tokenizer', k:'data', l:'请求文本'},
+  {f:'frontend.tokenizer', t:'core.sched', k:'data', l:'新请求：token id + 采样参数（ZMQ）'},
+  {f:'core.sched', t:'core.worker', k:'data', l:'StepPlan：按 rank 索引的开放记录（共享内存）', b:0.35},
+  {f:'core.worker', t:'core.sched', k:'data', l:'StepResult：新 token + 各单元的统计', b:0.35},
+  {f:'core.sched', t:'frontend.detok', k:'data', l:'新 token'},
+  {f:'frontend.detok', t:'frontend.http', k:'data', l:'文字增量（流式）'},
+  {f:'rsi.evalsvc', t:'frontend.http', k:'data', l:'发评测请求（走普通 OpenAI 接口）', via:[[1210,228],[464,228],[464,76]]},
+
+  /* 接口调用 */
+  {f:'core.sched', t:'policies.*', k:'call', l:'调用决策点：给快照，拿决定'},
+  {f:'core.sched', t:'sched.reqs', k:'call', l:'读写请求表', via:[[150,378],[548,378]]},
+  {f:'core.sched', t:'core.state.alloc', k:'call', l:'联合准入 / 释放 / 前缀匹配', via:[[170,386],[758,386]]},
+  {f:'core.sched', t:'core.change', k:'call', l:'提交内部 change-set（如 EPLB 重排）', via:[[200,263],[446,263],[446,126],[700,126]]},
+  {f:'core.worker', t:'core.plan', k:'call', l:'按（阶段, 分桶, epoch）取 plan 并执行'},
+  {f:'core.plan', t:'executors.*', k:'call', l:'交给执行后端'},
+  {f:'core.plan', t:'models.*', k:'call', l:'编 plan 时跟踪模型前向'},
+  {f:'models.*', t:'layers.*', k:'call', l:'用层单元拼模型'},
+  {f:'models.*', t:'moe.*', k:'call', l:'MoE 层（DS 1017）'},
+  {f:'layers.*', t:'core.kernels', k:'call', l:'按 definition 调用'},
+  {f:'moe.*', t:'core.kernels', k:'call', l:'路由 / dispatch / GEMM / combine'},
+  {f:'layers.*', t:'core.dist', k:'call', l:'TP all-reduce', b:0.06},
+  {f:'moe.*', t:'core.dist', k:'call', l:'EP all-to-all'},
+  {f:'core.api', t:'core.change', k:'call', l:'apply / --dry-run / serve'},
+  {f:'core.change', t:'core.manifest', k:'call', l:'静态检查'},
+  {f:'core.change', t:'core.deps', k:'call', l:'推导动作计划'},
+  {f:'core.change', t:'core.identity', k:'call', l:'算新身份'},
+  {f:'core.change', t:'core.supervisor', k:'call', l:'需要重启进程时'},
+  {f:'core.plan', t:'core.deps', k:'call', l:'登记派生产物和它的依赖', via:[[348,474],[892,474],[892,232],[778,232]]},
+  {f:'rsi.evalsvc', t:'rsi.lineage', k:'call', l:'写评测结果（附 diff）'},
+  {f:'rsi.evalsvc', t:'core.api', k:'call', l:'只用公开接口：冷启动实例、查状态', via:[[1310,183],[1310,54],[590,54]]},
+  {f:'rsi.lineage', t:'core.api', k:'call', l:'订阅事件、取快照（引擎不依赖它）', via:[[1200,50],[560,50]]},
+  {f:'core.context', t:'core.sched', k:'call', l:'每步现读的配置（chunk 大小、准入上限、EPLB 周期…）[实时]', via:[[90,906],[6,906],[6,338],[24,338]]},
+
+  /* 状态共享（同进程） */
+  {f:'core.state.weights', t:'moe.*', k:'state', l:'专家权重槽位 [按地址]'},
+  {f:'core.state.kinds', t:'moe.*', k:'state', l:'专家放置表、负载计数 [按地址]'},
+  {f:'core.state.kinds', t:'layers.*', k:'state', l:'KV / GDN state 视图 [按地址]', via:[[1206,876],[128,876]]},
+  {f:'core.state.weights', t:'layers.*', k:'state', l:'权重视图 [按地址]', via:[[1010,862],[110,862]]},
+  {f:'dist.groups', t:'core.dist', k:'state', l:'通信组对象', via:[[1206,702],[900,702],[900,628]]},
+
+  /* 派生 */
+  {f:'models.*', t:'core.plan', k:'derive', l:'模型代码 → plan [按值：走哪条代码、哪个分支]'},
+  {f:'core.kernels', t:'core.plan', k:'derive', l:'选中的 kernel 写死在 plan 里 [按值]'},
+  {f:'core.state.kinds', t:'core.plan', k:'derive', l:'状态布局版本、buffer 地址 [按地址]', via:[[1110,758],[1110,576],[380,576]]},
+  {f:'core.state.weights', t:'core.plan', k:'derive', l:'权重地址 [按地址]', via:[[1016,584],[400,584]]},
+  {f:'dist.groups', t:'core.plan', k:'derive', l:'通信组、通信 buffer 地址 [按地址]', via:[[1206,592],[420,592]]},
+  {f:'core.context', t:'core.plan', k:'derive', l:'编 plan 时读到的配置（如分桶列表）[按值]', via:[[128,906],[238,906],[238,566],[292,566]]},
+
+  /* 变更控制 */
+  {f:'core.change', t:'core.sched', k:'ctrl', l:'epoch 边界停下 → 重载单元 / 状态动作 → 提交或撤回；按需排空', via:[[760,135],[455,135],[455,253],[140,253]]},
+  {f:'core.change', t:'core.worker', k:'ctrl', l:'epoch 边界停下 → 重载单元 / 重录 graph / 状态动作 → 提交或撤回', via:[[850,135],[880,135],[880,401],[200,401]]},
+  {f:'core.change', t:'frontend.http', k:'ctrl', l:'切换期间让新请求排队，切完放行', via:[[760,135],[455,135],[455,104]]},
+  {f:'core.supervisor', t:'core.sched', k:'ctrl', l:'启动 / 停止 / 重启进程', via:[[960,244],[160,244]]},
+  {f:'core.supervisor', t:'core.worker', k:'ctrl', l:'经节点代理启动 / 停止 / 重启 rank 进程（只在必须时）', via:[[1000,232],[1000,410],[240,410]]},
+  {f:'core.supervisor', t:'core.nodeagent', k:'ctrl', l:'让每台机器的节点代理拉起本机进程、物化快照', via:[[1050,236],[1325,236],[1325,966],[1266,966]]},
+
+  /* 声明 / 注册 */
+  {f:'models.*', t:'core.state.kinds', k:'decl', l:'声明每层要存什么', via:[[620,692],[1190,692]]},
+  {f:'models.*', t:'core.state.weights', k:'decl', l:'声明权重名、格式和切分方式', via:[[590,682],[912,682],[912,648]]},
+  {f:'kernels.*', t:'core.kernels', k:'decl', l:'注册参照实现和各个 solution'},
+  {f:'core.state.kinds', t:'core.state.alloc', k:'decl', l:'状态声明（账本里的记账插件按它记账）', via:[[1302,758],[1302,338],[860,338]]},
+];
+
+const SCENARIOS = [
+  {id:'s1', nm:'① 服务一个请求的一步（decode）', steps:[
+    ['frontend.http','frontend.tokenizer','用户的请求进来，先把文字切成 token id。'],
+    ['frontend.tokenizer','core.sched','新请求送到调度宿主。'],
+    ['core.sched','sched.reqs','调度逻辑把请求记进请求表（状态单元），并追加到请求日志。'],
+    ['core.sched','policies.*','问决策点：这一步放哪些请求进来、prefill 切多大？默认策略是先来先服务 + 固定 chunk。'],
+    ['core.sched','core.state.alloc','去账本做联合准入：Qwen3.8 要 KV 块和 GDN state slot，两样都分到才放进来；顺便查前缀能复用多长。'],
+    ['core.sched','core.worker','生成 StepPlan：按 rank 索引，各单元往里贡献自己的分段；经共享内存发给每个 rank。'],
+    ['core.worker','core.plan','worker 按（decode、batch 8 这一档、当前 epoch）选出 plan；replay 前检查依赖有没有变。'],
+    ['core.plan','executors.*','把输入拷进 graph 的固定 buffer，replay。'],
+    ['core.state.holder','executors.*','graph 直接读写同一进程里状态单元持有的 KV 和权重。'],
+    ['core.worker','core.sched','采样出来的新 token 回给调度宿主。'],
+    ['core.sched','frontend.detok','推进请求表里的状态（结束的就释放资源），把 token 发给 detok。'],
+    ['frontend.detok','frontend.http','变回文字，流式返回；响应头里带着当前的系统身份。'],
+  ]},
+  {id:'s2', nm:'② 启动引擎（serve）', steps:[
+    ['core.api','core.change','<code>engine serve --source &lt;工作区&gt; --model qwen38</code>。在框架看来，启动就是“从空系统变到某个身份”的一次变更。'],
+    ['core.change','core.manifest','先查所有单元的清单和 import 图。'],
+    ['core.change','core.identity','算出启动身份，以后评测时可以拿它当起点。'],
+    ['core.change','core.supervisor','按拓扑数据决定要起哪些进程、每个进程装哪些单元。'],
+    ['core.supervisor','core.worker','每个 rank 起一个 worker 进程。单元运行时按依赖自动排顺序：先装状态单元（显存、权重、通信组、各种状态），再装逻辑单元。'],
+    ['core.worker','core.plan','plan 单元编 plan、录 decode graph，记下依赖。'],
+    ['core.plan','core.deps','把派生产物和依赖登记到控制面。'],
+    ['core.supervisor','core.sched','起调度宿主：装请求表、账本（按 worker 报来的状态声明建账）、调度逻辑、各个策略。'],
+    ['core.change','frontend.http','前端开始放行请求。'],
+  ]},
+  {id:'s3', nm:'③ apply：换一个调度策略', steps:[
+    ['core.api','core.change','agent 改了一个调度策略的代码，执行 apply。'],
+    ['core.change','core.manifest','静态检查通过。'],
+    ['core.change','core.deps','推导：只有这一个策略单元变了，没有别的单元依赖它的代码 → 动作：重载这一个单元。'],
+    ['core.change','core.sched','下一个 epoch 边界：卸掉旧策略单元，装上新的。其他单元、其他进程都不动。'],
+    ['core.change','core.identity','得到新身份，之后的响应都带新身份。'],
+  ]},
+  {id:'s4', nm:'④ apply：换 decode graph 里的一个 kernel', steps:[
+    ['core.api','core.change','agent 用 Triton 写了一个更快的 decode attention kernel，执行 apply。'],
+    ['core.change','core.deps','推导：新增一个 kernel 单元，换掉旧的绑定；kernel 的选择是按值录进 graph 的 → 只重录用到它的 decode graph；KV 和权重不动 → 不排空。'],
+    ['core.change','core.worker','prepare：每个 rank 装上新 kernel 单元，在第二套 buffer 里后台重录受影响的 graph，旧 graph 继续服务。'],
+    ['kernels.*','core.kernels','新 kernel 注册进 kernel 目录。注册是可撤销的，回滚时自动撤掉。'],
+    ['core.worker','core.plan','plan 单元按依赖记录只重录用到这个 kernel 的 graph，记下新的依赖。'],
+    ['core.change','core.worker','所有 rank 都准备好 → epoch 边界一起换成新 graph，卸掉旧 kernel 单元；有一个失败 → 全部撤回。'],
+    ['core.change','core.identity','得到新身份。'],
+  ]},
+  {id:'s5', nm:'⑤ EPLB 重排（DS 1017）', steps:[
+    ['moe.*','core.state.kinds','每一步，MoE 层顺手把每个专家收到的 token 数累加进负载计数（状态单元里，graph 按地址写）。'],
+    ['core.sched','policies.*','每隔 M 步，调度逻辑问 EPLB 触发策略：要不要重排？'],
+    ['core.sched','core.worker','要重排：让 worker 汇总负载（各 rank 之间 all-reduce），结果随 StepResult 带回。'],
+    ['core.sched','policies.*','EPLB 方案策略算出新的专家放置（默认用 DeepSeek 开源的 EPLB 算法）。'],
+    ['core.sched','core.change','新放置作为一次内部 change-set 提交，和 agent 的 apply 走同一条流程。'],
+    ['core.change','core.deps','推导：放置表和专家槽位都是“同地址改内容” → 不用重录 graph，也不用排空。'],
+    ['core.change','core.worker','prepare：每个 rank 算出要发出 / 收进哪些专家，备好临时 buffer。'],
+    ['core.worker','core.state.weights','到 epoch 边界，所有 EP rank 一起点对点搬专家权重，原地写进物理槽位，同时原地更新放置表。必须所有 rank 同时切，否则 token 会被发给错误的专家。'],
+  ]},
+  {id:'s6', nm:'⑥ patch 评测（RSI 平面）', steps:[
+    ['rsi.evalsvc','rsi.lineage','收到（起点身份, patch, 套件）。先去谱系确认起点存在，再做静态检查；不通过就直接拒绝，不占 GPU。'],
+    ['rsi.evalsvc','core.api','用起点快照 + patch 生成候选，然后在评测服务自己的 GPU 上分别冷启动起点和候选，两个都是全新实例。'],
+    ['core.api','core.change','每个实例都按“启动”场景走一遍：静态检查、算身份、起进程、装单元、录 graph。'],
+    ['rsi.evalsvc','frontend.http','通过普通 OpenAI 接口跑套件：先过门禁（正确性），再成对计时（起点、候选交替跑）。'],
+    ['rsi.evalsvc','rsi.lineage','结果按（起点, patch, 套件版本）写进谱系，附上 diff 方便审查。'],
+  ]},
+  {id:'s7', nm:'⑦ apply：改配置的值（不重启引擎）', steps:[
+    ['core.api','core.change','agent 改了几个配置键，执行 apply。下面用三个键举例。'],
+    ['core.change','core.deps','推导：先查每个键被谁、在什么时候读（运行时和录 graph 时都自动记下来了）。'],
+    ['core.context','core.sched','例 1：prefill 的 chunk 大小。调度逻辑每步都现读它（实时）……'],
+    ['core.change','core.sched','……读它的单元注册了“原地接受新配置”的钩子，下一个 epoch 边界换上新值。不重载任何单元，不排空。'],
+    ['core.context','core.plan','例 2：graph 的最大 batch 从 128 调到 256。它是编 plan 时读的，被录进了 graph（按值）……'],
+    ['core.change','core.worker','……plan 单元在后台补录新的分桶，旧 graph 继续服务，到 epoch 边界切过去。不排空，KV 保留，进程不重启。'],
+    ['core.change','core.supervisor','例 3：TP 从 4 改成 2。拓扑变了：排空，只重建 rank 进程，按新切法重新加载权重。控制面、前端、调度宿主不停，排队的请求不丢。'],
+    ['core.change','core.identity','三种情况都得到新身份。只有框架本体的代码变了，才需要重启整个引擎。'],
+  ]},
+  {id:'s8', nm:'⑧ apply：改调度机制的代码', steps:[
+    ['core.api','core.change','agent 改了调度机制的代码（比如加一条抢占规则），执行 apply。'],
+    ['core.change','core.deps','推导：重载调度逻辑单元；请求表和账本是状态单元，不受影响；worker 进程完全不动。'],
+    ['core.change','core.sched','epoch 边界：卸旧装新。不重启进程，也不重放日志。'],
+    ['core.sched','sched.reqs','新的调度逻辑从请求表里拿到所有在途请求，下一步照常调度，在途请求接着跑。'],
+    ['core.change','core.identity','得到新身份。'],
+  ]},
+  {id:'s9', nm:'⑨ apply：改 native 扩展（退路）', steps:[
+    ['core.api','core.change','agent 改了一个 CUDA C++ 扩展（.so）并重新编译，执行 apply。'],
+    ['core.change','core.deps','推导：.so 装进进程后卸不掉 → 只能重启用到它的 rank 进程；状态单元在这些进程里，会跟着没 → 要排空，重新加载权重。'],
+    ['core.change','core.supervisor','排空受影响的请求，请进程管家重启每个 rank 的 worker 进程。'],
+    ['core.supervisor','core.worker','新进程重新装状态单元（加载权重）和逻辑单元，重录 graph。'],
+    ['core.change','core.sched','调度宿主不重启：账本里这些 rank 的账作废重建，排队的请求不丢。'],
+    ['core.change','core.identity','得到新身份。'],
+  ]},
+];
+
+const DS_STEPS = [
+  {n:0, what:'装 DS 要用的 native 库：DeepGEMM、DeepEP、FlashMLA；如果还要升 torch / CUDA，也放在这一步。',
+   units:'依赖锁变了；还没有单元用到它们。', where:'Qwen 实例',
+   act:'native 库进不了正在跑的进程 → 重启 rank 进程；升 torch / CUDA 是平台变化 → 重启引擎。之后跑一遍 Qwen 回归。',
+   env:'fb', envT:'退路', pr:'—（身份覆盖依赖锁和平台版本，v0-plan 已有）',
+   note:'单独先做这一步，后面的步骤都便宜。'},
+  {n:1, what:'新增 DS 用到的 kernel：压缩 attention、indexer top-k、稀疏 attention、FP8 块量化 GEMM、FP4 分组 GEMM、MoE 路由（sqrtsoftplus）、dispatch / combine（先写基于 torch.distributed 的参照实现）、mHC 的 Sinkhorn、Engram 查表。每个都带 PyTorch 参照实现。',
+   units:'新增：每个 definition、每个 solution 各一个单元。', where:'Qwen 实例',
+   act:'只装新单元；没有 plan 用到它们 → 什么都不重录。', env:'in', envT:'包络内', pr:'kernel 目录运行时可注册'},
+  {n:2, what:'权重支持 FP8 块量化和 FP4 专家（权重和 scale 成对加载）。',
+   units:'新增两个权重格式单元。', where:'Qwen 实例',
+   act:'装新单元；Qwen 是 BF16，不受影响。', env:'in', envT:'包络内', pr:'P1：权重 = 格式 + 放置，格式是插件'},
+  {n:3, what:'新增 DS 的状态种类：压缩 block KV（每层压缩比不同）、indexer K、每序列 state slot（SWA 环形缓冲 + 压缩累加器，分可持久 / 可丢弃两区，128 token 边界打快照）、nextn KV、Engram 大表（放在 host 内存）。跨层共享用“借用”声明。',
+   units:'新增：每种状态一个存储单元（worker 里）+ 一个记账插件（账本里）。', where:'Qwen 实例',
+   act:'装新单元；Qwen 不声明这些状态 → 不分配。', env:'in', envT:'包络内',
+   pr:'P1 + P4：声明里有每项几个 token、放在哪、自有还是借用、快照对齐、分区',
+   note:'这是最可能“不够用”的一步：sglang 支持 DS V4 时另写了专用显存池（<code>mem_cache/deepseek_v4_memory_pool.py</code>）。所以 M0 必须拿 DS 1017 做纸面包络测试。'},
+  {n:4, what:'声明 DP、EP 两个并行维度。',
+   units:'只改拓扑数据；通信逻辑按维度名找组，不用改代码。', where:'Qwen 实例（DP = EP = 1，等于没变）',
+   act:'无动作。', env:'in', envT:'包络内', pr:'P1（mesh 是数据）+ P3'},
+  {n:5, what:'新增 DS 模型和它的层单元（压缩 attention 层、MoE 五段、mHC、Engram 层、nextn），加一个小尺寸配置（几层、少量专家、随机权重）。',
+   units:'新增模型单元和层单元。', where:'先装进 Qwen 实例（没人用，闲置）；再起一个新的开发实例 <code>--model ds1017-tiny</code>，1 张卡',
+   act:'新实例冷启动（这是启动，不是 apply）。', env:'act', envT:'已有动作',
+   pr:'P1：每层可以不同；plan 从实际跟踪得到 buffer'},
+  {n:6, what:'调度支持 DP：每个 DP rank 是一个调度域，有自己的一批请求和一本账；同一个 EP 组的 rank 每步一起走，没请求的跑空 batch；新增 DP 路由策略。',
+   units:'修改调度逻辑单元；新增 DP 路由策略单元；账本按调度域分。', where:'Qwen 实例 + DS 开发实例',
+   act:'重载调度逻辑单元；请求表、账本、worker 都不动。Qwen 只有一个调度域，行为必须不变（跑回归）。', env:'in', envT:'包络内',
+   pr:'P2 + P3：StepPlan 本来就按 rank 索引、是开放记录',
+   note:'没有 P2、P3 的话，这一步要改 StepPlan 的格式，两个进程里的单元一起重载，就成了“扩展接口”。'},
+  {n:7, what:'graph 分桶在 EP 组内对齐：all-to-all 要求组内所有 rank 一起跑同一个 graph 结构。',
+   units:'替换分桶策略单元：快照里有各 rank 的 batch 大小，作用范围是整个 EP 组。', where:'DS 开发实例',
+   act:'重载策略单元；分桶列表没变 → 不重录。', env:'in', envT:'包络内', pr:'P3 + P5'},
+  {n:8, what:'DS 开发实例改成 2 卡 DP2 + EP2。',
+   units:'改拓扑数据。', where:'DS 开发实例',
+   act:'重建 rank 进程（已有动作）。', env:'act', envT:'已有动作', pr:'P1'},
+  {n:9, what:'用 DeepEP 换掉参照 dispatcher：decode 用 low-latency 模式（能录进 graph），prefill 用 normal 模式。',
+   units:'替换 dispatch 的 solution 单元；DeepEP 通信 buffer 放进 dist.groups。', where:'DS 开发实例',
+   act:'dispatch 是按值录进 graph 的 → 重录 decode graph；DeepEP 模式作为运行时标志被记下，replay 前恢复。NVSHMEM 每个进程只能初始化一次，第一次接入要重启 rank 进程。',
+   env:'fb', envT:'包络内；首次接入走退路', pr:'P4：solution 声明能否录进 graph、是否需要进程级初始化'},
+  {n:10, what:'前缀缓存的 DS 规则：由 block KV 决定命中长度，SWA 缺了就回退一个块重算；128 token 边界打快照。',
+   units:'修改第 3 步的状态单元和记账插件，补上命中规则。', where:'DS 开发实例',
+   act:'重载这些单元 → 它们管的前缀缓存失效（KV 数值没变，只是命中规则变了）。', env:'in', envT:'包络内', pr:'P5：联合前缀匹配'},
+  {n:11, what:'nextn 投机解码：新增 nextn 草稿来源，复用 v0 的固定长度 verify。',
+   units:'新增草稿来源单元。', where:'DS 开发实例',
+   act:'装新单元；verify graph 重录。', env:'in', envT:'包络内', pr:'P4：被拒 token 的回滚走各状态种类自己的接口（SWA 环形缓冲自己处理回退）'},
+  {n:12, what:'EPLB：MoE 层顺手记负载；EPLB 触发策略、方案策略；专家搬迁。',
+   units:'新增负载计数状态、两个策略单元；权重存储声明“槽位间搬迁”动作。', where:'DS 开发实例',
+   act:'装新单元。之后每次重排都是一次内部 change-set：同地址改内容，不重录、不排空，所有 EP rank 同一 epoch 切换。', env:'in', envT:'包络内', pr:'P6 + P4'},
+  {n:13, what:'Engram：host 内存里的两张大表（各约 3.84 亿行），GPU 通过 RDMA 读取。',
+   units:'新增 Engram 层、host 放置的状态种类、查表 kernel。', where:'DS 开发实例（需要 RDMA 设备）',
+   act:'装新单元；显存持有者按声明分 host 内存。平台依赖（RDMA、NCCL 版本）走第 0 步那种退路。', env:'in', envT:'包络内；平台依赖走退路', pr:'P1：放置可以是 host'},
+  {n:14, what:'前端：DS 的 tokenizer（deepseek-recipe）、chat template、reasoning / tool parser。',
+   units:'新增前端单元，按模型选。', where:'前端',
+   act:'重载前端单元。', env:'in', envT:'包络内', pr:'—'},
+  {n:15, what:'新增 DS 评测套件（和 DeepInfer 的 batch-invariant 输出对齐），在评测服务上冷启动全尺寸 8 卡 DP8 + EP8。',
+   units:'RSI 平面新增套件。', where:'评测服务',
+   act:'冷启动起点和候选两个实例，跑套件。', env:'act', envT:'已有动作', pr:'—'},
+];
+
+const DS_SUMMARY = [
+  '16 步里，11 步只是新增或替换单元（包络内），3 步用的是已有动作（起新实例、重建 rank 进程），2 步要走退路（native 库或平台升级、NVSHMEM 首次初始化）。<b>没有一步要改框架本体。</b>',
+  '前提是 ③ 页的 P1–P6 从 v0 就成立。它们不要求 v0 实现任何 DS 功能，只要求 v0 的数据模型和接口一开始就做通用；CI 用假执行器、快速测试用 Qwen 就能验证。',
+  '如果没有这些原则，第 2、3、4、6、7、12 步都会变成“扩展接口”，第 12 步还会变成“包络外”（要给变更事务加一个内部入口，等于改框架本体）。',
+  '最大的不确定性在第 3 步：状态种类的声明够不够宽。M0 必须拿 DS 1017 做纸面包络测试。',
+  '退路只出现在 native 代码和平台层，这是 Python 进程的本质限制。',
+];
+
+const DS_FIXES = [
+  ['StepPlan 是固定结构，隐含“一个 TP 组一批请求”','按 rank 索引的开放记录，各单元贡献分段','P2、P3','第 6 步'],
+  ['决策点只看本 rank 的快照','快照由各单元贡献字段；作用范围可以是一个调度域或整个组','P3、P5','第 7 步'],
+  ['权重存储只有“按逻辑名寻址 + 布局描述符”','逻辑张量 = 格式插件 + 放置数据（含专家的物理槽位）','P1','第 2、12 步'],
+  ['状态声明只有粒度、页大小、快照','补齐：每项几个 token、放在哪（显存 / host）、自有还是借用、快照对齐、分区','P1、P4','第 3、13 步'],
+  ['账本只有一本，前缀命中由 KV 决定','账本按调度域分；前缀命中由各种状态联合决定','P3、P5','第 6、10 步'],
+  ['派生产物只说了 plan 和 graph','任何单元都能登记派生产物和它的依赖（如 EPLB 的映射表缓存、实测曲线），统一由 core.deps 通知重建','P4','第 9、12 步'],
+  ['动作是框架里的一张固定表','动作由单元声明、由单元执行，框架只按阶段调度','P4','第 9、12 步'],
+  ['进程拓扑写在进程管家的代码里','进程拓扑和并行拓扑（mesh）都是数据','P1','第 4、8 步'],
+  ['变更只来自 agent 的 apply','单元自己也能提交 change-set，走同一条流程','P6','第 12 步'],
+];
+
+const GLOSS = [
+  ['单元','管理和重载的最小单位：声明依赖、提供服务、所有注册都可撤销。每个模块都是一个或几个单元。'],
+  ['逻辑单元 / 状态单元','逻辑单元重载很便宜；状态单元持有显存、通信组、请求表这类东西，重载会丢掉它们。'],
+  ['框架本体','单元运行时、变更事务、进程管家、节点代理、配置、进程间传输、平台。只有它们改了才重启引擎。'],
+  ['节点代理','每台机器一个，替进程管家在本机拉起进程、物化代码快照、提供共享内存通道。单机时也有一个。'],
+  ['重载','卸掉旧单元（倒着执行撤销函数）、重新 import 代码、装上新单元；依赖它的单元自动跟着重载。'],
+  ['包络','只靠新增或替换单元就能做到的改动，叫“在包络内”；要改框架本体的，叫“包络外”。'],
+  ['mesh','并行拓扑的数据描述：有哪些维度（tp、dp、ep……）、各多大、每个 rank 在哪。'],
+  ['调度域','一组共用一批请求、一本账的 rank。TP 组是一个域；DS 的每个 DP rank 是一个域。'],
+  ['开放记录','由多个单元各自贡献分段的记录，新单元加自己的分段不影响别人。'],
+  ['rank','一张 GPU 上的一份执行单元。'],
+  ['StepPlan / StepResult','调度宿主每步发给 worker 的指令单 / worker 回给调度宿主的结果。'],
+  ['epoch 边界','两步之间的那一刻。所有变更只在这个时刻生效。'],
+  ['两阶段提交','先问所有参与者“准备好了吗”，全部说好才一起生效；有一个说不行就全部取消。'],
+  ['capture / replay','录 CUDA graph / 回放 CUDA graph。'],
+  ['派生产物','由别的东西“算出来”的东西，比如 plan、graph、缓存的映射表。上游变了它可能要重建。'],
+  ['definition / solution','kernel 的“算什么”和“怎么算”。一个 definition 可以有多个 solution，至少有一个 PyTorch 参照实现。'],
+  ['refit / grow / migrate','refit：布局不变只换内容；grow：只扩容，地址不变；migrate：按迁移函数换布局或搬位置。'],
+];
+
+const DECISIONS = [
+  ['账本放在调度宿主里，作为状态单元','同意'],
+  ['框架本体保持很小（加上节点代理一共七个）','同意'],
+  ['七条原则（P1–P7）都放进 v0','都放'],
+  ['v0 只含 Qwen3.8；v0.1 才含 DS 1017，按思想实验一的路线从 v0 演进出来；v0.2 是两机，按思想实验二的路线演进出来','是'],
+  ['状态单元的代码改了：默认“排空 + 重建”，提供迁移函数就不排空','同意'],
+  ['评测服务保留最简单的受保护路径：套件里一张路径列表','同意'],
+  ['前端三个单元先放在一个进程里','先放一起'],
+  ['参照模式下 EP 用确定性分发','先保留，做完 v0 再看'],
+  ['v0 全部用 Python。本体里作为独立进程的组件（节点代理、进程管家、变更事务）只通过版本化消息交互、不 import 单元，以后可以单独换成 Rust','全部 Python'],
+  ['v0.2 不要求共享文件系统；有 Lustre 就用来放权重，代码快照、JIT 缓存、sqlite、ipc 套接字仍放本机','不要求'],
+];
+
+const QUESTIONS = [
+  {t:'节点代理在 v0 就做成独立的一层吗？',
+   d:'v0 只有一台机器，节点代理可以只是控制面里的一个组件；但进程管家必须经过它拉进程，进程必须从它物化的快照目录加载代码，否则 v0.2 要改框架本体。',
+   r:'v0 就做成独立的一层，单机时就在本机；CI 里起两个节点代理模拟两台主机。'},
+  {t:'v0.2 里调度宿主一个进程管 16 个 rank，跨机每步走 TCP，够不够？',
+   d:'每步多一次跨机往返。v0 系列不追求性能，但如果慢到评测跑不完，就得优化。',
+   r:'v0.2 先这样；真慢了再加“每台机器一个转发单元”：调度宿主每台机器只发一份，转发单元在本机用共享内存分发。这是新增单元，在包络内。'},
+  {t:'一台机器掉了怎么办？',
+   d:'EP 组不完整，整个实例停服。可以等它恢复后重建，也可以降级成单机 DP8 + EP8（重新放置专家、重新加载权重）。',
+   r:'v0.2 先由人或 agent 手动选择；自动降级以后做成策略单元。不停服务的在线扩缩（像 Elastic EP）不在 v0 系列里。'},
+  {t:'两台机器上的权重怎么放？',
+   d:'476 GB 的 checkpoint，每台机器只需要自己那份专家和 attention 权重。',
+   r:'权重存储按放置数据只读本机需要的部分；路径按机器解析，本地盘或共享存储都行，不归引擎管（v0-plan 第 28 条）。'},
+];
+
+const MN_STEPS = [
+  {n:0, what:'准备第二台机器：同样的驱动、CUDA、torch、native 库；IB / RoCE 网卡，NVSHMEM 的 IBGDA；权重放在本地盘或共享存储；装上引擎，起一个节点代理。',
+   units:'无（环境准备，不归引擎管）。', where:'新机器',
+   act:'节点代理向控制面报到，上报本机平台信息；和第一台不一致就拒绝加入。', env:'act', envT:'已有动作（环境准备）', pr:'P7：节点代理；身份按机器记平台信息'},
+  {n:1, what:'新增跨机版的 dispatch：DeepEP internode（normal 模式两级转发：机内 NVLink、机间 RDMA；low-latency 模式走 RDMA）。solution 声明“支持跨机”。',
+   units:'新增 solution 单元。', where:'v0.1 实例（单机，用不到）',
+   act:'只装新单元，什么都不重录。', env:'in', envT:'包络内', pr:'P4：solution 声明能否跨机'},
+  {n:2, what:'EPLB 方案改用分层算法：先把专家组分到机器上，再在机器内分到卡上，减少跨机流量（DeepSeek EPLB 的 hierarchical 模式）。',
+   units:'替换 EPLB 方案策略单元；机器数从快照里的 mesh 物理布局读。', where:'v0.1 实例（只有一台机器时退化成原算法）',
+   act:'重载策略单元。', env:'in', envT:'包络内', pr:'P1：mesh 带物理布局，进快照'},
+  {n:3, what:'改拓扑数据：加入第二台机器；mesh 改成 DP16 + EP16，写明 rank 0–7 在 A、8–15 在 B；权重路径按机器写。',
+   units:'只改数据。', where:'v0.1 实例：这一次 apply 就是“改拓扑”',
+   act:'排空；推导出所有 rank 进程要重建（EP 组从 8 变成 16）。进程管家让 A、B 两台的节点代理各拉起 8 个 worker 进程。下面 4–8 都是这一次 apply 里框架自动做的。', env:'act', envT:'已有动作', pr:'P1 + P7'},
+  {n:4, what:'（自动）代码分发：两台机器的节点代理按 hash 拿到当前身份的快照内容，各自物化到本机目录，worker 从那里加载代码。',
+   units:'—', where:'两台机器',
+   act:'单元运行时照常装单元，不知道自己在哪台机器上。', env:'in', envT:'包络内', pr:'P7：代码从本机快照加载'},
+  {n:5, what:'（自动）通道：调度宿主和 B 上的 8 个 worker 之间的每步通道自动用 TCP；A 上的照旧用共享内存。',
+   units:'—', where:'两台机器',
+   act:'按两端位置选后端，单元看到的接口不变。', env:'in', envT:'包络内', pr:'P7：通道后端按位置选'},
+  {n:6, what:'（自动）通信组：按 mesh 建 16 卡的 DP / EP 组，rendezvous 地址来自拓扑数据；新进程里初始化 NVSHMEM（跨机）。',
+   units:'dist.groups 按新数据重建。', where:'两台机器',
+   act:'新进程本来就要初始化，不额外重启。', env:'in', envT:'包络内', pr:'P1 + P7'},
+  {n:7, what:'（自动）权重：每张卡放 24 个专家（384 / 16）加冗余，按新的放置从本机路径加载；attention 权重每个 DP rank 一份。',
+   units:'权重存储按新的放置数据加载。', where:'两台机器',
+   act:'只读本机需要的那部分权重。', env:'in', envT:'包络内', pr:'P1：放置是数据'},
+  {n:8, what:'（自动）plan 和调度：kernel 目录按 mesh 物理布局给 dispatch 选跨机版，录 decode graph；账本从 8 本变成 16 本（每个调度域一本），排队的请求不丢。',
+   units:'—', where:'两台机器 + 调度宿主',
+   act:'plan 单元重录 graph；调度逻辑照常工作。', env:'in', envT:'包络内', pr:'P3 + P4'},
+  {n:9, what:'之后 agent 的每一次 apply（比如换一个 kernel）。',
+   units:'同单机。', where:'v0.2 实例',
+   act:'change-set 内容先推到两台机器物化；两台机器上的相关进程在同一个 epoch 一起重载；两阶段提交多一次跨机往返。', env:'in', envT:'包络内', pr:'P6 + P7：参与者按“机器 + 进程”寻址'},
+  {n:10, what:'EPLB 跨机重排。',
+   units:'同单机。', where:'v0.2 实例',
+   act:'搬专家走 NCCL 点对点（跨机走 RDMA）；16 个 rank 同一个 epoch 切换。', env:'in', envT:'包络内', pr:'P6'},
+  {n:11, what:'一台机器掉了（比如 B）。',
+   units:'—', where:'v0.2 实例',
+   act:'节点代理失联，进程管家按“整台机器”上报；EP 组不完整，实例停服。动作是“改拓扑”：等 B 恢复后重建，或者降级成单机 DP8 + EP8（重新放置专家、重新加载权重）。', env:'act', envT:'已有动作', pr:'P1 + P7：机器是故障单位'},
+  {n:12, what:'评测：评测服务启动时被指定两台机器的 GPU，冷启动两台机器上的起点和候选，成对测量。',
+   units:'评测服务的配置。', where:'评测服务',
+   act:'和单机一样走冷启动。', env:'act', envT:'已有动作', pr:'P7'},
+  {n:13, what:'（以后，可选）性能：调度宿主每步要和 16 个 rank 通信，跨机走 TCP 比较慢 → 加“每台机器一个转发单元”。',
+   units:'新增转发单元，放在每台机器的一个进程里（进程拓扑数据加一个角色）。', where:'v0.2 实例',
+   act:'改拓扑数据 + 新增单元；调度宿主每台机器只发一份记录，转发单元在本机用共享内存分发。', env:'in', envT:'包络内', pr:'P1 + P2 + P7'},
+];
+
+const MN_SUMMARY = [
+  '14 步里，10 步在包络内，4 步用的是已有动作（环境准备、改拓扑、机器故障、评测冷启动）。<b>没有一步要改框架本体，也没有额外的退路。</b>',
+  '关键在 P7：它约束的是框架本体自己（进程管家、节点代理、进程间传输、单元运行时、变更事务）。v0 不按 P7 做的话，第 3–6 步和第 9 步都会变成“包络外”：要改本体、重启引擎，而且要人来设计。',
+  '其余的事（跨机 dispatch、分层 EPLB、16 本账、跨机放置）都靠 P1–P6，和思想实验一用的是同一套机制。',
+  '单机只是多机的特例：v0 在一台机器上起两个节点代理，就能在 CI 里测 P7。',
+];
+
+const MN_FIXES = [
+  ['进程管家直接在本机 spawn 进程','经每台机器上的节点代理拉起；单机时节点代理就在本机','P7','第 0、3 步'],
+  ['每步通道写死共享内存','按两端是否在同一台机器选后端：共享内存或 TCP / RDMA','P7','第 5 步'],
+  ['进程直接从 agent 的工作区 import 代码','从本机按身份物化的快照目录 import；apply 时把内容按 hash 推到每台机器','P7','第 4、9 步'],
+  ['mesh 只有逻辑维度','加上物理布局：每个 rank 在哪台机器、哪个 NVLink 域、本机第几张卡','P1','第 2、3、8 步'],
+  ['文件路径、rendezvous 地址假设本机','路径按机器解析；地址来自拓扑数据，不写死 localhost','P7','第 3、6、7 步'],
+  ['身份只记一份平台信息','每台机器各记一份，不一致就拒绝加入','P7','第 0 步'],
+  ['两阶段提交的参与者按本机进程寻址','按“机器 + 进程”寻址','P7','第 9 步'],
+  ['故障只按进程上报','节点代理失联 = 整台机器掉了，作为一种拓扑变化处理','P1、P7','第 11 步'],
+  ['kernel solution 只声明能不能录进 graph','还声明能不能跨机；kernel 目录按 mesh 物理布局选','P4','第 1、8 步'],
+];
+
+/* =====================================================================
+   渲染
+   ===================================================================== */
+const $ = s => document.querySelector(s);
+const byId = Object.fromEntries(MODS.map(m => [m.id, m]));
+const SVGNS = 'http://www.w3.org/2000/svg';
+const state = {sel:null, filters:new Set(Object.keys(ETYPES)), scn:null, step:0};
+
+function rectOf(m){ return {x:m.x, y:m.y, w:W, h:H}; }
+function ctr(m){ return [m.x + W/2, m.y + H/2]; }
+function inside(r, p, pad){ return p[0] > r.x-pad && p[0] < r.x+r.w+pad && p[1] > r.y-pad && p[1] < r.y+r.h+pad; }
+function bez(p0, c, p1, t){ const u = 1-t; return [u*u*p0[0]+2*u*t*c[0]+t*t*p1[0], u*u*p0[1]+2*u*t*c[1]+t*t*p1[1]]; }
+function clipFrom(r, from, to, pad){
+  let lo = 0, hi = 1;
+  for (let i = 0; i < 30; i++){
+    const m = (lo+hi)/2, p = [from[0]+(to[0]-from[0])*m, from[1]+(to[1]-from[1])*m];
+    if (inside(r, p, pad)) lo = m; else hi = m;
+  }
+  return [from[0]+(to[0]-from[0])*hi, from[1]+(to[1]-from[1])*hi];
+}
+function routeCurve(a, b, bend){
+  const p0 = ctr(a), p1 = ctr(b), dx = p1[0]-p0[0], dy = p1[1]-p0[1], L = Math.hypot(dx, dy) || 1;
+  const n = [-dy/L, dx/L], c = [(p0[0]+p1[0])/2 + n[0]*bend*L, (p0[1]+p1[1])/2 + n[1]*bend*L];
+  const N = 160, pts = [];
+  for (let i = 0; i <= N; i++) pts.push(bez(p0, c, p1, i/N));
+  let s = 0; while (s < N && inside(rectOf(a), pts[s], 2)) s++;
+  let e = N; while (e > 0 && inside(rectOf(b), pts[e], 7)) e--;
+  const seg = pts.slice(s, e+1);
+  return {pts:seg, mid:seg[Math.floor(seg.length/2)], poly:false};
+}
+function routeVia(a, b, via){
+  const s = clipFrom(rectOf(a), ctr(a), via[0], 2);
+  const e = clipFrom(rectOf(b), ctr(b), via[via.length-1], 7);
+  const pts = [s, ...via, e].filter((p, i, arr) => i === 0 || Math.hypot(p[0]-arr[i-1][0], p[1]-arr[i-1][1]) > 0.5);
+  let best = 0, mid = pts[0];
+  for (let i = 0; i < pts.length-1; i++){
+    const d = Math.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1]);
+    if (d > best){ best = d; mid = [(pts[i][0]+pts[i+1][0])/2, (pts[i][1]+pts[i+1][1])/2]; }
+  }
+  return {pts, mid, poly:true};
+}
+function route(fm, tm, e){
+  if (e && e.via) return routeVia(fm, tm, e.via);
+  return routeCurve(fm, tm, e && e.b !== undefined ? e.b : 0.12);
+}
+function pathD(r){
+  const p = r.pts, f = v => v.toFixed(1);
+  if (!r.poly) return p.map((q, i) => (i ? 'L' : 'M') + f(q[0]) + ' ' + f(q[1])).join(' ');
+  let d = 'M' + f(p[0][0]) + ' ' + f(p[0][1]);
+  for (let i = 1; i < p.length-1; i++){
+    const a = p[i-1], c = p[i], b = p[i+1];
+    const la = Math.hypot(c[0]-a[0], c[1]-a[1]), lb = Math.hypot(b[0]-c[0], b[1]-c[1]);
+    if (la < 1e-6 || lb < 1e-6){ d += ' L' + f(c[0]) + ' ' + f(c[1]); continue; }
+    const rr = Math.min(9, la/2, lb/2);
+    const s = [c[0]-(c[0]-a[0])/la*rr, c[1]-(c[1]-a[1])/la*rr], t = [c[0]+(b[0]-c[0])/lb*rr, c[1]+(b[1]-c[1])/lb*rr];
+    d += ' L' + f(s[0]) + ' ' + f(s[1]) + ' Q' + f(c[0]) + ' ' + f(c[1]) + ' ' + f(t[0]) + ' ' + f(t[1]);
+  }
+  const z = p[p.length-1];
+  return d + ' L' + f(z[0]) + ' ' + f(z[1]);
+}
+function el(tag, attrs, parent){
+  const x = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) x.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(x);
+  return x;
+}
+
+function buildStatic(){
+  const cv = $('#canvas');
+  for (const L of LANES){
+    const d = document.createElement('div');
+    d.className = 'lane' + (L.frame ? ' frame' : '') + (L.sub ? ' sub' : '');
+    Object.assign(d.style, {left:L.x+'px', top:L.y+'px', width:L.w+'px', height:L.h+'px', borderColor:L.bd, background:L.bg || 'transparent'});
+    const lb = document.createElement('div');
+    lb.className = 'lb'; lb.textContent = L.frame ? RANK_LABEL : L.label;
+    lb.style.color = L.fg || '#4b5563';
+    if (L.frame){ Object.assign(lb.style, {top:'-11px', left:'auto', right:'14px', background:'var(--bg)', padding:'0 6px'}); }
+    if (L.sub){ lb.style.fontSize = '11.5px'; }
+    d.appendChild(lb); cv.appendChild(d);
+  }
+  for (const m of MODS){
+    const d = document.createElement('div');
+    d.className = 'mod ' + m.kind + (m.rel === 'new' ? ' new' : '');
+    d.id = 'm-' + m.id;
+    Object.assign(d.style, {left:m.x+'px', top:m.y+'px'});
+    let tag = '';
+    if (m.kind === 'core') tag = '<span class="tag core">本体</span>';
+    else if (m.rel === 'new') tag = '<span class="tag">新</span>';
+    else if (m.rel === 'split') tag = '<span class="tag split">拆</span>';
+    d.innerHTML = '<div class="nm">' + m.nm + '</div><div class="id">' + m.id + '</div>' + tag;
+    d.addEventListener('click', ev => { ev.stopPropagation(); selectMod(m.id); });
+    cv.appendChild(d);
+  }
+  cv.addEventListener('click', () => { if (!state.scn) selectMod(null); });
+
+  for (const svg of [$('#edgeSvg'), $('#labelSvg')]){
+    const defs = el('defs', {}, svg);
+    const all = Object.assign({}, ETYPES, {scn:{color:'#f59e0b'}, past:{color:'#d6a54a'}});
+    for (const k in all){
+      const mk = el('marker', {id:svg.id+'-mk-'+k, viewBox:'0 0 10 10', refX:'9', refY:'5', markerWidth:'9', markerHeight:'9', markerUnits:'userSpaceOnUse', orient:'auto'}, defs);
+      el('path', {d:'M0,0 L10,5 L0,10 z', fill:all[k].color}, mk);
+    }
+  }
+
+  const fl = $('#filters');
+  for (const k in ETYPES){
+    const t = ETYPES[k];
+    const lab = document.createElement('label');
+    lab.innerHTML = '<input type="checkbox" checked data-k="' + k + '"><svg width="24" height="8"><line x1="1" y1="4" x2="23" y2="4" stroke="' + t.color + '" stroke-width="2.5" stroke-dasharray="' + t.dash + '"/></svg>' + t.nm;
+    lab.querySelector('input').addEventListener('change', ev => {
+      if (ev.target.checked) state.filters.add(k); else state.filters.delete(k);
+      render();
+    });
+    fl.appendChild(lab);
+  }
+
+  const sel = $('#scnSel');
+  for (const s of SCENARIOS){ const o = document.createElement('option'); o.value = s.id; o.textContent = s.nm; sel.appendChild(o); }
+  sel.addEventListener('change', () => startScn(sel.value || null));
+  $('#prevBtn').addEventListener('click', () => { if (state.scn && state.step > 0){ state.step--; render(); } });
+  $('#nextBtn').addEventListener('click', () => { if (state.scn && state.step < curScn().steps.length-1){ state.step++; render(); } });
+  $('#exitBtn').addEventListener('click', () => startScn(null));
+  document.addEventListener('keydown', ev => {
+    if (!state.scn) return;
+    if (ev.key === 'ArrowRight') $('#nextBtn').click();
+    if (ev.key === 'ArrowLeft') $('#prevBtn').click();
+    if (ev.key === 'Escape') startScn(null);
+  });
+}
+
+function curScn(){ return SCENARIOS.find(s => s.id === state.scn); }
+function startScn(id){
+  state.scn = id; state.step = 0; state.sel = null;
+  $('#scnSel').value = id || '';
+  render();
+}
+function selectMod(id){
+  state.sel = (state.sel === id) ? null : id;
+  render();
+}
+function edgeTouches(e, id){ return e.f === id || e.t === id; }
+
+function drawLabel(svg, p, text, color){
+  const side = p[0] < 120 ? 'start' : (p[0] > 1220 ? 'end' : 'middle');
+  const t = el('text', {x:p[0] + (side === 'start' ? 6 : side === 'end' ? -6 : 0), y:p[1]+4, 'text-anchor':side, 'font-size':'11.5',
+    fill:color, stroke:'#fff', 'stroke-width':'4', 'paint-order':'stroke', 'stroke-linejoin':'round'}, svg);
+  t.textContent = text;
+}
+
+function render(){
+  const es = $('#edgeSvg'), ls = $('#labelSvg');
+  for (const svg of [es, ls]) [...svg.querySelectorAll('g')].forEach(g => g.remove());
+  const gE = el('g', {}, es), gL = el('g', {}, ls);
+
+  const nb = new Set(), active = new Set(), past = new Set();
+  if (state.scn){
+    const sc = curScn();
+    sc.steps.forEach((s, i) => { if (i < state.step){ past.add(s[0]); past.add(s[1]); } });
+    const cur = sc.steps[state.step]; active.add(cur[0]); active.add(cur[1]);
+  } else if (state.sel){
+    for (const e of EDGES) if (state.filters.has(e.k) && edgeTouches(e, state.sel)) { nb.add(e.f); nb.add(e.t); }
+  }
+  for (const m of MODS){
+    const d = document.getElementById('m-' + m.id);
+    d.classList.remove('sel', 'nb', 'dim');
+    if (state.scn){
+      if (active.has(m.id)) d.classList.add('sel');
+      else if (past.has(m.id)) d.classList.add('nb');
+      else d.classList.add('dim');
+    } else if (state.sel){
+      if (m.id === state.sel) d.classList.add('sel');
+      else if (nb.has(m.id)) d.classList.add('nb');
+      else d.classList.add('dim');
+    }
+  }
+
+  for (const e of EDGES){
+    if (!state.filters.has(e.k)) continue;
+    const t = ETYPES[e.k], r = route(byId[e.f], byId[e.t], e);
+    let op = e.k === 'call' ? 0.3 : 0.45, w = t.w, hl = false;
+    if (state.scn){ op = 0.07; }
+    else if (state.sel){ hl = edgeTouches(e, state.sel); op = hl ? 1 : 0.07; w = hl ? t.w + 1 : t.w; }
+    const g = el('g', {opacity:op}, hl ? gL : gE);
+    el('path', {d:pathD(r), fill:'none', stroke:t.color, 'stroke-width':w, 'stroke-dasharray':t.dash, 'stroke-linecap':'round',
+      'marker-end':'url(#' + (hl ? 'labelSvg' : 'edgeSvg') + '-mk-' + e.k + ')'}, g);
+    if (hl) drawLabel(gL, r.mid, e.l, t.color);
+  }
+
+  if (state.scn){
+    const sc = curScn(), seen = {};
+    sc.steps.forEach((s, i) => {
+      if (i > state.step || s[0] === s[1]) return;
+      const known = EDGES.find(e => e.f === s[0] && e.t === s[1]);
+      const r = route(byId[s[0]], byId[s[1]], known || {b:0.15});
+      const key = s[0] + '>' + s[1], rep = seen[key] || 0;
+      seen[key] = rep + 1;
+      const bx = r.mid[0] + rep * 24, by = r.mid[1], cur = i === state.step;
+      const g = el('g', {opacity:cur ? 1 : 0.75}, gL);
+      el('path', {d:pathD(r), fill:'none', stroke:cur ? '#f59e0b' : '#d6a54a', 'stroke-width':cur ? 4 : 2.2,
+        'stroke-dasharray':cur ? '' : '5 4', 'stroke-linecap':'round', 'marker-end':'url(#labelSvg-mk-' + (cur ? 'scn' : 'past') + ')'}, g);
+      el('circle', {cx:bx, cy:by, r:cur ? 11 : 9, fill:cur ? '#f59e0b' : '#fff', stroke:'#d97706', 'stroke-width':1.5}, g);
+      const tx = el('text', {x:bx, y:by+4, 'text-anchor':'middle', 'font-size':cur ? 12 : 11, 'font-weight':700, fill:cur ? '#fff' : '#92400e'}, g);
+      tx.textContent = i+1;
+    });
+  }
+
+  $('#prevBtn').disabled = !state.scn || state.step === 0;
+  $('#nextBtn').disabled = !state.scn || state.step >= (state.scn ? curScn().steps.length-1 : 0);
+  $('#exitBtn').disabled = !state.scn;
+  renderPanel();
+}
+
+function kTag(k){ return '<span class="k" style="background:' + ETYPES[k].color + '">' + ETYPES[k].nm + '</span>'; }
+function ul(arr){ return arr && arr.length ? '<ul>' + arr.map(x => '<li>' + x + '</li>').join('') + '</ul>' : '<div class="meta">（无）</div>'; }
+
+function renderPanel(){
+  const P = $('#panel');
+  if (state.scn){
+    const sc = curScn(), cur = sc.steps[state.step];
+    let h = '<h3>' + sc.nm + '</h3><div class="meta">用“上一步 / 下一步”或键盘左右键翻页，Esc 退出。橙色是当前这一步，浅色是已经走过的。</div>';
+    h += '<div class="one"><b>第 ' + (state.step+1) + ' / ' + sc.steps.length + ' 步：</b>' + byId[cur[0]].nm + (cur[0] !== cur[1] ? ' → ' + byId[cur[1]].nm : '') + '<br>' + cur[2] + '</div>';
+    h += '<ol class="steps">' + sc.steps.map((s, i) => '<li data-i="' + i + '" class="' + (i === state.step ? 'cur' : (i < state.step ? 'past' : 'fut')) + '">' + byId[s[0]].nm + (s[0] !== s[1] ? ' → ' + byId[s[1]].nm : '') + '</li>').join('') + '</ol>';
+    P.innerHTML = h;
+    P.querySelectorAll('ol.steps li').forEach(li => li.addEventListener('click', () => { state.step = +li.dataset.i; render(); }));
+    return;
+  }
+  if (!state.sel){
+    P.innerHTML = '<h3>怎么看这张图</h3><ul>' +
+      '<li>彩色大框是<b>进程</b>，小框是<b>单元</b>。白色是逻辑单元，青色是状态单元，灰色粗框是框架本体。</li>' +
+      '<li>改了逻辑单元：只重载它和依赖它的单元，进程不重启。改了状态单元：重建它持有的状态。改了框架本体：重启引擎。</li>' +
+      '<li><b>点一个单元</b>：右边显示它负责什么、不负责什么、借鉴了哪里、改了之后要做什么；图上只留下和它相连的边。再点一次或点空白处取消。</li>' +
+      '<li>上方可以按<b>边的种类</b>筛选，也可以选一个<b>场景</b>一步一步看。场景⑧、⑨对比了“改调度代码”和“改 native 扩展”的差别。</li>' +
+      '<li>“③ 单元与重载”讲单元模型、动作阶梯和七条原则；“⑤”“⑥”两个思想实验检验这套设计能不能包住 DS 1017 和两机 16 卡。</li>' +
+      '<li>最下面一栏是框架本体和横切模块，每个进程里都有一份（节点代理是每台机器一个）。配置只画了两条边：“配置 → 调度”（每步现读，实时）和“配置 → plan”（录进 graph，按值）。</li></ul>' +
+      '<h4>名词小抄</h4><dl class="gloss">' + GLOSS.slice(0, 6).map(g => '<dt>' + g[0] + '</dt><dd>' + g[1] + '</dd>').join('') + '</dl>';
+    return;
+  }
+  const m = byId[state.sel];
+  const outs = EDGES.filter(e => e.f === m.id), ins = EDGES.filter(e => e.t === m.id);
+  let h = '<h3>' + m.nm + '</h3><div class="meta"><code>' + m.id + '</code>　' + (m.procText || PROC_NAME[m.lane]) + '</div>' +
+    '<div class="meta">类型：' + KIND_NAME[m.kind] + '</div>' +
+    '<div class="meta">与 v0-plan 的关系：' + REL_NAME[m.rel] + (m.relNote ? '。' + m.relNote : '') + '</div>' +
+    '<div class="one">' + m.one + '</div>' +
+    '<h4>负责</h4>' + ul(m.does) + '<h4>不负责</h4>' + ul(m.nodo) + '<h4>借鉴</h4>' + ul(m.borrow) +
+    '<h4>改了它的代码之后</h4><div>' + m.change + '</div>' +
+    (m.data ? '<h4>改了它管的内容之后（配置值 / 数据）</h4><div>' + m.data + '</div>' : '');
+  const li = (e, other, arrow) => '<li data-go="' + other + '">' + arrow + ' <b>' + byId[other].nm + '</b>：' + kTag(e.k) + e.l + '</li>';
+  h += '<h4>它发出的边（' + outs.length + '）</h4>' + (outs.length ? '<ul class="elist">' + outs.map(e => li(e, e.t, '→')).join('') + '</ul>' : '<div class="meta">（无）</div>');
+  h += '<h4>指向它的边（' + ins.length + '）</h4>' + (ins.length ? '<ul class="elist">' + ins.map(e => li(e, e.f, '←')).join('') + '</ul>' : '<div class="meta">（无）</div>');
+  P.innerHTML = h;
+  P.querySelectorAll('.elist li').forEach(x => x.addEventListener('click', () => { state.sel = x.dataset.go; render(); }));
+}
+
+/* ---------- 其他页 ---------- */
+function buildTables(){
+  const order = ['front','ctrl','rsi','sched','worker','state','cross'];
+  let h = '<tr><th>单元</th><th>类型</th><th>一句话</th><th>负责</th><th>不负责</th><th>改了它的代码之后 /<br>改了它管的内容之后</th><th>关系</th></tr>';
+  for (const lane of order){
+    h += '<tr><td class="grp" colspan="7">' + PROC_NAME[lane] + '</td></tr>';
+    for (const m of MODS.filter(x => x.lane === lane)){
+      h += '<tr><td><b>' + m.nm + '</b><br><code>' + m.id + '</code></td><td><span class="pill ' + m.kind + '">' + KIND_SHORT[m.kind] + '</span></td><td>' + m.one + '</td><td>' + ul(m.does) + '</td><td>' + ul(m.nodo) +
+        '</td><td><b>改代码：</b>' + m.change + (m.data ? '<br><b>改内容：</b>' + m.data : '') + '</td><td><span class="pill ' + m.rel + '">' + REL_NAME[m.rel] + '</span></td></tr>';
+    }
+  }
+  $('#modTable').innerHTML = h;
+
+  let eh = '<tr><th>种类</th><th>从</th><th>到</th><th>含义</th></tr>';
+  for (const k in ETYPES){
+    for (const e of EDGES.filter(x => x.k === k)){
+      eh += '<tr><td class="nw">' + kTag(k) + '</td><td>' + byId[e.f].nm + ' <code>' + e.f + '</code></td><td>' + byId[e.t].nm + ' <code>' + e.t + '</code></td><td>' + e.l + '</td></tr>';
+    }
+  }
+  $('#edgeTable').innerHTML = eh;
+  $('#glossFull').innerHTML = GLOSS.map(g => '<div><dt>' + g[0] + '</dt><dd>' + g[1] + '</dd></div>').join('');
+
+  const stepsTable = steps => '<tr><th>#</th><th style="width:24%">agent 这一步做什么</th><th>单元怎么变</th><th>apply 到哪</th><th style="width:20%">框架做了什么</th><th>包络</th><th>靠哪条原则</th></tr>' +
+    steps.map(s => '<tr><td>' + s.n + '</td><td>' + s.what + (s.note ? '<div class="meta" style="margin-top:4px">' + s.note + '</div>' : '') + '</td><td>' + s.units + '</td><td>' + s.where + '</td><td>' + s.act + '</td><td><span class="pill ' + s.env + '">' + s.envT + '</span></td><td>' + s.pr + '</td></tr>').join('');
+  const fixesTable = rows => '<tr><th>原来的设计</th><th>改成</th><th>原则</th><th>是哪一步暴露的</th></tr>' +
+    rows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td class="nw">' + r[2] + '</td><td class="nw">' + r[3] + '</td></tr>').join('');
+  $('#dsTable').innerHTML = stepsTable(DS_STEPS);
+  $('#dsSummary').innerHTML = DS_SUMMARY.map(x => '<li>' + x + '</li>').join('');
+  $('#dsFixes').innerHTML = fixesTable(DS_FIXES);
+  $('#mnTable').innerHTML = stepsTable(MN_STEPS);
+  $('#mnSummary').innerHTML = MN_SUMMARY.map(x => '<li>' + x + '</li>').join('');
+  $('#mnFixes').innerHTML = fixesTable(MN_FIXES);
+
+  $('#qsBox').innerHTML = '<h2>已经定下的</h2><table class="t"><tr><th>#</th><th>问题</th><th>决定</th></tr>' +
+    DECISIONS.map((d, i) => '<tr><td>' + (i+1) + '</td><td>' + d[0] + '</td><td class="nw">' + d[1] + '</td></tr>').join('') + '</table>' +
+    '<h2>思想实验二带出来的新问题</h2>' +
+    QUESTIONS.map((q, i) => '<div class="q"><h3>' + (i+1) + '. ' + q.t + '</h3><div>' + q.d + '</div><div class="rec"><b>倾向：</b>' + q.r + '</div></div>').join('');
+}
+
+/* ---------- 缩放、标签页、链接参数 ---------- */
+function fit(){
+  const box = $('#canvasBox');
+  const s = Math.min(1, box.clientWidth / 1340);
+  $('#canvasScale').style.transform = 'scale(' + s + ')';
+  box.style.height = (1030 * s) + 'px';
+}
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === t));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === 'sec-' + t.dataset.tab));
+  if (t.dataset.tab === 'map') fit();
+}));
+window.addEventListener('resize', fit);
+
+function applyHash(){
+  const q = new URLSearchParams(location.hash.slice(1));
+  if (q.get('s') && SCENARIOS.some(s => s.id === q.get('s'))){
+    state.scn = q.get('s'); state.sel = null;
+    state.step = Math.max(0, Math.min(+(q.get('i') || 1) - 1, curScn().steps.length - 1));
+    $('#scnSel').value = state.scn;
+  } else if (q.get('m') && byId[q.get('m')]){
+    state.scn = null; state.sel = q.get('m');
+  }
+  const tab = document.querySelector('.tab[data-tab="' + q.get('tab') + '"]');
+  if (tab) tab.click();
+}
+
+buildStatic();
+buildTables();
+applyHash();
+render();
+fit();
+</script>
+</body>
+</html>
