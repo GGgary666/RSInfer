@@ -238,10 +238,15 @@ class UnitRuntime:
         return entry[1] if entry is not None else None
 
     def units_touched_by(self, plan: ReloadPlan) -> set[UnitId]:
-        """Units ``plan`` would unload: listed for reload or removal, or importing a changed module."""
+        """Units whose instance ``plan`` replaces or creates: listed for reload or removal,
+        importing a changed module, using any of those (they are unloaded with their
+        providers), or added by it."""
         accepted = self._affected_modules(plan.changed_modules)
-        hit = {s.id for s in self._slots.values() if s.manifest.unit.entry_module in accepted}
-        return {*(s.id for s in plan.units_to_reload), *plan.units_to_remove, *hit}
+        direct = {*(s.id for s in plan.units_to_reload), *plan.units_to_remove,
+                  *(s.id for s in self._slots.values() if s.manifest.unit.entry_module in accepted)}
+        unloaded = {s.id for s in self._unload_order(self._slots[u] for u in direct if u in self._slots)}
+        added = {s.id for s in plan.units_to_add if s.id not in self._slots or not self._slots[s.id].staged}
+        return direct | unloaded | added
 
     def spec_of(self, unit: str) -> UnitSpec | None:
         slot = self._slots.get(UnitId(unit))

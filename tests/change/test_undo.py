@@ -210,6 +210,65 @@ def test_an_action_of_a_reloaded_unit_is_prepared_on_the_new_instance(tmp_path: 
     run(main())
 
 
+SERVICE = """
+from toyc.tunable import Op
+
+
+class Provider:
+    def __init__(self, ctx, config):
+        ctx.provide("toy.svc@1", self)
+
+
+class User:
+    def __init__(self, ctx, config):
+        self.svc = ctx.use("toy.svc@1")
+        ctx.on_action("toy.op", Op(ctx, config))
+
+
+class Addon:
+    def __init__(self, ctx, config):
+        ctx.on_action("toy.op", Op(ctx, config))
+"""
+PROVIDER = spec("toyc.provider", "toyc.svc:Provider", provides=["toy.svc@1"], process=["worker"])
+USER = spec("toyc.svc_user", "toyc.svc:User", requires=["toy.svc@1"], reads=["toyc.log_dir"], process=["worker"])
+ADDON = spec("toyc.addon", "toyc.svc:Addon", reads=["toyc.log_dir"], process=["worker"])
+NEEDS_PREPARE = {"needs_prepare": True}
+
+
+def test_users_of_a_reloaded_provider_prepare_on_their_new_instance(tmp_path: Path) -> None:
+    """Reloading a provider rebuilds its users too, so their actions wait for the safe point."""
+
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, stage=[PROVIDER, USER])])
+            files: dict[str, str | None] = {"engine/toyc/svc.py": e.c.blobs.put(SERVICE.encode())}
+            assert (await e.coord.submit(ChangeSet(base=e.coord.identity, files=files))).status == "committed"
+            ops_before = len(e.ops(W1))
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(
+                W1, reload=ReloadPlan(units_to_reload=[PROVIDER]),
+                actions=[UnitAction(UnitId(USER.id), "toy.op", NEEDS_PREPARE)])])
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status == "committed", r.diagnostics
+            assert e.ops(W1)[ops_before:] == ["op prepare", "op execute", "op commit"]
+
+    run(main())
+
+
+def test_a_unit_added_at_the_safe_point_prepares_there(tmp_path: Path) -> None:
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(
+                W1, reload=ReloadPlan(units_to_add=[ADDON]),
+                actions=[UnitAction(UnitId(ADDON.id), "toy.op", NEEDS_PREPARE)])])
+            files: dict[str, str | None] = {"engine/toyc/svc.py": e.c.blobs.put(SERVICE.encode())}
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity, files=files))
+            assert r.status == "committed", r.diagnostics
+            assert e.ops(W1) == ["op prepare", "op execute", "op commit"]
+            assert ADDON.id in {u.unit for u in (await e.status(W1)).units}
+
+    run(main())
+
+
 def test_an_action_whose_prepare_raised_is_still_aborted(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:

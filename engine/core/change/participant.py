@@ -185,7 +185,6 @@ class Participant:
             return fail(COMPONENT, "prepare", f"actions of units this change removes: {orphans}",
                         subject=str(self.host.spec.proc), code="change.action_on_removed_unit")
         try:
-            touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
             if a.config:
                 r = self.rt.config.stage(a.config)
                 if isinstance(r, Failed):
@@ -200,6 +199,8 @@ class Participant:
                     return r
                 c.staged = True
                 c.prepare_diags.append(self._one_shot(f"staging {len(a.stage)} new unit(s)", t0))
+            # after staging: a unit staged now keeps its instance, so it prepares now
+            touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
             for ua in a.actions:
                 if ua.unit in touched:  # its instance is replaced at the safe point; prepare the new one there
                     c.deferred.append(ua)
