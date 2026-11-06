@@ -887,10 +887,13 @@ class UnitRuntime:
                 return Failed([self._diag("stage", f"imports changed modules {conflict}", root,
                                           "unit.stage_needs_safe_point",
                                           hint="load it at the safe point instead")])
-            self._stage_root(root)
+        config_before = self.config.entries()
         r = self.config.declare_entries(config)
         if isinstance(r, Failed):
+            self.config.restore_entries(config_before)
             return r
+        if root is not None and root != self._code_root:
+            self._stage_root(root)
         for spec in units:
             errors += self._declare_unit(spec)
             self._slots[spec.id] = _Slot(spec, staged=True)

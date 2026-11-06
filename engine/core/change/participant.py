@@ -173,6 +173,8 @@ class Participant:
             if c.id != msg.change_id:
                 return fail(COMPONENT, "prepare", f"busy with change {c.id}", code="change.busy")
             c.renew()
+            if c.phase == "undone":
+                return self._fail("prepare", "change was already undone; waiting for Abort")
             if c.phase != "preparing":
                 return Ok(Prepared(c.id, list(c.prepare_diags)))
             if c.prepare_reply is not None:
@@ -365,6 +367,8 @@ class Participant:
             return c
         if c.phase in ("paused", "executed", "committed"):
             return Ok(Paused(c.id, self.host.epoch))
+        if c.phase == "undone":
+            return self._fail("pause", "change was already undone; waiting for Abort")
         if c.phase == "preparing":
             return self._fail("pause", "not prepared yet")
         if c.phase == "pausing" and c.pause_reply is not None:
@@ -521,7 +525,10 @@ class Participant:
             return Ok(self.finished[msg.change_id])
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
-            return Ok(Resumed(msg.change_id, self.host.identity, rolled_back=True))
+            # Abort can overtake Prepare; remember the decision without touching another change.
+            reply = Resumed(msg.change_id, self.host.identity, rolled_back=True)
+            self.finished[msg.change_id] = reply
+            return Ok(reply)
         if c.phase == "committed":
             return fail(COMPONENT, "abort", "committed decision cannot be rolled back", code="change.already_committed")
         self._rollback(c)
