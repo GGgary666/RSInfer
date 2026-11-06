@@ -144,8 +144,12 @@ class UnitContext:
 
         ``handler`` has ``prepare(args)``, ``execute(args)``, ``commit()`` and
         ``abort()``; draining units also ``start_drain(args)``, ``drained()`` and
-        ``abort_remaining() -> int``. ``prepare`` runs before the pause, the rest at
-        the epoch boundary. Raising fails the change, and every participant rolls back.
+        ``abort_remaining() -> int``. ``prepare`` runs before the pause while the old
+        version keeps serving, the rest at the epoch boundary. ``prepare`` either does
+        everything at once (returns ``None``; serving stops meanwhile) or returns an
+        iterator whose every ``next()`` does one small slice between two steps
+        (change.md §4.6); it must not change what is serving. Raising fails the
+        change, and every participant rolls back.
         """
         self._check_live()
         self._record(f"on_action({name})", self._rt._add_action(self._slot, name, handler))

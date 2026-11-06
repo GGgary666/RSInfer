@@ -52,6 +52,9 @@ class ChangeQueue:
     def __len__(self) -> int:
         return sum(len(q) for q in self._lanes.values())
 
+    def items(self) -> list[Queued]:
+        return [item for q in self._lanes.values() for item in q]
+
     def pop(self, current: Identity) -> tuple[Queued | None, list[Queued]]:
         """The next change to run, and the stale internal changes dropped on the way."""
         dropped: list[Queued] = []
