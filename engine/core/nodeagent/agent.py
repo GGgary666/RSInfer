@@ -89,11 +89,11 @@ def child_env(environ: Mapping[str, str], spec: ProcSpec, code_root: Path) -> di
     Other ``PYTHON*`` variables (hash seed, unbuffered output, fault handler) are
     not about where code comes from and are kept.
     """
-    env = {k: v for k, v in environ.items() if k not in CODE_SOURCE_VARS and k != "CUDA_VISIBLE_DEVICES"}
+    env = {k: v for k, v in {**environ, **spec.env}.items()
+           if k not in CODE_SOURCE_VARS and k != "CUDA_VISIBLE_DEVICES"}
     env["PYTHONPATH"] = str(code_root)
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # snapshots are read-only
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in spec.gpus)
-    env.update(spec.env)
     return env
 
 

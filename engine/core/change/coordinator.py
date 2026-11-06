@@ -312,7 +312,7 @@ class Coordinator:
         t0 = time.monotonic()
         if self.recovery_required:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
-                COMPONENT, "check", "a previous commit is unresolved; restart the engine",
+                COMPONENT, "check", "a previous change is unresolved; restart the engine",
                 code="change.recovery_required")]))
         # RECEIVED -> CHECKED
         if cs.source != "internal" and cs.base != old:
@@ -366,7 +366,8 @@ class Coordinator:
             self._fault("after_execute")
         except _Abort as e:
             undo = await self._abort(run)
-            return self._done(cid, self._result("aborted", cid, cs, None, run, [*run.diags, *e.diags, *undo], old=old))
+            status = "failed" if self.recovery_required else "aborted"
+            return self._done(cid, self._result(status, cid, cs, None, run, [*run.diags, *e.diags, *undo], old=old))
         except _Vanish as e:
             return self._vanish(run, str(e))
         status, diags = await self._commit(run)
@@ -454,10 +455,11 @@ class Coordinator:
                     run.reports[str(proc)] = e.report
         topo = run.plan.topology or self.sup.topology
         for proc in run.plan.stop:
-            run.stopped.append(proc)
             r = await self.sup.stop(proc)
             if isinstance(r, Failed):
+                self.recovery_required = True
                 raise _Abort(r.diagnostics)
+            run.stopped.append(proc)
         for pa in run.plan.procs:
             if pa.restart is None:
                 continue
@@ -556,30 +558,45 @@ class Coordinator:
         self.log.decide(run.id, "abort")  # before any Abort leaves
         out: list[Diagnostic] = []
         if self._take("skip_abort"):
+            self.recovery_required = True
             out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))
         else:
             results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.asked))
             for pa, r in zip(run.asked, results, strict=True):
-                if isinstance(r, Ok) and isinstance(r.value, Resumed):
+                if isinstance(r, Ok) and isinstance(r.value, Resumed) \
+                        and r.value.change_id == run.id and r.value.rolled_back:
                     self.sup.uses_snapshots(pa.proc, r.value.snapshots)
-                if isinstance(r, Failed):
-                    out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
+                else:
+                    self.recovery_required = True
+                    if isinstance(r, Failed):
+                        out += r.diagnostics
+                    out.append(diag(COMPONENT, "abort", f"rollback not confirmed: {r}", subject=str(pa.proc),
                                     code="change.abort_unacknowledged",
                                     hint="the participant asks for the decision when its lease runs out"))
         for proc in run.spawned:
-            await self.sup.stop(proc)
-            self.sup.forget(proc)
+            r = await self.sup.stop(proc)
+            if isinstance(r, Failed):
+                self.recovery_required = True
+                out += r.diagnostics
+            else:
+                self.sup.forget(proc)
         for proc in run.restarted:
             r = await self.sup.relaunch_previous(proc)
             if isinstance(r, Failed):
+                self.recovery_required = True
                 out += r.diagnostics
         for proc in run.stopped:  # their state is gone; they come back from the spec they had
             r = await self.sup.restart([proc])
+            if isinstance(r, Failed):
+                self.recovery_required = True
             out += r.diagnostics if isinstance(r, Failed) else [diag(
                 COMPONENT, "abort", "was stopped by the change; started again", subject=str(proc),
                 code="change.restarted_after_abort", severity="info")]
         if run.plan.topology is not None:
             self.sup.topology = run.old_topology
+        if self.recovery_required:
+            out.append(diag(COMPONENT, "abort", "rollback or process stop is unconfirmed; restart the engine",
+                            code="change.recovery_required"))
         run.lap("abort")
         return out
 

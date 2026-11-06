@@ -107,7 +107,8 @@ def test_a_participant_that_asks_and_hears_abort_rolls_back(tmp_path: Path) -> N
             e.planner.script = reload_everywhere()
             e.coord.faults |= {"after_pause", "skip_abort"}  # decides abort, but no Abort reaches anyone
             r = await e.coord.submit(e.code_change())
-            assert r.status == "aborted" and e.coord.decision_of(r.change_id) == "abort"
+            assert r.status == "failed" and e.coord.decision_of(r.change_id) == "abort"
+            assert e.coord.recovery_required
             await assert_rolled_back(e, old, "change.rolled_back_on_query")
 
     run(main())
