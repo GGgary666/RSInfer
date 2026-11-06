@@ -269,6 +269,34 @@ def test_a_unit_added_at_the_safe_point_prepares_there(tmp_path: Path) -> None:
     run(main())
 
 
+FLAVORED = """
+from toyc.logutil import log
+
+
+class Flavored:
+    def __init__(self, ctx, config):
+        log(config, ctx, f"flavored {config['toyc.addon_flavor']}")
+"""
+FLAVORED_SPEC = spec("toyc.flavored", "toyc.flavored:Flavored", reads=["toyc.log_dir"], process=["worker"],
+                     config={"toyc.addon_flavor": {"type": "str", "default": "plain", "binding": "startup"}})
+
+
+@pytest.mark.parametrize("how", ["staged", "added"])
+def test_a_new_unit_starts_with_the_config_the_change_sets_for_it(tmp_path: Path, how: str) -> None:
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            config: dict[str, object] = {"toyc.addon_flavor": "spicy"}
+            pa = ProcActions(W1, stage=[FLAVORED_SPEC], config=config) if how == "staged" else \
+                ProcActions(W1, reload=ReloadPlan(units_to_add=[FLAVORED_SPEC]), config=config)
+            e.planner.script = lambda inp: ActionPlan(procs=[pa])
+            files: dict[str, str | None] = {"engine/toyc/flavored.py": e.c.blobs.put(FLAVORED.encode())}
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity, files=files, config=config))
+            assert r.status == "committed", r.diagnostics
+            assert [line for line in e.c.log_of(W1) if line.startswith("flavored")] == ["flavored spicy"]
+
+    run(main())
+
+
 def test_an_action_whose_prepare_raised_is_still_aborted(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:

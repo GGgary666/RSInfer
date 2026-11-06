@@ -53,6 +53,7 @@ from core.change.types import ProcActions, UnitAction
 from core.common.ids import Identity, UnitId
 from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
+from core.context.config import ConfigEntry
 from core.ipc.rpc import Deferred
 from unit.runtime.types import ReloadPlan, ReloadReport, UnitSpec
 
@@ -89,6 +90,10 @@ class _Change:
     prepared_actions: list[UnitAction] = field(default_factory=list[UnitAction])
     """``prepare()`` was called on these (even if it raised): one ``abort()`` each undoes
     prepare and execute, on the instance that did them."""
+    config_now: dict[str, Any] = field(default_factory=dict[str, Any])
+    """Values of keys that exist already: taken at the epoch boundary."""
+    config_new: dict[str, ConfigEntry] = field(default_factory=dict[str, ConfigEntry])
+    """Values of keys owned by units added at the safe point: declared with them."""
     deferred: list[UnitAction] = field(default_factory=list[UnitAction])
     """Actions of units this change reloads: prepared at the safe point, on the new instance."""
     slicing: list[_Slices] = field(default_factory=list[_Slices])
@@ -185,15 +190,24 @@ class Participant:
             return fail(COMPONENT, "prepare", f"actions of units this change removes: {orphans}",
                         subject=str(self.host.spec.proc), code="change.action_on_removed_unit")
         try:
-            if a.config:
-                r = self.rt.config.stage(a.config)
+            # Keys of units this change brings are declared with those units, so they start with
+            # the values asked for; the other values are taken at the epoch boundary.
+            new_units = [*a.stage, *(a.reload.units_to_add if a.reload else [])]
+            owners = {key: (u.id, decl) for u in new_units for key, decl in u.manifest.config.items()}
+            for_new = {k: ConfigEntry(owners[k][0], owners[k][1], v) for k, v in a.config.items() if k in owners}
+            staged_ids = {u.id for u in a.stage}
+            c.config_now = {k: v for k, v in a.config.items() if k not in owners}
+            c.config_new = {k: e for k, e in for_new.items() if e.owner not in staged_ids}
+            if c.config_now:
+                r = self.rt.config.stage(c.config_now)
                 if isinstance(r, Failed):
                     return r
             if a.stage:
                 t0 = time.monotonic()
                 changed = a.reload.changed_modules if a.reload else []
                 r = self.rt.stage_new_units(a.stage, code_root=self._code_root_for(msg.identity),
-                                            changed_modules=changed)
+                                            changed_modules=changed,
+                                            config={k: e for k, e in for_new.items() if e.owner in staged_ids})
                 if isinstance(r, Failed):
                     self.rt.config.discard_staged()
                     return r
@@ -383,8 +397,8 @@ class Participant:
             plan = self._reload_plan(c)
             # the way back is taken before the new config takes effect, so it holds the old values
             reverse = self._reverse(plan) if plan is not None else None
-            if a.config:
-                c.undo.old_config = {k: self.rt.config.entries()[k].value for k in a.config}
+            if c.config_now:
+                c.undo.old_config = {k: self.rt.config.entries()[k].value for k in c.config_now}
                 commit = self.rt.config.commit()
                 if commit.hook_failures:
                     raise RuntimeError("; ".join(d.reason for d in commit.hook_failures))
@@ -425,6 +439,8 @@ class Participant:
             return ReloadPlan(new_code_root=root) if root is not None or staged else None
         if plan.new_code_root is None and root is not None:
             plan = msgspec.structs.replace(plan, new_code_root=root)
+        if c.config_new:  # values for keys of the units it adds, declared before they start
+            plan = msgspec.structs.replace(plan, config={**plan.config, **c.config_new})
         return plan
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:

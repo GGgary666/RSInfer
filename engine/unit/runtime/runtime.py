@@ -180,6 +180,7 @@ class UnitRuntime:
                     continue
                 errors += self._declare_unit(spec)
                 self._slots[spec.id] = _Slot(spec)
+            errors += self._check_reads(plan.units)
             if errors:
                 for spec in plan.units:
                     self._slots.pop(spec.id, None)
@@ -324,7 +325,8 @@ class UnitRuntime:
         return {name: mod for name, mod in list(sys.modules.items()) if self._is_engine_module(mod)}
 
     def _declare_unit(self, spec: UnitSpec) -> list[Diagnostic]:
-        """Declare keys the unit owns (unless already shipped) and check its reads."""
+        """Declare keys the unit owns (unless already shipped). Reads are checked by
+        ``_check_reads`` once every unit of the operation has declared its keys."""
         m = spec.manifest
         out: list[Diagnostic] = []
         if self.framework.contains(m.unit.entry_module):
@@ -341,8 +343,10 @@ class UnitRuntime:
             elif self.config.owner_of(key) != m.id:
                 out.append(self._diag("load", f"owns {key!r}, already owned by {self.config.owner_of(key)}",
                                       m.id, "config.owner_conflict"))
-        out += self.config.check_readable(m)
         return out
+
+    def _check_reads(self, specs: Iterable[UnitSpec]) -> list[Diagnostic]:
+        return [d for spec in specs for d in self.config.check_readable(spec.manifest)]
 
     def _settled_result(self) -> Result[None]:
         failed = [s for s in self._slots.values() if s.state is InstanceState.FAILED]
@@ -670,6 +674,7 @@ class UnitRuntime:
             for spec in to_add:
                 decl_errors += self._declare_unit(spec)
                 self._slots[spec.id] = _Slot(spec)
+            decl_errors += self._check_reads([*reload_specs.values(), *to_add])
             if decl_errors:
                 raise _Abort(decl_errors)
             self._settle()
@@ -881,6 +886,7 @@ class UnitRuntime:
         for spec in units:
             errors += self._declare_unit(spec)
             self._slots[spec.id] = _Slot(spec, staged=True)
+        errors += self._check_reads(units)
         if errors:
             self._discard_staged()
             return Failed(errors)
