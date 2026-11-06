@@ -525,7 +525,10 @@ class Participant:
             return Ok(self.finished[msg.change_id])
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
-            return Ok(Resumed(msg.change_id, self.host.identity, rolled_back=True))
+            # Abort can overtake Prepare; remember the decision without touching another change.
+            reply = Resumed(msg.change_id, self.host.identity, rolled_back=True)
+            self.finished[msg.change_id] = reply
+            return Ok(reply)
         if c.phase == "committed":
             return fail(COMPONENT, "abort", "committed decision cannot be rolled back", code="change.already_committed")
         self._rollback(c)
