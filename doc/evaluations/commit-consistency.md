@@ -1,5 +1,50 @@
 # Commit 丢失的一致性修复：A/B/C 对抗验证
 
+## 当前迁移版本：基于最新 framework-base
+
+B 已合入 `framework-base@6c783bc`，迁移代码提交为 `8f493de`。保留远程的分片准备、KeepAlive、QueryDecision 和 `EventLog.decide`，将 B 的提交确认屏障迁移到新实现；没有处理其他 review 问题，也没有修改 HTML 或其他既有 Markdown。
+
+相对 `6c783bc`，生产代码只涉及 7 个文件：`change/{config,coordinator,participant,protocol}.py`、`supervisor/{protocol,supervisor}.py` 和 `unit/runtime/host.py`。另外是本验证文档、集中回归文件 `test_commit_consistency.py`，以及适配新超时语义的两个既有 `test_in_doubt.py` 用例。
+
+迁移后的协议约定：
+
+- 决定提交先写 `EventLog.decide`；QueryDecision 返回同一个持久化决定。查询到 commit 也只能确认本地提交，不能绕过 Resume。
+- 执行后的参与者在查询失败或返回 unknown 时保持暂停。已提交参与者拒绝 Abort，等待 Resume；执行前的分片准备、续租和查询行为保留。
+- 每个确认阶段最多 `change.commit_attempts=3` 次，间隔使用远程已有的 `change.commit_retry_interval_s`。新增 `change.commit_ack_timeout_s=120`，同时限制 Commit 和 Resume 的总耗时，包括卡住的 RPC。
+- LOST 是故障检测结果，不证明旧进程停止服务。无法确认提交时返回 `failed/change.recovery_required`，不释放其他参与者，拒绝后续变更。恢复需要整体重启引擎，不自动重启某个参与者并假定它已安全替换。
+- 保留最新基线的身份语义：决定提交后，协调者当前身份及结果 `new_identity` 都是候选身份，即使确认失败；`old_identity` 仍是变更前身份。失败表示需要恢复，不代表已回滚。
+
+这些规则替代旧验证记录和当前 `doc/specs/change.md` 中“执行后问不到协调者就回滚”及“拒绝 Commit 后自动重启”的行为；旧记录保留用于复现实验历史。
+
+### 迁移后的验证
+
+以下 A/B/C 使用完全相同的最新测试文件；原始 A/C 分支未改写。
+
+| 角色 | 分支（前缀 `gw/framework-base/`） | 提交 | 结果 |
+| --- | --- | --- | --- |
+| 最新 A | `commit-consistency-latest-baseline` | `dd2cc50` | 8 个可比较语义用例：3 passed / 5 failed |
+| B | `commit-consistency` | `8f493de` | 同一 8 例全部通过；完整定向测试 19 passed |
+| 最新 C | `commit-consistency-latest-adversarial` | `15f30e4` | 初始 3 例仍全部通过；完整 19 例为 13 passed / 6 failed |
+
+C 仍仅增加两行：提交时立即恢复，提交阶段超时后重新暂停。加强测试检出了提前服务、错误确认及 RPC 超时时未保持暂停。A 没有运行全部 19 例，因为它既不支持新配置/Resume，又有永久丢包时无限重试的路径；只运行共同适用的 8 个用例，避免把接口差异当作缺陷证据。
+
+新增覆盖包括真实 ZMQ RPC 的 Commit/Resume 往返及丢失回执、故障检测误判 LOST、查询失败、卡住的 RPC 被截止时间取消，以及错误 change ID、identity 和 rolled_back 确认。
+
+静态检查：pyright 0 errors，`git diff --check` 通过。macOS / Python 3.12.13 全量检查：最新基线 79 passed / 34 failed；B 为 98 passed / 34 failed。32 个集群/事务用例仍被快照目录的 PermissionError 阻断，另有 TCP 背压、`typing.io.__spec__` 各一例失败。调整过的两个多进程用例也受快照前置步骤阻断，不能据此声称全量验证通过；本次没有扩大修改范围去修复这些问题。
+
+复现最新 A/B 共同的 8 个用例，在各自 worktree 中运行：
+
+```sh
+uv run --frozen --python 3.12 pytest tests/change/test_commit_consistency.py -q \
+  -k 'lost_commit_is_retried or no_participant_serves or lost_detector or query_timeout'
+```
+
+B/C 的完整测试去掉 `-k`；复现 C 的初始逃逸使用 `-k 'lost_commit_is_retried or persistent_commit_loss'`。
+
+---
+
+以下内容是迁移前、基于 `b006af1` 的历史实验记录。
+
 本记录只处理 PR #1 的第一个 P1 问题：Commit 未送达时，协调者仍报告提交成功；未收到 Commit 的参与者超时回滚，造成版本分裂。基线为 `framework-base` 的 `b006af178dc77c75faba0316fc7d1fca239ca9e2`。其他四个 review 问题不在本次修改范围内。
 
 ## 分支与实验结果
