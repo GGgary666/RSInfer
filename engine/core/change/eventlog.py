@@ -188,8 +188,11 @@ class EventLog:
                 continue
             self.blobs.delete(h)
             removed += 1
-        for cid, h in self.db.execute("SELECT id, changeset_hash FROM changes").fetchall():
-            if not self.blobs.has(h):
+        for (cid,) in self.db.execute("SELECT id FROM changes").fetchall():
+            cs = self.changeset(cid)
+            # The changeset metadata may survive after its file or artifact contents are gone.
+            if cs is None or self.blobs.missing(
+                    [h for h in cs.files.values() if h is not None] + list(cs.artifacts.values())):
                 self.db.execute("UPDATE changes SET content_purged = 1 WHERE id = ?", (cid,))
         self.db.commit()
         return removed
