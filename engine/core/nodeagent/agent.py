@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -76,6 +77,24 @@ def _die_with_parent() -> None:
     if sys.platform == "linux":
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         libc.prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+CODE_SOURCE_VARS = frozenset({"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"})
+"""Environment variables that decide where Python finds code: the snapshot decides that."""
+
+
+def child_env(environ: Mapping[str, str], spec: ProcSpec, code_root: Path) -> dict[str, str]:
+    """The environment of an engine process: engine code comes from ``code_root`` only.
+
+    Other ``PYTHON*`` variables (hash seed, unbuffered output, fault handler) are
+    not about where code comes from and are kept.
+    """
+    env = {k: v for k, v in environ.items() if k not in CODE_SOURCE_VARS and k != "CUDA_VISIBLE_DEVICES"}
+    env["PYTHONPATH"] = str(code_root)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # snapshots are read-only
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in spec.gpus)
+    env.update(spec.env)
+    return env
 
 
 class NodeAgent:
@@ -209,15 +228,6 @@ class NodeAgent:
 
     # ----------------------------------------------------------- processes
 
-    def _env(self, spec: ProcSpec, code_root: Path) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("PYTHON") and k != "CUDA_VISIBLE_DEVICES"}
-        env["PYTHONPATH"] = str(code_root)
-        env["PYTHONDONTWRITEBYTECODE"] = "1"  # snapshots are read-only
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in spec.gpus)
-        env.update(spec.env)
-        return env
-
     async def spawn(self, spec: ProcSpec) -> Result[msgspec.Struct]:
         if spec.proc.host != self.host:
             return fail(COMPONENT, "spawn", f"{spec.proc} belongs to another host", code="agent.wrong_host")
@@ -235,7 +245,7 @@ class NodeAgent:
         log = open(run_dir / "log", "wb")  # noqa: SIM115 - owned by the child
         process = await asyncio.create_subprocess_exec(
             self.python, "-P", "-s", "-m", "unit.runtime.host", str(spec_path),
-            cwd=run_dir, env=self._env(spec, snapshot / "engine"),
+            cwd=run_dir, env=child_env(os.environ, spec, snapshot / "engine"),
             stdin=asyncio.subprocess.DEVNULL, stdout=log, stderr=log,
             preexec_fn=_die_with_parent,
         )

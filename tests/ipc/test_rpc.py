@@ -51,6 +51,29 @@ def test_request_reply_and_handler_failures() -> None:
     asyncio.run(main())
 
 
+def test_a_timed_out_call_does_not_cut_off_other_calls_to_the_same_peer() -> None:
+    async def main() -> None:
+        zctx = zmq.asyncio.Context()
+        server = RpcServer(zctx, registry(), ep("host-a", "server"), BIND)
+
+        async def handle(env: Envelope, msg: msgspec.Struct) -> Result[msgspec.Struct]:
+            assert isinstance(msg, Ping)
+            await asyncio.sleep(msg.n / 10)
+            return Ok(Pong(msg.n))
+
+        task = asyncio.create_task(server.serve(handle))
+        client = RpcClient(zctx, registry(), ep("host-b", "client"))
+        long = asyncio.create_task(client.call(server.address, Ping(5), timeout=5))
+        short = await client.call(server.address, Ping(20), timeout=0.1)
+        assert isinstance(short, Failed) and short.has_code("ipc.timeout")
+        assert await long == Ok(Pong(5))
+        task.cancel()
+        client.close()
+        server.close()
+
+    asyncio.run(main())
+
+
 def test_unknown_schema_is_rejected_not_guessed() -> None:
     async def main() -> None:
         zctx = zmq.asyncio.Context()

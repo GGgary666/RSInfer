@@ -81,11 +81,17 @@ def log(config, ctx, text):
         f.write(text + "\\n")
 ''',
     "toyc/tunable.py": '''
+import time
+
 from toyc.logutil import log
 
 
 class Op:
-    """Takes part in changes as "toy.op"; args can make a phase fail."""
+    """Takes part in changes as "toy.op"; args can make a phase fail.
+
+    ``slices``: prepare in that many slices (``slice_s`` each, ``fail_slice`` raises);
+    ``prepare_s``: a one-shot prepare that takes that long.
+    """
     def __init__(self, ctx, config):
         self.ctx, self.config = ctx, config
         self.left = 0
@@ -96,7 +102,20 @@ class Op:
         if (args or {}).get("fail_at") == name:
             raise RuntimeError(f"injected {name} failure")
 
-    def prepare(self, args): self._phase("prepare", args)
+    def prepare(self, args):
+        self._phase("prepare", args)
+        if "slices" in args:
+            return self._slices(args)
+        time.sleep(args.get("prepare_s", 0))
+
+    def _slices(self, args):
+        for i in range(args["slices"]):
+            log(self.config, self.ctx, f"op slice {i}")
+            if args.get("fail_slice") == i:
+                raise RuntimeError(f"injected failure in slice {i}")
+            time.sleep(args.get("slice_s", 0))
+            yield
+
     def execute(self, args): self._phase("execute", args)
     def commit(self): self._phase("commit")
     def abort(self): self._phase("abort")
@@ -118,6 +137,7 @@ class Op:
 class Tunable:
     def __init__(self, ctx, config):
         self.config = config
+        time.sleep(config["toyc.init_delay_s"])  # e.g. loading weights
         ctx.on_action("toy.op", Op(ctx, config))
         ctx.on_config("toyc.chunk", lambda v: log(config, ctx, f"chunk {v}"))
         log(config, ctx, f"tunable loaded gen{ctx.instance.generation}")
@@ -145,6 +165,7 @@ SPECS: dict[str, UnitSpec] = {
     "toyc.tunable": spec("toyc.tunable", "toyc.tunable:Tunable", process=ALL_ROLES,
                          capabilities="accept_config = true", config={
                              "toyc.log_dir": {"type": "str", "default": "", "binding": "startup"},
+                             "toyc.init_delay_s": {"type": "float", "default": 0.0, "binding": "startup"},
                              "toyc.chunk": {"type": "int", "default": 8192, "binding": "live"}}),
     "toyc.versioned": spec("toyc.versioned", "toyc.versioned:Versioned", process=ALL_ROLES,
                            reads=["toyc.log_dir"]),
