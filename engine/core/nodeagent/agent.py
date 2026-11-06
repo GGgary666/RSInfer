@@ -118,6 +118,8 @@ class NodeAgent:
         self._materializing: set[Identity] = set()
         self._runs = itertools.count()
         self._shm = itertools.count()
+        self._lifecycle: dict[ProcId, asyncio.Lock] = {}
+        """Spawn and Stop of one ProcId run one at a time: a repeated request sees the first one's result."""
 
     # ------------------------------------------------------------ main
 
@@ -151,9 +153,11 @@ class NodeAgent:
             case Materialize():
                 return await self.materialize(msg)
             case Spawn():
-                return await self.spawn(msg.spec)
+                async with self._lifecycle.setdefault(msg.spec.proc, asyncio.Lock()):
+                    return await self.spawn(msg.spec)
             case Stop():
-                return await self.stop(msg.proc, msg.timeout_s)
+                async with self._lifecycle.setdefault(msg.proc, asyncio.Lock()):
+                    return await self.stop(msg.proc, msg.timeout_s, msg.incarnation)
             case AllocShm():
                 return self.alloc_shm(msg)
             case _:
@@ -215,12 +219,14 @@ class NodeAgent:
             return fail(COMPONENT, "materialize", f"{type(e).__name__}: {e}", subject=msg.identity,
                         code="agent.materialize_failed")
         self._materialized[msg.identity] = time.time()
-        self._prune()
+        self._prune(msg.keep)
         return Ok(Materialized(msg.identity, str(target), len(missing), len(msg.files) - len(missing)))
 
-    def _prune(self) -> None:
+    def _prune(self, keep_also: list[Identity]) -> None:
+        """Keep the snapshots processes started from, those the supervisor says they still
+        load code from (after in-place changes), those being made, and the newest others."""
         in_use = {rec.spec.identity for rec in self.procs.values() if rec.exit_code is None}
-        keep = in_use | self._materializing
+        keep = in_use | set(keep_also) | self._materializing
         others = sorted((t, i) for i, t in self._materialized.items() if i not in keep)
         for _, identity in others[: max(0, len(others) - self.tun.snapshot_retention)]:
             _rmtree(self.snapshot_dir(identity))
@@ -232,6 +238,14 @@ class NodeAgent:
         if spec.proc.host != self.host:
             return fail(COMPONENT, "spawn", f"{spec.proc} belongs to another host", code="agent.wrong_host")
         old = self.procs.get(spec.proc)
+        if old is not None and old.spec.incarnation == spec.incarnation:  # a repeated Spawn
+            if old.exit_code is not None:  # never started again under the same incarnation
+                return fail(COMPONENT, "spawn", f"incarnation {spec.incarnation} already ran and exited with "
+                            f"{old.exit_code}", subject=str(spec.proc), code="agent.already_exited")
+            return Ok(Spawned(spec.proc, old.process.pid))
+        if old is not None and old.spec.incarnation > spec.incarnation:
+            return fail(COMPONENT, "spawn", f"incarnation {spec.incarnation} is older than the last one here "
+                        f"({old.spec.incarnation})", subject=str(spec.proc), code="agent.stale_spawn")
         if old is not None and old.exit_code is None:
             return fail(COMPONENT, "spawn", f"{spec.proc} is already running", code="agent.running")
         snapshot = self.snapshot_dir(spec.identity)
@@ -264,10 +278,13 @@ class NodeAgent:
                                Exited(rec.spec.proc, rec.spec.incarnation, code, killed=code == -signal.SIGKILL),
                                timeout=self.tun.rpc_timeout_s)
 
-    async def stop(self, proc: ProcId, timeout_s: float) -> Result[msgspec.Struct]:
+    async def stop(self, proc: ProcId, timeout_s: float, incarnation: int) -> Result[msgspec.Struct]:
         rec = self.procs.get(proc)
         if rec is None:
             return fail(COMPONENT, "stop", f"{proc} is unknown", code="agent.unknown_proc")
+        if rec.spec.incarnation != incarnation:  # a late Stop must not hit the successor
+            return fail(COMPONENT, "stop", f"incarnation {incarnation} is not the one here ({rec.spec.incarnation})",
+                        subject=str(proc), code="agent.stale_stop")
         killed = False
         if rec.exit_code is None:
             rec.stopping = True

@@ -148,8 +148,11 @@ class UnitContext:
         version keeps serving, the rest at the epoch boundary. ``prepare`` either does
         everything at once (returns ``None``; serving stops meanwhile) or returns an
         iterator whose every ``next()`` does one small slice between two steps
-        (change.md §4.6); it must not change what is serving. Raising fails the
-        change, and every participant rolls back.
+        (change.md §4.6); it must not change what is serving. If the same change
+        reloads this unit, ``prepare`` runs at the safe point instead, on the new
+        instance, so one instance sees every phase. Raising fails the change, and
+        every participant rolls back; ``abort()`` is called once and must also undo
+        a ``prepare`` or ``execute`` that raised halfway.
         """
         self._check_live()
         self._record(f"on_action({name})", self._rt._add_action(self._slot, name, handler))

@@ -89,6 +89,11 @@ class _Abort(Exception):
         self.diags = diags
 
 
+def _blobs_of(cs: ChangeSet) -> set[str]:
+    """Blob hashes a change-set refers to: file contents and artifacts."""
+    return {*(h for h in cs.files.values() if h is not None), *cs.artifacts.values()}
+
+
 class _Vanish(Exception):
     """Injected: the coordinator goes silent in the middle of a change."""
 
@@ -106,6 +111,10 @@ class _Run:
     prepared: list[ProcActions] = field(default_factory=list[ProcActions])
     restarted: list[ProcId] = field(default_factory=list[ProcId])
     spawned: list[ProcId] = field(default_factory=list[ProcId])
+    stopped: list[ProcId] = field(default_factory=list[ProcId])
+    """Stopped by the plan; the supervisor keeps their specs until commit, so abort can restart them."""
+    old_topology: Topology | None = None
+    """The topology when the change started; abort puts it back."""
     timings: dict[str, float] = field(default_factory=dict[str, float])
     reports: dict[str, ReloadReport] = field(default_factory=dict[str, ReloadReport])
     diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
@@ -221,6 +230,10 @@ class Coordinator:
             finally:
                 self.busy = False
             self._deliver(item.data["future"], result)
+            try:
+                self.prune_blobs()
+            except Exception as e:  # noqa: BLE001 - retention must not stop the queue
+                self.log.event(None, "prune_failed", {"error": f"{type(e).__name__}: {e}"})
 
     def _finish_dropped(self, item: Queued) -> None:
         cid = self.log.begin(item.cs)
@@ -307,11 +320,11 @@ class Coordinator:
                 COMPONENT, "check", f"base {cs.base!r} is not the running identity {self.identity!r}",
                 code="change.stale_base", hint="rebase the change on the current identity")]))
         new_manifest = apply_changeset(self.manifest, cs)
-        missing = self.sup.blobs.missing(h for h in cs.files.values() if h is not None)
+        missing = self.sup.blobs.missing(_blobs_of(cs))
         if missing:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
-                COMPONENT, "check", f"{len(missing)} file contents are not in the blob store",
-                code="change.missing_blobs")]))
+                COMPONENT, "check", f"{len(missing)} file or artifact contents are not in the blob store",
+                code="change.missing_blobs", hint="upload them before submitting")]))
         inp = PlanInput(cs, self.identity, self.manifest, new_manifest, self.sup.status())
         checked = await self.checker.check(inp)
         if isinstance(checked, Failed):
@@ -328,7 +341,7 @@ class Coordinator:
                 COMPONENT, "plan", "the change touches the framework core", code="escalate.restart_engine",
                 hint="restart the engine from the new source")], plan=plan))
         new_identity = old if cs.state_only else self.identity_fn(new_manifest)
-        run = _Run(cid, cs, plan, new_identity)
+        run = _Run(cid, cs, plan, new_identity, old_topology=self.sup.topology)
         run.timings["check+plan"] = time.monotonic() - t0
         self.log.record_identity(new_identity, new_manifest, old if old != EMPTY else None)
         self._running = run
@@ -435,14 +448,16 @@ class Coordinator:
     async def _execute(self, run: _Run, manifest: IdentityManifest) -> None:
         executed = await self._gather([(pa.proc, self._call(pa.proc, Execute(run.id))) for pa in run.prepared])
         for proc, e in executed.items():
-            if isinstance(e, Executed) and e.report is not None:
-                run.reports[str(proc)] = e.report
+            if isinstance(e, Executed):
+                run.diags += e.diagnostics
+                if e.report is not None:
+                    run.reports[str(proc)] = e.report
         topo = run.plan.topology or self.sup.topology
         for proc in run.plan.stop:
+            run.stopped.append(proc)
             r = await self.sup.stop(proc)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
-            self.sup.forget(proc)
         for pa in run.plan.procs:
             if pa.restart is None:
                 continue
@@ -462,9 +477,12 @@ class Coordinator:
         run.lap("execute")
 
     async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool,
-                       deadline: float) -> list[Diagnostic]:
+                       deadline: float) -> tuple[list[Diagnostic], dict[ProcId, Resumed]]:
+        """Commit (or Resume) until every process confirms, within the attempts and the deadline.
+        Returns what is still unconfirmed, and the ``Resumed`` acknowledgements."""
         pending = list(procs)
         phase = "resume" if resume else "commit"
+        resumed: dict[ProcId, Resumed] = {}
 
         async def call(proc: ProcId, msg: msgspec.Struct) -> Result[msgspec.Struct]:
             remaining = deadline - time.monotonic()
@@ -478,7 +496,7 @@ class Coordinator:
 
         for attempt in range(self.tun.commit_attempts):
             if not pending:
-                return []
+                return [], resumed
             if time.monotonic() >= deadline:
                 break
             msg = Resume(run.id, run.identity) if resume else Commit(run.id)
@@ -491,12 +509,14 @@ class Coordinator:
                         or ack.change_id != run.id or ack.identity != run.identity:
                     retry.append(p)
                     self.log.event(run.id, f"{phase}_unacknowledged", {"proc": str(p), "attempt": attempt + 1})
+                elif isinstance(ack, Resumed):
+                    resumed[p] = ack
             pending = retry
             if pending and attempt + 1 < self.tun.commit_attempts:
                 await asyncio.sleep(min(self.tun.commit_retry_interval_s, max(0.0, deadline - time.monotonic())))
         return [diag(COMPONENT, phase,
                      f"{phase} not confirmed for committed identity {run.identity}; restart the engine",
-                     subject=str(p), code="change.recovery_required") for p in pending]
+                     subject=str(p), code="change.recovery_required") for p in pending], resumed
 
     async def _commit(self, run: _Run) -> tuple[ChangeStatus, list[Diagnostic]]:
         self.recovery_required = True
@@ -509,18 +529,26 @@ class Coordinator:
                 await asyncio.sleep(2 * self.tun.coordinator_timeout_s)
             finally:
                 self._quiet = False
+        for proc in run.stopped:  # decided: they are not coming back
+            self.sup.forget(proc)
         deadline = time.monotonic() + self.tun.commit_ack_timeout_s
-        errors = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False, deadline=deadline)
+        errors, _ = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False, deadline=deadline)
         if not errors:
             for pa in run.prepared:
                 self.sup.committed(pa.proc, run.identity, pa.plan_after)
             for proc in [*run.restarted, *run.spawned]:
                 self.sup.committed(proc, run.identity, None)
-            errors = await self._confirm(
+            errors, resumed = await self._confirm(
                 run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True, deadline=deadline)
+            for proc, ack in resumed.items():
+                self.sup.uses_snapshots(proc, ack.snapshots)
         run.lap("commit")
-        if errors:
-            return "failed", errors  # Never infer that a lost process has stopped serving.
+        if errors:  # never infer that a lost process has stopped serving
+            unconfirmed = sorted({d.subject for d in errors})
+            return "failed", [*errors, diag(
+                COMPONENT, "commit", f"decided to commit identity {run.identity}, but {', '.join(unconfirmed)} did "
+                "not confirm it; the engine needs recovery and refuses further changes until then",
+                code="change.recovery_required", hint="restart the engine (v0 has no online recovery yet)")]
         self.recovery_required = False
         return "committed", []
 
@@ -532,6 +560,8 @@ class Coordinator:
         else:
             results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.asked))
             for pa, r in zip(run.asked, results, strict=True):
+                if isinstance(r, Ok) and isinstance(r.value, Resumed):
+                    self.sup.uses_snapshots(pa.proc, r.value.snapshots)
                 if isinstance(r, Failed):
                     out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
                                     code="change.abort_unacknowledged",
@@ -543,6 +573,13 @@ class Coordinator:
             r = await self.sup.relaunch_previous(proc)
             if isinstance(r, Failed):
                 out += r.diagnostics
+        for proc in run.stopped:  # their state is gone; they come back from the spec they had
+            r = await self.sup.restart([proc])
+            out += r.diagnostics if isinstance(r, Failed) else [diag(
+                COMPONENT, "abort", "was stopped by the change; started again", subject=str(proc),
+                code="change.restarted_after_abort", severity="info")]
+        if run.plan.topology is not None:
+            self.sup.topology = run.old_topology
         run.lap("abort")
         return out
 
@@ -550,11 +587,12 @@ class Coordinator:
 
     def prune_blobs(self) -> int:
         """Blob retention (§5.1): keeps the current identity, the one being prepared, the
-        ``change.blob_retention`` most recent ones, and the contents of queued changes.
-        Nothing calls it on its own yet; returns how many blobs were deleted."""
+        ``change.blob_retention`` most recent ones, the contents of queued changes, and
+        every blob younger than ``change.blob_grace_s``. Runs after every change; returns
+        how many blobs were deleted."""
         keep = [self.identity, *([self._running.identity] if self._running else [])]
-        queued = {h for item in self.queue.items() for h in item.cs.files.values() if h is not None}
-        return self.log.prune(keep, self.tun.blob_retention, queued)
+        queued = {h for item in self.queue.items() for h in _blobs_of(item.cs)}
+        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s)
 
     # ------------------------------------------------------------- startup
 

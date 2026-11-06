@@ -1,6 +1,10 @@
 """Request/reply over ZMQ (doc/specs/ipc.md §2): change transactions, control
 commands, process check-in. Calls carry a timeout; on timeout the result is
-``Failed`` with ``ipc.timeout``. Idempotency is the caller's job.
+``Failed`` with ``ipc.timeout``.
+
+Every control message must be idempotent (ipc.md §4): a request that timed out
+may still sit in the send queue and arrive once the peer recovers, and callers
+retry. Receivers deduplicate, e.g. by change id or by incarnation.
 
 ``RpcServer``/``RpcClient`` are for asyncio processes (control plane, node
 agents); ``SyncRpcServer``/``SyncRpcClient`` for single-threaded loops (workers),

@@ -236,3 +236,13 @@ def test_optional_service_waits_for_pending_provider(generic: Callable[..., Unit
     rt = UnitRuntime(PROC)
     rt.load_process_plan(plan([user, provider], generic.root)).unwrap()  # type: ignore[attr-defined]
     assert events[:2] == [("load", provider.id), ("load", user.id)]
+
+
+@pytest.mark.parametrize("order", ["reader-first", "owner-first"])
+def test_reads_are_checked_once_every_unit_declared_its_keys(generic: Callable[..., UnitSpec], order: str) -> None:
+    owner = generic("owner", config={"toy.k": {"type": "int", "default": 1}})
+    reader = generic("reader", reads=["toy.k"])
+    units = [reader, owner] if order == "reader-first" else [owner, reader]
+    rt = UnitRuntime(PROC)
+    rt.load_process_plan(plan(units, generic.root)).unwrap()  # type: ignore[attr-defined]
+    assert set(rt.snapshot().states().values()) == {InstanceState.ACTIVE}

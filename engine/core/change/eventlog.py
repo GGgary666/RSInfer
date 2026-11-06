@@ -164,8 +164,9 @@ class EventLog:
 
     # -- retention ----------------------------------------------------------
 
-    def prune(self, keep: list[Identity], retention: int, extra: Iterable[str] = ()) -> int:
-        """Delete blobs not referenced by ``keep``, the ``retention`` most recent identities, or ``extra``."""
+    def prune(self, keep: list[Identity], retention: int, extra: Iterable[str] = (), *, grace_s: float = 0.0) -> int:
+        """Delete blobs not referenced by ``keep``, the ``retention`` most recent identities, or
+        ``extra``, and older than ``grace_s`` (an agent uploads before it submits)."""
         recent = [r[0] for r in self.db.execute(
             "SELECT identity FROM identities ORDER BY created_at DESC, rowid DESC LIMIT ?", (retention,))]
         kept = sorted({*keep, *recent})
@@ -183,6 +184,8 @@ class EventLog:
                 live.add(h)
         removed = 0
         for h in self.blobs.hashes() - live:
+            if grace_s > 0 and self.blobs.age(h) < grace_s:
+                continue
             self.blobs.delete(h)
             removed += 1
         for cid, h in self.db.execute("SELECT id, changeset_hash FROM changes").fetchall():

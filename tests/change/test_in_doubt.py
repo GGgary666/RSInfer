@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import signal
 from collections.abc import Callable
 from pathlib import Path
 
@@ -9,6 +12,7 @@ import msgspec
 import pytest
 
 from core.change.coordinator import PlanInput
+from core.change.state import apply_changeset
 from core.change.protocol import Commit
 from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.ids import Identity, ProcId, UnitId
@@ -206,11 +210,44 @@ def test_missing_commit_never_resumes_candidates_or_allows_another_change(
             assert r.status == "failed", r.diagnostics
             assert "change.recovery_required" in codes(list(r.diagnostics))
             assert e.coord.identity == r.new_identity
+            summary = [d for d in r.diagnostics if d.code == "change.recovery_required" and not d.subject]
+            assert f"decided to commit identity {r.new_identity}" in summary[0].reason
             for p in ALL:
                 assert (await e.status(p)).paused
                 assert e.versioned(p) == "versioned v2"
             blocked = await e.coord.submit(ChangeSet(base=e.coord.identity))
             assert blocked.status == "failed"
             assert "change.recovery_required" in codes(list(blocked.diagnostics))
+
+    run(main())
+
+
+def test_a_hung_participant_ends_the_commit_with_recovery_not_a_hang(tmp_path: Path) -> None:
+    """§7 test 16: alive but not answering is not lost. Confirmation gives up within
+    ``change.commit_ack_timeout_s``, nobody resumes, and later changes are refused."""
+
+    async def main() -> None:
+        async with engine(tmp_path, coordinator_timeout_s=LEASE, keepalive_interval_s=BEAT, commit_ack_timeout_s=2.0,
+                          commit_retry_interval_s=0.1) as e:
+            cs = e.code_change()
+            slow = restart_w1(e, init_delay_s=2.0)
+            e.planner.script = lambda inp: slow(inp) if inp.cs.files else ActionPlan()
+            change = asyncio.ensure_future(e.coord.submit(cs))
+            await wait_until(lambda: "op execute" in e.ops(W0))
+            hung = e.c.sup.local_pid(W0)
+            assert hung is not None
+            os.kill(hung, signal.SIGSTOP)  # like a rank stuck in NCCL: its agent still sees it running
+            follow = e.coord.enqueue(ChangeSet(base=e.coord.identity_fn(apply_changeset(e.coord.manifest, cs))))
+            try:
+                r = await asyncio.wait_for(change, 30)
+                assert r.status == "failed" and "change.recovery_required" in codes(list(r.diagnostics))
+                assert r.timings["commit"] < 2.0 + 1.0
+                assert e.coord.identity == r.new_identity  # decided, not rolled back
+                for p in (SCHED, W1):
+                    assert (await e.status(p)).paused  # no one resumes before everyone committed
+                blocked = await asyncio.wait_for(follow, 10)
+                assert blocked.status == "failed" and "change.recovery_required" in codes(list(blocked.diagnostics))
+            finally:
+                os.kill(hung, signal.SIGCONT)
 
     run(main())

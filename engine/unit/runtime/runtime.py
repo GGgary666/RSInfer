@@ -180,6 +180,7 @@ class UnitRuntime:
                     continue
                 errors += self._declare_unit(spec)
                 self._slots[spec.id] = _Slot(spec)
+            errors += self._check_reads(plan.units)
             if errors:
                 for spec in plan.units:
                     self._slots.pop(spec.id, None)
@@ -187,10 +188,15 @@ class UnitRuntime:
             self._settle()
             return self._settled_result()
 
-    def reload(self, plan: ReloadPlan) -> Result[ReloadReport]:
-        """Execute a reload instruction. Call only at a safe point."""
+    def reload(self, plan: ReloadPlan, *, values: dict[str, Any] | None = None) -> Result[ReloadReport]:
+        """Execute a reload instruction. Call only at a safe point.
+
+        ``values``: config values that change together with the reload. Units it builds read
+        them; if it fails, the old units are built again with the old values. ``on_config``
+        hooks of the other units are the caller's to run once it succeeded.
+        """
         with self._operation():
-            return self._reload(plan)
+            return self._reload(plan, values or {})
 
     def stage_new_units(
         self, units: list[UnitSpec], *, code_root: str | None = None,
@@ -236,6 +242,17 @@ class UnitRuntime:
         """The handler a unit registered with ``ctx.on_action(name, ...)``."""
         entry = self._actions.get((UnitId(unit), name))
         return entry[1] if entry is not None else None
+
+    def units_touched_by(self, plan: ReloadPlan) -> set[UnitId]:
+        """Units whose instance ``plan`` replaces or creates: listed for reload or removal,
+        importing a changed module, using any of those (they are unloaded with their
+        providers), or added by it."""
+        accepted = self._affected_modules(plan.changed_modules)
+        direct = {*(s.id for s in plan.units_to_reload), *plan.units_to_remove,
+                  *(s.id for s in self._slots.values() if s.manifest.unit.entry_module in accepted)}
+        unloaded = {s.id for s in self._unload_order(self._slots[u] for u in direct if u in self._slots)}
+        added = {s.id for s in plan.units_to_add if s.id not in self._slots or not self._slots[s.id].staged}
+        return direct | unloaded | added
 
     def spec_of(self, unit: str) -> UnitSpec | None:
         slot = self._slots.get(UnitId(unit))
@@ -313,7 +330,8 @@ class UnitRuntime:
         return {name: mod for name, mod in list(sys.modules.items()) if self._is_engine_module(mod)}
 
     def _declare_unit(self, spec: UnitSpec) -> list[Diagnostic]:
-        """Declare keys the unit owns (unless already shipped) and check its reads."""
+        """Declare keys the unit owns (unless already shipped). Reads are checked by
+        ``_check_reads`` once every unit of the operation has declared its keys."""
         m = spec.manifest
         out: list[Diagnostic] = []
         if self.framework.contains(m.unit.entry_module):
@@ -330,8 +348,10 @@ class UnitRuntime:
             elif self.config.owner_of(key) != m.id:
                 out.append(self._diag("load", f"owns {key!r}, already owned by {self.config.owner_of(key)}",
                                       m.id, "config.owner_conflict"))
-        out += self.config.check_readable(m)
         return out
+
+    def _check_reads(self, specs: Iterable[UnitSpec]) -> list[Diagnostic]:
+        return [d for spec in specs for d in self.config.check_readable(spec.manifest)]
 
     def _settled_result(self) -> Result[None]:
         failed = [s for s in self._slots.values() if s.state is InstanceState.FAILED]
@@ -584,7 +604,7 @@ class UnitRuntime:
                 loaded[name] = Path(file)
         return ImportGraph(loaded).importers_closure(c for c in changed if c in loaded)
 
-    def _reload(self, plan: ReloadPlan) -> Result[ReloadReport]:
+    def _reload(self, plan: ReloadPlan, values: dict[str, Any]) -> Result[ReloadReport]:
         errors: list[Diagnostic] = []
         reload_specs = {s.id: s for s in plan.units_to_reload}
         removed = set(plan.units_to_remove)
@@ -642,12 +662,16 @@ class UnitRuntime:
             paths = self._switch_root(plan.new_code_root)
             self._fault("after_switch")
 
-            r = self.config.declare_entries(plan.config)
-            if isinstance(r, Failed):
-                raise _Abort(r.diagnostics)
             for uid in removed:
                 del self._slots[uid]
                 self.config.retract_owner(uid)
+            # after the removals: a key may move from a removed unit to an added one
+            r = self.config.declare_entries(plan.config)
+            if isinstance(r, Failed):
+                raise _Abort(r.diagnostics)
+            applied = self.config.apply(values)
+            if isinstance(applied, Failed):
+                raise _Abort(applied.diagnostics)
             decl_errors: list[Diagnostic] = []
             for uid, spec in reload_specs.items():
                 slot = self._slots[uid]
@@ -658,6 +682,7 @@ class UnitRuntime:
             for spec in to_add:
                 decl_errors += self._declare_unit(spec)
                 self._slots[spec.id] = _Slot(spec)
+            decl_errors += self._check_reads([*reload_specs.values(), *to_add])
             if decl_errors:
                 raise _Abort(decl_errors)
             self._settle()
@@ -869,6 +894,7 @@ class UnitRuntime:
         for spec in units:
             errors += self._declare_unit(spec)
             self._slots[spec.id] = _Slot(spec, staged=True)
+        errors += self._check_reads(units)
         if errors:
             self._discard_staged()
             return Failed(errors)
