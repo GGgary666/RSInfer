@@ -3,115 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
 
-from core.change.coordinator import Coordinator, PlanInput
-from core.change.eventlog import EventLog
-from core.change.participant import ChangeTunables
+from core.change.coordinator import PlanInput
 from core.change.types import EMPTY, ActionPlan, ChangeMeta, ChangeResult, ChangeSet, ProcActions, UnitAction
 from core.common.ids import Identity, ProcId, UnitId
-from core.common.result import Ok, Result
-from core.supervisor import Topology, desired_procs
-from core.supervisor.protocol import ProcStatusReport, Status
-from tests.cluster.harness import SPECS, VERSIONED_V2, Cluster, build_tree, cluster, proc, process_plan, role, topology
-from unit.runtime import ReloadPlan
-
-SCHED = proc("host-a", "sched", 0)
-W0 = proc("host-a", "worker", 0)
-W1 = proc("host-b", "worker", 1)
-ALL = [SCHED, W0, W1]
-UNITS = ["toyc.loop", "toyc.tunable", "toyc.versioned"]
-
-type Script = Callable[[PlanInput], ActionPlan | Awaitable[ActionPlan]]
-
-
-class Scripted:
-    """Stands in for core.deps: startup spawns everything; other plans come from the test."""
-
-    def __init__(self, c: Cluster) -> None:
-        self.c = c
-        self.script: Script | None = None
-
-    async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
-        if inp.cs.source == "startup":
-            topo = inp.cs.topology
-            assert topo is not None
-            return Ok(ActionPlan(spawn=[process_plan(d, EMPTY, {"toyc.log_dir": str(self.c.logs)})
-                                        for d in desired_procs(topo).values()], topology=topo))
-        assert self.script is not None
-        out = self.script(inp)
-        return Ok(await out if isinstance(out, Awaitable) else out)
-
-
-@dataclass
-class Engine:
-    c: Cluster
-    coord: Coordinator
-    planner: Scripted
-    topo: Topology
-
-    async def status(self, p: ProcId) -> ProcStatusReport:
-        r = (await self.c.sup.call(p, Status())).unwrap()
-        assert isinstance(r, ProcStatusReport)
-        return r
-
-    def versioned(self, p: ProcId) -> str:
-        return [line for line in self.c.log_of(p) if line.startswith("versioned")][-1]
-
-    def ops(self, p: ProcId) -> list[str]:
-        return [line for line in self.c.log_of(p) if line.startswith("op ")]
-
-    def code_change(self) -> ChangeSet:
-        h = self.c.blobs.put(VERSIONED_V2.encode())
-        return ChangeSet(base=self.coord.identity, files={"engine/toyc/versioned.py": h})
-
-    async def epochs_advance(self, p: ProcId) -> bool:
-        a = (await self.status(p)).epoch or 0
-        await asyncio.sleep(0.1)
-        return ((await self.status(p)).epoch or 0) > a
-
-
-def reload_everywhere(fail: dict[ProcId, str] | None = None) -> Callable[[PlanInput], ActionPlan]:
-    fail = fail or {}
-
-    def script(inp: PlanInput) -> ActionPlan:
-        return ActionPlan(procs=[
-            ProcActions(p, reload=ReloadPlan(changed_modules=["toyc.versioned"],
-                                             units_to_reload=[SPECS["toyc.versioned"]]),
-                        actions=[UnitAction(UnitId("toyc.tunable"), "toy.op",
-                                            {"fail_at": fail[p]} if p in fail else {})],
-                        leads_epochs=p == SCHED)
-            for p in ALL])
-
-    return script
-
-
-@asynccontextmanager
-async def engine(tmp: Path, coordinator_timeout_s: float = 30.0) -> AsyncGenerator[Engine]:
-    async with cluster(tmp, ["host-a", "host-b"]) as c:
-        planner = Scripted(c)
-        coord = Coordinator(c.sup, EventLog(tmp / "events.sqlite", c.blobs), planner=planner,
-                            tun=ChangeTunables(coordinator_timeout_s=coordinator_timeout_s, drain_timeout_s=5.0))
-        await coord.start()
-        topo = topology(tmp, ["host-a", "host-b"], ["host-a", "host-b"],
-                        [role("sched", UNITS, hosts=["host-a"]), role("worker", UNITS)])
-        started = await coord.startup(c.blobs.ingest_tree(build_tree(tmp)), topo)
-        assert started.status == "committed", started.diagnostics
-        try:
-            yield Engine(c, coord, planner, topo)
-        finally:
-            coord.close()
-            await c.sup.stop_all()
-
-
-def run(coro: Coroutine[Any, Any, None]) -> None:
-    asyncio.run(coro)
+from core.supervisor import desired_procs
+from tests.change.engine import ALL, SCHED, W0, W1, Script, engine, reload_everywhere, run
+from tests.cluster.harness import process_plan
 
 
 def test_startup_is_a_change(tmp_path: Path) -> None:
@@ -184,31 +85,17 @@ def test_any_failure_rolls_back_every_participant(tmp_path: Path, name: str, fai
     run(main())
 
 
-def test_participants_roll_back_alone_when_the_coordinator_vanishes(tmp_path: Path) -> None:
-    async def main() -> None:
-        async with engine(tmp_path, coordinator_timeout_s=1.0) as e:
-            old = e.coord.identity
-            e.planner.script = reload_everywhere()
-            e.coord.faults.add("vanish_after_prepare")
-            assert (await e.coord.submit(e.code_change())).status == "aborted"
-            await asyncio.sleep(1.5)
-            for p in ALL:
-                st = await e.status(p)
-                assert st.identity == old and not st.paused
-                assert "change.coordinator_lost" in {d.code for d in st.diagnostics}
-                assert e.ops(p) == ["op prepare", "op abort"]
-
-    run(main())
-
-
 def test_state_only_internal_change_keeps_the_identity(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:
             old = e.coord.identity
             e.planner.script = lambda inp: ActionPlan(procs=[
                 ProcActions(p, actions=[UnitAction(UnitId("toyc.tunable"), "toy.op")]) for p in (W0, W1)])
-            r = await e.coord.submit(ChangeSet(base=old, source="internal", computed_under=old, state_only=True))
+            # internal changes do not check their base; the result names the running identity
+            r = await e.coord.submit(ChangeSet(base=Identity("whatever"), source="internal", computed_under=old,
+                                               state_only=True))
             assert r.status == "committed" and r.new_identity == old and r.state_version == 1
+            assert r.old_identity == old
             assert (await e.status(W1)).identity == old
             e.planner.script = reload_everywhere()
             r2 = await e.coord.submit(e.code_change())  # its base is still valid

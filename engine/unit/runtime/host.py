@@ -25,7 +25,8 @@ from typing import Any, Protocol
 import msgspec
 import zmq
 
-from core.change.participant import ChangeTunables, Participant
+from core.change.config import ChangeTunables
+from core.change.participant import Participant
 from core.common.ids import Endpoint, Epoch
 from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail

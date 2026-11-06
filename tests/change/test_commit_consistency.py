@@ -8,8 +8,10 @@ deadline, not by sleeping. Unit behavior is checked independently of identity la
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Generator
 from pathlib import Path
+from types import MethodType
 from typing import Protocol, cast
 
 import msgspec
@@ -19,10 +21,11 @@ import zmq.asyncio
 from core.change.blobs import BlobStore
 from core.change.coordinator import Coordinator, PlanInput
 from core.change.eventlog import EventLog
+from core.change.protocol import Commit, Decision, QueryDecision
 from core.change.types import ActionPlan, ChangeResult, ChangeSet, ProcActions, UnitAction
 from core.common.ids import HostId, Identity, ProcId
-from core.common.result import Ok, Result, fail
-from core.ipc.rpc import Deferred
+from core.common.result import Failed, Ok, Result, fail
+from core.ipc.rpc import Deferred, SyncRpcServer
 from core.supervisor.protocol import Materialized, ProcSpec
 from core.supervisor.supervisor import Supervisor, _Proc
 from core.supervisor.topology import DesiredProc, HostSpec, Mesh, RankPlacement, RoleSpec, Topology
@@ -89,7 +92,14 @@ class Harness:
         monkeypatch.setattr(self.sup, "call", self.call)
         monkeypatch.setattr(self.sup, "materialize", self.materialize)
         self.coord = Coordinator(self.sup, EventLog(tmp / "events.sqlite", self.sup.blobs), planner=self)
+        self.coord.tun = msgspec.structs.replace(self.coord.tun, commit_retry_interval_s=0.001)
         self.coord.identity = OLD
+        for host in self.hosts.values():
+            monkeypatch.setattr(host.client, "call", self.query)
+
+    def query(self, address: str, msg: msgspec.Struct, *, timeout: float) -> Result[msgspec.Struct]:
+        assert isinstance(msg, QueryDecision)
+        return Ok(Decision(msg.change_id, self.coord.decision_of(msg.change_id)))
 
     async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
         return Ok(self.action_plan)
@@ -173,6 +183,157 @@ def test_lost_commit_is_retried_until_every_participant_serves_new_version(harne
     asyncio.run(main())
 
 
+def test_lost_detector_cannot_turn_unacknowledged_commit_into_success(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = harness
+    h.drop_count = -1
+    monkeypatch.setattr(h.hosts[h.target].client, "call", lambda *args, **kw:
+                        fail("test", "query", "partitioned control plane", code="ipc.timeout"))
+
+    async def call(proc: ProcId, msg: msgspec.Struct, *, timeout: float | None = None) -> Result[msgspec.Struct]:
+        if proc == h.target and isinstance(msg, Commit):
+            h.sup._lose_proc(h.sup.procs[proc], "agent heartbeat timed out")
+        return await h.call(proc, msg, timeout=timeout)
+
+    monkeypatch.setattr(h.sup, "call", call)
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert result.status == "failed", result
+        assert all(host.paused for host in h.hosts.values())
+        assert all(h.unit_of(p).version == 2 for p in h.hosts)
+        assert not any(kind == "Resume" for _, kind in h.messages)
+
+    asyncio.run(main())
+
+
+def test_query_timeout_cannot_resume_old_version_alongside_new_version(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = harness
+    h.drop_count = 1
+    monkeypatch.setattr(h.hosts[h.target].client, "call", lambda *args, **kw:
+                        fail("test", "query", "reply lost while coordinator lives", code="ipc.timeout"))
+    split: list[dict[ProcId, int]] = []
+
+    def observe() -> None:
+        serving = {p: h.unit_of(p).version for p, host in h.hosts.items() if not host.paused}
+        if len(set(serving.values())) > 1:
+            split.append(serving)
+
+    h.observe = observe
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert not split, split
+        assert result.status == "committed", result.diagnostics
+        assert all(host.identity == result.new_identity for host in h.hosts.values())
+
+    asyncio.run(main())
+
+
+def test_confirmation_deadline_bounds_a_stuck_rpc_and_blocks_next_change(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = harness
+    h.coord.tun = msgspec.structs.replace(h.coord.tun, commit_ack_timeout_s=0.05)
+    cancelled: list[ProcId] = []
+
+    async def call(proc: ProcId, msg: msgspec.Struct, *, timeout: float | None = None) -> Result[msgspec.Struct]:
+        if proc == h.target and isinstance(msg, Commit):
+            try:
+                await asyncio.Future[None]()  # Simulate a transport that never returns.
+            finally:
+                cancelled.append(proc)
+        return await h.call(proc, msg, timeout=timeout)
+
+    monkeypatch.setattr(h.sup, "call", call)
+
+    async def main() -> None:
+        await h.coord.start()
+        started = time.monotonic()
+        result = await asyncio.wait_for(h.submit(), timeout=1.0)
+        assert 0.04 <= time.monotonic() - started < 1.0
+        assert result.status == "failed" and cancelled == [h.target]
+        assert all(host.paused for host in h.hosts.values())
+        assert h.coord.decision_of(result.change_id) == "commit"
+        count = len(h.messages)
+        assert (await h.submit()).status == "failed"
+        assert len(h.messages) == count
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("field", ["change_id", "identity", "rolled_back"])
+def test_invalid_confirmation_is_rejected(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    h = harness
+
+    async def call(proc: ProcId, msg: msgspec.Struct, *, timeout: float | None = None) -> Result[msgspec.Struct]:
+        reply = await h.call(proc, msg, timeout=timeout)
+        phase = "Resume" if field == "rolled_back" else "Commit"
+        if proc == h.target and type(msg).__name__ == phase and isinstance(reply, Ok):
+            wrong: object = {"change_id": -1, "identity": OLD, "rolled_back": True}[field]
+            return Ok(msgspec.structs.replace(reply.value, **{field: wrong}))
+        return reply
+
+    monkeypatch.setattr(h.sup, "call", call)
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert result.status == "failed"
+        assert any(d.code == "change.recovery_required" for d in result.diagnostics)
+        if field != "rolled_back":
+            assert all(host.paused for host in h.hosts.values())
+
+    asyncio.run(main())
+
+
+def test_commit_and_resume_cross_real_rpc_with_lost_commit_reply(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h = harness
+    for host in h.hosts.values():
+        monkeypatch.setattr(host.rpc, "defer", MethodType(SyncRpcServer.defer, host.rpc))
+    dropped = False
+
+    async def call(proc: ProcId, msg: msgspec.Struct, *, timeout: float | None = None) -> Result[msgspec.Struct]:
+        nonlocal dropped
+        r = await h.sup.client.call(h.hosts[proc].rpc.address, msg, timeout=timeout or 1.0)
+        if proc == h.target and isinstance(msg, Commit) and not dropped:
+            assert not isinstance(r, Failed), r
+            dropped = True
+            return fail("test", "rpc", "reply lost", code="ipc.timeout")
+        return r
+
+    monkeypatch.setattr(h.sup, "call", call)
+
+    async def serve() -> None:
+        while True:
+            for host in h.hosts.values():
+                host.safe_point()
+            await asyncio.sleep(0.001)
+
+    async def main() -> None:
+        serving = asyncio.create_task(serve())
+        try:
+            await h.coord.start()
+            result = await asyncio.wait_for(h.submit(), timeout=3.0)
+            assert dropped and result.status == "committed", result.diagnostics
+            assert all(host.identity == result.new_identity and not host.paused for host in h.hosts.values())
+            assert all(h.unit_of(p).commits == 1 for p in h.hosts)
+        finally:
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+
+    asyncio.run(main())
+
+
 @pytest.mark.parametrize("lost_target", [0, 1])
 @pytest.mark.parametrize("drop_reply", [False, True], ids=["lost-request", "lost-reply"])
 def test_no_participant_serves_before_global_commit_confirmation(
@@ -215,7 +376,7 @@ def test_persistent_commit_loss_is_not_reported_as_success(harness: Harness) -> 
         result = await h.submit()
         assert result.status == "failed", result
         assert any(d.code == "change.recovery_required" for d in result.diagnostics)
-        assert h.coord.identity == OLD
+        assert h.coord.identity == result.new_identity != OLD
         assert all(host.paused for host in h.hosts.values())
         assert all(h.unit_of(p).version == 2 for p in h.hosts)
         assert not any(kind in ("Resume", "Abort") for _, kind in h.messages)

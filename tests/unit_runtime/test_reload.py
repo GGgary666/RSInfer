@@ -313,6 +313,43 @@ def test_staging_refuses_units_that_import_changed_modules(world: World, snapsho
     assert str(v3) not in sys.path
 
 
+HELPER_KERNEL = '''
+from {pkg} import helper
+
+class Kernel:
+    def __init__(self, ctx, config):
+        self.value = helper.VALUE
+        ctx.register("cat@1", ("kernel", "triton"))
+'''
+
+
+def test_staging_refuses_units_that_import_changed_modules_not_loaded_here(world: World, snapshot: Snapshot) -> None:
+    """unit-runtime.md §8 test 9: the changed module would be found in the old snapshot first."""
+    v3 = with_kernel(world, snapshot, "v3", HELPER_KERNEL.format(pkg=world.pkg), helper="VALUE = 3\n")
+    rt = UnitRuntime(PROC)
+    rt.load_process_plan(ProcessPlan(PROC, Identity("v1"), [world.catalog, world.other],
+                                     code_root=str(world.v1))).unwrap()
+    assert f"{world.pkg}.helper" not in sys.modules
+    k = kernel_spec(world)
+    r = rt.stage_new_units([k], code_root=str(v3), changed_modules=[f"{world.pkg}.helper"])
+    assert isinstance(r, Failed) and r.has_code("unit.stage_needs_safe_point")
+    assert f"{world.pkg}.helper" not in sys.modules and str(v3) not in sys.path
+
+    rt.reload(ReloadPlan(changed_modules=[f"{world.pkg}.helper"], units_to_add=[k], new_code_root=str(v3))).unwrap()
+    assert rt.instance(k.id).value == 3  # type: ignore[union-attr]
+
+
+def test_a_staged_unit_that_imports_a_changed_module_fails_the_reload(world: World, snapshot: Snapshot) -> None:
+    v3 = with_kernel(world, snapshot, "v3", HELPER_KERNEL.format(pkg=world.pkg), helper="VALUE = 3\n")
+    rt = start(world)
+    k = kernel_spec(world)
+    rt.stage_new_units([k], code_root=str(v3)).unwrap()  # the plan forgot that helper changed
+    before = unit_state(rt)
+    r = rt.reload(ReloadPlan(changed_modules=[f"{world.pkg}.helper"], units_to_add=[k], new_code_root=str(v3)))
+    assert isinstance(r, Failed) and r.has_code("unit.staged_imports_changed")
+    assert unit_state(rt) == before and ask(rt, world) == 1
+
+
 def test_modified_modules_cannot_be_staged(world: World) -> None:
     rt = start(world)
     again = spec(f"{world.pkg}.policy2", f"{world.pkg}.policy:Policy", provides=["pol2@1"], requires=["cat@1"])

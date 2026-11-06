@@ -5,31 +5,43 @@ and from any of them to ABORTING → ABORTED. One change at a time; the rest wai
 the queue. It does not decide what to touch (``core.deps`` plans) and executes
 nothing itself (participants do); it sequences phases and tells the truth about
 the outcome.
+
+Participants that voted ``Prepared`` cannot decide alone (§4.7), so the
+coordinator renews their lease with ``KeepAlive`` while a change runs, writes
+its decision to the event log before sending ``Commit``/``Abort``, answers
+``QueryDecision`` from the log, and retries Commit/Resume within bounded limits.
+No participant resumes before every Commit is confirmed. A missing acknowledgement
+requires engine recovery, even when the failure detector reports a process lost.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 import msgspec
 
+from core.change.config import ChangeTunables
 from core.change.eventlog import EventLog
-from core.change.participant import ChangeTunables
 from core.change.protocol import (
     Abort,
     Commit,
     Committed,
+    Decision,
+    DecisionKind,
     Drain,
     Drained,
     Execute,
     Executed,
+    KeepAlive,
     Pause,
     Paused,
     Prepare,
+    Prepared,
+    QueryDecision,
     Resume,
     Resumed,
 )
@@ -37,7 +49,8 @@ from core.change.queue import ChangeQueue, Queued
 from core.change.state import IdentityFn, IdentityManifest, apply_changeset, identity_of
 from core.change.types import EMPTY, ActionPlan, ChangeResult, ChangeSet, ChangeStatus, ProcActions
 from core.common.ids import HostId, Identity, ProcId
-from core.common.result import Diagnostic, Failed, Ok, Result, diag
+from core.common.messages import Envelope
+from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 from core.supervisor.supervisor import ProcStatus, Supervisor
 from core.supervisor.topology import Topology
 from unit.runtime.types import ReloadReport
@@ -76,6 +89,10 @@ class _Abort(Exception):
         self.diags = diags
 
 
+class _Vanish(Exception):
+    """Injected: the coordinator goes silent in the middle of a change."""
+
+
 @dataclass
 class _Run:
     """Book-keeping of one change in flight, for the abort path."""
@@ -84,11 +101,15 @@ class _Run:
     cs: ChangeSet
     plan: ActionPlan
     identity: Identity
+    asked: list[ProcActions] = field(default_factory=list[ProcActions])
+    """Participants sent ``Prepare``: they get ``Abort`` if the change fails."""
     prepared: list[ProcActions] = field(default_factory=list[ProcActions])
     restarted: list[ProcId] = field(default_factory=list[ProcId])
     spawned: list[ProcId] = field(default_factory=list[ProcId])
     timings: dict[str, float] = field(default_factory=dict[str, float])
     reports: dict[str, ReloadReport] = field(default_factory=dict[str, ReloadReport])
+    diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
+    """Reported by participants along the way (e.g. one-shot prepares)."""
     aborted_requests: int = 0
     _t: float = field(default_factory=time.monotonic)
 
@@ -109,35 +130,74 @@ class Coordinator:
         self.checker = checker or AcceptAll()
         self.identity_fn = identity_fn
         self.tun = tun or ChangeTunables()
-        if self.tun.commit_attempts < 1 or self.tun.commit_retry_delay_s < 0:
-            raise ValueError("commit_attempts must be positive and commit_retry_delay_s nonnegative")
+        if self.tun.commit_attempts < 1 or self.tun.commit_retry_interval_s < 0 \
+                or not 0 < self.tun.commit_ack_timeout_s < float("inf"):
+            raise ValueError("commit limits must be positive and finite; retry interval must be nonnegative")
         self.recovery_required = False
         self.identity: Identity = EMPTY
         self.manifest = IdentityManifest()
         self.state_version = 0
         self.queue = ChangeQueue()
         self.faults: set[str] = set()
-        """One-shot fault points: ``after_check``, ``after_prepare``, ``after_pause``,
-        ``after_execute``, and ``vanish_after_prepare`` (the coordinator goes silent)."""
+        """Fault points for tests. One-shot: ``after_check``, ``after_prepare``, ``after_pause``,
+        ``after_execute``; ``vanish_during_prepare`` and ``vanish_after_prepare`` (the coordinator
+        goes silent: no keepalives, no ``Abort``, queries about the change unanswered);
+        ``skip_abort`` (decides abort, sends no ``Abort``); ``delay_commit`` (decides commit, then
+        stays quiet for twice the participants' lease before sending ``Commit``). While set: ``no_decisions``
+        (``QueryDecision`` is never answered)."""
         self.busy = False
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._running: _Run | None = None
+        self._silent: set[int] = set()
+        self._quiet = False
+        self._background: set[asyncio.Task[Any]] = set()
         self.on_result: list[Callable[[ChangeResult], None]] = []
 
     # ------------------------------------------------------------ queue
 
     async def start(self) -> None:
+        self.sup.handlers[QueryDecision] = self._on_query
         self._task = asyncio.create_task(self._worker())
 
     def close(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
+        self.sup.handlers.pop(QueryDecision, None)
+        for t in [*self._background, *([self._task] if self._task else [])]:
+            t.cancel()
 
     def enqueue(self, cs: ChangeSet, *, dry_run: bool = False) -> asyncio.Future[ChangeResult]:
         fut: asyncio.Future[ChangeResult] = asyncio.get_running_loop().create_future()
+        invalid = self._invalid(cs)
+        if invalid:  # rejected as soon as it is received (§6)
+            cid = self.log.begin(cs)
+            self._deliver(fut, self._done(cid, self._result("failed", cid, cs, None, None, invalid)))
+            return fut
         self.queue.push(Queued(cs, dry_run, data={"future": fut}))
         self._wake.set()
         return fut
+
+    def _invalid(self, cs: ChangeSet) -> list[Diagnostic]:
+        out: list[Diagnostic] = []
+        if cs.source == "internal" and cs.computed_under is None:
+            out.append(diag(COMPONENT, "receive", "an internal change must say which identity it was computed under",
+                            code="change.missing_computed_under", hint="set computed_under"))
+        if cs.state_only:
+            touched = [name for name, changed in [
+                ("files", bool(cs.files)), ("config", bool(cs.config)), ("deps", bool(cs.deps)),
+                ("topology", cs.topology is not None), ("artifacts", bool(cs.artifacts))] if changed]
+            if touched:
+                out.append(diag(COMPONENT, "receive",
+                                f"a state-only change cannot change {touched}: the identity would not say what runs",
+                                code="change.state_only_with_content",
+                                hint="submit it as a change that produces a new identity"))
+        return out
+
+    def _deliver(self, fut: object, result: ChangeResult) -> None:
+        assert isinstance(fut, asyncio.Future)
+        if not fut.done():
+            fut.set_result(result)  # type: ignore[union-attr]
+        for cb in self.on_result:
+            cb(result)
 
     async def submit(self, cs: ChangeSet, *, dry_run: bool = False) -> ChangeResult:
         return await self.enqueue(cs, dry_run=dry_run)
@@ -160,12 +220,7 @@ class Coordinator:
                                             code="change.internal_error")])
             finally:
                 self.busy = False
-            fut = item.data["future"]
-            assert isinstance(fut, asyncio.Future)
-            if not fut.done():
-                fut.set_result(result)  # type: ignore[union-attr]
-            for cb in self.on_result:
-                cb(result)
+            self._deliver(item.data["future"], result)
 
     def _finish_dropped(self, item: Queued) -> None:
         cid = self.log.begin(item.cs)
@@ -174,27 +229,66 @@ class Coordinator:
             code="change.stale_internal", severity="info", hint="the unit recomputes it next cycle")])
         self.log.finish(result)
         self.log.event(cid, "dropped_stale_internal", {"computed_under": item.cs.computed_under})
-        fut = item.data["future"]
-        assert isinstance(fut, asyncio.Future)
-        if not fut.done():
-            fut.set_result(result)  # type: ignore[union-attr]
-        for cb in self.on_result:
-            cb(result)
+        self._deliver(item.data["future"], result)
 
     def _result(self, status: ChangeStatus, cid: int, cs: ChangeSet, new: Identity | None,
-                run: _Run | None, diags: list[Diagnostic], plan: ActionPlan | None = None) -> ChangeResult:
+                run: _Run | None, diags: list[Diagnostic], plan: ActionPlan | None = None,
+                old: Identity | None = None) -> ChangeResult:
+        """``old``: the running identity before the change (internal changes do not check ``cs.base``)."""
         return ChangeResult(
-            status=status, change_id=cid, old_identity=self.identity if status != "committed" else cs.base,
+            status=status, change_id=cid, old_identity=old if old is not None else self.identity,
             new_identity=new, plan=run.plan if run else plan, timings=dict(run.timings) if run else {},
             aborted_requests=run.aborted_requests if run else 0,
             restarted=list(run.restarted) if run else [], reports=dict(run.reports) if run else {},
             state_version=self.state_version, diagnostics=diags,
         )
 
-    def _fault(self, point: str) -> None:
+    def _take(self, point: str) -> bool:
         if point in self.faults:
             self.faults.discard(point)
+            return True
+        return False
+
+    def _fault(self, point: str) -> None:
+        if self._take(point):
             raise _Abort([diag(COMPONENT, point, f"fault injected at {point}", code="change.injected_fault")])
+
+    def _spawn(self, coro: Coroutine[Any, Any, object]) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    # ------------------------------------------------------- decisions (§4.7)
+
+    def decision_of(self, change_id: int) -> DecisionKind:
+        decided = self.log.decision(change_id)
+        if decided is not None:
+            return decided
+        if self._running is not None and self._running.id == change_id:
+            return "pending"
+        return "abort" if self.log.known(change_id) else "unknown"  # never decided commit: presumed abort
+
+    async def _on_query(self, env: Envelope, msg: msgspec.Struct) -> Result[msgspec.Struct]:
+        assert isinstance(msg, QueryDecision)
+        if "no_decisions" in self.faults or msg.change_id in self._silent:
+            return fail(COMPONENT, "query", "the coordinator does not answer (injected)", code="change.injected_fault")
+        return Ok(Decision(msg.change_id, self.decision_of(msg.change_id)))
+
+    async def _keepalive(self, run: _Run) -> None:
+        """Renew every participant's lease, also through long phases such as restarts."""
+        procs = [pa.proc for pa in run.plan.participants()]
+        interval = self.tun.keepalive_interval_s
+        while True:
+            await asyncio.sleep(interval)
+            if run.id in self._silent or self._quiet:
+                continue
+            for p in procs:
+                self._spawn(self._call(p, KeepAlive(run.id), timeout=interval))
+
+    def _vanish(self, run: _Run, phase: str) -> ChangeResult:
+        self._silent.add(run.id)
+        return self._done(run.id, self._result("aborted", run.id, run.cs, None, run, [diag(
+            COMPONENT, phase, "coordinator vanished (injected)", code="change.injected_fault")]))
 
     # ------------------------------------------------------------- one change
 
@@ -208,7 +302,7 @@ class Coordinator:
                 COMPONENT, "check", "a previous commit is unresolved; restart the engine",
                 code="change.recovery_required")]))
         # RECEIVED -> CHECKED
-        if cs.source != "internal" and cs.base != self.identity:
+        if cs.source != "internal" and cs.base != old:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
                 COMPONENT, "check", f"base {cs.base!r} is not the running identity {self.identity!r}",
                 code="change.stale_base", hint="rebase the change on the current identity")]))
@@ -237,13 +331,21 @@ class Coordinator:
         run = _Run(cid, cs, plan, new_identity)
         run.timings["check+plan"] = time.monotonic() - t0
         self.log.record_identity(new_identity, new_manifest, old if old != EMPTY else None)
+        self._running = run
+        keepalive = asyncio.create_task(self._keepalive(run))
+        try:
+            return await self._transact(run, old, new_manifest)
+        finally:
+            keepalive.cancel()
+            self._running = None
+
+    async def _transact(self, run: _Run, old: Identity, new_manifest: IdentityManifest) -> ChangeResult:
+        cid, cs = run.id, run.cs
         try:
             self._fault("after_check")
             await self._prepare(run, new_manifest)
-            if "vanish_after_prepare" in self.faults:
-                self.faults.discard("vanish_after_prepare")
-                return self._done(cid, self._result("aborted", cid, cs, None, run, [diag(
-                    COMPONENT, "prepare", "coordinator vanished (injected)", code="change.injected_fault")]))
+            if self._take("vanish_after_prepare"):
+                raise _Vanish("prepare")
             self._fault("after_prepare")
             await self._pause(run)
             self._fault("after_pause")
@@ -251,21 +353,17 @@ class Coordinator:
             self._fault("after_execute")
         except _Abort as e:
             undo = await self._abort(run)
-            return self._done(cid, self._result("aborted", cid, cs, None, run, [*e.diags, *undo]))
-        # Persist the irreversible decision before sending any Commit. Once sent,
-        # neither RPC failure nor timeout is evidence that rollback is safe.
-        self.log.event(cid, "commit_decided", {"identity": new_identity,
-                       "participants": [str(pa.proc) for pa in run.prepared]})
-        self.recovery_required = True
-        committed = await self._commit(run)
-        if committed:
-            return self._done(cid, self._result("failed", cid, cs, new_identity, run, committed))
-        self.recovery_required = False
-        self.identity = new_identity
+            return self._done(cid, self._result("aborted", cid, cs, None, run, [*run.diags, *e.diags, *undo], old=old))
+        except _Vanish as e:
+            return self._vanish(run, str(e))
+        status, diags = await self._commit(run)
+        # The decision is durable and the other participants serve the new identity,
+        # so it is current even when a participant could not be brought along.
+        self.identity = run.identity
         self.manifest = new_manifest
         if cs.state_only:
             self.state_version += 1
-        return self._done(cid, self._result("committed", cid, cs, new_identity, run, []))
+        return self._done(cid, self._result(status, cid, cs, run.identity, run, [*run.diags, *diags], old=old))
 
     def _done(self, cid: int, result: ChangeResult) -> ChangeResult:
         self.log.finish(result)
@@ -296,14 +394,21 @@ class Coordinator:
         if errors:
             raise _Abort(errors)
         participants = run.plan.participants()
-        calls: list[tuple[ProcId, Awaitable[Result[msgspec.Struct]]]] = []
-        for pa in participants:
-            msg = Prepare(run.id, run.identity, pa, self.tun.coordinator_timeout_s)
-            calls.append((pa.proc, self._call(pa.proc, msg)))
-        results = await asyncio.gather(*(c for _, c in calls))
-        for (proc, _), r in zip(calls, results, strict=True):
+        run.asked = list(participants)
+        calls = [self._call(pa.proc, Prepare(run.id, run.identity, pa, self.tun.coordinator_timeout_s),
+                            timeout=self.tun.prepare_timeout_s) for pa in participants]
+        if self._take("vanish_during_prepare"):
+            sent = [asyncio.create_task(c) for c in calls]
+            await asyncio.sleep(0.1)  # the Prepares are on their way; nothing else follows
+            for t in sent:
+                t.cancel()
+            raise _Vanish("prepare")
+        results = await asyncio.gather(*calls)
+        for pa, r in zip(participants, results, strict=True):
             if isinstance(r, Ok):
-                run.prepared.append(next(pa for pa in participants if pa.proc == proc))
+                run.prepared.append(pa)
+                if isinstance(r.value, Prepared):
+                    run.diags += r.value.diagnostics
         errors = [d for r in results if isinstance(r, Failed) for d in r.diagnostics]
         if errors:
             raise _Abort(errors)
@@ -356,12 +461,28 @@ class Coordinator:
             self.sup.topology = run.plan.topology
         run.lap("execute")
 
-    async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool) -> list[Diagnostic]:
+    async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool,
+                       deadline: float) -> list[Diagnostic]:
         pending = list(procs)
         phase = "resume" if resume else "commit"
+
+        async def call(proc: ProcId, msg: msgspec.Struct) -> Result[msgspec.Struct]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return fail(COMPONENT, phase, "confirmation deadline expired", code="change.commit_ack_timeout")
+            try:
+                return await asyncio.wait_for(
+                    self._call(proc, msg, timeout=min(remaining, self.sup.tun.rpc_timeout_s)), remaining)
+            except TimeoutError:
+                return fail(COMPONENT, phase, "confirmation deadline expired", code="change.commit_ack_timeout")
+
         for attempt in range(self.tun.commit_attempts):
+            if not pending:
+                return []
+            if time.monotonic() >= deadline:
+                break
             msg = Resume(run.id, run.identity) if resume else Commit(run.id)
-            results = await asyncio.gather(*(self._call(p, msg) for p in pending))
+            results = await asyncio.gather(*(call(p, msg) for p in pending))
             retry: list[ProcId] = []
             for p, r in zip(pending, results, strict=True):
                 ack = r.value if isinstance(r, Ok) else None
@@ -371,34 +492,50 @@ class Coordinator:
                     retry.append(p)
                     self.log.event(run.id, f"{phase}_unacknowledged", {"proc": str(p), "attempt": attempt + 1})
             pending = retry
-            if not pending:
-                return []
-            if attempt + 1 < self.tun.commit_attempts:
-                await asyncio.sleep(self.tun.commit_retry_delay_s)
-        return [diag(COMPONENT, phase, f"{phase} not confirmed; restart engine to recover the committed decision",
+            if pending and attempt + 1 < self.tun.commit_attempts:
+                await asyncio.sleep(min(self.tun.commit_retry_interval_s, max(0.0, deadline - time.monotonic())))
+        return [diag(COMPONENT, phase,
+                     f"{phase} not confirmed for committed identity {run.identity}; restart the engine",
                      subject=str(p), code="change.recovery_required") for p in pending]
 
-    async def _commit(self, run: _Run) -> list[Diagnostic]:
-        errors = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False)
-        if errors:
-            return errors  # All existing participants remain paused; do not send Abort.
-        for pa in run.prepared:
-            self.sup.committed(pa.proc, run.identity, pa.plan_after)
-        for proc in [*run.restarted, *run.spawned]:
-            self.sup.committed(proc, run.identity, None)
-        # Candidate processes also started paused; none serves before the barrier.
-        errors = await self._confirm(run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True)
+    async def _commit(self, run: _Run) -> tuple[ChangeStatus, list[Diagnostic]]:
+        self.recovery_required = True
+        self.log.decide(run.id, "commit")  # QueryDecision must see the same durable decision.
+        self.log.event(run.id, "commit_decided", {"identity": run.identity,
+                       "participants": [str(pa.proc) for pa in run.prepared]})
+        if self._take("delay_commit"):
+            self._quiet = True
+            try:
+                await asyncio.sleep(2 * self.tun.coordinator_timeout_s)
+            finally:
+                self._quiet = False
+        deadline = time.monotonic() + self.tun.commit_ack_timeout_s
+        errors = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False, deadline=deadline)
+        if not errors:
+            for pa in run.prepared:
+                self.sup.committed(pa.proc, run.identity, pa.plan_after)
+            for proc in [*run.restarted, *run.spawned]:
+                self.sup.committed(proc, run.identity, None)
+            errors = await self._confirm(
+                run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True, deadline=deadline)
         run.lap("commit")
-        return errors
+        if errors:
+            return "failed", errors  # Never infer that a lost process has stopped serving.
+        self.recovery_required = False
+        return "committed", []
 
     async def _abort(self, run: _Run) -> list[Diagnostic]:
+        self.log.decide(run.id, "abort")  # before any Abort leaves
         out: list[Diagnostic] = []
-        results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.prepared))
-        for pa, r in zip(run.prepared, results, strict=True):
-            if isinstance(r, Failed):
-                out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
-                                code="change.abort_unacknowledged",
-                                hint="executed participants stay paused until an explicit decision or engine restart"))
+        if self._take("skip_abort"):
+            out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))
+        else:
+            results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.asked))
+            for pa, r in zip(run.asked, results, strict=True):
+                if isinstance(r, Failed):
+                    out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
+                                    code="change.abort_unacknowledged",
+                                    hint="the participant asks for the decision when its lease runs out"))
         for proc in run.spawned:
             await self.sup.stop(proc)
             self.sup.forget(proc)
@@ -408,6 +545,16 @@ class Coordinator:
                 out += r.diagnostics
         run.lap("abort")
         return out
+
+    # ------------------------------------------------------------ retention
+
+    def prune_blobs(self) -> int:
+        """Blob retention (§5.1): keeps the current identity, the one being prepared, the
+        ``change.blob_retention`` most recent ones, and the contents of queued changes.
+        Nothing calls it on its own yet; returns how many blobs were deleted."""
+        keep = [self.identity, *([self._running.identity] if self._running else [])]
+        queued = {h for item in self.queue.items() for h in item.cs.files.values() if h is not None}
+        return self.log.prune(keep, self.tun.blob_retention, queued)
 
     # ------------------------------------------------------------- startup
 

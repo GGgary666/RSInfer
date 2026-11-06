@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import msgspec
 
@@ -107,6 +108,18 @@ class EventLog:
                         (change_id, kind, _json.encode(detail).decode(), time.time()))
         self.db.commit()
 
+    def decide(self, change_id: int, decision: Literal["commit", "abort"]) -> None:
+        """The coordinator's decision, durable before any ``Commit``/``Abort`` is sent (§4.7)."""
+        self.event(change_id, "decision", {"decision": decision})
+
+    def decision(self, change_id: int) -> Literal["commit", "abort"] | None:
+        row = self.db.execute("SELECT detail_json FROM events WHERE change_id = ? AND kind = 'decision'"
+                              " ORDER BY id DESC LIMIT 1", (change_id,)).fetchone()
+        return json.loads(row[0])["decision"] if row else None
+
+    def known(self, change_id: int) -> bool:
+        return self.db.execute("SELECT 1 FROM changes WHERE id = ?", (change_id,)).fetchone() is not None
+
     def events(self, kind: str | None = None) -> list[tuple[int | None, str, dict[str, Any]]]:
         rows = self.db.execute("SELECT change_id, kind, detail_json FROM events ORDER BY id").fetchall()
         return [(c, k, json.loads(d)) for c, k, d in rows if kind is None or k == kind]
@@ -151,12 +164,12 @@ class EventLog:
 
     # -- retention ----------------------------------------------------------
 
-    def prune(self, keep: list[Identity], retention: int) -> int:
-        """Delete blobs not referenced by ``keep`` or the ``retention`` most recent identities."""
+    def prune(self, keep: list[Identity], retention: int, extra: Iterable[str] = ()) -> int:
+        """Delete blobs not referenced by ``keep``, the ``retention`` most recent identities, or ``extra``."""
         recent = [r[0] for r in self.db.execute(
             "SELECT identity FROM identities ORDER BY created_at DESC, rowid DESC LIMIT ?", (retention,))]
         kept = sorted({*keep, *recent})
-        live: set[str] = set()
+        live: set[str] = set(extra)
         for identity in kept:
             row = self.db.execute("SELECT manifest_hash FROM identities WHERE identity = ?", (identity,)).fetchone()
             if row is None:

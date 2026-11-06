@@ -10,11 +10,12 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
-from core.common.ids import HostId
+from core.common.ids import HostId, Identity
 from core.common.result import Failed, Ok
-from core.supervisor.protocol import ProcStatusReport, Status
+from core.nodeagent.agent import child_env
+from core.supervisor.protocol import ProcSpec, ProcStatusReport, Status
 from tests.cluster.harness import ENGINE, REPO, build_tree, cluster, proc, role, topology
-from unit.runtime import InstanceState
+from unit.runtime import InstanceState, ProcessPlan
 
 
 def run(coro: Coroutine[Any, Any, None]) -> None:
@@ -61,6 +62,20 @@ def test_cold_start_on_two_hosts_loads_only_snapshot_code(tmp_path: Path) -> Non
             await c.sup.stop_all()
 
     run(main())
+
+
+def test_child_env_replaces_only_where_code_comes_from(tmp_path: Path) -> None:
+    w = proc("host-a", "worker", 0)
+    spec = ProcSpec(w, Identity("i"), ProcessPlan(w, Identity("i"), []), "tcp://control", "addr",
+                    env={"EXTRA": "1"}, gpus=[2, 3])
+    environ = {"PYTHONPATH": "/repo/engine", "PYTHONHOME": "/x", "PYTHONSTARTUP": "/y", "PYTHONUSERBASE": "/z",
+               "PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1", "PYTHONFAULTHANDLER": "1",
+               "CUDA_VISIBLE_DEVICES": "0", "HOME": "/home/u"}
+    env = child_env(environ, spec, tmp_path / "engine")
+    assert env["PYTHONPATH"] == str(tmp_path / "engine")
+    assert not {"PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"} & set(env)
+    assert (env["PYTHONHASHSEED"], env["PYTHONUNBUFFERED"], env["PYTHONFAULTHANDLER"]) == ("0", "1", "1")
+    assert (env["CUDA_VISIBLE_DEVICES"], env["EXTRA"], env["HOME"]) == ("2,3", "1", "/home/u")
 
 
 def test_materialize_reuses_blobs_and_never_leaves_half_snapshots(tmp_path: Path) -> None:

@@ -1,41 +1,57 @@
 """The participant side of a change, inside every process host (change.md §4).
 
-Requests are served at safe points only. Replies that must wait (drained,
-paused at the epoch boundary) are deferred and sent from a later safe point.
-Before execution, coordinator timeout rolls back and resumes serving. After
-execution, a decision may already exist elsewhere: stay paused until an explicit
-Abort or Commit/Resume arrives. Recovery of a lost coordinator requires an engine
-restart; timeout alone cannot establish that rollback is safe.
+Requests are served at safe points only. Replies that must wait (prepared,
+drained, paused at the epoch boundary) are deferred and sent from a later safe
+point.
+
+Prepare runs in slices (§4.6): a unit's ``prepare(args)`` may return an
+iterator, and every safe point advances each unfinished one by one ``next()``,
+so the old version keeps serving in between. A ``prepare`` that returns
+``None`` was done in one shot; how long serving stopped for it is reported.
+
+Any coordinator message renews the participant's lease (§4.7). When the lease
+runs out while still preparing, the participant withdraws by itself: it has
+promised nothing yet. After ``Prepared`` it must not decide alone: it asks the
+coordinator. After execution, an unavailable or unknown decision cannot justify
+rollback: stay paused. Commit fixes the decision, but only Resume releases the
+pause after the coordinator has confirmed every participant.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 
+from core.change.config import ChangeTunables
 from core.change.protocol import (
     Abort,
+    Alive,
     Commit,
     Committed,
+    Decision,
+    DecisionKind,
     Drain,
     Drained,
     Execute,
     Executed,
+    KeepAlive,
     Pause,
     Paused,
     Prepare,
     Prepared,
+    QueryDecision,
     Resume,
     Resumed,
 )
 from core.change.types import ProcActions, UnitAction
 from core.common.ids import Identity, UnitId
 from core.common.messages import Envelope
-from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
+from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
 from core.ipc.rpc import Deferred
 from unit.runtime.types import ReloadPlan, ReloadReport, UnitSpec
 
@@ -44,15 +60,8 @@ if TYPE_CHECKING:
 
 COMPONENT = "change.participant"
 
-Phase = Literal["prepared", "draining", "drained", "pausing", "paused", "executed", "committed"]
-
-
-class ChangeTunables(msgspec.Struct, frozen=True):
-    coordinator_timeout_s: float = 60.0
-    drain_timeout_s: float = 10.0
-    blob_retention: int = 20
-    commit_attempts: int = 3
-    commit_retry_delay_s: float = 0.1
+Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "committed"]
+type _Slices = tuple[UnitAction, Iterator[object]]
 
 
 @dataclass
@@ -70,8 +79,14 @@ class _Change:
     actions: ProcActions
     deadline: float
     timeout_s: float
-    phase: Phase = "prepared"
+    phase: Phase = "preparing"
+    staged: bool = False
     prepared_actions: list[UnitAction] = field(default_factory=list[UnitAction])
+    """``prepare()`` was called on these: ``abort()`` undoes them."""
+    slicing: list[_Slices] = field(default_factory=list[_Slices])
+    """Sliced preparations not finished yet."""
+    prepare_reply: Deferred | None = None
+    prepare_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     executed_actions: list[UnitAction] = field(default_factory=list[UnitAction])
     undo: _Undo = field(default_factory=_Undo)
     report: ReloadReport | None = None
@@ -80,6 +95,9 @@ class _Change:
     aborted_requests: int = 0
     pause_reply: Deferred | None = None
     pause_after: int | None = None
+
+    def renew(self) -> None:
+        self.deadline = time.monotonic() + self.timeout_s
 
 
 class Participant:
@@ -93,8 +111,8 @@ class Participant:
         self._initial_resume_pending = host.spec.start_paused
         self.diagnostics: list[Diagnostic] = []
         for type_, handler in [(Prepare, self.on_prepare), (Drain, self.on_drain), (Pause, self.on_pause),
-                               (Execute, self.on_execute), (Commit, self.on_commit), (Resume, self.on_resume),
-                               (Abort, self.on_abort)]:
+                               (Execute, self.on_execute), (Commit, self.on_commit), (Abort, self.on_abort),
+                               (KeepAlive, self.on_keepalive), (Resume, self.on_resume)]:
             host.handlers[type_] = handler
         host.safe_point_hooks.append(self.tick)
 
@@ -119,59 +137,123 @@ class Participant:
         if c is None or c.id != change_id:
             return fail(COMPONENT, "protocol", f"change {change_id} is not in progress here",
                         subject=str(self.host.spec.proc), code="change.unknown_change")
-        c.deadline = time.monotonic() + c.timeout_s  # the coordinator is alive
+        c.renew()  # the coordinator is alive
         return c
 
     def _fail(self, phase: str, e: BaseException | str) -> Failed:
         reason = e if isinstance(e, str) else f"{type(e).__name__}: {e}"
         return fail(COMPONENT, phase, reason, subject=str(self.host.spec.proc), code=f"change.{phase}_failed")
 
+    def _note(self, phase: str, reason: str, code: str, severity: Severity = "warning") -> None:
+        self.diagnostics.append(diag(COMPONENT, phase, reason, subject=str(self.host.spec.proc), code=code,
+                                     severity=severity))
+
+    def on_keepalive(self, env: Envelope, msg: KeepAlive) -> Result[msgspec.Struct]:
+        c = self._current(msg.change_id)
+        return c if isinstance(c, Failed) else Ok(Alive(c.id))
+
     # ----------------------------------------------------------- prepare
 
-    def on_prepare(self, env: Envelope, msg: Prepare) -> Result[msgspec.Struct]:
+    def on_prepare(self, env: Envelope, msg: Prepare) -> Result[msgspec.Struct] | Deferred:
         c = self.change
         if c is not None:
-            if c.id == msg.change_id:
-                return Ok(Prepared(msg.change_id))
-            return fail(COMPONENT, "prepare", f"busy with change {c.id}", code="change.busy")
+            if c.id != msg.change_id:
+                return fail(COMPONENT, "prepare", f"busy with change {c.id}", code="change.busy")
+            c.renew()
+            if c.phase != "preparing":
+                return Ok(Prepared(c.id, list(c.prepare_diags)))
+            if c.prepare_reply is not None:
+                c.prepare_reply.resolve(fail(COMPONENT, "prepare", "superseded by a repeated Prepare",
+                                             code="change.duplicate"))
+            reply = c.prepare_reply = self.host.rpc.defer()
+            return reply
         if msg.change_id in self.finished:
             return fail(COMPONENT, "prepare", "change already finished", code="change.finished")
-        c = _Change(msg.change_id, msg.identity, msg.actions, time.monotonic() + msg.coordinator_timeout_s,
-                    msg.coordinator_timeout_s)
+        c = _Change(msg.change_id, msg.identity, msg.actions, 0.0, msg.coordinator_timeout_s)
         a = msg.actions
-        staged = False
         try:
             if a.config:
                 r = self.rt.config.stage(a.config)
                 if isinstance(r, Failed):
                     return r
             if a.stage:
+                t0 = time.monotonic()
                 changed = a.reload.changed_modules if a.reload else []
                 r = self.rt.stage_new_units(a.stage, code_root=self._code_root_for(msg.identity),
                                             changed_modules=changed)
                 if isinstance(r, Failed):
                     self.rt.config.discard_staged()
                     return r
-                staged = True
+                c.staged = True
+                c.prepare_diags.append(self._one_shot(f"staging {len(a.stage)} new unit(s)", t0))
             for ua in a.actions:
-                self._handler(ua).prepare(ua.args)
+                t0 = time.monotonic()
+                out = self._handler(ua).prepare(ua.args)
                 c.prepared_actions.append(ua)
+                if out is None:
+                    c.prepare_diags.append(self._one_shot(
+                        f"{ua.unit}.{ua.action}", t0,
+                        hint="return an iterator from prepare() to prepare in slices between steps"))
+                else:
+                    c.slicing.append((ua, iter(out)))
         except Exception as e:  # noqa: BLE001 - a failing unit fails the change, not the process
-            self._abort_prepared(c, staged)
+            self._abort_prepared(c)
             return self._fail("prepare", e)
         self.change = c
-        return Ok(Prepared(msg.change_id))
+        c.renew()  # work done for the coordinator does not count against its lease
+        if not c.slicing:
+            c.phase = "prepared"
+            return Ok(Prepared(c.id, list(c.prepare_diags)))
+        reply = c.prepare_reply = self.host.rpc.defer()
+        return reply
 
-    def _abort_prepared(self, c: _Change, staged: bool) -> None:
+    def _one_shot(self, what: str, since: float, hint: str = "") -> Diagnostic:
+        took = time.monotonic() - since
+        return diag(COMPONENT, "prepare", f"{what} prepared in one shot: serving stopped for {took:.3f}s",
+                    subject=str(self.host.spec.proc), code="change.prepare_one_shot", hint=hint, severity="info")
+
+    def _advance(self, c: _Change) -> None:
+        """One slice of every unfinished preparation; ``Prepared`` once all are done."""
+        try:
+            for item in list(c.slicing):
+                try:
+                    next(item[1])
+                except StopIteration:
+                    c.slicing.remove(item)
+        except Exception as e:  # noqa: BLE001
+            if c.prepare_reply is not None:
+                c.prepare_reply.resolve(self._fail("prepare", e))
+            self._rollback(c)
+            self._resume(c, rolled_back=True)
+            return
+        if not c.slicing:
+            c.phase = "prepared"
+            c.renew()
+            if c.prepare_reply is not None:
+                c.prepare_reply.resolve(Ok(Prepared(c.id, list(c.prepare_diags))))
+                c.prepare_reply = None
+
+    def _abort_prepared(self, c: _Change) -> None:
+        for ua, it in c.slicing:
+            close = getattr(it, "close", None)
+            try:
+                if close is not None:
+                    close()
+            except Exception as e:  # noqa: BLE001
+                self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}",
+                                             code="change.abort_failed"))
+        c.slicing.clear()
         for ua in reversed(c.prepared_actions):
             try:
                 self._handler(ua).abort()
             except Exception as e:  # noqa: BLE001
                 self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}",
                                              code="change.abort_failed"))
+        c.prepared_actions.clear()
         self.rt.config.discard_staged()
-        if staged:
+        if c.staged:
             self.rt.discard_staged()
+            c.staged = False
 
     # ------------------------------------------------------- drain/pause
 
@@ -179,6 +261,8 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return c
+        if c.phase == "preparing":
+            return self._fail("drain", "not prepared yet")
         if c.phase != "prepared":
             return Ok(Drained(c.id, c.aborted_requests))
         try:
@@ -213,6 +297,8 @@ class Participant:
             return c
         if c.phase in ("paused", "executed", "committed"):
             return Ok(Paused(c.id, self.host.epoch))
+        if c.phase == "preparing":
+            return self._fail("pause", "not prepared yet")
         c.phase = "pausing"
         c.pause_after = msg.after_epoch
         reply = c.pause_reply = self.host.rpc.defer()
@@ -265,6 +351,7 @@ class Participant:
             c.phase = "paused"
             return e.failed if isinstance(e, _Failed) else self._fail("execute", e)
         c.phase = "executed"
+        c.renew()
         return Ok(Executed(c.id, c.report))
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:
@@ -298,10 +385,12 @@ class Participant:
     # ---------------------------------------------------- commit / abort
 
     def on_commit(self, env: Envelope, msg: Commit) -> Result[msgspec.Struct]:
-        if msg.change_id in self.finished:
-            done = self.finished[msg.change_id]
+        done = self.finished.get(msg.change_id)
+        if done is not None:
             if done.rolled_back:
-                return fail(COMPONENT, "commit", "change was already aborted", code="change.already_aborted")
+                return fail(COMPONENT, "commit", f"rolled back change {msg.change_id} before Commit arrived",
+                            subject=str(self.host.spec.proc), code="change.already_rolled_back",
+                            hint="restart this process at the new identity")
             return Ok(Committed(done.change_id, done.identity))
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
@@ -310,6 +399,9 @@ class Participant:
             return Ok(Committed(c.id, c.identity))
         if c.phase != "executed":
             return fail(COMPONENT, "commit", f"not executed (phase {c.phase})", code="change.not_executed")
+        return Ok(self._commit(c))
+
+    def _commit(self, c: _Change) -> Committed:
         for ua in c.actions.actions:
             try:
                 self._handler(ua).commit()
@@ -318,7 +410,8 @@ class Participant:
                                              code="change.commit_hook_failed"))
         self.host.identity = c.identity
         c.phase = "committed"
-        return Ok(Committed(c.id, c.identity))
+        c.renew()
+        return Committed(c.id, c.identity)
 
     def on_resume(self, env: Envelope, msg: Resume) -> Result[msgspec.Struct]:
         done = self.finished.get(msg.change_id)
@@ -328,7 +421,6 @@ class Participant:
             return Ok(done)
         c = self.change
         if c is None and self._initial_resume_pending and self.host.identity == msg.identity:
-            # A newly spawned/restarted process was initialized from the candidate snapshot.
             self.host.paused = False
             self._initial_resume_pending = False
             done = Resumed(msg.change_id, msg.identity)
@@ -350,12 +442,12 @@ class Participant:
         return Ok(self._resume(c, rolled_back=True))
 
     def _rollback(self, c: _Change) -> None:
-        for d in (c.drain_reply, c.pause_reply):
+        for d in (c.prepare_reply, c.drain_reply, c.pause_reply):
             if d is not None:
                 d.resolve(fail(COMPONENT, "abort", "change aborted", code="change.aborted"))
         if c.phase == "executed":
             self._undo_execute(c)
-        self._abort_prepared(c, staged=bool(c.actions.stage))
+        self._abort_prepared(c)
 
     def _resume(self, c: _Change, *, rolled_back: bool) -> Resumed:
         self.host.paused = False
@@ -370,24 +462,51 @@ class Participant:
         c = self.change
         if c is None:
             return
-        if c.phase == "draining":
+        if c.phase == "preparing":
+            self._advance(c)
+        elif c.phase == "draining":
             self._check_drain(c)
         elif c.phase == "pausing":
             self._check_pause(c)
-        if time.monotonic() > c.deadline:
-            if c.phase in ("executed", "committed"):
-                # The decision may already be committed elsewhere. Stay fenced until
-                # an explicit decision/resume arrives, or the engine is restarted.
-                c.deadline = float("inf")
-                self.diagnostics.append(diag(
-                    COMPONENT, "timeout", f"change {c.id} is in doubt; remaining paused",
-                    subject=str(self.host.spec.proc), code="change.in_doubt"))
-                return
-            self.diagnostics.append(diag(
-                COMPONENT, "timeout", f"lost the coordinator of change {c.id} for {c.timeout_s}s; rolled back",
-                subject=str(self.host.spec.proc), code="change.coordinator_lost"))
-            self._rollback(c)
-            self._resume(c, rolled_back=True)
+        if self.change is c and time.monotonic() > c.deadline:
+            self._lease_expired(c)
+
+    def _lease_expired(self, c: _Change) -> None:
+        silent = f"heard nothing from the coordinator of change {c.id} for {c.timeout_s}s"
+        if c.phase == "committed":
+            c.renew()
+            self._note("timeout", f"{silent}; waiting for Resume", "change.in_doubt")
+            return
+        if c.phase == "preparing":  # it has promised nothing yet
+            self._give_up(c, f"{silent} while preparing; withdrew", "change.coordinator_lost")
+            return
+        answer = self._query(c)
+        if answer == "pending":
+            c.renew()
+            self._note("timeout", f"{silent}; the coordinator answered 'pending'; waiting", "change.decision_pending",
+                       severity="info")
+        elif answer == "commit" and c.phase == "executed":
+            self._commit(c)
+            self._note("timeout", f"{silent}; the coordinator answered 'commit'; committed",
+                       "change.committed_on_query")
+        elif c.phase == "executed" and answer != "abort":
+            c.renew()
+            self._note("timeout", f"{silent}; decision unresolved; remaining paused", "change.in_doubt")
+        elif answer is None:
+            self._give_up(c, f"{silent} and could not reach it; rolled back", "change.coordinator_lost")
+        else:
+            self._give_up(c, f"{silent}; the coordinator answered {answer!r} (phase {c.phase}); rolled back",
+                          "change.rolled_back_on_query")
+
+    def _query(self, c: _Change) -> DecisionKind | None:
+        r = self.host.client.call(self.host.spec.control, QueryDecision(c.id), timeout=self.host.ipc.rpc_timeout_s)
+        return r.value.decision if isinstance(r, Ok) and isinstance(r.value, Decision) \
+            and r.value.change_id == c.id else None
+
+    def _give_up(self, c: _Change, reason: str, code: str) -> None:
+        self._note("timeout", reason, code, severity="error" if code == "change.coordinator_lost" else "warning")
+        self._rollback(c)
+        self._resume(c, rolled_back=True)
 
 
 class _Failed(Exception):

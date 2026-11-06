@@ -198,8 +198,10 @@ class UnitRuntime:
     ) -> Result[None]:
         """Prepare phase: load *new* units next to the running ones (§6.3).
 
-        Units whose code imports a changed module cannot be staged: the old
-        module is still loaded, so they must wait for the safe point.
+        Units whose code imports a changed module cannot be staged, whether or
+        not that module is loaded here: a loaded one is the old version, and an
+        unloaded one would be found in the current snapshot first. They wait
+        for the safe point.
         """
         with self._operation():
             return self._stage(units, code_root, set(changed_modules), config or {})
@@ -604,10 +606,14 @@ class UnitRuntime:
         if framework_hit:
             return Failed([diag(COMPONENT, "check", f"framework modules import changed code: {framework_hit}",
                                 code=ESCALATE_ENGINE, hint="framework code must not import units")])
-        code_hit = {
-            s.id for s in self._slots.values()
-            if s.manifest.unit.entry_module in accepted and not s.staged
-        }
+        bypassed = sorted(
+            s.id for s in self._slots.values() if s.staged and s.manifest.unit.entry_module in accepted)
+        if bypassed:
+            return Failed([self._diag("check", "was staged during prepare but imports a changed module", uid,
+                                      "unit.staged_imports_changed",
+                                      hint="units that import changed modules are loaded at the safe point")
+                           for uid in bypassed])
+        code_hit = {s.id for s in self._slots.values() if s.manifest.unit.entry_module in accepted}
         unplanned = sorted(code_hit - set(reload_specs) - removed)
         warnings = [
             self._diag("check", "imports a changed module but was not in the plan; reloading it too",
@@ -850,9 +856,8 @@ class UnitRuntime:
                 return Failed([self._diag("stage", "another snapshot is already staged", root,
                                           "unit.stage_conflict")])
             graph = ImportGraph(scan_root(Path(root)))
-            loaded = set(self._engine_modules())
             closure = graph.imports_closure(s.manifest.unit.entry_module for s in units)
-            conflict = sorted(closure & changed & loaded)
+            conflict = sorted(closure & changed)
             if conflict:
                 return Failed([self._diag("stage", f"imports changed modules {conflict}", root,
                                           "unit.stage_needs_safe_point",

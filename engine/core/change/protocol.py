@@ -5,10 +5,13 @@ Every message carries the change id; participants answer duplicates idempotently
 
 from __future__ import annotations
 
+from typing import Literal
+
 import msgspec
 
 from core.change.types import ProcActions
 from core.common.ids import Identity
+from core.common.result import Diagnostic
 from unit.runtime.types import ReloadReport
 
 
@@ -22,6 +25,8 @@ class Prepare(msgspec.Struct, frozen=True):
 
 class Prepared(msgspec.Struct, frozen=True):
     change_id: int
+    diagnostics: list[Diagnostic] = []
+    """E.g. preparations done in one shot, and how long serving stopped for them (§4.6)."""
 
 
 class Drain(msgspec.Struct, frozen=True):
@@ -78,6 +83,30 @@ class Resumed(msgspec.Struct, frozen=True):
     rolled_back: bool = False
 
 
+class KeepAlive(msgspec.Struct, frozen=True):
+    """The coordinator is alive, only busy: renews the participant's lease (§4.7)."""
+
+    change_id: int
+
+
+class Alive(msgspec.Struct, frozen=True):
+    change_id: int
+
+
+type DecisionKind = Literal["commit", "abort", "pending", "unknown"]
+
+
+class QueryDecision(msgspec.Struct, frozen=True):
+    """A participant whose lease ran out after ``Prepared`` asks for the outcome."""
+
+    change_id: int
+
+
+class Decision(msgspec.Struct, frozen=True):
+    change_id: int
+    decision: DecisionKind
+
+
 MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("change.prepare@1", Prepare),
     ("change.prepared@1", Prepared),
@@ -92,4 +121,8 @@ MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("change.resume@1", Resume),
     ("change.abort@1", Abort),
     ("change.resumed@1", Resumed),
+    ("change.keepalive@1", KeepAlive),
+    ("change.alive@1", Alive),
+    ("change.query_decision@1", QueryDecision),
+    ("change.decision@1", Decision),
 ]

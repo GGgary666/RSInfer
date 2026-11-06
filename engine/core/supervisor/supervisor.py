@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -96,6 +96,7 @@ class _Proc:
 
 
 type PlanFor = Callable[[DesiredProc], ProcessPlan]
+type ControlHandler = Callable[[Envelope, msgspec.Struct], Awaitable[Result[msgspec.Struct]]]
 
 
 class Supervisor:
@@ -123,6 +124,8 @@ class Supervisor:
         self._host_changed = asyncio.Condition()
         self._previous: dict[ProcId, tuple[DesiredProc, ProcSpec]] = {}
         self._incarnation: dict[ProcId, int] = {}
+        self.handlers: dict[type[msgspec.Struct], ControlHandler] = {}
+        """Other control-plane messages arriving at this endpoint, e.g. the coordinator's ``QueryDecision``."""
 
     async def start(self) -> None:
         self._tasks.append(asyncio.create_task(self.server.serve(self._dispatch)))
@@ -151,6 +154,9 @@ class Supervisor:
             case Lookup():
                 return Ok(Found(self.endpoint(msg.proc, msg.channel)))
             case _:
+                handler = self.handlers.get(type(msg))
+                if handler is not None:
+                    return await handler(env, msg)
                 return fail(COMPONENT, "dispatch", f"unexpected {env.schema}", code="supervisor.unhandled")
 
     async def _register(self, msg: Register) -> Result[msgspec.Struct]:
