@@ -374,8 +374,11 @@ class Supervisor:
 
     async def stop(self, proc: ProcId, timeout_s: float | None = None) -> Result[None]:
         rec = self.procs.get(proc)
-        if rec is None or rec.state == "STOPPED" or self.hosts[proc.host].lost:
+        if rec is None or rec.state == "STOPPED":
             return Ok(None)
+        if self.hosts[proc.host].lost:
+            return fail(COMPONENT, "stop", "host is lost; process stop is unconfirmed", subject=str(proc),
+                        code="supervisor.stop_unconfirmed")
         rec.state = "STOPPING"
         r = await self.client.call(self.hosts[proc.host].agent,
                                    Stop(proc, timeout_s if timeout_s is not None else self.tun.stop_timeout_s,
@@ -414,11 +417,16 @@ class Supervisor:
         return await self.launch(plan, identity, topo, start_paused=start_paused)
 
     async def relaunch_previous(self, proc: ProcId) -> Result[None]:
-        prev = self._previous.pop(proc, None)
+        prev = self._previous.get(proc)
         if prev is None:
             return Ok(None)
-        await self.stop(proc)
-        return await self.spawn(*prev)
+        r = await self.stop(proc)
+        if isinstance(r, Failed):
+            return r
+        r = await self.spawn(*prev)
+        if isinstance(r, Ok):
+            self._previous.pop(proc, None)
+        return r
 
     def committed(self, proc: ProcId, identity: Identity, plan_after: ProcessPlan | None) -> None:
         """A participant changed in place and now serves ``identity``."""
@@ -445,9 +453,13 @@ class Supervisor:
         errors: list[Diagnostic] = []
         for p in procs:
             rec = self.procs[p]
-            for r in (await self.stop(p), await self.spawn(rec.desired, rec.spec)):
-                if isinstance(r, Failed):
-                    errors += r.diagnostics
+            r = await self.stop(p)
+            if isinstance(r, Failed):
+                errors += r.diagnostics
+                continue
+            r = await self.spawn(rec.desired, rec.spec)
+            if isinstance(r, Failed):
+                errors += r.diagnostics
         return Failed(errors) if errors else Ok(None)
 
     async def stop_all(self) -> None:

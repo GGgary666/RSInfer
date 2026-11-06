@@ -101,6 +101,7 @@ class _Change:
     prepare_reply: Deferred | None = None
     prepare_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     execute_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
+    undo_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     undo: _Undo = field(default_factory=_Undo)
     report: ReloadReport | None = None
     drain_reply: Deferred | None = None
@@ -272,6 +273,20 @@ class Participant:
 
     def _undo(self, c: _Change) -> None:
         """Put back everything this change did here, newest first. Calling it again does nothing."""
+        if c.undo_diags:
+            return  # a failed undo needs recovery, not a second attempt reported as success
+        before = len(self.diagnostics)
+        try:
+            self._undo_actions(c)
+        except Exception as e:  # noqa: BLE001 - cleanup failures also prevent resuming
+            self.diagnostics += self._fail("abort", e).diagnostics
+        c.undo_diags = self.diagnostics[before:]
+        if c.undo_diags:
+            self.change = c
+            c.phase = "undone"
+            self.host.paused = True
+
+    def _undo_actions(self, c: _Change) -> None:
         for ua, it in c.slicing:
             close = getattr(it, "close", None)
             try:
@@ -430,7 +445,7 @@ class Participant:
             for ua in a.actions:
                 self._handler(ua).execute(ua.args)
         except Exception as e:  # noqa: BLE001
-            self._undo(c)  # everything is back; only the Abort is still to come
+            self._undo(c)  # Abort acknowledges the undo, or reports that recovery is required
             c.phase = "undone"
             return e.failed if isinstance(e, _Failed) else self._fail("execute", e)
         c.phase = "executed"
@@ -518,7 +533,7 @@ class Participant:
             return Ok(done)
         if c is None or c.id != msg.change_id or c.phase != "committed" or c.identity != msg.identity:
             return fail(COMPONENT, "resume", "change has not committed", code="change.not_committed")
-        return Ok(self._resume(c, rolled_back=False))
+        return self._resume(c, rolled_back=False)
 
     def on_abort(self, env: Envelope, msg: Abort) -> Result[msgspec.Struct]:
         if msg.change_id in self.finished:
@@ -532,7 +547,7 @@ class Participant:
         if c.phase == "committed":
             return fail(COMPONENT, "abort", "committed decision cannot be rolled back", code="change.already_committed")
         self._rollback(c)
-        return Ok(self._resume(c, rolled_back=True))
+        return self._resume(c, rolled_back=True)
 
     def _rollback(self, c: _Change) -> None:
         for d in (c.prepare_reply, c.drain_reply, c.pause_reply):
@@ -540,12 +555,14 @@ class Participant:
                 d.resolve(fail(COMPONENT, "abort", "change aborted", code="change.aborted"))
         self._undo(c)
 
-    def _resume(self, c: _Change, *, rolled_back: bool) -> Resumed:
+    def _resume(self, c: _Change, *, rolled_back: bool) -> Result[Resumed]:
+        if c.undo_diags:
+            return Failed(list(c.undo_diags))
         self.host.paused = False
         self.change = None
         reply = Resumed(c.id, self.host.identity, rolled_back, self._snapshots())
         self.finished[c.id] = reply
-        return reply
+        return Ok(reply)
 
     def _snapshots(self) -> list[Identity]:
         """Snapshots this process still loads code from: modules unchanged by in-place

@@ -60,8 +60,13 @@ class ChangeQueue:
         dropped: list[Queued] = []
         while True:
             if self._lanes["fault"]:
+                item = self._lanes["fault"].popleft()
+                if item.cs.source == "internal" and item.cs.computed_under is not None \
+                        and item.cs.computed_under != current:
+                    dropped.append(item)
+                    continue
                 self._internal_streak = 0
-                return self._lanes["fault"].popleft(), dropped
+                return item, dropped
             normal_waiting = bool(self._lanes["normal"])
             if self._lanes["internal"] and (not normal_waiting or self._internal_streak < 1):
                 item = self._lanes["internal"].popleft()
