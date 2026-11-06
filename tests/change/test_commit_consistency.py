@@ -19,13 +19,13 @@ import zmq.asyncio
 from core.change.blobs import BlobStore
 from core.change.coordinator import Coordinator, PlanInput
 from core.change.eventlog import EventLog
-from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
+from core.change.types import ActionPlan, ChangeResult, ChangeSet, ProcActions, UnitAction
 from core.common.ids import HostId, Identity, ProcId
 from core.common.result import Ok, Result, fail
 from core.ipc.rpc import Deferred
 from core.supervisor.protocol import Materialized, ProcSpec
 from core.supervisor.supervisor import Supervisor, _Proc
-from core.supervisor.topology import DesiredProc
+from core.supervisor.topology import DesiredProc, HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 from tests.support import spec, write_tree
 from unit.runtime import ProcessPlan
 from unit.runtime.host import ProcessHost
@@ -75,7 +75,7 @@ class Harness:
         root = write_tree(tmp / "code", {f"{pkg}/versioned.py": UNIT})
         self.unit = spec(f"{pkg}.versioned", f"{pkg}.versioned:Unit")
         for i in range(2):
-            proc = ProcId(HostId(f"host-{i}"), "worker", 0)
+            proc = ProcId(HostId(f"host-{i}"), "worker", i)
             plan = ProcessPlan(proc, OLD, [self.unit], code_root=str(root))
             ps = ProcSpec(proc, OLD, plan, self.sup.address, "127.0.0.1")
             host = self.hosts[proc] = ProcessHost(ps)
@@ -131,7 +131,7 @@ class Harness:
             return fail("test", "rpc", "reply lost", code="ipc.timeout")
         return result
 
-    async def submit(self):
+    async def submit(self) -> ChangeResult:
         return await self.coord.submit(ChangeSet(base=OLD, config={"revision": 2}))
 
     def close(self) -> None:
@@ -173,6 +173,39 @@ def test_lost_commit_is_retried_until_every_participant_serves_new_version(harne
     asyncio.run(main())
 
 
+@pytest.mark.parametrize("lost_target", [0, 1])
+@pytest.mark.parametrize("drop_reply", [False, True], ids=["lost-request", "lost-reply"])
+def test_no_participant_serves_before_global_commit_confirmation(
+    harness: Harness, lost_target: int, drop_reply: bool,
+) -> None:
+    """Observe the interval between deliveries, not just the final state.
+
+    The early-resume mutant passes the initial tests by fencing again at timeout.
+    Serving during that interval is already a violation that a later pause cannot undo.
+    """
+    h = harness
+    h.target = list(h.hosts)[lost_target]
+    h.drop_count = 1
+    h.drop_reply = drop_reply
+    premature_service: list[tuple[ProcId, int]] = []
+
+    def observe() -> None:
+        if any(host.identity == OLD for host in h.hosts.values()):
+            premature_service.extend((p, h.unit_of(p).version) for p, host in h.hosts.items()
+                                     if host.identity != OLD and not host.paused)
+
+    h.observe = observe
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert not premature_service, f"served before all participants committed: {premature_service}"
+        assert result.status == "committed", result.diagnostics
+        assert all(not host.paused and host.identity == result.new_identity for host in h.hosts.values())
+
+    asyncio.run(main())
+
+
 def test_persistent_commit_loss_is_not_reported_as_success(harness: Harness) -> None:
     h = harness
     h.drop_count = -1
@@ -191,5 +224,106 @@ def test_persistent_commit_loss_is_not_reported_as_success(harness: Harness) -> 
         assert blocked.status == "failed"
         assert len(h.messages) == count  # No subsequent transaction enters an unresolved state.
         assert h.coord.log.events("commit_decided")
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("drop_reply", [False, True], ids=["lost-request", "lost-reply"])
+def test_resume_loss_retries_without_committing_twice(harness: Harness, drop_reply: bool) -> None:
+    h = harness
+    h.drop_kind = "Resume"
+    h.drop_count = 1
+    h.drop_reply = drop_reply
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert result.status == "committed", result.diagnostics
+        assert h.messages.count((h.target, "Resume")) == 2
+        assert all(not host.paused and host.identity == result.new_identity for host in h.hosts.values())
+        assert all(h.unit_of(p).commits == 1 for p in h.hosts)
+
+    asyncio.run(main())
+
+
+def test_persistent_resume_loss_blocks_following_changes(harness: Harness) -> None:
+    h = harness
+    h.drop_kind = "Resume"
+    h.drop_count = -1
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert result.status == "failed"
+        assert any(d.code == "change.recovery_required" for d in result.diagnostics)
+        assert h.hosts[h.target].paused
+        assert all(host.identity == result.new_identity for host in h.hosts.values())
+        assert all(h.unit_of(p).version == 2 for p in h.hosts)
+        assert not any(kind == "Abort" for _, kind in h.messages)
+        count = len(h.messages)
+        assert (await h.submit()).status == "failed"
+        assert len(h.messages) == count
+
+    asyncio.run(main())
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["spawn", "restart"])
+def test_candidate_process_starts_paused_until_commit_barrier(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, restart: bool,
+) -> None:
+    h = harness
+    candidate = h.target if restart else ProcId(HostId("host-new"), "worker", 2)
+    existing = list(h.hosts)
+    desired_procs = existing if restart else [*existing, candidate]
+    topo = Topology(
+        hosts=[HostSpec(p.host, "127.0.0.1", "/unused") for p in desired_procs],
+        mesh=Mesh({"tp": len(desired_procs)}),
+        placement=[RankPlacement(i, p.host, 0) for i, p in enumerate(desired_procs)],
+        roles=[RoleSpec("worker", [h.unit.id], per_rank=True)],
+    )
+    plan = msgspec.structs.replace(h.hosts[h.first].spec.plan, proc=candidate)
+    participants = [pa for pa in h.action_plan.procs if pa.proc != candidate]
+    h.action_plan = ActionPlan(
+        procs=participants + ([ProcActions(candidate, restart=plan)] if restart else []),
+        spawn=[] if restart else [plan], topology=topo,
+    )
+    born_paused: list[bool] = []
+    before_barrier: list[bool] = []
+
+    async def spawn(desired: DesiredProc, ps: ProcSpec) -> Result[None]:
+        old = h.hosts.pop(desired.proc, None)
+        if old is not None:
+            old.shutdown()
+        host = h.hosts[desired.proc] = ProcessHost(ps)
+        host.runtime.load_process_plan(ps.plan).unwrap()
+        # A candidate snapshot starts with the new behavior already installed.
+        h.unit_of(desired.proc).version = 2
+        monkeypatch.setattr(host.rpc, "defer", Capture)
+        h.sup.procs[desired.proc] = _Proc(desired, ps, "RUNNING")
+        born_paused.append(host.paused)
+        observe()
+        return Ok(None)
+
+    async def stop(proc: ProcId, timeout_s: float | None = None) -> Result[None]:
+        return Ok(None)
+
+    def observe() -> None:
+        if born_paused and any(h.hosts[pa.proc].identity == OLD for pa in participants):
+            before_barrier.append(h.hosts[candidate].paused)
+
+    monkeypatch.setattr(h.sup, "spawn", spawn)
+    monkeypatch.setattr(h.sup, "stop", stop)
+    h.observe = observe
+
+    async def main() -> None:
+        await h.coord.start()
+        result = await h.submit()
+        assert born_paused == [True], result.diagnostics
+        assert before_barrier and all(before_barrier)
+        assert result.status == "committed", result.diagnostics
+        assert not h.hosts[candidate].paused
+        assert h.hosts[candidate].identity == result.new_identity
+        assert h.unit_of(candidate).version == 2
+        assert (candidate, "Resume") in h.messages
 
     asyncio.run(main())
