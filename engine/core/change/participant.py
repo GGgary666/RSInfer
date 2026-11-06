@@ -53,7 +53,7 @@ from core.change.types import ProcActions, UnitAction
 from core.common.ids import Identity, UnitId
 from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
-from core.context.config import ConfigEntry
+from core.context.config import ConfigCommit, ConfigEntry
 from core.ipc.rpc import Deferred
 from unit.runtime.types import ReloadPlan, ReloadReport, UnitSpec
 
@@ -189,6 +189,9 @@ class Participant:
         if orphans:
             return fail(COMPONENT, "prepare", f"actions of units this change removes: {orphans}",
                         subject=str(self.host.spec.proc), code="change.action_on_removed_unit")
+        c.undo.modules_before = set(sys.modules)  # before staging loads anything from the candidate
+        if (candidate := self._code_root_for(msg.identity)) != self.rt.code_root:
+            c.undo.candidate_root = candidate
         try:
             # Keys of units this change brings are declared with those units, so they start with
             # the values asked for; the other values are taken at the epoch boundary.
@@ -399,17 +402,21 @@ class Participant:
             reverse = self._reverse(plan) if plan is not None else None
             if c.config_now:
                 c.undo.old_config = {k: self.rt.config.entries()[k].value for k in c.config_now}
-                commit = self.rt.config.commit()
-                if commit.hook_failures:
-                    raise RuntimeError("; ".join(d.reason for d in commit.hook_failures))
-            if plan is not None:
-                c.undo.candidate_root = plan.new_code_root
-                c.undo.modules_before = set(sys.modules)
-                r = self.rt.reload(plan)
+            if plan is None:
+                if c.config_now:
+                    self._run_hooks(self.rt.config.commit())
+            else:
+                # the values change inside the reload: if it fails, the old units come back with the
+                # old values; the units it did not rebuild hear about them only once it succeeded
+                self.rt.config.discard_staged()
+                c.undo.candidate_root = plan.new_code_root or c.undo.candidate_root
+                r = self.rt.reload(plan, values=c.config_now)
                 if isinstance(r, Failed):
                     raise _Failed(r)
                 c.report = r.value
                 c.undo.reverse_reload = reverse
+                changed = {k: v for k, v in c.config_now.items() if c.undo.old_config.get(k) != v}
+                self._run_hooks(self.rt.config.run_hooks(changed, skip_units=set(r.value.loaded)))
             for ua in c.deferred:  # the new instances of reloaded units prepare now, all at once
                 c.prepared_actions.append(ua)
                 t0 = time.monotonic()
@@ -425,6 +432,11 @@ class Participant:
         c.phase = "executed"
         c.renew()
         return Ok(Executed(c.id, c.report, list(c.execute_diags)))
+
+    @staticmethod
+    def _run_hooks(commit: ConfigCommit) -> None:
+        if commit.hook_failures:
+            raise RuntimeError("; ".join(d.reason for d in commit.hook_failures))
 
     def _reload_plan(self, c: _Change) -> ReloadPlan | None:
         """The reload execute does: the planned one, moved to the new identity's snapshot. Without

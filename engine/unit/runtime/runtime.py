@@ -188,10 +188,15 @@ class UnitRuntime:
             self._settle()
             return self._settled_result()
 
-    def reload(self, plan: ReloadPlan) -> Result[ReloadReport]:
-        """Execute a reload instruction. Call only at a safe point."""
+    def reload(self, plan: ReloadPlan, *, values: dict[str, Any] | None = None) -> Result[ReloadReport]:
+        """Execute a reload instruction. Call only at a safe point.
+
+        ``values``: config values that change together with the reload. Units it builds read
+        them; if it fails, the old units are built again with the old values. ``on_config``
+        hooks of the other units are the caller's to run once it succeeded.
+        """
         with self._operation():
-            return self._reload(plan)
+            return self._reload(plan, values or {})
 
     def stage_new_units(
         self, units: list[UnitSpec], *, code_root: str | None = None,
@@ -599,7 +604,7 @@ class UnitRuntime:
                 loaded[name] = Path(file)
         return ImportGraph(loaded).importers_closure(c for c in changed if c in loaded)
 
-    def _reload(self, plan: ReloadPlan) -> Result[ReloadReport]:
+    def _reload(self, plan: ReloadPlan, values: dict[str, Any]) -> Result[ReloadReport]:
         errors: list[Diagnostic] = []
         reload_specs = {s.id: s for s in plan.units_to_reload}
         removed = set(plan.units_to_remove)
@@ -664,6 +669,9 @@ class UnitRuntime:
             r = self.config.declare_entries(plan.config)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
+            applied = self.config.apply(values)
+            if isinstance(applied, Failed):
+                raise _Abort(applied.diagnostics)
             decl_errors: list[Diagnostic] = []
             for uid, spec in reload_specs.items():
                 slot = self._slots[uid]

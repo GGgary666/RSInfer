@@ -191,6 +191,47 @@ def test_abort_of_a_config_change_with_a_reload_rebuilds_units_with_the_old_valu
     run(main())
 
 
+def test_a_failed_reload_brings_the_old_units_back_with_the_old_config(tmp_path: Path) -> None:
+    """The reload fails inside Execute: the runtime builds the old units again, before any abort."""
+
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            reload = ReloadPlan(changed_modules=["toyc.tunable"], units_to_reload=[SPECS["toyc.tunable"]])
+            e.planner.script = lambda inp: ActionPlan(procs=[
+                ProcActions(W1, config={"toyc.flavor": "spicy"}, reload=reload)])
+            broken = TOY["toyc/tunable.py"].replace("        self.config = config\n",
+                                                    "        raise RuntimeError('broken tunable')\n", 1)
+            files: dict[str, str | None] = {"engine/toyc/tunable.py": e.c.blobs.put(broken.encode())}
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity, files=files, config={"toyc.flavor": "spicy"}))
+            assert r.status == "aborted" and any("broken tunable" in d.reason for d in r.diagnostics)
+            loads = [line for line in e.c.log_of(W1) if line.startswith("tunable loaded")]
+            assert loads[-1].endswith("flavor plain")  # rebuilt after the failure, with the old value
+            assert all(not line.endswith("spicy") for line in loads)
+
+            fine = ReloadPlan(units_to_reload=[SPECS["toyc.tunable"]])
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, reload=fine)])
+            assert (await e.coord.submit(ChangeSet(base=e.coord.identity))).status == "committed"
+            assert e.c.log_of(W1)[-1].endswith("flavor plain")  # and the table says so too
+
+    run(main())
+
+
+def test_a_staged_unit_aborted_after_execute_can_be_staged_again(tmp_path: Path) -> None:
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            kernel = spec("toyc.kernel", "toyc.kernel:Kernel", process=["worker"])
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, stage=[kernel])])
+            files: dict[str, str | None] = {"engine/toyc/kernel.py": e.c.blobs.put(KERNEL.encode())}
+            e.coord.faults.add("after_execute")
+            assert (await e.coord.submit(ChangeSet(base=e.coord.identity, files=files))).status == "aborted"
+            assert "toyc.kernel" not in {u.unit for u in (await e.status(W1)).units}
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity, files=files))  # the same change again
+            assert r.status == "committed", r.diagnostics
+            assert "toyc.kernel" in {u.unit for u in (await e.status(W1)).units}
+
+    run(main())
+
+
 def test_an_action_of_a_reloaded_unit_is_prepared_on_the_new_instance(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:

@@ -10,7 +10,7 @@ boundary through ``stage()`` + ``commit()``.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Collection, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -218,12 +218,29 @@ class ConfigStore:
         """Apply staged values and run ``on_config`` hooks of their readers."""
         changed = self._staged or {}
         self._staged = None
+        for key, value in changed.items():
+            self._keys[key].value = value
+        return self.run_hooks(changed)
+
+    def apply(self, values: dict[str, Any]) -> Result[dict[str, Any]]:
+        """Set values without running hooks: part of a larger operation (a reload) that
+        runs the hooks once it succeeded, or puts the old values back if it fails."""
+        diags = self._validate(values)
+        if diags:
+            return Failed(diags)
+        changed = {k: v for k, v in values.items() if self._keys[k].value != v}
+        for key, value in changed.items():
+            self._keys[key].value = value
+        return Ok(changed)
+
+    def run_hooks(self, changed: dict[str, Any], *, skip_units: Collection[str] = ()) -> ConfigCommit:
+        """``on_config`` hooks for ``changed`` keys; units in ``skip_units`` were built after the change."""
         called: list[tuple[str, InstanceId]] = []
         failures: list[Diagnostic] = []
         for key, value in changed.items():
-            self._keys[key].value = value
-        for key, value in changed.items():
             for inst, hook in list(self._hooks.get(key, {}).items()):
+                if inst.unit in skip_units:
+                    continue
                 try:
                     hook(value)
                     called.append((key, inst))
