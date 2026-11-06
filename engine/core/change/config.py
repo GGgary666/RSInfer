@@ -14,9 +14,11 @@ class ChangeTunables(msgspec.Struct, frozen=True):
     """How long the coordinator waits for ``Prepared`` (sliced prepares take a while)."""
     drain_timeout_s: float = 10.0
     commit_retry_interval_s: float = 1.0
-    """Pause between rounds of ``Commit`` to participants that did not answer yet."""
+    """Pause between attempts of ``Commit``/``Resume`` to participants that did not confirm yet."""
+    commit_attempts: int = 3
+    """Maximum attempts per Commit/Resume confirmation phase."""
     commit_ack_timeout_s: float = 120.0
-    """A participant that has not acknowledged ``Commit`` by then is restarted at the new identity."""
+    """Total time allowed for Commit and Resume confirmation, including RPC waits."""
     blob_retention: int = 20
     """Blobs of this many recent identities survive ``Coordinator.prune_blobs``."""
     blob_grace_s: float = 3600.0

@@ -391,16 +391,19 @@ class Supervisor:
         rec.exit_code = r.value.exit_code
         return Ok(None)
 
-    async def launch(self, plan: ProcessPlan, identity: Identity, topo: Topology) -> Result[None]:
+    async def launch(self, plan: ProcessPlan, identity: Identity, topo: Topology, *,
+                     start_paused: bool = False) -> Result[None]:
         """Start one process of ``topo`` with ``plan``."""
         d = desired_procs(topo).get(plan.proc)
         if d is None:
             return fail(COMPONENT, "launch", "not part of the topology", subject=str(plan.proc),
                         code="supervisor.not_in_topology")
         plan = msgspec.structs.replace(plan, identity=identity)
-        return await self.spawn(d, self._spec(topo, d, identity, lambda _: plan))
+        spec = msgspec.structs.replace(self._spec(topo, d, identity, lambda _: plan), start_paused=start_paused)
+        return await self.spawn(d, spec)
 
-    async def relaunch(self, plan: ProcessPlan, identity: Identity, topo: Topology) -> Result[None]:
+    async def relaunch(self, plan: ProcessPlan, identity: Identity, topo: Topology, *,
+                       start_paused: bool = False) -> Result[None]:
         """Replace a process; ``relaunch_previous`` undoes it."""
         old = self.procs.get(plan.proc)
         if old is not None:
@@ -408,7 +411,7 @@ class Supervisor:
             r = await self.stop(plan.proc)
             if isinstance(r, Failed):
                 return r
-        return await self.launch(plan, identity, topo)
+        return await self.launch(plan, identity, topo, start_paused=start_paused)
 
     async def relaunch_previous(self, proc: ProcId) -> Result[None]:
         prev = self._previous.pop(proc, None)
@@ -417,17 +420,22 @@ class Supervisor:
         await self.stop(proc)
         return await self.spawn(*prev)
 
-    def committed(self, proc: ProcId, identity: Identity, plan_after: ProcessPlan | None,
-                  snapshots: Iterable[Identity] = ()) -> None:
-        """A participant changed in place and now serves ``identity``, loading code from ``snapshots``."""
+    def committed(self, proc: ProcId, identity: Identity, plan_after: ProcessPlan | None) -> None:
+        """A participant changed in place and now serves ``identity``."""
         rec = self.procs.get(proc)
         if rec is None:
             return
         plan = plan_after or rec.spec.plan
-        rec.spec = msgspec.structs.replace(rec.spec, identity=identity,
+        rec.spec = msgspec.structs.replace(rec.spec, identity=identity, start_paused=False,
                                            plan=msgspec.structs.replace(plan, identity=identity))
-        rec.snapshots = {identity, *(set(snapshots) or rec.snapshots)}
+        rec.snapshots.add(identity)
         self._previous.pop(proc, None)
+
+    def uses_snapshots(self, proc: ProcId, snapshots: Iterable[Identity]) -> None:
+        """What a process reported it still loads code from (after a commit or an abort)."""
+        rec, reported = self.procs.get(proc), set(snapshots)
+        if rec is not None and reported:
+            rec.snapshots = {rec.spec.identity, *reported}
 
     def forget(self, proc: ProcId) -> None:
         self.procs.pop(proc, None)

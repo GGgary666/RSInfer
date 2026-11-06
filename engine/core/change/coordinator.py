@@ -9,10 +9,9 @@ the outcome.
 Participants that voted ``Prepared`` cannot decide alone (§4.7), so the
 coordinator renews their lease with ``KeepAlive`` while a change runs, writes
 its decision to the event log before sending ``Commit``/``Abort``, answers
-``QueryDecision`` from the log, and retries ``Commit`` until each participant
-acknowledges it or is lost. A participant that rolled back on its own is
-restarted at the new identity: a change is never reported committed while a
-participant still serves the old one.
+``QueryDecision`` from the log, and retries Commit/Resume within bounded limits.
+No participant resumes before every Commit is confirmed. A missing acknowledgement
+requires engine recovery, even when the failure detector reports a process lost.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from core.change.eventlog import EventLog
 from core.change.protocol import (
     Abort,
     Commit,
+    Committed,
     Decision,
     DecisionKind,
     Drain,
@@ -42,6 +42,7 @@ from core.change.protocol import (
     Prepare,
     Prepared,
     QueryDecision,
+    Resume,
     Resumed,
 )
 from core.change.queue import ChangeQueue, Queued
@@ -50,7 +51,6 @@ from core.change.types import EMPTY, ActionPlan, ChangeResult, ChangeSet, Change
 from core.common.ids import HostId, Identity, ProcId
 from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
-from core.supervisor.protocol import ProcStatusReport, Status
 from core.supervisor.supervisor import ProcStatus, Supervisor
 from core.supervisor.topology import Topology
 from unit.runtime.types import ReloadReport
@@ -93,9 +93,6 @@ class _Vanish(Exception):
     """Injected: the coordinator goes silent in the middle of a change."""
 
 
-_UNREACHABLE = {"ipc.timeout", "supervisor.no_endpoint"}
-
-
 @dataclass
 class _Run:
     """Book-keeping of one change in flight, for the abort path."""
@@ -136,6 +133,10 @@ class Coordinator:
         self.checker = checker or AcceptAll()
         self.identity_fn = identity_fn
         self.tun = tun or ChangeTunables()
+        if self.tun.commit_attempts < 1 or self.tun.commit_retry_interval_s < 0 \
+                or not 0 < self.tun.commit_ack_timeout_s < float("inf"):
+            raise ValueError("commit limits must be positive and finite; retry interval must be nonnegative")
+        self.recovery_required = False
         self.identity: Identity = EMPTY
         self.manifest = IdentityManifest()
         self.state_version = 0
@@ -145,8 +146,7 @@ class Coordinator:
         ``after_execute``; ``vanish_during_prepare`` and ``vanish_after_prepare`` (the coordinator
         goes silent: no keepalives, no ``Abort``, queries about the change unanswered);
         ``skip_abort`` (decides abort, sends no ``Abort``); ``delay_commit`` (decides commit, then
-        stays quiet for twice the participants' lease before sending ``Commit``); ``restart_fails``
-        (restarting a participant that refused ``Commit`` fails). While set: ``no_decisions``
+        stays quiet for twice the participants' lease before sending ``Commit``). While set: ``no_decisions``
         (``QueryDecision`` is never answered)."""
         self.busy = False
         self._wake = asyncio.Event()
@@ -304,6 +304,10 @@ class Coordinator:
         cid = self.log.begin(cs)
         old = self.identity
         t0 = time.monotonic()
+        if self.recovery_required:
+            return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
+                COMPONENT, "check", "a previous commit is unresolved; restart the engine",
+                code="change.recovery_required")]))
         # RECEIVED -> CHECKED
         if cs.source != "internal" and cs.base != old:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
@@ -454,100 +458,94 @@ class Coordinator:
                 continue
             assert topo is not None
             run.restarted.append(pa.proc)
-            r = await self.sup.relaunch(pa.restart, run.identity, topo)
+            r = await self.sup.relaunch(pa.restart, run.identity, topo, start_paused=True)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
         for plan in run.plan.spawn:
             assert topo is not None
             run.spawned.append(plan.proc)
-            r = await self.sup.launch(plan, run.identity, topo)
+            r = await self.sup.launch(plan, run.identity, topo, start_paused=True)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
         if run.plan.topology is not None:
             self.sup.topology = run.plan.topology
         run.lap("execute")
 
+    async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool,
+                       deadline: float) -> tuple[list[Diagnostic], dict[ProcId, Resumed]]:
+        """Commit (or Resume) until every process confirms, within the attempts and the deadline.
+        Returns what is still unconfirmed, and the ``Resumed`` acknowledgements."""
+        pending = list(procs)
+        phase = "resume" if resume else "commit"
+        resumed: dict[ProcId, Resumed] = {}
+
+        async def call(proc: ProcId, msg: msgspec.Struct) -> Result[msgspec.Struct]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return fail(COMPONENT, phase, "confirmation deadline expired", code="change.commit_ack_timeout")
+            try:
+                return await asyncio.wait_for(
+                    self._call(proc, msg, timeout=min(remaining, self.sup.tun.rpc_timeout_s)), remaining)
+            except TimeoutError:
+                return fail(COMPONENT, phase, "confirmation deadline expired", code="change.commit_ack_timeout")
+
+        for attempt in range(self.tun.commit_attempts):
+            if not pending:
+                return [], resumed
+            if time.monotonic() >= deadline:
+                break
+            msg = Resume(run.id, run.identity) if resume else Commit(run.id)
+            results = await asyncio.gather(*(call(p, msg) for p in pending))
+            retry: list[ProcId] = []
+            for p, r in zip(pending, results, strict=True):
+                ack = r.value if isinstance(r, Ok) else None
+                valid = (isinstance(ack, Resumed) and not ack.rolled_back) if resume else isinstance(ack, Committed)
+                if not valid or not isinstance(ack, (Committed, Resumed)) \
+                        or ack.change_id != run.id or ack.identity != run.identity:
+                    retry.append(p)
+                    self.log.event(run.id, f"{phase}_unacknowledged", {"proc": str(p), "attempt": attempt + 1})
+                elif isinstance(ack, Resumed):
+                    resumed[p] = ack
+            pending = retry
+            if pending and attempt + 1 < self.tun.commit_attempts:
+                await asyncio.sleep(min(self.tun.commit_retry_interval_s, max(0.0, deadline - time.monotonic())))
+        return [diag(COMPONENT, phase,
+                     f"{phase} not confirmed for committed identity {run.identity}; restart the engine",
+                     subject=str(p), code="change.recovery_required") for p in pending], resumed
+
     async def _commit(self, run: _Run) -> tuple[ChangeStatus, list[Diagnostic]]:
-        self.log.decide(run.id, "commit")  # before any Commit leaves
+        self.recovery_required = True
+        self.log.decide(run.id, "commit")  # QueryDecision must see the same durable decision.
+        self.log.event(run.id, "commit_decided", {"identity": run.identity,
+                       "participants": [str(pa.proc) for pa in run.prepared]})
         if self._take("delay_commit"):
             self._quiet = True
             try:
                 await asyncio.sleep(2 * self.tun.coordinator_timeout_s)
             finally:
                 self._quiet = False
-        out: list[Diagnostic] = []
-        refused: list[tuple[ProcActions, Failed]] = []
-        pending = list(run.prepared)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.tun.commit_ack_timeout_s
-        while pending:
-            left = deadline - loop.time()
-            if left <= 0:  # alive but not answering (stopped, hung in NCCL): restart it like a refusal
-                refused += [(pa, Failed([diag(
-                    COMPONENT, "commit", f"did not acknowledge Commit within {self.tun.commit_ack_timeout_s}s",
-                    subject=str(pa.proc), code="change.commit_ack_timeout")])) for pa in pending]
-                break
-            timeout = min(self.sup.tun.rpc_timeout_s, left)
-            results = await asyncio.gather(*(self._call(pa.proc, Commit(run.id), timeout=timeout) for pa in pending))
-            retry: list[ProcActions] = []
-            for pa, r in zip(pending, results, strict=True):
-                if isinstance(r, Ok) and isinstance(r.value, Resumed) and not r.value.rolled_back \
-                        and r.value.identity == run.identity:
-                    self.sup.committed(pa.proc, run.identity, pa.plan_after, r.value.snapshots)
-                elif isinstance(r, Failed) and {d.code for d in r.diagnostics} <= _UNREACHABLE:
-                    if self.sup.proc_state(pa.proc) == "RUNNING":
-                        retry.append(pa)
-                        continue
-                    self.sup.committed(pa.proc, run.identity, pa.plan_after)  # a restart brings the new identity
-                    out.append(diag(COMPONENT, "commit", f"was lost before acknowledging Commit ({r})",
-                                    subject=str(pa.proc), code="change.lost_before_commit", severity="warning"))
-                else:
-                    refused.append((pa, r if isinstance(r, Failed) else Failed([diag(
-                        COMPONENT, "commit", f"answered {r}", code="change.commit_not_taken")])))
-            pending = retry
-            if pending:
-                await asyncio.sleep(max(0.0, min(self.tun.commit_retry_interval_s, deadline - loop.time())))
-        for proc in run.stopped:
+        for proc in run.stopped:  # decided: they are not coming back
             self.sup.forget(proc)
-        restart_failed = False
-        for pa, r in refused:
-            codes = sorted({d.code for d in r.diagnostics})
-            self.log.event(run.id, "commit_refused", {"proc": str(pa.proc), "codes": codes})
-            self.sup.committed(pa.proc, run.identity, pa.plan_after)
-            run.restarted.append(pa.proc)
-            restarted = await self._restart(pa.proc)
-            if isinstance(restarted, Failed):
-                restart_failed = True
-                out += [*r.diagnostics, *restarted.diagnostics]
-            else:
-                out.append(diag(COMPONENT, "commit", f"refused Commit ({', '.join(codes)}); restarted at the new "
-                                "identity", subject=str(pa.proc), code="change.restarted_at_new_identity",
-                                severity="warning"))
+        deadline = time.monotonic() + self.tun.commit_ack_timeout_s
+        errors, _ = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False, deadline=deadline)
+        if not errors:
+            for pa in run.prepared:
+                self.sup.committed(pa.proc, run.identity, pa.plan_after)
+            for proc in [*run.restarted, *run.spawned]:
+                self.sup.committed(proc, run.identity, None)
+            errors, resumed = await self._confirm(
+                run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True, deadline=deadline)
+            for proc, ack in resumed.items():
+                self.sup.uses_snapshots(proc, ack.snapshots)
         run.lap("commit")
-        if restart_failed:
-            return "failed", [*out, *await self._where(run), diag(
-                COMPONENT, "commit", f"the current identity is {run.identity}: the decision to commit is in the "
-                "event log and the other participants serve it", code="change.current_identity",
-                hint=f"base the next change on {run.identity}", severity="warning")]
-        return "committed", out
-
-    async def _restart(self, proc: ProcId) -> Result[None]:
-        if self._take("restart_fails"):
-            return fail(COMPONENT, "commit", "restart failed (injected)", subject=str(proc),
-                        code="change.injected_fault")
-        return await self.sup.restart([proc])
-
-    async def _where(self, run: _Run) -> list[Diagnostic]:
-        """Which identity every process of the change serves now."""
-        procs = sorted({*(pa.proc for pa in run.plan.procs), *run.spawned})
-        out: list[Diagnostic] = []
-        for p in procs:
-            r = await self._call(p, Status())
-            where = r.value.identity if isinstance(r, Ok) and isinstance(r.value, ProcStatusReport) \
-                else f"nothing (it is {self.sup.proc_state(p)})"
-            out.append(diag(COMPONENT, "commit", f"serves {where}", subject=str(p),
-                            code="change.participant_identity", severity="info"))
-        return out
+        if errors:  # never infer that a lost process has stopped serving
+            unconfirmed = sorted({d.subject for d in errors})
+            return "failed", [*errors, diag(
+                COMPONENT, "commit", f"decided to commit identity {run.identity}, but {', '.join(unconfirmed)} did "
+                "not confirm it; the engine needs recovery and refuses further changes until then",
+                code="change.recovery_required", hint="restart the engine (v0 has no online recovery yet)")]
+        self.recovery_required = False
+        return "committed", []
 
     async def _abort(self, run: _Run) -> list[Diagnostic]:
         self.log.decide(run.id, "abort")  # before any Abort leaves
@@ -557,6 +555,8 @@ class Coordinator:
         else:
             results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.asked))
             for pa, r in zip(run.asked, results, strict=True):
+                if isinstance(r, Ok) and isinstance(r.value, Resumed):
+                    self.sup.uses_snapshots(pa.proc, r.value.snapshots)
                 if isinstance(r, Failed):
                     out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
                                     code="change.abort_unacknowledged",

@@ -12,9 +12,9 @@ so the old version keeps serving in between. A ``prepare`` that returns
 Any coordinator message renews the participant's lease (§4.7). When the lease
 runs out while still preparing, the participant withdraws by itself: it has
 promised nothing yet. After ``Prepared`` it must not decide alone: it asks the
-coordinator, and rolls back only if the answer is ``abort``/``unknown`` or no
-answer comes. A ``Commit`` that arrives after such a rollback is refused with
-``change.already_rolled_back``.
+coordinator. After execution, an unavailable or unknown decision cannot justify
+rollback: stay paused. Commit fixes the decision, but only Resume releases the
+pause after the coordinator has confirmed every participant.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from core.change.protocol import (
     Abort,
     Alive,
     Commit,
+    Committed,
     Decision,
     DecisionKind,
     Drain,
@@ -45,6 +46,7 @@ from core.change.protocol import (
     Prepare,
     Prepared,
     QueryDecision,
+    Resume,
     Resumed,
 )
 from core.change.types import ProcActions, UnitAction
@@ -59,7 +61,8 @@ if TYPE_CHECKING:
 
 COMPONENT = "change.participant"
 
-Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone"]
+Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone",
+                "committed"]
 type _Slices = tuple[UnitAction, Iterator[object]]
 
 
@@ -110,10 +113,11 @@ class Participant:
         self.change: _Change | None = None
         self.finished: dict[int, Resumed] = {}
         """Replies to Commit/Abort of finished changes, for duplicate messages."""
+        self._initial_resume_pending = host.spec.start_paused
         self.diagnostics: list[Diagnostic] = []
         for type_, handler in [(Prepare, self.on_prepare), (Drain, self.on_drain), (Pause, self.on_pause),
                                (Execute, self.on_execute), (Commit, self.on_commit), (Abort, self.on_abort),
-                               (KeepAlive, self.on_keepalive)]:
+                               (KeepAlive, self.on_keepalive), (Resume, self.on_resume)]:
             host.handlers[type_] = handler
         host.safe_point_hooks.append(self.tick)
 
@@ -322,7 +326,7 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return c
-        if c.phase in ("paused", "executed"):
+        if c.phase in ("paused", "executed", "committed"):
             return Ok(Paused(c.id, self.host.epoch))
         if c.phase == "preparing":
             return self._fail("pause", "not prepared yet")
@@ -409,16 +413,18 @@ class Participant:
             if done.rolled_back:
                 return fail(COMPONENT, "commit", f"rolled back change {msg.change_id} before Commit arrived",
                             subject=str(self.host.spec.proc), code="change.already_rolled_back",
-                            hint="restart this process at the new identity")
-            return Ok(done)
+                            hint="the engine needs recovery")
+            return Ok(Committed(done.change_id, done.identity))
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return c
+        if c.phase == "committed":
+            return Ok(Committed(c.id, c.identity))
         if c.phase != "executed":
             return fail(COMPONENT, "commit", f"not executed (phase {c.phase})", code="change.not_executed")
         return Ok(self._commit(c))
 
-    def _commit(self, c: _Change) -> Resumed:
+    def _commit(self, c: _Change) -> Committed:
         for ua in c.actions.actions:
             try:
                 self._handler(ua).commit()
@@ -426,7 +432,26 @@ class Participant:
                 self.diagnostics.append(diag(COMPONENT, "commit", f"{ua.unit}.{ua.action}: {e}",
                                              code="change.commit_hook_failed"))
         self.host.identity = c.identity
-        return self._resume(c, rolled_back=False)
+        c.phase = "committed"
+        c.renew()
+        return Committed(c.id, c.identity)
+
+    def on_resume(self, env: Envelope, msg: Resume) -> Result[msgspec.Struct]:
+        done = self.finished.get(msg.change_id)
+        if done is not None:
+            if done.rolled_back or done.identity != msg.identity:
+                return fail(COMPONENT, "resume", "change did not commit this identity", code="change.not_committed")
+            return Ok(done)
+        c = self.change
+        if c is None and self._initial_resume_pending and self.host.identity == msg.identity:
+            self.host.paused = False
+            self._initial_resume_pending = False
+            done = Resumed(msg.change_id, msg.identity, snapshots=self._snapshots())
+            self.finished[msg.change_id] = done
+            return Ok(done)
+        if c is None or c.id != msg.change_id or c.phase != "committed" or c.identity != msg.identity:
+            return fail(COMPONENT, "resume", "change has not committed", code="change.not_committed")
+        return Ok(self._resume(c, rolled_back=False))
 
     def on_abort(self, env: Envelope, msg: Abort) -> Result[msgspec.Struct]:
         if msg.change_id in self.finished:
@@ -434,6 +459,8 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return Ok(Resumed(msg.change_id, self.host.identity, rolled_back=True))
+        if c.phase == "committed":
+            return fail(COMPONENT, "abort", "committed decision cannot be rolled back", code="change.already_committed")
         self._rollback(c)
         return Ok(self._resume(c, rolled_back=True))
 
@@ -484,6 +511,10 @@ class Participant:
 
     def _lease_expired(self, c: _Change) -> None:
         silent = f"heard nothing from the coordinator of change {c.id} for {c.timeout_s}s"
+        if c.phase == "committed":
+            c.renew()
+            self._note("timeout", f"{silent}; waiting for Resume", "change.in_doubt")
+            return
         if c.phase == "preparing":  # it has promised nothing yet
             self._give_up(c, f"{silent} while preparing; withdrew", "change.coordinator_lost")
             return
@@ -496,6 +527,9 @@ class Participant:
             self._commit(c)
             self._note("timeout", f"{silent}; the coordinator answered 'commit'; committed",
                        "change.committed_on_query")
+        elif c.phase == "executed" and answer != "abort":
+            c.renew()
+            self._note("timeout", f"{silent}; decision unresolved; remaining paused", "change.in_doubt")
         elif answer is None:
             self._give_up(c, f"{silent} and could not reach it; rolled back", "change.coordinator_lost")
         else:
@@ -504,7 +538,8 @@ class Participant:
 
     def _query(self, c: _Change) -> DecisionKind | None:
         r = self.host.client.call(self.host.spec.control, QueryDecision(c.id), timeout=self.host.ipc.rpc_timeout_s)
-        return r.value.decision if isinstance(r, Ok) and isinstance(r.value, Decision) else None
+        return r.value.decision if isinstance(r, Ok) and isinstance(r.value, Decision) \
+            and r.value.change_id == c.id else None
 
     def _give_up(self, c: _Change, reason: str, code: str) -> None:
         self._note("timeout", reason, code, severity="error" if code == "change.coordinator_lost" else "warning")
