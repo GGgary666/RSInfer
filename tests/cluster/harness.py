@@ -1,0 +1,277 @@
+"""A real control plane in the test's event loop, node agents as child processes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import signal
+import sys
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import zmq.asyncio
+
+from core.change.blobs import BlobStore
+from core.common.ids import HostId, Identity, ProcId, UnitId
+from core.context.config import ConfigEntry
+from core.supervisor import (
+    DesiredProc,
+    HostSpec,
+    Loss,
+    Mesh,
+    RankPlacement,
+    RoleSpec,
+    Supervisor,
+    SupervisorTunables,
+    Topology,
+)
+from tests.support import spec, write_tree
+from unit.runtime import ProcessPlan, UnitSpec
+
+REPO = Path(__file__).resolve().parents[2]
+ENGINE = REPO / "engine"
+ADDRESS = "127.0.0.1"  # test data: every fake host lives on this machine
+
+TOY = {
+    "toyc/__init__.py": "",
+    "toyc/units.py": '''
+import time
+
+
+class Idle:
+    def __init__(self, ctx, config):
+        pass
+
+
+class Loop:
+    """Counts epochs; never blocks for long."""
+    def __init__(self, ctx, config):
+        self.epoch = 0
+        ctx.provide("proc.loop@1", self)
+
+    def step(self):
+        time.sleep(0.005)
+        self.epoch += 1
+        return self.epoch
+
+
+class Stubborn:
+    """A loop stuck inside a step: it never reaches a safe point again."""
+    def __init__(self, ctx, config):
+        ctx.provide("proc.loop@1", self)
+
+    def step(self):
+        time.sleep(3600)
+''',
+    "toyc/logutil.py": '''
+import os
+
+
+def log(config, ctx, text):
+    """One file per process, so tests can see what each participant did."""
+    d = config["toyc.log_dir"]
+    if not d:
+        return
+    p = ctx.instance.proc
+    with open(os.path.join(d, f"{p.host}-{p.role}-{p.index}.log"), "a") as f:
+        f.write(text + "\\n")
+''',
+    "toyc/tunable.py": '''
+from toyc.logutil import log
+
+
+class Op:
+    """Takes part in changes as "toy.op"; args can make a phase fail."""
+    def __init__(self, ctx, config):
+        self.ctx, self.config = ctx, config
+        self.left = 0
+        self.never = False
+
+    def _phase(self, name, args=None):
+        log(self.config, self.ctx, f"op {name}")
+        if (args or {}).get("fail_at") == name:
+            raise RuntimeError(f"injected {name} failure")
+
+    def prepare(self, args): self._phase("prepare", args)
+    def execute(self, args): self._phase("execute", args)
+    def commit(self): self._phase("commit")
+    def abort(self): self._phase("abort")
+
+    def start_drain(self, args):
+        self.left = args.get("ticks", 0)
+        self.never = args.get("never", False)
+        log(self.config, self.ctx, "drain start")
+
+    def drained(self):
+        self.left -= 1
+        return not self.never and self.left <= 0
+
+    def abort_remaining(self):
+        log(self.config, self.ctx, "drain timeout")
+        return 3
+
+
+class Tunable:
+    def __init__(self, ctx, config):
+        self.config = config
+        ctx.on_action("toy.op", Op(ctx, config))
+        ctx.on_config("toyc.chunk", lambda v: log(config, ctx, f"chunk {v}"))
+        log(config, ctx, f"tunable loaded gen{ctx.instance.generation}")
+''',
+    "toyc/versioned.py": '''
+from toyc.logutil import log
+
+VERSION = 1
+
+
+class Versioned:
+    def __init__(self, ctx, config):
+        log(config, ctx, f"versioned v{VERSION}")
+''',
+}
+
+VERSIONED_V2 = "from toyc.logutil import log\n\nVERSION = 2\n\n\nclass Versioned:\n" \
+    "    def __init__(self, ctx, config):\n        log(config, ctx, f\"versioned v{VERSION}\")\n"
+
+ALL_ROLES = ["sched", "worker", "frontend"]
+
+SPECS: dict[str, UnitSpec] = {
+    "toyc.idle": spec("toyc.idle", "toyc.units:Idle", process=ALL_ROLES,
+                      config={"toyc.mesh": {"type": "any", "default": {}, "binding": "startup"}}),
+    "toyc.tunable": spec("toyc.tunable", "toyc.tunable:Tunable", process=ALL_ROLES,
+                         capabilities="accept_config = true", config={
+                             "toyc.log_dir": {"type": "str", "default": "", "binding": "startup"},
+                             "toyc.chunk": {"type": "int", "default": 8192, "binding": "live"}}),
+    "toyc.versioned": spec("toyc.versioned", "toyc.versioned:Versioned", process=ALL_ROLES,
+                           reads=["toyc.log_dir"]),
+    "toyc.loop": spec("toyc.loop", "toyc.units:Loop", provides=["proc.loop@1"], process=["sched", "worker"]),
+    "toyc.stubborn": spec("toyc.stubborn", "toyc.units:Stubborn", provides=["proc.loop@1"], process=["worker"]),
+}
+
+FAST = {
+    "nodeagent.heartbeat_interval_s": 0.1,
+    "nodeagent.rpc_timeout_s": 5.0,
+}
+
+
+def build_tree(root: Path, extra: dict[str, str] | None = None) -> Path:
+    """An engine source tree: the framework from this repo plus toy units."""
+    src = root / "src"
+    shutil.copytree(ENGINE, src / "engine", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    write_tree(src / "engine", {**TOY, **(extra or {})})
+    return src
+
+
+def topology(tmp: Path, hosts: list[str], ranks: list[str], roles: list[RoleSpec]) -> Topology:
+    return Topology(
+        hosts=[HostSpec(HostId(h), ADDRESS, str(tmp / h / "snapshots")) for h in hosts],
+        mesh=Mesh({"tp": len(ranks)}),
+        placement=[RankPlacement(i, HostId(h), i) for i, h in enumerate(ranks)],
+        roles=roles,
+    )
+
+
+def role(name: str, units: list[str], hosts: list[str] | None = None) -> RoleSpec:
+    return RoleSpec(name, [UnitId(u) for u in units], per_rank=hosts is None,
+                    hosts=[HostId(h) for h in hosts or []])
+
+
+@dataclass
+class Agent:
+    host: str
+    process: asyncio.subprocess.Process
+    root: Path
+
+    def kill(self) -> None:
+        if self.process.returncode is None:
+            os.killpg(self.process.pid, signal.SIGKILL)
+
+
+@dataclass
+class Cluster:
+    tmp: Path
+    sup: Supervisor
+    blobs: BlobStore
+    agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
+    losses: list[Loss] = field(default_factory=list[Loss])
+
+    async def start_agent(self, host: str, platform: dict[str, object] | None = None) -> Agent:
+        root = self.tmp / host / "snapshots"
+        env = {**os.environ, "PYTHONPATH": str(ENGINE)}
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "core.nodeagent", "--host", host, "--address", ADDRESS,
+            "--supervisor", self.sup.address, "--root", str(root),
+            "--platform", json.dumps(platform or {"name": "fake", "versions": {"driver": "0"}}),
+            "--tunables", json.dumps(FAST),
+            env=env, start_new_session=True,
+            stdout=open(self.tmp / f"agent-{host}.log", "wb"), stderr=asyncio.subprocess.STDOUT,
+        )
+        agent = self.agents[host] = Agent(host, process, root)
+        return agent
+
+    def ingest(self, src: Path) -> tuple[Identity, dict[str, str]]:
+        files = self.blobs.ingest_tree(src)
+        identity = Identity(self.blobs.put(json.dumps(files, sort_keys=True).encode())[:16])
+        return identity, files
+
+    def plan_for(self, identity: Identity, extra: Callable[[DesiredProc], dict[str, object]] | None = None
+                 ) -> Callable[[DesiredProc], ProcessPlan]:
+        return lambda d: process_plan(d, identity, {"toyc.log_dir": str(self.logs), **(extra(d) if extra else {})})
+
+    @property
+    def logs(self) -> Path:
+        d = self.tmp / "logs"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def log_of(self, p: ProcId) -> list[str]:
+        f = self.logs / f"{p.host}-{p.role}-{p.index}.log"
+        return f.read_text().splitlines() if f.exists() else []
+
+    async def wait_loss(self, kind: str, timeout: float = 10.0) -> Loss:
+        loss = await asyncio.wait_for(self.sup.losses.get(), timeout)
+        while loss.kind != kind:
+            loss = await asyncio.wait_for(self.sup.losses.get(), timeout)
+        return loss
+
+
+def process_plan(d: DesiredProc, identity: Identity, values: dict[str, object]) -> ProcessPlan:
+    """The units of ``d`` with their owned keys set from ``values`` (defaults otherwise)."""
+    units = [SPECS[u] for u in d.units]
+    config = {
+        key: ConfigEntry(s.id, decl, values.get(key, decl.default))
+        for s in units for key, decl in s.manifest.config.items()
+    }
+    return ProcessPlan(d.proc, identity, units, config=config)
+
+
+@asynccontextmanager
+async def cluster(tmp: Path, hosts: list[str], proc_tunables: dict[str, float] | None = None,
+                  **sup_tun: float) -> AsyncGenerator[Cluster]:
+    zctx = zmq.asyncio.Context()
+    tun = SupervisorTunables(**{"heartbeat_timeout_s": 1.0, "monitor_interval_s": 0.05,
+                                "checkin_timeout_s": 30.0, "rpc_timeout_s": 10.0, **sup_tun})
+    sup = Supervisor(zctx, host=HostId("host-a"), bind_address=ADDRESS, blobs=BlobStore(tmp / "blobs"),
+                     tun=tun, proc_tunables={"host.idle_poll_s": 0.01, **(proc_tunables or {})})
+    await sup.start()
+    c = Cluster(tmp, sup, sup.blobs)
+    try:
+        for h in hosts:
+            await c.start_agent(h)
+        (await sup.wait_for_hosts([HostId(h) for h in hosts], 20)).unwrap()
+        yield c
+    finally:
+        for a in c.agents.values():
+            a.kill()
+        for a in c.agents.values():
+            await a.process.wait()
+        sup.close()
+        zctx.destroy(linger=0)
+
+
+def proc(host: str, role_: str, index: int) -> ProcId:
+    return ProcId(HostId(host), role_, index)
