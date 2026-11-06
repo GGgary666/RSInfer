@@ -124,6 +124,8 @@ class RpcClient:
         self._ids = itertools.count(1)
         self._socks: dict[str, tuple[zmq.asyncio.Socket, asyncio.Task[None]]] = {}
         self._pending: dict[int, asyncio.Future[RpcFrame]] = {}
+        self._waiting: dict[str, set[int]] = {}
+        """Request ids still waiting for a reply, per peer."""
 
     def _sock(self, address: str) -> zmq.asyncio.Socket:
         entry = self._socks.get(address)
@@ -146,7 +148,13 @@ class RpcClient:
                 fut.set_result(frame)
 
     def _drop(self, address: str) -> None:
-        """Forget a peer that did not answer, so queued requests are not delivered later."""
+        """Forget a peer that did not answer, so queued requests are not delivered later.
+
+        Only when nothing else waits on it: a short call (a keepalive) timing out
+        must not cut off a long one (a deferred ``Prepared``) to the same peer.
+        """
+        if self._waiting.get(address):
+            return
         entry = self._socks.pop(address, None)
         if entry is not None:
             entry[1].cancel()
@@ -158,16 +166,24 @@ class RpcClient:
         rid = next(self._ids)
         fut: asyncio.Future[RpcFrame] = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
-        await sock.send(_enc.encode(RpcFrame("req", rid, self._registry.wrap(msg, self._me, epoch))))
+        waiting = self._waiting.setdefault(address, set())
+        waiting.add(rid)
+        frame: RpcFrame | None = None
         try:
+            await sock.send(_enc.encode(RpcFrame("req", rid, self._registry.wrap(msg, self._me, epoch))))
             frame = await asyncio.wait_for(fut, timeout)
         except TimeoutError:
+            pass
+        finally:
             self._pending.pop(rid, None)
+            waiting.discard(rid)
+        if frame is None:
             self._drop(address)
             return _timeout(address, msg, timeout)
         return _decode_reply(self._registry, frame)
 
     def close(self) -> None:
+        self._waiting.clear()
         for address in list(self._socks):
             self._drop(address)
 
