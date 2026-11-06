@@ -10,13 +10,15 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
+import pytest
 from msgspec.structs import replace
 
 from core.common.ids import HostId, Identity
 from core.common.result import Failed, Ok
-from core.nodeagent.agent import child_env
+from core.nodeagent.agent import AgentTunables, NodeAgent, child_env
 from core.supervisor.protocol import ProcSpec, ProcStatusReport, Spawn, Spawned, Status, Stop
 from tests.cluster.harness import ENGINE, REPO, build_tree, cluster, proc, role, topology
+from platforms.base import PlatformInfo
 from unit.runtime import InstanceState, ProcessPlan
 
 
@@ -238,5 +240,43 @@ def test_failed_unit_is_reported_by_check_in(tmp_path: Path) -> None:
             assert "broken" in r.diagnostics[0].reason
             assert isinstance(await c.sup.call(proc("host-a", "worker", 0), Status()), Ok)
             await c.sup.stop_all()
+
+    run(main())
+
+
+def test_concurrent_repeated_spawns_start_one_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two copies of one Spawn arriving together (a retry overtaking a slow start)."""
+
+    class Child:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+    async def main() -> None:
+        started: list[int] = []
+        slow = asyncio.Event()
+
+        async def create(*args: object, **kwargs: object) -> Child:
+            started.append(len(started))
+            await slow.wait()
+            return Child(1000 + len(started))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+        agent = NodeAgent(host=HostId("host-a"), address="127.0.0.1", supervisor="unused",
+                          snapshot_root=tmp_path / "snapshots", run_root=tmp_path / "runs",
+                          platform=PlatformInfo("fake"), tun=AgentTunables())
+        (tmp_path / "snapshots" / "i1").mkdir(parents=True)
+        w = proc("host-a", "worker", 0)
+        spec = ProcSpec(w, Identity("i1"), ProcessPlan(w, Identity("i1"), []), "unused", "127.0.0.1", incarnation=1)
+        env = agent.registry.wrap(Spawn(spec), agent.me)
+        dispatch = agent._dispatch  # pyright: ignore[reportPrivateUsage] - where the RPC server hands requests
+        both = asyncio.gather(dispatch(env, Spawn(spec)), dispatch(env, Spawn(spec)))
+        await asyncio.sleep(0.05)
+        slow.set()
+        first, second = await both
+        assert started == [0] and first == second == Ok(Spawned(w, 1001))
 
     run(main())

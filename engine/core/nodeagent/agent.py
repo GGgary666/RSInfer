@@ -118,6 +118,8 @@ class NodeAgent:
         self._materializing: set[Identity] = set()
         self._runs = itertools.count()
         self._shm = itertools.count()
+        self._lifecycle: dict[ProcId, asyncio.Lock] = {}
+        """Spawn and Stop of one ProcId run one at a time: a repeated request sees the first one's result."""
 
     # ------------------------------------------------------------ main
 
@@ -151,9 +153,11 @@ class NodeAgent:
             case Materialize():
                 return await self.materialize(msg)
             case Spawn():
-                return await self.spawn(msg.spec)
+                async with self._lifecycle.setdefault(msg.spec.proc, asyncio.Lock()):
+                    return await self.spawn(msg.spec)
             case Stop():
-                return await self.stop(msg.proc, msg.timeout_s, msg.incarnation)
+                async with self._lifecycle.setdefault(msg.proc, asyncio.Lock()):
+                    return await self.stop(msg.proc, msg.timeout_s, msg.incarnation)
             case AllocShm():
                 return self.alloc_shm(msg)
             case _:
@@ -234,8 +238,11 @@ class NodeAgent:
         if spec.proc.host != self.host:
             return fail(COMPONENT, "spawn", f"{spec.proc} belongs to another host", code="agent.wrong_host")
         old = self.procs.get(spec.proc)
-        if old is not None and old.spec.incarnation == spec.incarnation:
-            return Ok(Spawned(spec.proc, old.process.pid))  # a repeated Spawn
+        if old is not None and old.spec.incarnation == spec.incarnation:  # a repeated Spawn
+            if old.exit_code is not None:  # never started again under the same incarnation
+                return fail(COMPONENT, "spawn", f"incarnation {spec.incarnation} already ran and exited with "
+                            f"{old.exit_code}", subject=str(spec.proc), code="agent.already_exited")
+            return Ok(Spawned(spec.proc, old.process.pid))
         if old is not None and old.spec.incarnation > spec.incarnation:
             return fail(COMPONENT, "spawn", f"incarnation {spec.incarnation} is older than the last one here "
                         f"({old.spec.incarnation})", subject=str(spec.proc), code="agent.stale_spawn")
