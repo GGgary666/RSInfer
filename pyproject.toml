@@ -1,0 +1,43 @@
+[project]
+name = "agxinfer"
+version = "0.0.0"
+description = "RSI-native inference engine"
+requires-python = ">=3.12"
+dependencies = [
+    "msgspec>=0.19",
+    "pyzmq>=26",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2.3",
+    "hypothesis>=6.100",
+    "pyright>=1.1.390",
+]
+
+[tool.uv]
+# The engine source tree is never installed: processes import it from a
+# snapshot directory (doc/specs/nodeagent.md), and an editable install would
+# put the agent's workspace on sys.path.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["engine", "."]
+addopts = "-ra"
+timeout = 120
+
+[tool.pyright]
+include = ["engine", "tests"]
+extraPaths = ["engine", "."]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportPrivateUsage = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportUnknownLambdaType = false

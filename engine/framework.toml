@@ -1,0 +1,20 @@
+# Modules that make up the framework core (doc/specs/README.md).
+# A change to any of them cannot be reloaded: it restarts the engine.
+# A prefix covers the package and everything below it.
+[framework]
+modules = [
+    "core",            # the package itself only; its subpackages are listed below
+    "core.common",
+    "core.context",
+    "core.ipc",
+    "core.nodeagent",
+    "core.supervisor",
+    "core.change",
+    "unit",
+    "unit.runtime",
+    "platforms",
+    "platforms.base",
+    "platforms.fake",
+]
+# Packages listed here match only the package's own __init__, not its children.
+exact = ["core", "unit", "platforms"]
