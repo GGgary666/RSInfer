@@ -38,6 +38,8 @@ class ProcSpec(msgspec.Struct, frozen=True):
     """Framework tunables for the process (``host.*``, ``ipc.*``, ``change.*``)."""
     incarnation: int = 0
     """Grows every time the supervisor spawns this ProcId; reports about older ones are stale."""
+    start_paused: bool = False
+    """A transaction starts candidate processes fenced until all participants commit."""
 
 
 # ------------------------------------------------------ agent -> supervisor

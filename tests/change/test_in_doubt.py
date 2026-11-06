@@ -5,9 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+import msgspec
+import pytest
+
 from core.change.coordinator import PlanInput
-from core.change.types import ActionPlan, ProcActions, UnitAction
+from core.change.protocol import Commit
+from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.ids import Identity, ProcId, UnitId
+from core.common.result import Result, fail
 from core.supervisor import desired_procs
 from tests.change.engine import ALL, SCHED, W0, W1, Engine, engine, reload_everywhere, run, wait_until
 from tests.cluster.harness import process_plan
@@ -160,44 +165,52 @@ def test_keepalives_carry_participants_through_a_long_execute(tmp_path: Path) ->
     run(main())
 
 
-def test_a_participant_that_rolled_back_is_restarted_never_reported_committed(tmp_path: Path) -> None:
+def test_executed_participants_wait_when_queries_fail_then_commit_without_restart(tmp_path: Path) -> None:
     """§7 test 13: committed means every participant serves the new identity."""
 
     async def main() -> None:
         async with engine(tmp_path, coordinator_timeout_s=LEASE, keepalive_interval_s=3600.0) as e:
             pids = {p: e.c.sup.local_pid(p) for p in (SCHED, W0)}
             e.planner.script = restart_w1(e, init_delay_s=3 * LEASE)
-            e.coord.faults.add("no_decisions")  # SCHED and W0 cannot reach it and roll back
+            e.coord.faults.add("no_decisions")  # Query failure must not resume old code after Execute.
             r = await e.coord.submit(e.code_change())
             assert r.status == "committed", r.diagnostics
-            restarted = {d.subject for d in r.diagnostics if d.code == "change.restarted_at_new_identity"}
-            assert restarted == {str(SCHED), str(W0)}
-            assert sorted(r.restarted) == sorted(ALL)
+            assert r.restarted == [W1]
             for p in ALL:
                 assert (await e.status(p)).identity == r.new_identity == e.coord.identity
                 assert e.versioned(p) == "versioned v2"
             for p in (SCHED, W0):
-                assert e.c.sup.local_pid(p) != pids[p]
-                assert ["op prepare", "op execute", "op abort"] == e.ops(p)[:3]  # the old process rolled back
-            assert e.coord.log.events("commit_refused")
+                assert e.c.sup.local_pid(p) == pids[p]
+                assert e.ops(p) == ["op prepare", "op execute", "op commit"]
+                assert "change.in_doubt" in await notes(e, p)
 
     run(main())
 
 
-def test_when_the_restart_fails_too_the_result_is_failed_and_says_where_everyone_is(tmp_path: Path) -> None:
+def test_missing_commit_never_resumes_candidates_or_allows_another_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def main() -> None:
-        async with engine(tmp_path, coordinator_timeout_s=LEASE, keepalive_interval_s=3600.0) as e:
-            old = e.coord.identity
-            e.planner.script = restart_w1(e, init_delay_s=3 * LEASE)
-            e.coord.faults |= {"no_decisions", "restart_fails"}  # one of the two restarts fails
+        async with engine(tmp_path, commit_ack_timeout_s=2.0, commit_retry_interval_s=0.01) as e:
+            e.planner.script = restart_w1(e, init_delay_s=0.0)
+            original = e.c.sup.call
+
+            async def call(proc: ProcId, msg: msgspec.Struct, *, timeout: float | None = None
+                           ) -> Result[msgspec.Struct]:
+                if proc == W0 and isinstance(msg, Commit):
+                    return fail("test", "rpc", "Commit lost", code="ipc.timeout")
+                return await original(proc, msg, timeout=timeout)
+
+            monkeypatch.setattr(e.c.sup, "call", call)
             r = await e.coord.submit(e.code_change())
             assert r.status == "failed", r.diagnostics
-            where = {d.subject: d.reason for d in r.diagnostics if d.code == "change.participant_identity"}
-            assert sorted(where) == sorted(str(p) for p in ALL)
-            on_old = [p for p in ALL if where[str(p)] == f"serves {old}"]
-            assert len(on_old) == 1 and on_old[0] in (SCHED, W0)
+            assert "change.recovery_required" in codes(list(r.diagnostics))
+            assert e.coord.identity == r.new_identity
             for p in ALL:
-                expected = old if p in on_old else r.new_identity
-                assert (await e.status(p)).identity == expected
+                assert (await e.status(p)).paused
+                assert e.versioned(p) == "versioned v2"
+            blocked = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert blocked.status == "failed"
+            assert "change.recovery_required" in codes(list(blocked.diagnostics))
 
     run(main())

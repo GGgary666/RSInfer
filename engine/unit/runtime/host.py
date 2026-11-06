@@ -97,7 +97,7 @@ class ProcessHost:
         self.identity = spec.identity
         """The identity this process serves; a committed change moves it."""
         self.epoch: Epoch | None = None
-        self.paused = False
+        self.paused = spec.start_paused
         """Set by the change participant: no ``step()`` while a change executes."""
         self.stopping = False
         self.diagnostics: list[Diagnostic] = []
