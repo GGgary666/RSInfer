@@ -186,6 +186,13 @@ class ShmWriter:
             skip = cap - pos if cap - pos < size else 0
             if cap - (head - tail) >= skip + size:
                 break
+            if skip and cap - (head - tail) >= skip:
+                # Publish padding separately: padding + record may exceed capacity.
+                # Only the reader advances tail, after consuming any queued records.
+                if skip >= 4:
+                    struct.pack_into("<I", r.buf, _HEADER + pos, _MARK)
+                r.set_u64(_O_HEAD, head + skip)
+                continue
             if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
                 raise PeerLost("step-stream reader is gone")
             if deadline is not None and time.monotonic() > deadline:
