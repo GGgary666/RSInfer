@@ -46,7 +46,7 @@ DECLARED → SPAWNING → RUNNING → STOPPING → STOPPED
 
 ## 5. 健康检查
 
-- 节点代理每隔固定间隔（待确认，默认 1 秒）上报本机进程的状态。
+- 节点代理每隔固定间隔上报本机进程的状态。间隔是配置项 `nodeagent.heartbeat_interval_s`，默认 1 秒（已确认）；超时判定是配置项 `supervisor.heartbeat_timeout_s`。
 - 进程退出或心跳超时：标为 `LOST`，向 `core.change` 报“进程丢失”。
 - 节点代理本身失联：这台机器上的所有进程都标为 `LOST`，报“机器丢失”。机器是故障的单位。
 - v0 对丢失不自动处理，只报告；由 agent 或人决定重建还是改拓扑（v0.2 的自动降级以后做成策略单元）。
