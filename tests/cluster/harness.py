@@ -48,15 +48,17 @@ class Idle:
 
 
 class Loop:
-    """Counts epochs; never blocks for long."""
+    """Never blocks for long. Every process numbers its steps the same way, as workers follow
+    the scheduler's step numbers (change.md 4.2): the fake hosts share this machine's clock,
+    so a restarted worker joins the current number instead of counting from zero."""
+    STEP_S = 0.005
+
     def __init__(self, ctx, config):
-        self.epoch = 0
         ctx.provide("proc.loop@1", self)
 
     def step(self):
-        time.sleep(0.005)
-        self.epoch += 1
-        return self.epoch
+        time.sleep(self.STEP_S)
+        return int(time.time() / self.STEP_S)
 
 
 class Stubborn:
