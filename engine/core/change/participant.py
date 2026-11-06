@@ -2,8 +2,10 @@
 
 Requests are served at safe points only. Replies that must wait (drained,
 paused at the epoch boundary) are deferred and sent from a later safe point.
-If the coordinator disappears after ``Prepared``, the participant rolls back by
-itself after ``change.coordinator_timeout_s`` and resumes serving.
+Before execution, coordinator timeout rolls back and resumes serving. After
+execution, a decision may already exist elsewhere: stay paused until an explicit
+Abort or Commit/Resume arrives. Recovery of a lost coordinator requires an engine
+restart; timeout alone cannot establish that rollback is safe.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import msgspec
 from core.change.protocol import (
     Abort,
     Commit,
+    Committed,
     Drain,
     Drained,
     Execute,
@@ -26,6 +29,7 @@ from core.change.protocol import (
     Paused,
     Prepare,
     Prepared,
+    Resume,
     Resumed,
 )
 from core.change.types import ProcActions, UnitAction
@@ -40,13 +44,15 @@ if TYPE_CHECKING:
 
 COMPONENT = "change.participant"
 
-Phase = Literal["prepared", "draining", "drained", "pausing", "paused", "executed"]
+Phase = Literal["prepared", "draining", "drained", "pausing", "paused", "executed", "committed"]
 
 
 class ChangeTunables(msgspec.Struct, frozen=True):
     coordinator_timeout_s: float = 60.0
     drain_timeout_s: float = 10.0
     blob_retention: int = 20
+    commit_attempts: int = 3
+    commit_retry_delay_s: float = 0.1
 
 
 @dataclass
@@ -84,9 +90,11 @@ class Participant:
         self.change: _Change | None = None
         self.finished: dict[int, Resumed] = {}
         """Replies to Commit/Abort of finished changes, for duplicate messages."""
+        self._initial_resume_pending = host.spec.start_paused
         self.diagnostics: list[Diagnostic] = []
         for type_, handler in [(Prepare, self.on_prepare), (Drain, self.on_drain), (Pause, self.on_pause),
-                               (Execute, self.on_execute), (Commit, self.on_commit), (Abort, self.on_abort)]:
+                               (Execute, self.on_execute), (Commit, self.on_commit), (Resume, self.on_resume),
+                               (Abort, self.on_abort)]:
             host.handlers[type_] = handler
         host.safe_point_hooks.append(self.tick)
 
@@ -203,7 +211,7 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return c
-        if c.phase in ("paused", "executed"):
+        if c.phase in ("paused", "executed", "committed"):
             return Ok(Paused(c.id, self.host.epoch))
         c.phase = "pausing"
         c.pause_after = msg.after_epoch
@@ -291,10 +299,15 @@ class Participant:
 
     def on_commit(self, env: Envelope, msg: Commit) -> Result[msgspec.Struct]:
         if msg.change_id in self.finished:
-            return Ok(self.finished[msg.change_id])
+            done = self.finished[msg.change_id]
+            if done.rolled_back:
+                return fail(COMPONENT, "commit", "change was already aborted", code="change.already_aborted")
+            return Ok(Committed(done.change_id, done.identity))
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return c
+        if c.phase == "committed":
+            return Ok(Committed(c.id, c.identity))
         if c.phase != "executed":
             return fail(COMPONENT, "commit", f"not executed (phase {c.phase})", code="change.not_executed")
         for ua in c.actions.actions:
@@ -304,6 +317,25 @@ class Participant:
                 self.diagnostics.append(diag(COMPONENT, "commit", f"{ua.unit}.{ua.action}: {e}",
                                              code="change.commit_hook_failed"))
         self.host.identity = c.identity
+        c.phase = "committed"
+        return Ok(Committed(c.id, c.identity))
+
+    def on_resume(self, env: Envelope, msg: Resume) -> Result[msgspec.Struct]:
+        done = self.finished.get(msg.change_id)
+        if done is not None:
+            if done.rolled_back or done.identity != msg.identity:
+                return fail(COMPONENT, "resume", "change did not commit this identity", code="change.not_committed")
+            return Ok(done)
+        c = self.change
+        if c is None and self._initial_resume_pending and self.host.identity == msg.identity:
+            # A newly spawned/restarted process was initialized from the candidate snapshot.
+            self.host.paused = False
+            self._initial_resume_pending = False
+            done = Resumed(msg.change_id, msg.identity)
+            self.finished[msg.change_id] = done
+            return Ok(done)
+        if c is None or c.id != msg.change_id or c.phase != "committed" or c.identity != msg.identity:
+            return fail(COMPONENT, "resume", "change has not committed", code="change.not_committed")
         return Ok(self._resume(c, rolled_back=False))
 
     def on_abort(self, env: Envelope, msg: Abort) -> Result[msgspec.Struct]:
@@ -312,6 +344,8 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             return Ok(Resumed(msg.change_id, self.host.identity, rolled_back=True))
+        if c.phase == "committed":
+            return fail(COMPONENT, "abort", "committed decision cannot be rolled back", code="change.already_committed")
         self._rollback(c)
         return Ok(self._resume(c, rolled_back=True))
 
@@ -341,6 +375,14 @@ class Participant:
         elif c.phase == "pausing":
             self._check_pause(c)
         if time.monotonic() > c.deadline:
+            if c.phase in ("executed", "committed"):
+                # The decision may already be committed elsewhere. Stay fenced until
+                # an explicit decision/resume arrives, or the engine is restarted.
+                c.deadline = float("inf")
+                self.diagnostics.append(diag(
+                    COMPONENT, "timeout", f"change {c.id} is in doubt; remaining paused",
+                    subject=str(self.host.spec.proc), code="change.in_doubt"))
+                return
             self.diagnostics.append(diag(
                 COMPONENT, "timeout", f"lost the coordinator of change {c.id} for {c.timeout_s}s; rolled back",
                 subject=str(self.host.spec.proc), code="change.coordinator_lost"))

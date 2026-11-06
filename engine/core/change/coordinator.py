@@ -22,6 +22,7 @@ from core.change.participant import ChangeTunables
 from core.change.protocol import (
     Abort,
     Commit,
+    Committed,
     Drain,
     Drained,
     Execute,
@@ -29,6 +30,8 @@ from core.change.protocol import (
     Pause,
     Paused,
     Prepare,
+    Resume,
+    Resumed,
 )
 from core.change.queue import ChangeQueue, Queued
 from core.change.state import IdentityFn, IdentityManifest, apply_changeset, identity_of
@@ -106,6 +109,9 @@ class Coordinator:
         self.checker = checker or AcceptAll()
         self.identity_fn = identity_fn
         self.tun = tun or ChangeTunables()
+        if self.tun.commit_attempts < 1 or self.tun.commit_retry_delay_s < 0:
+            raise ValueError("commit_attempts must be positive and commit_retry_delay_s nonnegative")
+        self.recovery_required = False
         self.identity: Identity = EMPTY
         self.manifest = IdentityManifest()
         self.state_version = 0
@@ -197,6 +203,10 @@ class Coordinator:
         cid = self.log.begin(cs)
         old = self.identity
         t0 = time.monotonic()
+        if self.recovery_required:
+            return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
+                COMPONENT, "check", "a previous commit is unresolved; restart the engine",
+                code="change.recovery_required")]))
         # RECEIVED -> CHECKED
         if cs.source != "internal" and cs.base != self.identity:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
@@ -242,7 +252,15 @@ class Coordinator:
         except _Abort as e:
             undo = await self._abort(run)
             return self._done(cid, self._result("aborted", cid, cs, None, run, [*e.diags, *undo]))
-        await self._commit(run)
+        # Persist the irreversible decision before sending any Commit. Once sent,
+        # neither RPC failure nor timeout is evidence that rollback is safe.
+        self.log.event(cid, "commit_decided", {"identity": new_identity,
+                       "participants": [str(pa.proc) for pa in run.prepared]})
+        self.recovery_required = True
+        committed = await self._commit(run)
+        if committed:
+            return self._done(cid, self._result("failed", cid, cs, new_identity, run, committed))
+        self.recovery_required = False
         self.identity = new_identity
         self.manifest = new_manifest
         if cs.state_only:
@@ -325,26 +343,53 @@ class Coordinator:
                 continue
             assert topo is not None
             run.restarted.append(pa.proc)
-            r = await self.sup.relaunch(pa.restart, run.identity, topo)
+            r = await self.sup.relaunch(pa.restart, run.identity, topo, start_paused=True)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
         for plan in run.plan.spawn:
             assert topo is not None
             run.spawned.append(plan.proc)
-            r = await self.sup.launch(plan, run.identity, topo)
+            r = await self.sup.launch(plan, run.identity, topo, start_paused=True)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
         if run.plan.topology is not None:
             self.sup.topology = run.plan.topology
         run.lap("execute")
 
-    async def _commit(self, run: _Run) -> None:
-        results = await asyncio.gather(*(self._call(pa.proc, Commit(run.id)) for pa in run.prepared))
-        for pa, r in zip(run.prepared, results, strict=True):
-            if isinstance(r, Failed):  # cannot happen in a healthy participant; it will time out alone
-                self.log.event(run.id, "commit_unacknowledged", {"proc": str(pa.proc)})
+    async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool) -> list[Diagnostic]:
+        pending = list(procs)
+        phase = "resume" if resume else "commit"
+        for attempt in range(self.tun.commit_attempts):
+            msg = Resume(run.id, run.identity) if resume else Commit(run.id)
+            results = await asyncio.gather(*(self._call(p, msg) for p in pending))
+            retry: list[ProcId] = []
+            for p, r in zip(pending, results, strict=True):
+                ack = r.value if isinstance(r, Ok) else None
+                valid = (isinstance(ack, Resumed) and not ack.rolled_back) if resume else isinstance(ack, Committed)
+                if not valid or not isinstance(ack, (Committed, Resumed)) \
+                        or ack.change_id != run.id or ack.identity != run.identity:
+                    retry.append(p)
+                    self.log.event(run.id, f"{phase}_unacknowledged", {"proc": str(p), "attempt": attempt + 1})
+            pending = retry
+            if not pending:
+                return []
+            if attempt + 1 < self.tun.commit_attempts:
+                await asyncio.sleep(self.tun.commit_retry_delay_s)
+        return [diag(COMPONENT, phase, f"{phase} not confirmed; restart engine to recover the committed decision",
+                     subject=str(p), code="change.recovery_required") for p in pending]
+
+    async def _commit(self, run: _Run) -> list[Diagnostic]:
+        errors = await self._confirm(run, [pa.proc for pa in run.prepared], resume=False)
+        if errors:
+            return errors  # All existing participants remain paused; do not send Abort.
+        for pa in run.prepared:
             self.sup.committed(pa.proc, run.identity, pa.plan_after)
+        for proc in [*run.restarted, *run.spawned]:
+            self.sup.committed(proc, run.identity, None)
+        # Candidate processes also started paused; none serves before the barrier.
+        errors = await self._confirm(run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True)
         run.lap("commit")
+        return errors
 
     async def _abort(self, run: _Run) -> list[Diagnostic]:
         out: list[Diagnostic] = []
@@ -353,7 +398,7 @@ class Coordinator:
             if isinstance(r, Failed):
                 out.append(diag(COMPONENT, "abort", f"no answer to Abort: {r}", subject=str(pa.proc),
                                 code="change.abort_unacknowledged",
-                                hint="the participant rolls back by itself after its coordinator timeout"))
+                                hint="executed participants stay paused until an explicit decision or engine restart"))
         for proc in run.spawned:
             await self.sup.stop(proc)
             self.sup.forget(proc)

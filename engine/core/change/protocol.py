@@ -58,6 +58,16 @@ class Commit(msgspec.Struct, frozen=True):
     change_id: int
 
 
+class Committed(msgspec.Struct, frozen=True):
+    change_id: int
+    identity: Identity
+
+
+class Resume(msgspec.Struct, frozen=True):
+    change_id: int
+    identity: Identity
+
+
 class Abort(msgspec.Struct, frozen=True):
     change_id: int
 
@@ -77,7 +87,9 @@ MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("change.paused@1", Paused),
     ("change.execute@1", Execute),
     ("change.executed@1", Executed),
-    ("change.commit@1", Commit),
+    ("change.commit@2", Commit),
+    ("change.committed@1", Committed),
+    ("change.resume@1", Resume),
     ("change.abort@1", Abort),
     ("change.resumed@1", Resumed),
 ]
