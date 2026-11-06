@@ -147,7 +147,7 @@ class Tunable:
         time.sleep(config["toyc.init_delay_s"])  # e.g. loading weights
         ctx.on_action("toy.op", Op(ctx, config))
         ctx.on_config("toyc.chunk", lambda v: log(config, ctx, f"chunk {v}"))
-        log(config, ctx, f"tunable loaded gen{ctx.instance.generation}")
+        log(config, ctx, f"tunable loaded gen{ctx.instance.generation} flavor {config['toyc.flavor']}")
 ''',
     "toyc/versioned.py": '''
 from toyc.logutil import log
@@ -173,6 +173,7 @@ SPECS: dict[str, UnitSpec] = {
                          capabilities="accept_config = true", config={
                              "toyc.log_dir": {"type": "str", "default": "", "binding": "startup"},
                              "toyc.init_delay_s": {"type": "float", "default": 0.0, "binding": "startup"},
+                             "toyc.flavor": {"type": "str", "default": "plain", "binding": "startup"},
                              "toyc.chunk": {"type": "int", "default": 8192, "binding": "live"}}),
     "toyc.versioned": spec("toyc.versioned", "toyc.versioned:Versioned", process=ALL_ROLES,
                            reads=["toyc.log_dir"]),

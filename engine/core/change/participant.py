@@ -263,15 +263,15 @@ class Participant:
             except Exception as e:  # noqa: BLE001
                 self._abort_failed(ua, e)
         c.prepared_actions.clear()
+        if c.undo.old_config:  # before the old units are built again: they read these values
+            self.rt.config.stage(c.undo.old_config)
+            self.rt.config.commit()
+            c.undo.old_config = {}
         if c.undo.reverse_reload is not None:
             r = self.rt.reload(c.undo.reverse_reload)
             if isinstance(r, Failed):
                 self.diagnostics += r.diagnostics
             c.undo.reverse_reload = None
-        if c.undo.old_config:
-            self.rt.config.stage(c.undo.old_config)
-            self.rt.config.commit()
-            c.undo.old_config = {}
         self.rt.config.discard_staged()
         if c.staged:
             self.rt.discard_staged()
@@ -360,13 +360,14 @@ class Participant:
             return fail(COMPONENT, "execute", f"not paused (phase {c.phase})", code="change.not_paused")
         a = c.actions
         try:
+            # the way back is taken before the new config takes effect, so it holds the old values
+            reverse = self._reverse(a.reload) if a.reload is not None else None
             if a.config:
                 c.undo.old_config = {k: self.rt.config.entries()[k].value for k in a.config}
                 commit = self.rt.config.commit()
                 if commit.hook_failures:
                     raise RuntimeError("; ".join(d.reason for d in commit.hook_failures))
             if a.reload is not None:
-                reverse = self._reverse(a.reload)
                 plan = a.reload
                 if plan.new_code_root is None and (root := self._code_root_for(c.identity)) is not None \
                         and root != self.rt.code_root:

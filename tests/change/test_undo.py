@@ -103,6 +103,25 @@ def test_abort_after_removing_a_unit_brings_back_its_config(tmp_path: Path) -> N
     run(main())
 
 
+def test_abort_of_a_config_change_with_a_reload_rebuilds_units_with_the_old_values(tmp_path: Path) -> None:
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            reload = ReloadPlan(units_to_reload=[SPECS["toyc.tunable"]])
+            e.planner.script = lambda inp: ActionPlan(procs=[
+                ProcActions(W1, config={"toyc.flavor": "spicy"}, reload=reload)])
+            e.coord.faults.add("after_execute")
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity, config={"toyc.flavor": "spicy"}))
+            assert r.status == "aborted"
+            loads = [line for line in e.c.log_of(W1) if line.startswith("tunable loaded")]
+            assert loads[-2].endswith("flavor spicy") and loads[-1].endswith("flavor plain")  # the instance
+
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, reload=reload)])
+            assert (await e.coord.submit(ChangeSet(base=e.coord.identity))).status == "committed"
+            assert e.c.log_of(W1)[-1].endswith("flavor plain")  # the config table
+
+    run(main())
+
+
 def test_an_action_of_a_reloaded_unit_is_prepared_on_the_new_instance(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:
