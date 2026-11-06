@@ -72,6 +72,9 @@ class _Undo:
 
     reverse_reload: ReloadPlan | None = None
     old_config: dict[str, Any] = field(default_factory=dict[str, Any])
+    candidate_root: str | None = None
+    """The snapshot execute switched to; modules first imported from it go when it is undone."""
+    modules_before: set[str] = field(default_factory=set[str])
 
 
 @dataclass
@@ -268,7 +271,7 @@ class Participant:
             self.rt.config.commit()
             c.undo.old_config = {}
         if c.undo.reverse_reload is not None:
-            r = self.rt.reload(c.undo.reverse_reload)
+            r = self.rt.reload(self._with_fresh_modules(c.undo))
             if isinstance(r, Failed):
                 self.diagnostics += r.diagnostics
             c.undo.reverse_reload = None
@@ -276,6 +279,22 @@ class Participant:
         if c.staged:
             self.rt.discard_staged()
             c.staged = False
+
+    def _with_fresh_modules(self, undo: _Undo) -> ReloadPlan:
+        """The reverse reload, also dropping modules first imported from the candidate snapshot
+        during the change; otherwise they stay loaded from a snapshot that is about to go."""
+        assert undo.reverse_reload is not None
+        if undo.candidate_root is None:
+            return undo.reverse_reload
+        candidate = Path(undo.candidate_root).resolve()
+        fresh: set[str] = set()
+        for name, mod in list(sys.modules.items()):
+            file = getattr(mod, "__file__", None)
+            if name not in undo.modules_before and file and file.endswith(".py") \
+                    and not self.rt.framework.contains(name) and Path(file).resolve().is_relative_to(candidate):
+                fresh.add(name)
+        changed = sorted({*undo.reverse_reload.changed_modules, *fresh})
+        return msgspec.structs.replace(undo.reverse_reload, changed_modules=changed)
 
     def _abort_failed(self, ua: UnitAction, e: Exception) -> None:
         self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}", code="change.abort_failed"))
@@ -360,18 +379,17 @@ class Participant:
             return fail(COMPONENT, "execute", f"not paused (phase {c.phase})", code="change.not_paused")
         a = c.actions
         try:
+            plan = self._reload_plan(c)
             # the way back is taken before the new config takes effect, so it holds the old values
-            reverse = self._reverse(a.reload) if a.reload is not None else None
+            reverse = self._reverse(plan) if plan is not None else None
             if a.config:
                 c.undo.old_config = {k: self.rt.config.entries()[k].value for k in a.config}
                 commit = self.rt.config.commit()
                 if commit.hook_failures:
                     raise RuntimeError("; ".join(d.reason for d in commit.hook_failures))
-            if a.reload is not None:
-                plan = a.reload
-                if plan.new_code_root is None and (root := self._code_root_for(c.identity)) is not None \
-                        and root != self.rt.code_root:
-                    plan = msgspec.structs.replace(plan, new_code_root=root)
+            if plan is not None:
+                c.undo.candidate_root = plan.new_code_root
+                c.undo.modules_before = set(sys.modules)
                 r = self.rt.reload(plan)
                 if isinstance(r, Failed):
                     raise _Failed(r)
@@ -392,6 +410,21 @@ class Participant:
         c.phase = "executed"
         c.renew()
         return Ok(Executed(c.id, c.report, list(c.execute_diags)))
+
+    def _reload_plan(self, c: _Change) -> ReloadPlan | None:
+        """The reload execute does: the planned one, moved to the new identity's snapshot. Without
+        one, still move there if the code root differs or staged units wait: after the change the
+        process loads code from the snapshot of the identity it serves, and staged units are its own."""
+        plan = c.actions.reload
+        root = self._code_root_for(c.identity)
+        if root is not None and root == self.rt.code_root:
+            root = None
+        staged = any(u.staged for u in self.rt.snapshot().units)
+        if plan is None:
+            return ReloadPlan(new_code_root=root) if root is not None or staged else None
+        if plan.new_code_root is None and root is not None:
+            plan = msgspec.structs.replace(plan, new_code_root=root)
+        return plan
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:
         """The reload that puts this process back: old specs, and the config they had."""

@@ -7,10 +7,21 @@ from pathlib import Path
 import pytest
 
 from core.change.coordinator import PlanInput
+from core.change.state import apply_changeset
 from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.ids import UnitId
 from tests.change.engine import ALL, SCHED, UNITS, W0, W1, Engine, engine, reload_everywhere, run
 from tests.cluster.harness import SPECS, TOY, VERSIONED_V2, role, topology
+from tests.support import spec
+
+KERNEL = """
+from toyc.logutil import log
+
+
+class Kernel:
+    def __init__(self, ctx, config):
+        pass
+"""
 from unit.runtime import ReloadPlan
 
 
@@ -47,6 +58,64 @@ def test_snapshots_the_processes_still_load_code_from_are_not_pruned(tmp_path: P
             r = await e.coord.submit(ChangeSet(base=current, files={"engine/toyc/versioned.py": v3}))
             assert r.status == "committed", r.diagnostics
             assert all(e.versioned(p) == "versioned v3" for p in ALL)
+
+    run(main())
+
+
+def test_abort_after_execute_leaves_nothing_loaded_from_the_candidate(tmp_path: Path) -> None:
+    """A module the candidate imports for the first time goes with the abort; the candidate
+    snapshot can then be pruned and the next update still works."""
+
+    async def main() -> None:
+        async with engine(tmp_path, agent={"nodeagent.snapshot_retention": 1}) as e:
+            e.planner.script = everyone_idle  # extra.py exists from here on, but nothing imports it
+            added = await e.coord.submit(ChangeSet(base=e.coord.identity,
+                                                   files={"engine/toyc/extra.py": e.c.blobs.put(b"X = 1\n")}))
+            assert added.status == "committed", added.diagnostics
+            base = e.coord.identity
+            uses_extra = VERSIONED_V2.replace("VERSION = 2", "from toyc import extra\n\nVERSION = 2")
+            e.planner.script = reload_everywhere()
+            e.coord.faults.add("after_execute")
+            cs = ChangeSet(base=base, files={"engine/toyc/versioned.py": e.c.blobs.put(uses_extra.encode())})
+            candidate = e.coord.identity_fn(apply_changeset(e.coord.manifest, cs))
+            assert (await e.coord.submit(cs)).status == "aborted"
+            e.planner.script = everyone_idle
+            for i in range(3):  # each materializes another snapshot; retention keeps one spare
+                e.coord.faults.add("after_prepare")
+                h = e.c.blobs.put(f"Y = {i}\n".encode())
+                assert (await e.coord.submit(ChangeSet(base=base, files={f"engine/toyc/other{i}.py": h}))
+                        ).status == "aborted"
+            for host in ("host-a", "host-b"):
+                root = Path(e.c.agents[host].root)
+                assert not (root / candidate).exists() and (root / base).is_dir(), host
+
+            e.planner.script = reload_everywhere()
+            v3 = e.c.blobs.put(VERSIONED_V2.replace("VERSION = 2", "VERSION = 3").encode())
+            r = await e.coord.submit(ChangeSet(base=base, files={"engine/toyc/versioned.py": v3}))
+            assert r.status == "committed", r.diagnostics
+            assert all(e.versioned(p) == "versioned v3" for p in ALL)
+
+    run(main())
+
+
+def test_units_staged_by_a_committed_change_are_its_own(tmp_path: Path) -> None:
+    """A change that only stages a unit commits it for good: a later aborted change keeps it."""
+
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            kernel = spec("toyc.kernel", "toyc.kernel:Kernel", process=["worker"])
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, stage=[kernel])])
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity,
+                                               files={"engine/toyc/kernel.py": e.c.blobs.put(KERNEL.encode())}))
+            assert r.status == "committed", r.diagnostics
+            assert "toyc.kernel" in {u.unit for u in (await e.status(W1)).units}
+
+            e.planner.script = reload_everywhere()
+            e.coord.faults.add("after_execute")
+            assert (await e.coord.submit(e.code_change())).status == "aborted"
+            assert "toyc.kernel" in {u.unit for u in (await e.status(W1)).units}
+            assert (await e.coord.submit(e.code_change())).status == "committed"
+            assert "toyc.kernel" in {u.unit for u in (await e.status(W1)).units}
 
     run(main())
 
