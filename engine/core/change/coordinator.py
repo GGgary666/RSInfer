@@ -89,6 +89,11 @@ class _Abort(Exception):
         self.diags = diags
 
 
+def _blobs_of(cs: ChangeSet) -> set[str]:
+    """Blob hashes a change-set refers to: file contents and artifacts."""
+    return {*(h for h in cs.files.values() if h is not None), *cs.artifacts.values()}
+
+
 class _Vanish(Exception):
     """Injected: the coordinator goes silent in the middle of a change."""
 
@@ -315,11 +320,11 @@ class Coordinator:
                 COMPONENT, "check", f"base {cs.base!r} is not the running identity {self.identity!r}",
                 code="change.stale_base", hint="rebase the change on the current identity")]))
         new_manifest = apply_changeset(self.manifest, cs)
-        missing = self.sup.blobs.missing(h for h in cs.files.values() if h is not None)
+        missing = self.sup.blobs.missing(_blobs_of(cs))
         if missing:
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
-                COMPONENT, "check", f"{len(missing)} file contents are not in the blob store",
-                code="change.missing_blobs")]))
+                COMPONENT, "check", f"{len(missing)} file or artifact contents are not in the blob store",
+                code="change.missing_blobs", hint="upload them before submitting")]))
         inp = PlanInput(cs, self.identity, self.manifest, new_manifest, self.sup.status())
         checked = await self.checker.check(inp)
         if isinstance(checked, Failed):
@@ -586,7 +591,7 @@ class Coordinator:
         every blob younger than ``change.blob_grace_s``. Runs after every change; returns
         how many blobs were deleted."""
         keep = [self.identity, *([self._running.identity] if self._running else [])]
-        queued = {h for item in self.queue.items() for h in item.cs.files.values() if h is not None}
+        queued = {h for item in self.queue.items() for h in _blobs_of(item.cs)}
         return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s)
 
     # ------------------------------------------------------------- startup
