@@ -1,10 +1,12 @@
-"""change.md §6 and §5.1 without processes: what the coordinator refuses on receipt, blob retention."""
+"""change.md §6, §5.1 and §7 test 17 without processes: refusals on receipt, blob retention."""
 
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -26,7 +28,7 @@ class Nothing:
         return Ok(ActionPlan())
 
 
-def coordinator(tmp: Path, **tun: int) -> Coordinator:
+def coordinator(tmp: Path, **tun: Any) -> Coordinator:
     log = EventLog(tmp / "events.sqlite", BlobStore(tmp / "blobs"))
     sup = cast(Supervisor, object())  # never reached: nothing here runs a change
     c = Coordinator(sup, log, planner=Nothing(), checker=AcceptAll(), tun=ChangeTunables(**tun))
@@ -54,7 +56,7 @@ def test_invalid_changes_are_refused_on_receipt(tmp_path: Path, cs: ChangeSet, c
 
 def test_blob_retention_keeps_what_queued_changes_still_need(tmp_path: Path) -> None:
     async def main() -> None:
-        c = coordinator(tmp_path, blob_retention=1)
+        c = coordinator(tmp_path, blob_retention=1, blob_grace_s=0.0)
         blobs = c.log.blobs
         for n in range(3):
             m = IdentityManifest(files={"engine/k.py": blobs.put(f"v{n}\n".encode())})
@@ -71,3 +73,20 @@ def test_blob_retention_keeps_what_queued_changes_still_need(tmp_path: Path) -> 
         assert c.log.manifest(current) is not None
 
     asyncio.run(main())
+
+
+def test_young_blobs_are_never_pruned(tmp_path: Path) -> None:
+    """§7 test 17: an agent uploads first and submits later."""
+    c = coordinator(tmp_path, blob_grace_s=3600.0)
+    blobs = c.log.blobs
+    fresh = blobs.put(b"uploaded a moment ago, not referenced yet\n")
+    stale = blobs.put(b"uploaded two hours ago, never used\n")
+    two_hours_ago = time.time() - 7200
+    os.utime(blobs.root / stale[:2] / stale[2:], (two_hours_ago, two_hours_ago))
+    assert c.prune_blobs() == 1
+    assert blobs.has(fresh) and not blobs.has(stale)
+
+    reused = blobs.put(b"old content, uploaded again\n")
+    os.utime(blobs.root / reused[:2] / reused[2:], (two_hours_ago, two_hours_ago))
+    blobs.put(b"old content, uploaded again\n")  # uploading it again restarts its grace period
+    assert c.prune_blobs() == 0 and blobs.has(reused)

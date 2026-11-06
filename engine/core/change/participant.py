@@ -19,6 +19,7 @@ answer comes. A ``Commit`` that arrives after such a rollback is refused with
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ if TYPE_CHECKING:
 
 COMPONENT = "change.participant"
 
-Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed"]
+Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone"]
 type _Slices = tuple[UnitAction, Iterator[object]]
 
 
@@ -80,12 +81,15 @@ class _Change:
     phase: Phase = "preparing"
     staged: bool = False
     prepared_actions: list[UnitAction] = field(default_factory=list[UnitAction])
-    """``prepare()`` was called on these: ``abort()`` undoes them."""
+    """``prepare()`` was called on these (even if it raised): one ``abort()`` each undoes
+    prepare and execute, on the instance that did them."""
+    deferred: list[UnitAction] = field(default_factory=list[UnitAction])
+    """Actions of units this change reloads: prepared at the safe point, on the new instance."""
     slicing: list[_Slices] = field(default_factory=list[_Slices])
     """Sliced preparations not finished yet."""
     prepare_reply: Deferred | None = None
     prepare_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
-    executed_actions: list[UnitAction] = field(default_factory=list[UnitAction])
+    execute_diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     undo: _Undo = field(default_factory=_Undo)
     report: ReloadReport | None = None
     drain_reply: Deferred | None = None
@@ -168,7 +172,13 @@ class Participant:
             return fail(COMPONENT, "prepare", "change already finished", code="change.finished")
         c = _Change(msg.change_id, msg.identity, msg.actions, 0.0, msg.coordinator_timeout_s)
         a = msg.actions
+        removed = set(a.reload.units_to_remove) if a.reload else set[UnitId]()
+        orphans = sorted({ua.unit for ua in a.actions if ua.unit in removed})
+        if orphans:
+            return fail(COMPONENT, "prepare", f"actions of units this change removes: {orphans}",
+                        subject=str(self.host.spec.proc), code="change.action_on_removed_unit")
         try:
+            touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
             if a.config:
                 r = self.rt.config.stage(a.config)
                 if isinstance(r, Failed):
@@ -184,9 +194,12 @@ class Participant:
                 c.staged = True
                 c.prepare_diags.append(self._one_shot(f"staging {len(a.stage)} new unit(s)", t0))
             for ua in a.actions:
+                if ua.unit in touched:  # its instance is replaced at the safe point; prepare the new one there
+                    c.deferred.append(ua)
+                    continue
+                c.prepared_actions.append(ua)  # before the call: abort() also undoes a prepare that raised
                 t0 = time.monotonic()
                 out = self._handler(ua).prepare(ua.args)
-                c.prepared_actions.append(ua)
                 if out is None:
                     c.prepare_diags.append(self._one_shot(
                         f"{ua.unit}.{ua.action}", t0,
@@ -194,7 +207,7 @@ class Participant:
                 else:
                     c.slicing.append((ua, iter(out)))
         except Exception as e:  # noqa: BLE001 - a failing unit fails the change, not the process
-            self._abort_prepared(c)
+            self._undo(c)
             return self._fail("prepare", e)
         self.change = c
         c.renew()  # work done for the coordinator does not count against its lease
@@ -230,27 +243,38 @@ class Participant:
                 c.prepare_reply.resolve(Ok(Prepared(c.id, list(c.prepare_diags))))
                 c.prepare_reply = None
 
-    def _abort_prepared(self, c: _Change) -> None:
+    def _undo(self, c: _Change) -> None:
+        """Put back everything this change did here, newest first. Calling it again does nothing."""
         for ua, it in c.slicing:
             close = getattr(it, "close", None)
             try:
                 if close is not None:
                     close()
             except Exception as e:  # noqa: BLE001
-                self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}",
-                                             code="change.abort_failed"))
+                self._abort_failed(ua, e)
         c.slicing.clear()
-        for ua in reversed(c.prepared_actions):
+        for ua in reversed(c.prepared_actions):  # before a reverse reload replaces the instances
             try:
                 self._handler(ua).abort()
             except Exception as e:  # noqa: BLE001
-                self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}",
-                                             code="change.abort_failed"))
+                self._abort_failed(ua, e)
         c.prepared_actions.clear()
+        if c.undo.reverse_reload is not None:
+            r = self.rt.reload(c.undo.reverse_reload)
+            if isinstance(r, Failed):
+                self.diagnostics += r.diagnostics
+            c.undo.reverse_reload = None
+        if c.undo.old_config:
+            self.rt.config.stage(c.undo.old_config)
+            self.rt.config.commit()
+            c.undo.old_config = {}
         self.rt.config.discard_staged()
         if c.staged:
             self.rt.discard_staged()
             c.staged = False
+
+    def _abort_failed(self, ua: UnitAction, e: Exception) -> None:
+        self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}", code="change.abort_failed"))
 
     # ------------------------------------------------------- drain/pause
 
@@ -260,6 +284,12 @@ class Participant:
             return c
         if c.phase == "preparing":
             return self._fail("drain", "not prepared yet")
+        if c.phase == "draining":  # a repeated Drain: the newest request gets the answer
+            if c.drain_reply is not None:
+                c.drain_reply.resolve(fail(COMPONENT, "drain", "superseded by a repeated Drain",
+                                           code="change.duplicate"))
+            reply = c.drain_reply = self.host.rpc.defer()
+            return reply
         if c.phase != "prepared":
             return Ok(Drained(c.id, c.aborted_requests))
         try:
@@ -296,6 +326,8 @@ class Participant:
             return Ok(Paused(c.id, self.host.epoch))
         if c.phase == "preparing":
             return self._fail("pause", "not prepared yet")
+        if c.phase == "pausing" and c.pause_reply is not None:
+            c.pause_reply.resolve(fail(COMPONENT, "pause", "superseded by a repeated Pause", code="change.duplicate"))
         c.phase = "pausing"
         c.pause_after = msg.after_epoch
         reply = c.pause_reply = self.host.rpc.defer()
@@ -319,7 +351,7 @@ class Participant:
         if isinstance(c, Failed):
             return c
         if c.phase == "executed":
-            return Ok(Executed(c.id, c.report))
+            return Ok(Executed(c.id, c.report, list(c.execute_diags)))
         if c.phase != "paused":
             return fail(COMPONENT, "execute", f"not paused (phase {c.phase})", code="change.not_paused")
         a = c.actions
@@ -340,44 +372,34 @@ class Participant:
                     raise _Failed(r)
                 c.report = r.value
                 c.undo.reverse_reload = reverse
+            for ua in c.deferred:  # the new instances of reloaded units prepare now, all at once
+                c.prepared_actions.append(ua)
+                t0 = time.monotonic()
+                for _ in self._handler(ua).prepare(ua.args) or ():
+                    pass
+                c.execute_diags.append(self._one_shot(f"{ua.unit}.{ua.action} (its unit was reloaded)", t0))
             for ua in a.actions:
                 self._handler(ua).execute(ua.args)
-                c.executed_actions.append(ua)
         except Exception as e:  # noqa: BLE001
-            self._undo_execute(c)
-            c.phase = "paused"
+            self._undo(c)  # everything is back; only the Abort is still to come
+            c.phase = "undone"
             return e.failed if isinstance(e, _Failed) else self._fail("execute", e)
         c.phase = "executed"
         c.renew()
-        return Ok(Executed(c.id, c.report))
+        return Ok(Executed(c.id, c.report, list(c.execute_diags)))
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:
+        """The reload that puts this process back: old specs, and the config they had."""
         old_reload = [s for u in plan.units_to_reload if (s := self.rt.spec_of(u.id)) is not None]
         removed: list[UnitSpec] = [s for u in plan.units_to_remove if (s := self.rt.spec_of(u)) is not None]
         added = [UnitId(s.id) for s in plan.units_to_add]
         staged = [UnitId(u.unit) for u in self.rt.snapshot().units if u.staged]
+        owners = {*(s.id for s in old_reload), *(s.id for s in removed)}
+        config = {k: e for k, e in self.rt.config.entries().items() if e.owner in owners or k in plan.config}
         return ReloadPlan(
             changed_modules=plan.changed_modules, units_to_reload=old_reload, units_to_add=removed,
-            units_to_remove=sorted(set(added) | set(staged)), new_code_root=self.rt.code_root,
+            units_to_remove=sorted(set(added) | set(staged)), new_code_root=self.rt.code_root, config=config,
         )
-
-    def _undo_execute(self, c: _Change) -> None:
-        for ua in reversed(c.executed_actions):
-            try:
-                self._handler(ua).abort()
-            except Exception as e:  # noqa: BLE001
-                self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}",
-                                             code="change.abort_failed"))
-        c.executed_actions.clear()
-        if c.undo.reverse_reload is not None:
-            r = self.rt.reload(c.undo.reverse_reload)
-            if isinstance(r, Failed):
-                self.diagnostics += r.diagnostics
-            c.undo.reverse_reload = None
-        if c.undo.old_config:
-            self.rt.config.stage(c.undo.old_config)
-            self.rt.config.commit()
-            c.undo.old_config = {}
 
     # ---------------------------------------------------- commit / abort
 
@@ -419,16 +441,31 @@ class Participant:
         for d in (c.prepare_reply, c.drain_reply, c.pause_reply):
             if d is not None:
                 d.resolve(fail(COMPONENT, "abort", "change aborted", code="change.aborted"))
-        if c.phase == "executed":
-            self._undo_execute(c)
-        self._abort_prepared(c)
+        self._undo(c)
 
     def _resume(self, c: _Change, *, rolled_back: bool) -> Resumed:
         self.host.paused = False
         self.change = None
-        reply = Resumed(c.id, self.host.identity, rolled_back)
+        reply = Resumed(c.id, self.host.identity, rolled_back, self._snapshots())
         self.finished[c.id] = reply
         return reply
+
+    def _snapshots(self) -> list[Identity]:
+        """Snapshots this process still loads code from: modules unchanged by in-place
+        changes keep their files in older snapshots, so node agents must keep those."""
+        root = self.rt.code_root
+        if root is None:
+            return []
+        current = Path(root).resolve().parent
+        out = {current.name}
+        for mod in list(sys.modules.values()):
+            file = getattr(mod, "__file__", None)
+            if not file:
+                continue
+            path = Path(file).resolve()
+            if path.is_relative_to(current.parent):
+                out.add(path.relative_to(current.parent).parts[0])
+        return sorted(Identity(i) for i in out)
 
     # ---------------------------------------------------------- safe point
 

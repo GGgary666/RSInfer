@@ -237,6 +237,12 @@ class UnitRuntime:
         entry = self._actions.get((UnitId(unit), name))
         return entry[1] if entry is not None else None
 
+    def units_touched_by(self, plan: ReloadPlan) -> set[UnitId]:
+        """Units ``plan`` would unload: listed for reload or removal, or importing a changed module."""
+        accepted = self._affected_modules(plan.changed_modules)
+        hit = {s.id for s in self._slots.values() if s.manifest.unit.entry_module in accepted}
+        return {*(s.id for s in plan.units_to_reload), *plan.units_to_remove, *hit}
+
     def spec_of(self, unit: str) -> UnitSpec | None:
         slot = self._slots.get(UnitId(unit))
         return slot.spec if slot is not None else None
@@ -642,12 +648,13 @@ class UnitRuntime:
             paths = self._switch_root(plan.new_code_root)
             self._fault("after_switch")
 
-            r = self.config.declare_entries(plan.config)
-            if isinstance(r, Failed):
-                raise _Abort(r.diagnostics)
             for uid in removed:
                 del self._slots[uid]
                 self.config.retract_owner(uid)
+            # after the removals: a key may move from a removed unit to an added one
+            r = self.config.declare_entries(plan.config)
+            if isinstance(r, Failed):
+                raise _Abort(r.diagnostics)
             decl_errors: list[Diagnostic] = []
             for uid, spec in reload_specs.items():
                 slot = self._slots[uid]

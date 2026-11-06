@@ -78,6 +78,8 @@ def test_any_failure_rolls_back_every_participant(tmp_path: Path, name: str, fai
                 assert st.identity == old and not st.paused, p
                 assert e.versioned(p) == "versioned v1", p
                 assert await e.epochs_advance(p), p
+                assert e.ops(p)[0] == "op prepare" and e.ops(p)[-1] == "op abort", p
+                assert e.ops(p).count("op abort") == 1, (p, e.ops(p))  # once, even after execute
             # the system is healthy afterwards
             e.planner.script = reload_everywhere()
             assert (await e.coord.submit(e.code_change())).status == "committed"

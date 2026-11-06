@@ -109,6 +109,9 @@ class _Run:
     prepared: list[ProcActions] = field(default_factory=list[ProcActions])
     restarted: list[ProcId] = field(default_factory=list[ProcId])
     spawned: list[ProcId] = field(default_factory=list[ProcId])
+    stopped: list[ProcId] = field(default_factory=list[ProcId])
+    """Stopped by the plan; the supervisor keeps their specs until commit, so abort can restart them."""
+    old_topology: Topology | None = None
     timings: dict[str, float] = field(default_factory=dict[str, float])
     reports: dict[str, ReloadReport] = field(default_factory=dict[str, ReloadReport])
     diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
@@ -221,6 +224,10 @@ class Coordinator:
             finally:
                 self.busy = False
             self._deliver(item.data["future"], result)
+            try:
+                self.prune_blobs()
+            except Exception as e:  # noqa: BLE001 - retention must not stop the queue
+                self.log.event(None, "prune_failed", {"error": f"{type(e).__name__}: {e}"})
 
     def _finish_dropped(self, item: Queued) -> None:
         cid = self.log.begin(item.cs)
@@ -431,14 +438,17 @@ class Coordinator:
     async def _execute(self, run: _Run, manifest: IdentityManifest) -> None:
         executed = await self._gather([(pa.proc, self._call(pa.proc, Execute(run.id))) for pa in run.prepared])
         for proc, e in executed.items():
-            if isinstance(e, Executed) and e.report is not None:
-                run.reports[str(proc)] = e.report
+            if isinstance(e, Executed):
+                run.diags += e.diagnostics
+                if e.report is not None:
+                    run.reports[str(proc)] = e.report
         topo = run.plan.topology or self.sup.topology
+        run.old_topology = self.sup.topology
         for proc in run.plan.stop:
+            run.stopped.append(proc)
             r = await self.sup.stop(proc)
             if isinstance(r, Failed):
                 raise _Abort(r.diagnostics)
-            self.sup.forget(proc)
         for pa in run.plan.procs:
             if pa.restart is None:
                 continue
@@ -468,13 +478,22 @@ class Coordinator:
         out: list[Diagnostic] = []
         refused: list[tuple[ProcActions, Failed]] = []
         pending = list(run.prepared)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.tun.commit_ack_timeout_s
         while pending:
-            results = await asyncio.gather(*(self._call(pa.proc, Commit(run.id)) for pa in pending))
+            left = deadline - loop.time()
+            if left <= 0:  # alive but not answering (stopped, hung in NCCL): restart it like a refusal
+                refused += [(pa, Failed([diag(
+                    COMPONENT, "commit", f"did not acknowledge Commit within {self.tun.commit_ack_timeout_s}s",
+                    subject=str(pa.proc), code="change.commit_ack_timeout")])) for pa in pending]
+                break
+            timeout = min(self.sup.tun.rpc_timeout_s, left)
+            results = await asyncio.gather(*(self._call(pa.proc, Commit(run.id), timeout=timeout) for pa in pending))
             retry: list[ProcActions] = []
             for pa, r in zip(pending, results, strict=True):
                 if isinstance(r, Ok) and isinstance(r.value, Resumed) and not r.value.rolled_back \
                         and r.value.identity == run.identity:
-                    self.sup.committed(pa.proc, run.identity, pa.plan_after)
+                    self.sup.committed(pa.proc, run.identity, pa.plan_after, r.value.snapshots)
                 elif isinstance(r, Failed) and {d.code for d in r.diagnostics} <= _UNREACHABLE:
                     if self.sup.proc_state(pa.proc) == "RUNNING":
                         retry.append(pa)
@@ -487,7 +506,9 @@ class Coordinator:
                         COMPONENT, "commit", f"answered {r}", code="change.commit_not_taken")])))
             pending = retry
             if pending:
-                await asyncio.sleep(self.tun.commit_retry_interval_s)
+                await asyncio.sleep(max(0.0, min(self.tun.commit_retry_interval_s, deadline - loop.time())))
+        for proc in run.stopped:
+            self.sup.forget(proc)
         restart_failed = False
         for pa, r in refused:
             codes = sorted({d.code for d in r.diagnostics})
@@ -504,7 +525,10 @@ class Coordinator:
                                 severity="warning"))
         run.lap("commit")
         if restart_failed:
-            return "failed", [*out, *await self._where(run)]
+            return "failed", [*out, *await self._where(run), diag(
+                COMPONENT, "commit", f"the current identity is {run.identity}: the decision to commit is in the "
+                "event log and the other participants serve it", code="change.current_identity",
+                hint=f"base the next change on {run.identity}", severity="warning")]
         return "committed", out
 
     async def _restart(self, proc: ProcId) -> Result[None]:
@@ -544,6 +568,13 @@ class Coordinator:
             r = await self.sup.relaunch_previous(proc)
             if isinstance(r, Failed):
                 out += r.diagnostics
+        for proc in run.stopped:  # their state is gone; they come back from the spec they had
+            r = await self.sup.restart([proc])
+            out += r.diagnostics if isinstance(r, Failed) else [diag(
+                COMPONENT, "abort", "was stopped by the change; started again", subject=str(proc),
+                code="change.restarted_after_abort", severity="info")]
+        if run.plan.topology is not None:
+            self.sup.topology = run.old_topology
         run.lap("abort")
         return out
 
@@ -551,11 +582,12 @@ class Coordinator:
 
     def prune_blobs(self) -> int:
         """Blob retention (§5.1): keeps the current identity, the one being prepared, the
-        ``change.blob_retention`` most recent ones, and the contents of queued changes.
-        Nothing calls it on its own yet; returns how many blobs were deleted."""
+        ``change.blob_retention`` most recent ones, the contents of queued changes, and
+        every blob younger than ``change.blob_grace_s``. Runs after every change; returns
+        how many blobs were deleted."""
         keep = [self.identity, *([self._running.identity] if self._running else [])]
         queued = {h for item in self.queue.items() for h in item.cs.files.values() if h is not None}
-        return self.log.prune(keep, self.tun.blob_retention, queued)
+        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s)
 
     # ------------------------------------------------------------- startup
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -32,13 +33,19 @@ class BlobStore:
     def put(self, data: bytes) -> str:
         h = content_hash(data)
         path = self._path(h)
-        if not path.exists():
+        if path.exists():
+            os.utime(path)  # uploaded again: its grace period starts again (change.md §5.1)
+        else:
             path.parent.mkdir(exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=path.parent)
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, path)
         return h
+
+    def age(self, h: str) -> float:
+        """Seconds since the blob was last stored."""
+        return time.time() - self._path(h).stat().st_mtime
 
     def get(self, h: str) -> bytes | None:
         try:

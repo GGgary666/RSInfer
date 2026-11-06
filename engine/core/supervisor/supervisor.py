@@ -93,6 +93,8 @@ class _Proc:
     exit_code: int | None = None
     local_pid: int | None = None
     checked_in: asyncio.Event = field(default_factory=asyncio.Event)
+    snapshots: set[Identity] = field(default_factory=set[Identity])
+    """Snapshots the process loads code from: the one it started from, and those of in-place changes."""
 
 
 type PlanFor = Callable[[DesiredProc], ProcessPlan]
@@ -199,6 +201,8 @@ class Supervisor:
 
     def _check_in(self, msg: CheckIn) -> Result[msgspec.Struct]:
         rec = self.procs.get(msg.proc)
+        if rec is not None and rec.state == "RUNNING" and rec.checkin == msg:
+            return Ok(CheckedIn())  # a repeated check-in
         if rec is None or rec.state != "SPAWNING" or rec.spec.incarnation != msg.incarnation:
             return fail(COMPONENT, "check_in", "process was not being spawned", subject=str(msg.proc),
                         code="supervisor.unexpected_check_in")
@@ -341,12 +345,14 @@ class Supervisor:
 
     async def materialize(self, host: HostId, identity: Identity, files: dict[str, str]) -> Result[msgspec.Struct]:
         h = self.hosts[host]
-        return await self.client.call(h.agent, Materialize(identity, files), timeout=self.tun.rpc_timeout_s)
+        # every record: a stopped or lost process may still be started again from its spec
+        keep = sorted({i for p, rec in self.procs.items() if p.host == host for i in rec.snapshots})
+        return await self.client.call(h.agent, Materialize(identity, files, keep), timeout=self.tun.rpc_timeout_s)
 
     async def spawn(self, desired: DesiredProc, spec: ProcSpec) -> Result[None]:
         self._incarnation[desired.proc] = self._incarnation.get(desired.proc, 0) + 1
         spec = msgspec.structs.replace(spec, incarnation=self._incarnation[desired.proc])
-        rec = self.procs[desired.proc] = _Proc(desired, spec, "SPAWNING")
+        rec = self.procs[desired.proc] = _Proc(desired, spec, "SPAWNING", snapshots={spec.identity})
         r = await self.client.call(self.hosts[desired.proc.host].agent, Spawn(spec), timeout=self.tun.rpc_timeout_s)
         if isinstance(r, Failed):
             rec.state = "LOST"
@@ -372,8 +378,12 @@ class Supervisor:
             return Ok(None)
         rec.state = "STOPPING"
         r = await self.client.call(self.hosts[proc.host].agent,
-                                   Stop(proc, timeout_s if timeout_s is not None else self.tun.stop_timeout_s),
+                                   Stop(proc, timeout_s if timeout_s is not None else self.tun.stop_timeout_s,
+                                        rec.spec.incarnation),
                                    timeout=self.tun.rpc_timeout_s + (timeout_s or self.tun.stop_timeout_s))
+        if isinstance(r, Failed) and r.has_code("agent.stale_stop"):
+            rec.state = "STOPPED"  # this incarnation is not running there any more
+            return Ok(None)
         if isinstance(r, Failed):
             return r
         assert isinstance(r.value, Stopped)
@@ -407,14 +417,16 @@ class Supervisor:
         await self.stop(proc)
         return await self.spawn(*prev)
 
-    def committed(self, proc: ProcId, identity: Identity, plan_after: ProcessPlan | None) -> None:
-        """A participant changed in place and now serves ``identity``."""
+    def committed(self, proc: ProcId, identity: Identity, plan_after: ProcessPlan | None,
+                  snapshots: Iterable[Identity] = ()) -> None:
+        """A participant changed in place and now serves ``identity``, loading code from ``snapshots``."""
         rec = self.procs.get(proc)
         if rec is None:
             return
         plan = plan_after or rec.spec.plan
         rec.spec = msgspec.structs.replace(rec.spec, identity=identity,
                                            plan=msgspec.structs.replace(plan, identity=identity))
+        rec.snapshots = {identity, *(set(snapshots) or rec.snapshots)}
         self._previous.pop(proc, None)
 
     def forget(self, proc: ProcId) -> None:

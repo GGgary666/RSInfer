@@ -94,6 +94,8 @@ class Materialize(msgspec.Struct, frozen=True):
     identity: Identity
     files: dict[str, str]
     """Snapshot-relative path -> content hash."""
+    keep: list[Identity] = []
+    """Snapshots the processes on this host still load code from: never pruned."""
 
 
 class Materialized(msgspec.Struct, frozen=True):
@@ -116,6 +118,8 @@ class Spawned(msgspec.Struct, frozen=True):
 class Stop(msgspec.Struct, frozen=True):
     proc: ProcId
     timeout_s: float
+    incarnation: int
+    """Which process of this ProcId: a late Stop must not hit its successor."""
 
 
 class Stopped(msgspec.Struct, frozen=True):

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import signal
 from collections.abc import Callable
 from pathlib import Path
 
 from core.change.coordinator import PlanInput
-from core.change.types import ActionPlan, ProcActions, UnitAction
+from core.change.state import apply_changeset
+from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.ids import Identity, ProcId, UnitId
 from core.supervisor import desired_procs
 from tests.change.engine import ALL, SCHED, W0, W1, Engine, engine, reload_everywhere, run, wait_until
@@ -178,7 +182,7 @@ def test_a_participant_that_rolled_back_is_restarted_never_reported_committed(tm
                 assert e.versioned(p) == "versioned v2"
             for p in (SCHED, W0):
                 assert e.c.sup.local_pid(p) != pids[p]
-                assert ["op prepare", "op execute", "op abort"] == e.ops(p)[:3]  # the old process rolled back
+                assert e.ops(p) == ["op prepare", "op execute", "op abort"]  # the old process rolled back
             assert e.coord.log.events("commit_refused")
 
     run(main())
@@ -196,8 +200,41 @@ def test_when_the_restart_fails_too_the_result_is_failed_and_says_where_everyone
             assert sorted(where) == sorted(str(p) for p in ALL)
             on_old = [p for p in ALL if where[str(p)] == f"serves {old}"]
             assert len(on_old) == 1 and on_old[0] in (SCHED, W0)
+            current = [d for d in r.diagnostics if d.code == "change.current_identity"]
+            assert e.coord.identity == r.new_identity
+            assert f"the current identity is {r.new_identity}" in current[0].reason
             for p in ALL:
                 expected = old if p in on_old else r.new_identity
                 assert (await e.status(p)).identity == expected
+
+    run(main())
+
+
+def test_a_hung_participant_is_restarted_after_the_commit_ack_timeout(tmp_path: Path) -> None:
+    """§7 test 16: alive but not answering is not lost; the queue must not wait forever."""
+
+    async def main() -> None:
+        async with engine(tmp_path, coordinator_timeout_s=LEASE, keepalive_interval_s=BEAT, commit_ack_timeout_s=2.0,
+                          sup={"stop_timeout_s": 1.0}) as e:
+            cs = e.code_change()
+            new = e.coord.identity_fn(apply_changeset(e.coord.manifest, cs))
+            slow = restart_w1(e, init_delay_s=2.0)
+            e.planner.script = lambda inp: slow(inp) if inp.cs.files else ActionPlan(procs=[
+                ProcActions(p, config={"toyc.chunk": 4096}, leads_epochs=p == SCHED) for p in ALL])
+            change = asyncio.ensure_future(e.coord.submit(cs))
+            await wait_until(lambda: "op execute" in e.ops(W0))
+            hung = e.c.sup.local_pid(W0)
+            assert hung is not None
+            os.kill(hung, signal.SIGSTOP)  # like a rank stuck in NCCL: its agent still sees it running
+            follow = e.coord.enqueue(ChangeSet(base=new, config={"toyc.chunk": 4096}, source="config"))
+
+            r = await change
+            assert r.status == "committed", r.diagnostics
+            restarted = [d for d in r.diagnostics if d.code == "change.restarted_at_new_identity"]
+            assert [d.subject for d in restarted] == [str(W0)] and "change.commit_ack_timeout" in restarted[0].reason
+            assert W0 in r.restarted and e.c.sup.local_pid(W0) != hung
+            for p in ALL:
+                assert (await e.status(p)).identity == new
+            assert (await follow).status == "committed"
 
     run(main())

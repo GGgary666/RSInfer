@@ -1,6 +1,7 @@
 """Two-phase commit messages between the coordinator and participants (change.md §4.3).
 
-Every message carries the change id; participants answer duplicates idempotently.
+Every message carries the change id; participants answer duplicate and late
+messages idempotently (ipc.md §4).
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ class Execute(msgspec.Struct, frozen=True):
 class Executed(msgspec.Struct, frozen=True):
     change_id: int
     report: ReloadReport | None
+    diagnostics: list[Diagnostic] = []
 
 
 class Commit(msgspec.Struct, frozen=True):
@@ -71,6 +73,8 @@ class Resumed(msgspec.Struct, frozen=True):
     change_id: int
     identity: Identity
     rolled_back: bool = False
+    snapshots: list[Identity] = []
+    """Snapshots the process still loads code from; its node agent must keep them."""
 
 
 class KeepAlive(msgspec.Struct, frozen=True):

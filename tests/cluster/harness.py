@@ -90,12 +90,14 @@ class Op:
     """Takes part in changes as "toy.op"; args can make a phase fail.
 
     ``slices``: prepare in that many slices (``slice_s`` each, ``fail_slice`` raises);
-    ``prepare_s``: a one-shot prepare that takes that long.
+    ``prepare_s``: a one-shot prepare that takes that long; ``needs_prepare``: execute
+    fails unless this very instance was prepared.
     """
     def __init__(self, ctx, config):
         self.ctx, self.config = ctx, config
         self.left = 0
         self.never = False
+        self.prepared = False
 
     def _phase(self, name, args=None):
         log(self.config, self.ctx, f"op {name}")
@@ -103,6 +105,7 @@ class Op:
             raise RuntimeError(f"injected {name} failure")
 
     def prepare(self, args):
+        self.prepared = True
         self._phase("prepare", args)
         if "slices" in args:
             return self._slices(args)
@@ -116,7 +119,11 @@ class Op:
             time.sleep(args.get("slice_s", 0))
             yield
 
-    def execute(self, args): self._phase("execute", args)
+    def execute(self, args):
+        self._phase("execute", args)
+        if args.get("needs_prepare") and not self.prepared:
+            raise RuntimeError("executed on an instance that was never prepared")
+
     def commit(self): self._phase("commit")
     def abort(self): self._phase("abort")
 
@@ -219,6 +226,7 @@ class Cluster:
     blobs: BlobStore
     agents: dict[str, Agent] = field(default_factory=dict[str, Agent])
     losses: list[Loss] = field(default_factory=list[Loss])
+    agent_tunables: dict[str, float] = field(default_factory=lambda: dict(FAST))
 
     async def start_agent(self, host: str, platform: dict[str, object] | None = None) -> Agent:
         root = self.tmp / host / "snapshots"
@@ -227,7 +235,7 @@ class Cluster:
             sys.executable, "-m", "core.nodeagent", "--host", host, "--address", ADDRESS,
             "--supervisor", self.sup.address, "--root", str(root),
             "--platform", json.dumps(platform or {"name": "fake", "versions": {"driver": "0"}}),
-            "--tunables", json.dumps(FAST),
+            "--tunables", json.dumps(self.agent_tunables),
             env=env, start_new_session=True,
             stdout=open(self.tmp / f"agent-{host}.log", "wb"), stderr=asyncio.subprocess.STDOUT,
         )
@@ -272,14 +280,15 @@ def process_plan(d: DesiredProc, identity: Identity, values: dict[str, object]) 
 
 @asynccontextmanager
 async def cluster(tmp: Path, hosts: list[str], proc_tunables: dict[str, float] | None = None,
-                  **sup_tun: float) -> AsyncGenerator[Cluster]:
+                  agent_tunables: dict[str, float] | None = None, sup_tunables: dict[str, float] | None = None,
+                  ) -> AsyncGenerator[Cluster]:
     zctx = zmq.asyncio.Context()
     tun = SupervisorTunables(**{"heartbeat_timeout_s": 1.0, "monitor_interval_s": 0.05,
-                                "checkin_timeout_s": 30.0, "rpc_timeout_s": 10.0, **sup_tun})
+                                "checkin_timeout_s": 30.0, "rpc_timeout_s": 10.0, **(sup_tunables or {})})
     sup = Supervisor(zctx, host=HostId("host-a"), bind_address=ADDRESS, blobs=BlobStore(tmp / "blobs"),
                      tun=tun, proc_tunables={"host.idle_poll_s": 0.01, **(proc_tunables or {})})
     await sup.start()
-    c = Cluster(tmp, sup, sup.blobs)
+    c = Cluster(tmp, sup, sup.blobs, agent_tunables={**FAST, **(agent_tunables or {})})
     try:
         for h in hosts:
             await c.start_agent(h)
