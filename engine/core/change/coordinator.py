@@ -109,6 +109,7 @@ class _Run:
     stopped: list[ProcId] = field(default_factory=list[ProcId])
     """Stopped by the plan; the supervisor keeps their specs until commit, so abort can restart them."""
     old_topology: Topology | None = None
+    """The topology when the change started; abort puts it back."""
     timings: dict[str, float] = field(default_factory=dict[str, float])
     reports: dict[str, ReloadReport] = field(default_factory=dict[str, ReloadReport])
     diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
@@ -335,7 +336,7 @@ class Coordinator:
                 COMPONENT, "plan", "the change touches the framework core", code="escalate.restart_engine",
                 hint="restart the engine from the new source")], plan=plan))
         new_identity = old if cs.state_only else self.identity_fn(new_manifest)
-        run = _Run(cid, cs, plan, new_identity)
+        run = _Run(cid, cs, plan, new_identity, old_topology=self.sup.topology)
         run.timings["check+plan"] = time.monotonic() - t0
         self.log.record_identity(new_identity, new_manifest, old if old != EMPTY else None)
         self._running = run
@@ -447,7 +448,6 @@ class Coordinator:
                 if e.report is not None:
                     run.reports[str(proc)] = e.report
         topo = run.plan.topology or self.sup.topology
-        run.old_topology = self.sup.topology
         for proc in run.plan.stop:
             run.stopped.append(proc)
             r = await self.sup.stop(proc)

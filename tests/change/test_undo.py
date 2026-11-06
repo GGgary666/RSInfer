@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from core.change.coordinator import PlanInput
 from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.ids import UnitId
@@ -49,24 +51,35 @@ def test_snapshots_the_processes_still_load_code_from_are_not_pruned(tmp_path: P
     run(main())
 
 
-def test_abort_starts_processes_the_change_stopped_and_restores_the_topology(tmp_path: Path) -> None:
+TOPOLOGY_ABORTS = ["after_prepare", "after_pause", "participant_execute", "after_execute"]
+
+
+@pytest.mark.parametrize("where", TOPOLOGY_ABORTS)
+def test_abort_restores_the_topology_and_the_processes_the_change_stopped(tmp_path: Path, where: str) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:
             old = e.coord.identity
             before = e.c.sup.topology
             smaller = topology(tmp_path, ["host-a", "host-b"], ["host-a"],
                                [role("sched", UNITS, hosts=["host-a"]), role("worker", UNITS)])
+            fail_w0 = [UnitAction(UnitId("toyc.tunable"), "toy.op", {"fail_at": "execute"})] \
+                if where == "participant_execute" else []
             e.planner.script = lambda inp: ActionPlan(
-                procs=[ProcActions(SCHED, leads_epochs=True), ProcActions(W0)], stop=[W1], topology=smaller)
+                procs=[ProcActions(SCHED, leads_epochs=True), ProcActions(W0, actions=fail_w0)], stop=[W1],
+                topology=smaller)
             pid = e.c.sup.local_pid(W1)
-            e.coord.faults.add("after_execute")
+            if where != "participant_execute":
+                e.coord.faults.add(where)
             r = await e.coord.submit(ChangeSet(base=old, topology=smaller))
             assert r.status == "aborted"
-            assert "change.restarted_after_abort" in {d.code for d in r.diagnostics}
-            assert e.c.sup.proc_state(W1) == "RUNNING" and e.c.sup.local_pid(W1) != pid
-            assert (await e.status(W1)).identity == old
             assert e.c.sup.topology == before
+            assert e.c.sup.proc_state(W1) == "RUNNING" and (await e.status(W1)).identity == old
+            stopped = where == "after_execute"  # only then had the change stopped W1
+            assert (e.c.sup.local_pid(W1) != pid) == stopped
+            assert ("change.restarted_after_abort" in {d.code for d in r.diagnostics}) == stopped
 
+            e.planner.script = lambda inp: ActionPlan(
+                procs=[ProcActions(SCHED, leads_epochs=True), ProcActions(W0)], stop=[W1], topology=smaller)
             r = await e.coord.submit(ChangeSet(base=old, topology=smaller))
             assert r.status == "committed", r.diagnostics
             assert e.c.sup.proc_state(W1) is None and e.c.sup.topology == smaller
