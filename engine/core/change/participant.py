@@ -302,8 +302,11 @@ class Participant:
                 self._abort_failed(ua, e)
         c.prepared_actions.clear()
         if c.undo.old_config:  # before the old units are built again: they read these values
-            self.rt.config.stage(c.undo.old_config)
-            self.rt.config.commit()
+            restored = self.rt.config.stage(c.undo.old_config)
+            if isinstance(restored, Failed):
+                self.diagnostics += restored.diagnostics
+            else:
+                self.diagnostics += self.rt.config.commit().hook_failures
             c.undo.old_config = {}
         if c.undo.reverse_reload is not None:
             r = self.rt.reload(self._with_fresh_modules(c.undo))
@@ -446,6 +449,12 @@ class Participant:
                 self._handler(ua).execute(ua.args)
         except Exception as e:  # noqa: BLE001
             self._undo(c)  # Abort acknowledges the undo, or reports that recovery is required
+            if isinstance(e, _Failed):
+                # reload() can fail to restore its old instances before returning Failed.
+                # Finish the participant's cleanup, then keep that rollback failure sticky.
+                rollback_errors = [d for d in e.failed.diagnostics if d.phase == "rollback" and d.severity == "error"]
+                self.diagnostics += rollback_errors
+                c.undo_diags += rollback_errors
             c.phase = "undone"
             return e.failed if isinstance(e, _Failed) else self._fail("execute", e)
         c.phase = "executed"
