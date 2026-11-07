@@ -95,7 +95,7 @@
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、状态单元的变更（`state-changes.md`：排空与版本迁移，只有规格）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
 - `doc/archive/`：旧版文档，不再维护。
