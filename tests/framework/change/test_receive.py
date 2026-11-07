@@ -154,3 +154,44 @@ def test_a_check_or_plan_that_raises_ends_the_change_as_failed(tmp_path: Path, s
         assert status == "failed" and finished is not None
 
     asyncio.run(main())
+
+
+def test_pruning_between_changes_is_batched_and_rate_limited(tmp_path: Path) -> None:
+    """change.md §5.1: pruning gives the event loop back between batches (RPCs and heartbeats go on)
+    and runs at most every ``change.blob_prune_interval_s``."""
+
+    async def main() -> None:
+        c = coordinator(tmp_path, blob_grace_s=0.0, blob_prune_batch=2, blob_prune_interval_s=3600.0)
+        for n in range(5):
+            c.log.blobs.put(f"no longer referenced {n}\n".encode())
+        ticks = 0
+
+        async def other_work() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        t = asyncio.create_task(other_work())
+        await asyncio.sleep(0)
+        before = ticks
+        assert await c.prune_if_due() == 5
+        assert ticks - before >= 2  # it ran between the three batches
+        c.log.blobs.put(b"uploaded after the pass\n")
+        assert await c.prune_if_due() == 0  # not due again yet
+        t.cancel()
+
+    asyncio.run(main())
+
+
+def test_a_queued_change_goes_before_the_rest_of_the_pruning(tmp_path: Path) -> None:
+    async def main() -> None:
+        c = coordinator(tmp_path, blob_grace_s=0.0, blob_prune_batch=2)
+        for n in range(5):
+            c.log.blobs.put(f"no longer referenced {n}\n".encode())
+        c.enqueue(ChangeSet(base=BASE, config={"k": 1}))  # waits: no worker runs here
+        assert await c.prune_if_due() == 2  # one batch, then the change's turn
+        assert await c.prune_if_due() == 2  # still due: the next pass carries on
+        assert len(c.log.blobs.hashes()) == 1
+
+    asyncio.run(main())

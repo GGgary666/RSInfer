@@ -162,11 +162,14 @@ class Coordinator:
         if self.tun.commit_attempts < 1 or self.tun.commit_retry_interval_s < 0 \
                 or not 0 < self.tun.commit_ack_timeout_s < float("inf"):
             raise ValueError("commit limits must be positive and finite; retry interval must be nonnegative")
+        if self.tun.blob_prune_batch < 1 or self.tun.blob_prune_interval_s < 0:
+            raise ValueError("change.blob_prune_batch must be positive, change.blob_prune_interval_s nonnegative")
         self.recovery_required = False
         self.identity: Identity = EMPTY
         self.manifest = IdentityManifest()
         self.state_version = 0
         self.queue = ChangeQueue()
+        self._prune_due_at = 0.0
         self.faults = Faults()
         """Fault points for tests (``core.change.faults.POINTS``)."""
         self.busy = False
@@ -244,7 +247,7 @@ class Coordinator:
                 self.busy = False
             self._deliver(item.data["future"], result)
             try:
-                self.prune_blobs()
+                await self.prune_if_due()
             except Exception as e:  # noqa: BLE001 - retention must not stop the queue
                 self.log.event(None, "prune_failed", {"error": f"{type(e).__name__}: {e}"})
 
@@ -648,14 +651,32 @@ class Coordinator:
 
     # ------------------------------------------------------------ retention
 
-    def prune_blobs(self) -> int:
+    def prune_blobs(self, limit: int | None = None) -> int:
         """Blob retention (§5.1): keeps the current identity, the one being prepared, the
         ``change.blob_retention`` most recent ones, the contents of queued changes, and
-        every blob younger than ``change.blob_grace_s``. Runs after every change; returns
-        how many blobs were deleted."""
+        every blob younger than ``change.blob_grace_s``. Deletes at most ``limit`` blobs;
+        returns how many it deleted."""
         keep = [self.identity, *([self._running.identity] if self._running else [])]
         queued = {h for item in self.queue.items() for h in _blobs_of(item.cs)}
-        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s)
+        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s, limit=limit)
+
+    async def prune_if_due(self) -> int:
+        """Retention between changes, without holding up the control plane: at most every
+        ``change.blob_prune_interval_s``, in batches of ``change.blob_prune_batch`` with the event
+        loop free in between (RPCs and heartbeats go on). A queued change goes first; the rest
+        is pruned after it. Each batch decides afresh what to keep."""
+        if time.monotonic() < self._prune_due_at:
+            return 0
+        removed = 0
+        while True:
+            n = self.prune_blobs(limit=self.tun.blob_prune_batch)
+            removed += n
+            if n < self.tun.blob_prune_batch:
+                self._prune_due_at = time.monotonic() + self.tun.blob_prune_interval_s
+                return removed
+            await asyncio.sleep(0)
+            if len(self.queue):
+                return removed  # still due: the next pass carries on
 
     # ------------------------------------------------------------- startup
 

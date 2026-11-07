@@ -23,3 +23,7 @@ class ChangeTunables(msgspec.Struct, frozen=True):
     """Blobs of this many recent identities survive ``Coordinator.prune_blobs``."""
     blob_grace_s: float = 3600.0
     """Blobs younger than this are never pruned: agents upload before they submit."""
+    blob_prune_interval_s: float = 300.0
+    """Between changes, blobs are pruned at most this often (§5.1)."""
+    blob_prune_batch: int = 500
+    """Blobs deleted per batch; the event loop runs between batches, and a queued change goes first."""
