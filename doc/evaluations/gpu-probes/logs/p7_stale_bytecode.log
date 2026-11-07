@@ -1,0 +1,1 @@
+RESULT {"wrote": [1, 2, 3], "imported": [1, 1, 3], "same_second_rewrite_imports_stale_code": true, "without_bytecode_cache": [1, 2], "python": "3.12.3"}

@@ -1,0 +1,20 @@
+ROW {"it": 0, "decode_ok": true, "import_ms": 2921.0, "decode_first_call_ms": 990.7, "capture_ms": 105.2, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 1, "decode_ok": true, "import_ms": 765.1, "decode_first_call_ms": 6.8, "capture_ms": 86.8, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 2, "decode_ok": true, "import_ms": 765.3, "decode_first_call_ms": 7.3, "capture_ms": 111.1, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 3, "decode_ok": true, "import_ms": 779.6, "decode_first_call_ms": 6.7, "capture_ms": 100.0, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 4, "decode_ok": true, "import_ms": 773.8, "decode_first_call_ms": 6.7, "capture_ms": 99.0, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 5, "decode_ok": true, "import_ms": 770.3, "decode_first_call_ms": 6.7, "capture_ms": 115.3, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 6, "decode_ok": true, "import_ms": 767.0, "decode_first_call_ms": 6.8, "capture_ms": 186.2, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 7, "decode_ok": true, "import_ms": 822.7, "decode_first_call_ms": 6.7, "capture_ms": 101.5, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 8, "decode_ok": true, "import_ms": 789.2, "decode_first_call_ms": 7.0, "capture_ms": 104.5, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 9, "decode_ok": true, "import_ms": 767.9, "decode_first_call_ms": 6.3, "capture_ms": 87.0, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}
+RESULT {"mode": "fla", "iterations": 10, "error": null, "all_ok": true, "first": {"it": 0, "decode_ok": true, "import_ms": 2921.0, "decode_first_call_ms": 990.7, "capture_ms": 105.2, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}, "last": {"it": 9, "decode_ok": true, "import_ms": 767.9, "decode_first_call_ms": 6.3, "capture_ms": 87.0, "new_ops": 52, "alloc_mb": 205.8, "reserved_mb": 216.0}, "threads": 67}
+ROW {"started": "first chunk_gated_delta_rule call"}
+RESULT {"mode": "fla_prefill", "timed_out_after_s": 600}
+RESULT {"mode": "fla_stale_graph", "ok_before_purge": true, "ok_after_purge": true, "error": null, "fla_modules_left": 0}
+2026-11-08 02:32:23,592 - INFO - core.py:635 - flashinfer.jit: Building JIT module batch_prefill_with_kv_cache_dtype_q_bf16_dtype_kv_bf16_dtype_o_bf16_dtype_idx_i32_head_dim_qk_256_head_dim_vo_256_posenc_0_use_swa_False_use_logits_cap_False_f16qk_False_kv_stride_equal; this can take several minutes on first use.
+ROW {"it": 0, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 506.1, "plan_and_first_run_ms": 19554.1, "capture_ms": 58.6, "replan_ms": 0.4, "new_ops": 5, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 1, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 336.5, "plan_and_first_run_ms": 26.7, "capture_ms": 54.8, "replan_ms": 0.3, "new_ops": 5, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 2, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 277.6, "plan_and_first_run_ms": 25.5, "capture_ms": 75.5, "replan_ms": 0.2, "new_ops": 5, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 3, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 281.6, "plan_and_first_run_ms": 25.2, "capture_ms": 90.4, "replan_ms": 0.2, "new_ops": 5, "alloc_mb": 648.7, "reserved_mb": 662.0}
+RESULT {"mode": "flashinfer", "iterations": 4, "error": null, "threads": 66}
