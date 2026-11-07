@@ -6,7 +6,7 @@
 
 清理后检查 change-set 元数据是否存在，并检查其引用的非删除文件与 artifact blob；任一缺失即标记 content_purged。保留原有宽限期及保留规则，删除文件的 None 值不作为 blob hash。
 
-仅修改一个生产文件：`engine/core/change/eventlog.py`。新增 `tests/adversarial/test_retention_content_flags.py` 和本文。fix、加强测试、文档放在同一个提交中。
+仅修改一个生产文件：`engine/core/change/eventlog.py`。新增 `tests/framework/adversarial/test_retention_content_flags.py` 和本文。fix、加强测试、文档放在同一个提交中。
 
 ## A/B/C 实测
 
@@ -29,16 +29,16 @@ A/B/C 使用相同的初始及加强测试；没有 xfail、skip 或放宽原断
 在对应 worktree 的项目环境中执行初始测试：
 
 ```sh
-python -m pytest tests/adversarial/test_retention_evidence.py -q -k 'aborted_change'
+python -m pytest tests/framework/adversarial/test_retention_evidence.py -q -k 'aborted_change'
 ```
 
 执行初始及加强测试：
 
 ```sh
-python -m pytest tests/adversarial/test_retention_evidence.py tests/adversarial/test_retention_content_flags.py -q -k 'aborted_change or purge_flags'
+python -m pytest tests/framework/adversarial/test_retention_evidence.py tests/framework/adversarial/test_retention_content_flags.py -q -k 'aborted_change or purge_flags'
 ```
 
-四项修复在 `gw/framework-base/adversarial-fixes` 集成验证，完整反例集命令为 `python -m pytest tests/adversarial -q`。
+四项修复在 `gw/framework-base/adversarial-fixes` 集成验证，完整反例集命令为 `python -m pytest tests/framework/adversarial -q`。
 
 本次依用户授权在 macOS / CPython 3.12.13 本地验证；没有添加非 Linux 兼容代码。Linux 验收仍需 CI。协议用例使用真实 Participant/UnitRuntime，并保留 PR #9 中的真实 RPC 用例；它们不依赖快照目录 rename 的平台适配。既有平台失败不作为本修复的产品缺陷。
 
