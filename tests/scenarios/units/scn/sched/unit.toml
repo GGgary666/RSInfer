@@ -1,0 +1,21 @@
+[unit]
+id = "scn.sched"
+kind = "logic"
+process = ["sched"]
+entry = "scn.sched.unit:Unit"
+
+[provides]
+services = ["proc.loop@1", "scn.policies@1"]
+
+[requires]
+services = ["scn.requests@1"]
+optional = ["scn.balancer@1"]
+
+[config]
+"scn.chunk" = { type = "int", default = 1, binding = "live" }
+
+[reads]
+config = ["scn.log_dir"]
+
+[capabilities]
+accept_config = true

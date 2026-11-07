@@ -1,0 +1,20 @@
+[unit]
+id = "scn.balancer"
+kind = "logic"
+process = ["sched"]
+entry = "scn.balancer.unit:Unit"
+
+[provides]
+services = ["scn.balancer@1"]
+
+[requires]
+services = ["proc.control@1"]
+
+[config]
+"scn.rebalance" = { type = "int", default = 0, binding = "live" }
+
+[reads]
+config = ["scn.log_dir"]
+
+[capabilities]
+accept_config = true

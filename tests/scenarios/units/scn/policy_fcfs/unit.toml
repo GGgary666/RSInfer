@@ -1,0 +1,11 @@
+[unit]
+id = "scn.policy_fcfs"
+kind = "logic"
+process = ["sched"]
+entry = "scn.policy_fcfs.unit:Unit"
+
+[requires]
+services = ["scn.policies@1"]
+
+[reads]
+config = ["scn.log_dir"]

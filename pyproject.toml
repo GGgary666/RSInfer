@@ -27,6 +27,9 @@ testpaths = ["tests"]
 pythonpath = ["engine", "."]
 addopts = "-ra --ignore=tests/framework/formal"
 timeout = 120
+markers = [
+    "covers(edges=(), ladder=(), kinds=()): what a test exercises, for the coverage check (tests/scenarios/coverage.py)",
+]
 
 [tool.pyright]
 include = ["engine", "tests"]

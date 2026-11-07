@@ -1,0 +1,14 @@
+[unit]
+id = "scn.worker"
+kind = "logic"
+process = ["worker"]
+entry = "scn.worker.unit:Unit"
+
+[provides]
+services = ["proc.loop@1"]
+
+[requires]
+services = ["scn.plan@1"]
+
+[reads]
+config = ["scn.log_dir"]
