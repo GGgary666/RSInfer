@@ -1,0 +1,8 @@
+[unit]
+id = "core.identity"
+kind = "logic"
+process = ["control"]
+entry = "core.identity.unit:Unit"
+
+[provides]
+services = ["ctrl.identity@1"]

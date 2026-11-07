@@ -1,0 +1,12 @@
+[unit]
+id = "core.api"
+kind = "logic"
+process = ["control"]
+entry = "core.api.unit:Unit"
+
+[provides]
+services = ["ctrl.api@1"]
+
+[requires]
+services = ["ctrl.change@1", "ctrl.supervisor@1", "ctrl.blobs@1", "ctrl.events@1", "ctrl.self@1"]
+optional = ["ctrl.identity@1", "ctrl.manifest@1"]

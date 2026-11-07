@@ -1,0 +1,11 @@
+[unit]
+id = "core.deps"
+kind = "logic"
+process = ["control"]
+entry = "core.deps.unit:Unit"
+
+[provides]
+services = ["ctrl.deps@1"]
+
+[requires]
+services = ["ctrl.self@1", "ctrl.supervisor@1"]
