@@ -78,6 +78,21 @@ class Planner(Protocol):
     def plan(self, inp: PlanInput) -> Awaitable[Result[ActionPlan]]: ...
 
 
+class LocalParticipant(Protocol):
+    """The control-plane process itself, for ``ActionPlan.control`` (its control-plane units).
+    The coordinator runs one change at a time, so between two of its steps the control
+    process is at a safe point; there is nothing to pause."""
+
+    def prepare(self, change_id: int, identity: Identity, actions: ProcActions,
+                files: dict[str, str]) -> Awaitable[Result[None]]: ...
+
+    def execute(self, change_id: int) -> Result[None]: ...
+
+    def commit(self, change_id: int) -> None: ...
+
+    def abort(self, change_id: int) -> list[Diagnostic]: ...
+
+
 class AcceptAll:
     async def check(self, inp: PlanInput) -> Result[None]:
         return Ok(None)
@@ -132,12 +147,14 @@ class Coordinator:
     def __init__(
         self, supervisor: Supervisor, log: EventLog, *, planner: Planner, checker: Checker | None = None,
         identity_fn: IdentityFn = identity_of, tun: ChangeTunables | None = None,
+        local: LocalParticipant | None = None,
     ) -> None:
         self.sup = supervisor
         self.log = log
         self.planner = planner
         self.checker = checker or AcceptAll()
         self.identity_fn = identity_fn
+        self.local = local
         self.tun = tun or ChangeTunables()
         if self.tun.commit_attempts < 1 or self.tun.commit_retry_interval_s < 0 \
                 or not 0 < self.tun.commit_ack_timeout_s < float("inf"):
@@ -334,14 +351,21 @@ class Coordinator:
         if isinstance(planned, Failed):
             return self._done(cid, self._result("failed", cid, cs, None, None, planned.diagnostics))
         plan = planned.value
-        if item.dry_run:
-            return self._done(cid, self._result("planned", cid, cs, None, None, [], plan=plan))
-        if plan.restart_engine:
+        notes = [*checked.diagnostics, *planned.diagnostics]  # warnings found on the way
+        try:
+            new_identity = old if cs.state_only else self.identity_fn(new_manifest)
+        except Exception as e:  # noqa: BLE001 - the identity comes from a unit (core.identity)
             return self._done(cid, self._result("failed", cid, cs, None, None, [diag(
+                COMPONENT, "identity", f"cannot compute the identity: {type(e).__name__}: {e}",
+                code="change.no_identity")], plan=plan))
+        if item.dry_run:
+            return self._done(cid, self._result("planned", cid, cs, new_identity, None, notes, plan=plan))
+        if plan.restart_engine:
+            return self._done(cid, self._result("failed", cid, cs, None, None, [*notes, diag(
                 COMPONENT, "plan", "the change touches the framework core", code="escalate.restart_engine",
                 hint="restart the engine from the new source")], plan=plan))
-        new_identity = old if cs.state_only else self.identity_fn(new_manifest)
         run = _Run(cid, cs, plan, new_identity, old_topology=self.sup.topology)
+        run.diags += notes
         run.timings["check+plan"] = time.monotonic() - t0
         self.log.record_identity(new_identity, new_manifest, old if old != EMPTY else None)
         self._running = run
@@ -426,6 +450,13 @@ class Coordinator:
         errors = [d for r in results if isinstance(r, Failed) for d in r.diagnostics]
         if errors:
             raise _Abort(errors)
+        if run.plan.control is not None:
+            if self.local is None:
+                raise _Abort([diag(COMPONENT, "prepare", "the plan changes the control plane, which has no "
+                                   "local participant here", code="change.no_control_plane")])
+            local = await self.local.prepare(run.id, run.identity, run.plan.control, manifest.files)
+            if isinstance(local, Failed):
+                raise _Abort(local.diagnostics)
         run.lap("prepare")
 
     async def _pause(self, run: _Run) -> None:
@@ -476,6 +507,10 @@ class Coordinator:
                 raise _Abort(r.diagnostics)
         if run.plan.topology is not None:
             self.sup.topology = run.plan.topology
+        if run.plan.control is not None and self.local is not None:
+            local = self.local.execute(run.id)
+            if isinstance(local, Failed):
+                raise _Abort(local.diagnostics)
         run.lap("execute")
 
     async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool,
@@ -523,6 +558,8 @@ class Coordinator:
     async def _commit(self, run: _Run) -> tuple[ChangeStatus, list[Diagnostic]]:
         self.recovery_required = True
         self.log.decide(run.id, "commit")  # QueryDecision must see the same durable decision.
+        if run.plan.control is not None and self.local is not None:
+            self.local.commit(run.id)
         self.log.event(run.id, "commit_decided", {"identity": run.identity,
                        "participants": [str(pa.proc) for pa in run.prepared]})
         if self._take("delay_commit"):
@@ -557,6 +594,8 @@ class Coordinator:
     async def _abort(self, run: _Run) -> list[Diagnostic]:
         self.log.decide(run.id, "abort")  # before any Abort leaves
         out: list[Diagnostic] = []
+        if run.plan.control is not None and self.local is not None:
+            out += self.local.abort(run.id)
         if self._take("skip_abort"):
             self.recovery_required = True
             out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))

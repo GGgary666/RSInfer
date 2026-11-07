@@ -55,7 +55,7 @@ from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
 from core.context.config import ConfigCommit, ConfigEntry
 from core.ipc.rpc import Deferred
-from unit.runtime.types import ReloadPlan, ReloadReport, UnitSpec
+from unit.runtime.types import ReloadPlan, ReloadReport
 
 if TYPE_CHECKING:
     from unit.runtime.host import ProcessHost
@@ -484,17 +484,7 @@ class Participant:
         return plan
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:
-        """The reload that puts this process back: old specs, and the config they had."""
-        old_reload = [s for u in plan.units_to_reload if (s := self.rt.spec_of(u.id)) is not None]
-        removed: list[UnitSpec] = [s for u in plan.units_to_remove if (s := self.rt.spec_of(u)) is not None]
-        added = [UnitId(s.id) for s in plan.units_to_add]
-        staged = [UnitId(u.unit) for u in self.rt.snapshot().units if u.staged]
-        owners = {*(s.id for s in old_reload), *(s.id for s in removed)}
-        config = {k: e for k, e in self.rt.config.entries().items() if e.owner in owners or k in plan.config}
-        return ReloadPlan(
-            changed_modules=plan.changed_modules, units_to_reload=old_reload, units_to_add=removed,
-            units_to_remove=sorted(set(added) | set(staged)), new_code_root=self.rt.code_root, config=config,
-        )
+        return self.rt.reverse_plan(plan)
 
     # ---------------------------------------------------- commit / abort
 

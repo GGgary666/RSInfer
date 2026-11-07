@@ -39,6 +39,7 @@ from unit.runtime.imports import ImportGraph, scan_root
 from unit.runtime.proxy import Provision, ServiceProxy
 from unit.runtime.registry import leftovers, running_as
 from unit.runtime.types import (
+    DerivedArtifact,
     InstanceInfo,
     InstanceState,
     ProcessPlan,
@@ -52,6 +53,9 @@ COMPONENT = "unit.runtime"
 
 ESCALATE_PROCESS = "escalate.restart_process"
 ESCALATE_ENGINE = "escalate.restart_engine"
+
+HOST_UNIT = UnitId("host")
+"""The owner of services the process host provides (``provide_host``)."""
 
 
 @dataclass
@@ -159,6 +163,7 @@ class UnitRuntime:
         self._load_log: list[UnitId] = []
         self._unload_log: list[UnitId] = []
         self._actions: dict[tuple[UnitId, str], tuple[InstanceId, object]] = {}
+        self._derived: dict[tuple[UnitId, str], tuple[InstanceId, DerivedArtifact]] = {}
 
     # ------------------------------------------------------------------ API
 
@@ -168,6 +173,7 @@ class UnitRuntime:
                 root = _resolve(plan.code_root)
                 if root not in sys.path:
                     sys.path.insert(0, root)
+                self._prefer_root(root)
                 self._code_root = root
                 self._add_root(root)
             r = self.config.declare_entries(plan.config)
@@ -233,6 +239,17 @@ class UnitRuntime:
         with self._operation():
             self._settle()
 
+    def provide_host(self, name: str, obj: object) -> None:
+        """A service the process host itself offers units (``ctrl.*``, ``proc.*``): owned by no
+        unit, never unloaded. Units waiting for it load at the next safe point."""
+        if name in self._services:
+            raise ServiceConflictError(f"{name!r} is already provided by {self._services[name].owner}")
+        self._services[name] = Provision(name, InstanceId(self.proc, HOST_UNIT, 0), obj)
+
+    def derived(self) -> list[DerivedArtifact]:
+        """Derived artifacts registered by the units loaded now."""
+        return [a for _, a in sorted(self._derived.values(), key=lambda e: (e[1].owner, e[1].name))]
+
     def lookup(self, service: str) -> Any | None:
         """For the process host: a proxy to the current provider, without a dependency edge."""
         prov = self._services.get(service)
@@ -253,6 +270,20 @@ class UnitRuntime:
         unloaded = {s.id for s in self._unload_order(self._slots[u] for u in direct if u in self._slots)}
         added = {s.id for s in plan.units_to_add if s.id not in self._slots or not self._slots[s.id].staged}
         return direct | unloaded | added
+
+    def reverse_plan(self, plan: ReloadPlan) -> ReloadPlan:
+        """The reload that puts this process back after ``plan``: the old specs, and the
+        config they had. Take it before ``plan`` (and its new config values) take effect."""
+        old_reload = [s for u in plan.units_to_reload if (s := self.spec_of(u.id)) is not None]
+        removed = [s for u in plan.units_to_remove if (s := self.spec_of(u)) is not None]
+        added = [UnitId(s.id) for s in plan.units_to_add]
+        staged = [s.id for s in self._slots.values() if s.staged]
+        owners = {*(s.id for s in old_reload), *(s.id for s in removed)}
+        config = {k: e for k, e in self.config.entries().items() if e.owner in owners or k in plan.config}
+        return ReloadPlan(
+            changed_modules=plan.changed_modules, units_to_reload=old_reload, units_to_add=removed,
+            units_to_remove=sorted(set(added) | set(staged)), new_code_root=self._code_root, config=config,
+        )
 
     def spec_of(self, unit: str) -> UnitSpec | None:
         slot = self._slots.get(UnitId(unit))
@@ -313,6 +344,19 @@ class UnitRuntime:
         d = diag(COMPONENT, phase, reason, subject=subject, code=code, hint=hint, severity=severity)
         self._diags.append(d)
         return d
+
+    def _prefer_root(self, root: str) -> None:
+        """Packages imported before from elsewhere look in ``root`` first, so modules not loaded yet come
+        from the snapshot. A no-op in processes started from the snapshot; in the control plane its own
+        framework code was imported where it was started, and its units must still come from snapshots."""
+        for name, mod in list(sys.modules.items()):
+            path = getattr(mod, "__path__", None)
+            if not isinstance(path, list):
+                continue
+            directory = os.path.join(root, *name.split("."))
+            if os.path.isfile(os.path.join(directory, "__init__.py")) and directory not in path:
+                path.insert(0, directory)
+        importlib.invalidate_caches()
 
     def _add_root(self, root: str) -> None:
         if root not in self._roots:
@@ -399,6 +443,22 @@ class UnitRuntime:
             if slot.instance == prov.owner:
                 slot.provisions.pop(prov.name, None)
                 slot.staged_provisions.pop(prov.name, None)
+
+    def _add_derived(self, slot: _Slot, artifact: DerivedArtifact) -> Callable[[], None] | None:
+        """Records ``artifact``; returns its undo the first time, ``None`` when it replaces a record."""
+        assert slot.instance is not None
+        key = (slot.id, artifact.name)
+        first = key not in self._derived or self._derived[key][0] != slot.instance
+        self._derived[key] = (slot.instance, artifact)
+        if not first:
+            return None
+
+        def remove() -> None:
+            entry = self._derived.get(key)
+            if entry is not None and entry[0] == slot.instance:
+                del self._derived[key]
+
+        return remove
 
     def _add_action(self, slot: _Slot, name: str, handler: object) -> Callable[[], None]:
         assert slot.instance is not None
@@ -522,6 +582,7 @@ class UnitRuntime:
                 self._revoke(prov)
         left += [f"config hook {k}" for k in self.config.hooks_of(inst)]
         left += [f"action {n}" for (_, n), (owner, _) in self._actions.items() if owner == inst]
+        left += [f"derived {a.name}" for owner, a in self._derived.values() if owner == inst]
         left += self.resources.held_by(inst)
         left += leftovers(inst)
         if left:

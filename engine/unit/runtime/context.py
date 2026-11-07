@@ -6,7 +6,7 @@ instance; unloading runs them in reverse order (unit-runtime.md §5).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +25,7 @@ from unit.runtime.errors import (
 )
 from unit.runtime.proxy import ServiceProxy
 from unit.runtime.registry import running_as
-from unit.runtime.types import InstanceState
+from unit.runtime.types import DerivedArtifact, InstanceState
 
 if TYPE_CHECKING:
     from unit.runtime.runtime import UnitRuntime, _Slot
@@ -170,6 +170,22 @@ class UnitContext:
         buf, release = self._rt.resources.lease_buffer(self.instance, name, factory)
         self._record(f"lease_buffer({name})", release)
         return buf
+
+    def derived(self, name: str, *, rebuild: str, config: Iterable[str] = (), units: Iterable[str] = ()) -> None:
+        """Register a derived artifact this unit built (a plan, a graph, a cached table).
+
+        ``config``: keys recorded into it by value (for a graph, the ``config`` entries of
+        ``graph.values``); ``units``: units whose code it was built with; ``rebuild``: the
+        ``ctx.on_action`` that rebuilds it next to the old one. ``core.deps`` reads these
+        to decide what an upstream change rebuilds (modules.html, "派生"). Registering the
+        same name again (after a rebuild) replaces the record.
+        """
+        self._check_live()
+        artifact = DerivedArtifact(self.id, name, rebuild, sorted(set(config)),
+                                   sorted(UnitId(u) for u in set(units)))
+        undo = self._rt._add_derived(self._slot, artifact)
+        if undo is not None:
+            self._record(f"derived({name})", undo)
 
     @contextmanager
     def plan_scope(self, plan_id: str) -> Generator[None]:

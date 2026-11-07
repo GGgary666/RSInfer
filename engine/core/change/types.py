@@ -27,6 +27,15 @@ class ChangeMeta(msgspec.Struct, frozen=True):
     """Responds to a lost process or machine: goes to the front of the queue."""
 
 
+class StateRequest(msgspec.Struct, frozen=True):
+    """Ask the state units ``unit`` to change what they hold, through their own action
+    (``migrate`` for EPLB): state contents, not part of what the system is."""
+
+    unit: UnitId
+    action: str
+    args: dict[str, Any] = {}
+
+
 class ChangeSet(msgspec.Struct, frozen=True):
     base: Identity
     files: dict[str, str | None] = {}
@@ -41,6 +50,8 @@ class ChangeSet(msgspec.Struct, frozen=True):
     """Internal changes: the identity they were computed under; stale ones are dropped."""
     state_only: bool = False
     """Internal changes that only change state contents (EPLB): no new identity."""
+    state: list[StateRequest] = []
+    """State requests; the only content a ``state_only`` change may carry."""
 
 
 class UnitAction(msgspec.Struct, frozen=True):
@@ -77,6 +88,8 @@ class ActionPlan(msgspec.Struct, frozen=True):
     """The plan ``core.deps`` derives; ``--dry-run`` returns it, and it is what runs."""
 
     procs: list[ProcActions] = []
+    control: ProcActions | None = None
+    """For the control-plane process itself (its control-plane units), run by the coordinator."""
     spawn: list[ProcessPlan] = []
     """New processes (startup, topology changes)."""
     stop: list[ProcId] = []

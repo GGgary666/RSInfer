@@ -174,6 +174,10 @@ class ConfigStore:
         """Put declarations back as ``entries()`` returned them (reload rollback)."""
         self._keys = {k: _Key(e.owner, e.decl, e.value) for k, e in entries.items()}
 
+    def value(self, key: str) -> Any:
+        """The current value, without recording a read."""
+        return self._key(key).value
+
     def owner_of(self, key: str) -> UnitId | None:
         k = self._keys.get(key)
         return k.owner if k else None
@@ -344,6 +348,13 @@ class ConfigView:
 
     def get(self, key: str) -> Any:
         return self[key]
+
+    def peek(self, key: str) -> Any:
+        """The current value without recording a read: for re-checking a dependency that was
+        recorded already (a graph built from a value given in a change's action args)."""
+        if key not in self._allowed:
+            raise UndeclaredConfigKey(f"{self._reader.unit} peeks at {key!r}, which is not in its manifest")
+        return self._store.value(key)
 
     def keys(self) -> frozenset[str]:
         return self._allowed
