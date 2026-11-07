@@ -116,3 +116,41 @@ def test_queued_artifacts_survive_pruning_and_missing_ones_are_refused(tmp_path:
             c.close()
 
     asyncio.run(main())
+
+
+class Raises:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def check(self, inp: PlanInput) -> Result[None]:
+        raise self.error
+
+    async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
+        raise self.error
+
+
+@pytest.mark.parametrize("stage", ["check", "plan"])
+def test_a_check_or_plan_that_raises_ends_the_change_as_failed(tmp_path: Path, stage: str) -> None:
+    """The checks and the plan come from units (core.manifest, core.deps). If one raises, the change
+    fails with a diagnostic naming the stage, and its record ends: it does not stay 'received'."""
+
+    async def main() -> None:
+        log = EventLog(tmp_path / "events.sqlite", BlobStore(tmp_path / "blobs"))
+        sup = cast(Supervisor, SimpleNamespace(blobs=log.blobs, status=lambda: [], handlers={}))
+        raises = Raises(SyntaxError("'(' was never closed"))
+        c = Coordinator(sup, log, planner=raises if stage == "plan" else Nothing(),
+                        checker=raises if stage == "check" else AcceptAll(), tun=ChangeTunables())
+        c.identity = BASE
+        await c.start()
+        try:
+            r = await c.enqueue(ChangeSet(base=BASE, config={"k": 1}))
+        finally:
+            c.close()
+        assert r.status == "failed" and r.change_id > 0
+        assert [d.code for d in r.diagnostics] == [f"change.{stage}_crashed"]
+        assert "SyntaxError" in r.diagnostics[0].reason
+        status, finished = log.db.execute("SELECT status, finished_at FROM changes WHERE id = ?",
+                                          (r.change_id,)).fetchone()
+        assert status == "failed" and finished is not None
+
+    asyncio.run(main())

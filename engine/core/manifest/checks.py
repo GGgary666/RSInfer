@@ -30,6 +30,9 @@ PROCESS_HOST_SERVICES = frozenset({"proc.control@1"})
 
 MUTABLE_CALLS = frozenset({"list", "dict", "set", "bytearray", "defaultdict", "deque", "OrderedDict", "Counter"})
 NATIVE_SUFFIXES = (".so", ".pyd")
+READ_METHODS = frozenset({"get", "peek"})
+"""``ConfigView`` methods that read a key: ``peek`` reads without recording the read, but the key
+must still be declared."""
 
 
 def check_tree(root: Path, topology: Topology | None, framework: FrameworkModules
@@ -38,13 +41,31 @@ def check_tree(root: Path, topology: Topology | None, framework: FrameworkModule
     tree = read_tree(root)
     errors = list(tree.errors)
     warnings: list[Diagnostic] = []
+    parsed = _parse_all(tree, errors)
     _entries(tree, errors)
-    _config(tree, errors, warnings)
+    _config(tree, parsed, errors, warnings)
     _roles(tree, topology, errors)
-    _imports(tree, framework, errors)
-    _modules(tree, framework, errors)
+    _imports(tree, parsed, framework, errors)
+    _modules(tree, parsed, framework, errors)
     _natives(tree, errors, warnings)
     return errors, warnings
+
+
+def _parse_all(tree: Tree, errors: list[Diagnostic]) -> dict[str, ast.Module]:
+    """Every module's syntax tree. A module that does not parse is an error, and the checks that
+    read code skip it: they cannot tell what it imports or reads."""
+    out: dict[str, ast.Module] = {}
+    for module, path in sorted(tree.modules.items()):
+        try:
+            out[module] = ast.parse(path.read_bytes(), filename=str(path))
+        except (SyntaxError, ValueError) as e:  # ValueError: undecodable source
+            where = f"{path.relative_to(tree.root).as_posix()}"
+            if isinstance(e, SyntaxError) and e.lineno is not None:
+                where += f", line {e.lineno}"
+            reason = e.msg if isinstance(e, SyntaxError) else str(e)
+            errors.append(diag(COMPONENT, "syntax", f"{module} does not parse ({where}): {reason}",
+                               subject=tree.owner.get(module) or module, code="manifest.syntax_error"))
+    return out
 
 
 def _entries(tree: Tree, errors: list[Diagnostic]) -> None:
@@ -54,7 +75,8 @@ def _entries(tree: Tree, errors: list[Diagnostic]) -> None:
                                subject=uid, code="manifest.missing_entry"))
 
 
-def _config(tree: Tree, errors: list[Diagnostic], warnings: list[Diagnostic]) -> None:
+def _config(tree: Tree, parsed: Mapping[str, ast.Module], errors: list[Diagnostic],
+            warnings: list[Diagnostic]) -> None:
     owners: dict[str, list[UnitId]] = {}
     for uid, s in tree.units.items():
         for key in s.manifest.config:
@@ -71,24 +93,27 @@ def _config(tree: Tree, errors: list[Diagnostic], warnings: list[Diagnostic]) ->
         readable = s.manifest.readable_keys()
         used: set[str] = set()
         for module in s.modules:
-            used |= _config_keys(tree.modules[module])
+            if module in parsed:
+                used |= _config_keys(parsed[module])
         for key in sorted(used - readable):
             errors.append(diag(COMPONENT, "config", f"code reads {key!r}, which its manifest does not declare",
                                subject=uid, code="manifest.read_not_declared",
                                hint="add it to [config] (if this unit owns it) or [reads]"))
+        if any(module not in parsed for module in s.modules):
+            continue  # its unread keys may be read by the code that does not parse
         for key in sorted(set(s.manifest.reads.config) - used):
             warnings.append(diag(COMPONENT, "config", f"declares it reads {key!r}, but its code never does",
                                  subject=uid, code="manifest.unused_read", severity="warning"))
 
 
-def _config_keys(path: Path) -> set[str]:
-    """String keys in ``config["k"]``, ``x.config["k"]``, ``config.get("k")``."""
+def _config_keys(mod: ast.Module) -> set[str]:
+    """String keys in ``config["k"]``, ``x.config["k"]``, ``config.get("k")``, ``config.peek("k")``."""
     keys: set[str] = set()
-    for node in ast.walk(_parse(path)):
+    for node in ast.walk(mod):
         if isinstance(node, ast.Subscript) and _is_config(node.value) and isinstance(node.slice, ast.Constant) \
                 and isinstance(node.slice.value, str):
             keys.add(node.slice.value)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" \
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in READ_METHODS \
                 and _is_config(node.func.value) and node.args and isinstance(node.args[0], ast.Constant) \
                 and isinstance(node.args[0].value, str):
             keys.add(node.args[0].value)
@@ -126,8 +151,11 @@ def _roles(tree: Tree, topology: Topology | None, errors: list[Diagnostic]) -> N
                                        hint="it would wait in PENDING forever"))
 
 
-def _imports(tree: Tree, framework: FrameworkModules, errors: list[Diagnostic]) -> None:
+def _imports(tree: Tree, parsed: Mapping[str, ast.Module], framework: FrameworkModules,
+             errors: list[Diagnostic]) -> None:
     for module, uid in sorted(tree.owner.items()):
+        if module not in parsed:
+            continue
         path = tree.modules[module]
         for name in sorted(imports_of(path, module, path.name == "__init__.py")):
             target = _resolve(name, tree.modules)
@@ -151,13 +179,13 @@ def _resolve(name: str, modules: dict[str, Path]) -> str | None:
     return None
 
 
-def _modules(tree: Tree, framework: FrameworkModules, errors: list[Diagnostic]) -> None:
-    for module, path in sorted(tree.modules.items()):
+def _modules(tree: Tree, parsed: Mapping[str, ast.Module], framework: FrameworkModules,
+             errors: list[Diagnostic]) -> None:
+    for module, mod in sorted(parsed.items()):
         if framework.contains(module):
             continue
         uid = tree.owner.get(module)
         subject = uid or module
-        mod = _parse(path)
         for node in mod.body:
             target, value = _assignment(node)
             if target is not None and value is not None and not target.startswith("__") and _mutable(value):
@@ -217,6 +245,3 @@ def _natives(tree: Tree, errors: list[Diagnostic], warnings: list[Diagnostic]) -
             warnings.append(diag(COMPONENT, "native", f"declares {path}, which is not in the tree", subject=uid,
                                  code="manifest.missing_native", severity="warning"))
 
-
-def _parse(path: Path) -> ast.Module:
-    return ast.parse(path.read_bytes(), filename=str(path))

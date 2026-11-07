@@ -17,7 +17,7 @@ from core.common.framework import FrameworkModules
 from core.common.ids import ProcId, UnitId
 from core.common.manifest import ConfigKeyDecl
 from core.common.result import Diagnostic, Failed, Ok, Result, diag
-from core.context.config import ConfigEntry
+from core.context.config import config_entries
 from core.sourcetree import Tree, module_of
 from core.supervisor.protocol import ProcIntrospection
 from core.supervisor.topology import DesiredProc, Topology, desired_procs
@@ -109,16 +109,8 @@ def _desired(tree: Tree, topo: Topology) -> dict[ProcId, DesiredProc]:
 
 def _process_plan(proc: ProcId, units: list[UnitId], tree: Tree, values: dict[str, Any]) -> ProcessPlan:
     """What a process is: its units and the config keys they own or read, with this system's values."""
-    owners = _owners(tree)
-    config: dict[str, ConfigEntry] = {}
-    for uid in units:
-        m = tree.units[uid].manifest
-        for key, decl in m.config.items():
-            config[key] = ConfigEntry(uid, decl, values.get(key, decl.default))
-        for key in m.reads.config:
-            if key not in config and key in owners:
-                owner, decl = owners[key]
-                config[key] = ConfigEntry(owner, decl, values.get(key, decl.default))
+    config = config_entries([tree.units[u].manifest for u in units], [s.manifest for s in tree.units.values()],
+                            values)
     return ProcessPlan(proc, EMPTY, [UnitSpec(tree.units[u].manifest) for u in sorted(units)], config)
 
 
@@ -170,6 +162,50 @@ class _Planner:
         """New units load during prepare unless they import a changed module (unit-runtime.md §6.3)."""
         s = self.w.new_tree.units[uid]
         return not (self.new_graph.imports_closure([s.manifest.unit.entry_module]) & self.changed)
+
+    def staging(self, intro: ProcIntrospection, added: list[UnitId], changed_keys: dict[str, Any]
+                ) -> tuple[list[UnitId], dict[UnitId, str]]:
+        """Which new units load during prepare (rung 0); the others are added inside the reload at the
+        safe point, which declares new keys and applies new values before it builds them. A unit loads
+        early only if what it needs is ready then: its code imports no changed module, every key it
+        owns or reads is declared with its final value, and every service it uses is provided. Returns
+        the early units and why each other one waits."""
+        declared = set(intro.config)
+        here = [UnitId(u.unit) for u in intro.units]
+        provided_now = {name for u in here for name in self._provides(u)}
+        early = {u for u in added if self.stageable(u)}
+        why = {u: "it imports changed code" for u in added if u not in early}
+        while True:  # deferring one unit can defer those that need it
+            late = {u: r for u in sorted(early) if (r := self._not_ready(u, early, declared, changed_keys,
+                                                                          provided_now, set(why)))}
+            if not late:
+                return sorted(early), why
+            early -= set(late)
+            why.update(late)
+
+    def _not_ready(self, uid: UnitId, early: set[UnitId], declared: set[str], changed_keys: dict[str, Any],
+                   provided_now: set[str], late: set[UnitId]) -> str:
+        m = self.w.new_tree.units[uid].manifest
+        taken = sorted(k for k in m.config if k in declared)
+        if taken:
+            return f"it owns {taken}, declared here by another unit until the reload"
+        setting = sorted(k for k in m.reads.config if k in changed_keys)
+        if setting:
+            return f"it reads {setting}, which this change sets"
+        undeclared = sorted(k for k in m.reads.config if k not in declared
+                            and (k not in self.owners or self.owners[k][0] not in early))
+        if undeclared:
+            return f"it reads {undeclared}, which only the reload declares here"
+        needs = sorted(name for name in [*m.requires.services, *m.requires.optional]
+                       if name not in provided_now and not any(name in self._provides(u) for u in early)
+                       and any(name in self._provides(u) for u in late))
+        if needs:
+            return f"it uses {needs}, provided by units added at the safe point"
+        return ""
+
+    def _provides(self, uid: UnitId) -> list[str]:
+        s = self.w.new_tree.units.get(uid) or self.base_tree.units.get(uid)
+        return list(s.manifest.provides.services) if s is not None else []
 
     def natives_touch(self, units: list[UnitId]) -> bool:
         changed = {p.removeprefix("engine/") for p in self.changed_paths}
@@ -242,18 +278,9 @@ class _Planner:
             if r.unit in target:
                 actions.append(UnitAction(r.unit, r.action, dict(r.args)))
 
-        # a unit staged during prepare is built under the old values; one that reads a key this change
-        # sets is added inside the reload instead, which builds it under the new values
-        early: list[UnitId] = []
-        for u in added:
-            if not self.stageable(u):
-                continue
-            reads = sorted(w.new_tree.units[u].manifest.readable_keys() & set(changed_keys))
-            if reads:
-                w.notes.append(f"{intro.proc}: {u} reads {reads}, which this change sets; adding it at the "
-                               "safe point")
-            else:
-                early.append(u)
+        early, why = self.staging(intro, added, changed_keys)
+        for u, reason in sorted(why.items()):
+            w.notes.append(f"{intro.proc}: {u} is added at the safe point: {reason}")
         stage = [UnitSpec(w.new_tree.units[u].manifest) for u in early]
         add_at_safe_point = [UnitSpec(w.new_tree.units[u].manifest) for u in added if u not in early]
         # keys new to this process: those of added units come with the units (participant), the others

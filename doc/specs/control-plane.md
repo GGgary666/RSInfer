@@ -24,12 +24,14 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
   3. 读快照里所有 `unit.toml`，装上 `process` 含 `"control"` 的单元；
   4. 提交启动变更（从空系统到第一个身份）：用 `core.manifest` 检查、`core.deps` 出计划、`core.identity` 算身份，进程管家按计划拉起进程。
 - **宿主服务**：控制面单元需要框架的东西（blob 存储、进程管家、协调者、事件日志），由宿主以服务的形式提供：`ctrl.blobs@1`、`ctrl.supervisor@1`、`ctrl.change@1`、`ctrl.events@1`。宿主服务不属于任何单元，不会被卸载（`UnitRuntime.provide_host`）。
-- **协调者的三个接口**改成每次变更时向服务要：`ctrl.manifest@1`（静态检查）、`ctrl.deps@1`（动作计划）、`ctrl.identity@1`（身份）。服务不在（单元没装上或者失败了）就 `Failed(control.unit_missing)`，什么都不动。
+- **协调者的三个接口**改成每次变更时向服务要：`ctrl.manifest@1`（静态检查）、`ctrl.deps@1`（动作计划）、`ctrl.identity@1`（身份）。服务不在（单元没装上或者失败了）就 `Failed(control.unit_missing)`，什么都不动。它们来自单元，抛异常时协调者把它变成 `change.check_crashed` / `change.plan_crashed`；变更记录一旦开始，无论哪里抛异常，都以 `failed` 结束，不会停在 `received`。
 - **控制端口**：沿用进程管家已有的控制端点。`core.control.protocol` 定义 API 消息，宿主把它们转给 `ctrl.api@1`（`core.api` 单元）。客户端：`python -m core.control.client --control <地址> status|apply|check|introspect|logs`。
 - **控制面单元的重载**：动作计划里多一段 `ActionPlan.control`（给控制面进程的 `ProcActions`）。协调者在 Execute 阶段、所有参与者都执行完之后在本进程执行它；撤回时按反向计划恢复。
   - 执行完、提交前检查：四个控制面单元都 ACTIVE，而且 `ctrl.identity@1`、`ctrl.manifest@1`、`ctrl.deps@1`、`ctrl.api@1` 都有人提供（和启动时同一个检查）。不满足就撤回，否则提交以后控制接口就没了。
   - 撤回没能把旧的控制面单元装回来（反向重载失败、装回来以后服务不全），和远端参与者没确认撤回一样：协调者进入“需要恢复”，拒绝后续变更。
 - **控制面单元从哪里加载**：控制面进程自己的框架代码来自启动它的地方（工作区或仓库），控制面单元来自快照。为此单元运行时装进程计划时，会让已经导入的包先去快照目录里找还没加载的模块（`UnitRuntime._prefer_root`）；从快照启动的进程里这一步什么都不做。
+  - 这些包（比如 `core`）的 `__file__` 不在快照里，但 `__path__` 里有快照目录。重载换快照时，切换、备份、恢复搜索路径的包，除了从快照加载的，也包括 `__path__` 里有快照目录的（2026-11-07 复审修复：原来只看 `__file__`，`core.__path__` 一直指着第一个快照，改了 `core/sourcetree.py`、在 `core/` 下加控制面单元、改控制面单元包的 `__init__.py`，提交了却还在跑旧代码，或者找不到新模块）。
+  - 第一次装进程计划时，已经从别处导入、快照里也有的非框架模块（单元代码、库）会先从 `sys.modules` 里去掉，再从快照导入：单元代码只从快照跑。单独起的控制面这时只导入了框架代码，这一步什么都不做；在测试进程里跑的控制面可能已经导入了单元模块（比如 `tests/units` 先导入了 `core.sourcetree`），以前会一直用仓库里那份。
 
 ## 2. `core.identity`：系统身份
 
@@ -45,8 +47,9 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 | 检查 | 诊断码 |
 |---|---|
 | 每个 `unit.toml` 能解析，单元 id 不重复，入口模块存在 | `manifest.invalid`、`manifest.duplicate_unit`、`manifest.missing_entry` |
+| 每个 `.py` 都能解析（报文件和行号）；解析不了的模块，后面读代码的检查跳过它 | `manifest.syntax_error` |
 | 每个配置键只有一个主人；`[reads]` 里的键必须有人声明 | `manifest.config_owner`、`manifest.undeclared_read` |
-| 代码里 `config["k"]` 读到的键必须在清单里声明；声明了却从没读过的报警告 | `manifest.read_not_declared`、`manifest.unused_read`（警告） |
+| 代码里 `config["k"]`、`config.get("k")`、`config.peek("k")` 读到的键必须在清单里声明；声明了却从没读过的报警告 | `manifest.read_not_declared`、`manifest.unused_read`（警告） |
 | 拓扑里每个进程角色：每个单元的必需服务都有人提供；单元的 `process` 含这个角色 | `manifest.unprovided_service`、`manifest.wrong_role` |
 | 单元的代码不 import 别的单元目录里的模块（只能通过服务名拿） | `manifest.cross_unit_import` |
 | 单元模块里没有模块级可变全局变量，也不用 `global` | `manifest.mutable_global` |
@@ -65,12 +68,19 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 | 状态单元管的内容（内部变更里的状态请求） | 状态单元自己的动作（如 `migrate`） | 4 |
 | 被派生产物按值依赖的配置键或单元代码 | 产物主人的重建动作（准备阶段在第二套 buffer 里做） | 3 |
 | 单元代码或清单 | 重载这个单元（依赖它的单元由运行时跟着重载） | 2 |
-| 新增单元 | 准备阶段装上；import 了改动模块的，或者读了这次变更改的配置键的，到安全点随重载一起装（在准备阶段装会拿到旧值） | 0 / 2 |
+| 新增单元 | 准备阶段装上，前提是它建起来之前要的东西那时都已就绪（见下）；否则到安全点随重载一起装 | 0 / 2 |
 | 读它的单元注册了钩子（`ctx.on_config`），键不是 `startup` 绑定 | 原地接受新值 | 1 |
 | 读它的单元没注册钩子，或者键是 `startup` 绑定 | 重载读它的单元 | 2 |
 
 - 每个进程的单元：拓扑里角色的 `units` 不为空就用它；为空就是所有 `process` 含这个角色的单元。改单元列表在原地加、减单元，不重启进程。
 - “改动过的模块”只算原来就有、被改了或删了的模块；新文件不算（新单元是加进来，不是重载）。
+- 新单元能不能在准备阶段装：它建起来之前，代码、配置声明、候选值和要用的服务都必须已经就绪。下面任何一条不满足，就到安全点随重载一起装（重载先声明新键、应用新值，再建单元），并在 `notes` 里写明原因：
+  - 不 import 改动过的模块；
+  - 它读的键在这个进程里已经声明，而且这次变更不改它的值；或者键的主人也在准备阶段装。读别的角色的单元拥有的键，属于前者不满足、后者也不满足的情况；
+  - 它自己拥有的键没被进程里别的单元声明着（键从要删的单元转给它时，要等重载先删掉旧主人）；
+  - 它要用的服务（必需的和可选的）已经有人提供，或者由同样在准备阶段装的新单元提供；
+  - 推迟一个单元，可能让依赖它的单元也推迟，所以反复检查到不再变化。
+- 进程计划里的配置项（启动、重启、新起的进程，和控制面启动时）都由同一个函数算：单元拥有的键和它 `[reads]` 里别的单元拥有的键，值是给定的或主人的默认值（`core.context.config.config_entries`）。参与者把变更的值分成两份：新单元拥有的键跟着新单元一起声明，其余的在重载里生效（`core.change.participant.new_unit_config`，远端参与者和控制面共用）。
 - 配置值和重载一起发生时，新值在重载里面生效：重载失败，旧单元按旧值重建。
 - 规划前同步问每个在跑的进程要自省信息；有一个进程问不到，整个计划失败（否则它会留在旧身份上）。
 - 同样的输入总是给出同样的计划，所以 `--dry-run` 给出的就是实际执行的计划；dry-run 的结果也带着候选身份。

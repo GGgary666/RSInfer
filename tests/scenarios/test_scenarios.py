@@ -8,6 +8,8 @@ admission, real collectives); the docstrings say what is in and what is out.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -427,6 +429,221 @@ def test_a_new_unit_is_built_with_the_values_of_its_change(tmp_path: Path) -> No
             for p in (W0, W1):
                 assert rungs(r.plan, p) == {1, 2, 3}
                 assert s.lines(p, "reader built") == ["reader built with max_batch 16"]
-            assert any("scn.reader reads ['scn.max_batch']" in n for n in r.plan.notes)
+            assert any("scn.reader is added at the safe point: it reads ['scn.max_batch'], which this change sets" in n
+                       for n in r.plan.notes)
+
+    run(main())
+
+
+def _control_module(s: Scenario, name: str) -> Path:
+    """Where the control plane loaded ``name`` from, relative to its code root."""
+    root = s.cp.runtime.code_root
+    file = getattr(sys.modules[name], "__file__", None)
+    assert root is not None and file is not None
+    assert Path(file).is_relative_to(root), f"{name} is loaded from {file}, not from the code root {root}"
+    return Path(file).relative_to(root)
+
+
+@pytest.mark.covers(edges=("ctrl",), ladder=(2,), kinds=("logic",))
+def test_a_library_of_the_control_plane_units_is_reloaded_from_the_new_snapshot(tmp_path: Path) -> None:
+    """``core`` was imported where the control plane started, before any snapshot; the control
+    units and their library ``core.sourcetree`` come from snapshots through ``core.__path__``.
+    Changing the library must load it from the new snapshot, and the units must use it."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.edit("core/sourcetree.py", "    return Tree(root, units, modules, owner, errors)\n",
+                   '    if (root / "REJECT").exists():\n'
+                   '        errors.append(diag("core.manifest", "manifest", "rejected by the new library",\n'
+                   '                           code="manifest.rejected"))\n'
+                   "    return Tree(root, units, modules, owner, errors)\n")
+            r = await s.apply()
+            await everyone_on(s, r)
+            assert r.plan is not None and r.plan.control is not None and r.plan.control.reload is not None
+            assert "core.sourcetree" in r.plan.control.reload.changed_modules
+            assert _control_module(s, "core.sourcetree") == Path("core/sourcetree.py")
+            checks = sys.modules["core.manifest.checks"]
+            assert getattr(checks, "read_tree").__module__ == "core.sourcetree"
+            assert Path(getattr(checks, "read_tree").__code__.co_filename).is_relative_to(str(s.cp.runtime.code_root))
+            s.write("REJECT", "")
+            checked = await s.client.check(await s.change())
+            assert isinstance(checked, Failed) and checked.has_code("manifest.rejected")
+
+    run(main())
+
+
+PROBE_TOML = """[unit]
+id = "core.probe"
+kind = "logic"
+process = ["control"]
+entry = "core.probe.unit:Unit"
+
+[provides]
+services = ["ctrl.probe@1"]
+
+[config]
+"ctrl.probe_level" = { type = "int", default = 1, binding = "startup" }
+"ctrl.probe_mode" = { type = "str", default = "plain", binding = "startup" }
+
+[reads]
+config = ["scn.chunk", "scn.log_dir"]
+"""
+PROBE = """from typing import Any
+
+
+class Probe:
+    def __init__(self, values: dict[str, Any]) -> None:
+        self._values = values
+
+    def values(self) -> dict[str, Any]:
+        return dict(self._values)
+
+
+class Unit:
+    def __init__(self, ctx: Any, config: Any) -> None:
+        ctx.provide("ctrl.probe@1", Probe({
+            "ctrl.probe_level": config["ctrl.probe_level"], "ctrl.probe_mode": config["ctrl.probe_mode"],
+            "scn.chunk": config["scn.chunk"], "scn.log_dir": config["scn.log_dir"],
+        }))
+"""
+PROBE_FILES = {"core/probe/__init__.py": "", "core/probe/unit.toml": PROBE_TOML, "core/probe/unit.py": PROBE}
+
+
+def _probe_values(s: Scenario) -> dict[str, Any]:
+    probe = s.cp.runtime.lookup("ctrl.probe@1")
+    assert probe is not None
+    return probe.values()
+
+
+@pytest.mark.covers(edges=("ctrl", "decl"), ladder=(0, 2), kinds=("logic",))
+def test_a_new_control_plane_unit_under_core_is_loaded_from_the_snapshot(tmp_path: Path) -> None:
+    """A new control-plane unit in ``core/`` exists only in the new snapshot; ``core`` itself was
+    imported from elsewhere, so only its ``__path__`` can find it. Its own keys are declared with
+    it (one set by the change, one left at its default), and the keys it reads from another role
+    are declared by the reload, before it is built."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            for rel, text in PROBE_FILES.items():
+                s.write(rel, text)
+            r = await s.apply(config={"ctrl.probe_level": 5})
+            await everyone_on(s, r)
+            assert _probe_values(s) == {"ctrl.probe_level": 5, "ctrl.probe_mode": "plain", "scn.chunk": 1,
+                                        "scn.log_dir": str(tmp_path / "logs")}
+            assert _control_module(s, "core.probe.unit") == Path("core/probe/unit.py")
+            assert "core.probe" in {u.unit for u in (await s.status()).control_units}
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl", "decl"), kinds=("framework",))
+def test_the_control_plane_starts_units_that_read_keys_of_another_role(tmp_path: Path) -> None:
+    """At startup a control-plane unit gets the keys it owns and the keys it reads from units of
+    other roles, with the values given (``scn.log_dir``) or the owners' defaults (``scn.chunk``)."""
+
+    async def main() -> None:
+        async with scenario(tmp_path, files=PROBE_FILES) as s:
+            assert _probe_values(s) == {"ctrl.probe_level": 1, "ctrl.probe_mode": "plain", "scn.chunk": 1,
+                                        "scn.log_dir": str(tmp_path / "logs")}
+
+    run(main())
+
+
+CHUNK_READER_TOML = """[unit]
+id = "scn.chunk_reader"
+kind = "logic"
+process = ["worker"]
+entry = "scn.chunk_reader.unit:Unit"
+
+[reads]
+config = ["scn.chunk", "scn.log_dir", "scn.rebalance"]
+"""
+CHUNK_READER = """from typing import Any
+
+from ..journal import Journal
+
+
+class Unit:
+    def __init__(self, ctx: Any, config: Any) -> None:
+        Journal(config["scn.log_dir"], ctx).write(
+            f"chunk reader built with chunk {config['scn.chunk']} rebalance {config['scn.rebalance']}")
+"""
+
+
+@pytest.mark.covers(edges=("decl",), ladder=(1, 2), kinds=("logic",))
+def test_a_new_unit_reading_keys_of_another_role_is_built_after_they_are_declared(tmp_path: Path) -> None:
+    """A new worker unit reads keys the scheduler's units own: the workers have never declared
+    them, so it cannot be staged during prepare; the reload declares them (one set by the change,
+    one at its owner's default), then builds it."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.write("scn/chunk_reader/__init__.py", "")
+            s.write("scn/chunk_reader/unit.toml", CHUNK_READER_TOML)
+            s.write("scn/chunk_reader/unit.py", CHUNK_READER)
+            r = await s.apply(config={"scn.chunk": 4})
+            await everyone_on(s, r)
+            for p in (W0, W1):
+                assert rungs(r.plan, p) == {2}
+                assert s.lines(p, "chunk reader built") == ["chunk reader built with chunk 4 rebalance 0"]
+            assert rungs(r.plan, SCHED) == {1}
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), ladder=(2,), kinds=("logic",))
+def test_a_control_unit_package_init_is_updated_and_rolled_back(tmp_path: Path) -> None:
+    """A changed ``core/api/__init__.py`` reloads ``core.api`` from the new snapshot; when a later
+    change to it aborts, the package, the unit and ``core.__path__`` are the ones from before."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.write("core/api/__init__.py", '"""``core.api``."""\n\nMARK = 2\n')
+            r = await s.apply()
+            await everyone_on(s, r)
+            assert _control_module(s, "core.api") == Path("core/api/__init__.py")
+            assert getattr(sys.modules["core.api"], "MARK") == 2
+            committed_root = s.cp.runtime.code_root
+            core_path = list(getattr(sys.modules["core"], "__path__"))
+            assert core_path[0] == os.path.join(str(committed_root), "core")
+
+            s.write("core/api/__init__.py", '"""``core.api``."""\n\nMARK = 3\n')
+            s.cp.coord.faults.add("after_execute")
+            r = await s.apply()
+            assert r.status == "aborted", r.diagnostics
+            assert s.cp.runtime.code_root == committed_root
+            assert list(getattr(sys.modules["core"], "__path__")) == core_path
+            assert getattr(sys.modules["core"], "api") is sys.modules["core.api"]
+            assert getattr(sys.modules["core.api"], "MARK") == 2
+            assert _control_module(s, "core.api") == Path("core/api/__init__.py")
+
+            r = await s.apply()
+            await everyone_on(s, r)
+            assert getattr(sys.modules["core.api"], "MARK") == 3
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_a_syntax_error_is_a_static_check_failure_and_the_change_ends_failed(tmp_path: Path) -> None:
+    """⑥ for code that does not parse: ``check`` and ``apply`` both report it as a static check
+    (``manifest.syntax_error``, with the file and line), and the change record ends as failed."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            before = (await s.status()).identity
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = (1")
+            checked = await s.client.check(await s.change())
+            assert isinstance(checked, Failed) and checked.has_code("manifest.syntax_error"), checked
+            assert any("scn/policy_fcfs/unit.py, line" in d.reason for d in checked.diagnostics)
+            r = await s.apply()
+            assert r.status == "failed" and r.change_id > 0
+            assert "manifest.syntax_error" in {d.code for d in r.diagnostics}
+            row = s.cp.log.db.execute("SELECT status, finished_at FROM changes WHERE id = ?",
+                                      (r.change_id,)).fetchone()
+            assert row[0] == "failed" and row[1] is not None
+            assert (await s.status()).identity == before
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = (1", "VERSION = 2")
+            assert (await s.apply()).status == "committed"
 
     run(main())

@@ -10,7 +10,7 @@ boundary through ``stage()`` + ``commit()``.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Collection, Generator
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -54,6 +54,25 @@ class ConfigEntry(msgspec.Struct, frozen=True):
     owner: UnitId
     decl: ConfigKeyDecl
     value: Any
+
+
+def config_entries(units: Iterable[UnitManifest], manifests: Iterable[UnitManifest],
+                   values: Mapping[str, Any]) -> dict[str, ConfigEntry]:
+    """The keys ``units`` own or read (``[reads]``, often owned by a unit of another role), each with
+    its owner's declaration among ``manifests`` and the value in ``values`` or the owner's default.
+    What a process of these units must have declared before any of them is built. A read key that
+    no manifest declares is left out: the runtime reports it when the reader is declared."""
+    owners = {key: (m.id, decl) for m in manifests for key, decl in m.config.items()}
+    out: dict[str, ConfigEntry] = {}
+    for m in units:
+        for key, decl in m.config.items():
+            out[key] = ConfigEntry(m.id, decl, values.get(key, decl.default))
+    for m in units:
+        for key in m.reads.config:
+            if key not in out and key in owners:
+                owner, decl = owners[key]
+                out[key] = ConfigEntry(owner, decl, values.get(key, decl.default))
+    return out
 
 
 class ConfigReads(msgspec.Struct, frozen=True):

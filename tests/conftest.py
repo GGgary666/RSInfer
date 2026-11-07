@@ -10,18 +10,24 @@ from tests.framework.support import events
 
 @pytest.fixture(autouse=True)
 def _isolate_imports() -> Generator[None]:
-    """Each test gets back the sys.path, sys.modules and package search paths it started with:
-    units are imported into the test process, and a control plane run in it points packages at
-    its snapshots."""
+    """Each test gets back the sys.path, sys.modules (the same module objects) and package search
+    paths it started with: units are imported into the test process, and a control plane run in it
+    points packages at its snapshots and loads unit code from them only."""
     path = list(sys.path)
-    modules = set(sys.modules)
+    modules = dict(sys.modules)
     package_paths = {name: list(p) for name, m in sys.modules.items()
                      if isinstance(p := getattr(m, "__path__", None), list)}
     events.clear()
     yield
     sys.path[:] = path
-    for name in set(sys.modules) - modules:
+    for name in set(sys.modules) - set(modules):
         del sys.modules[name]
+    for name, mod in modules.items():  # dropped or replaced by a reload: the test's own copies again
+        if sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
+            parent, _, child = name.rpartition(".")
+            if parent in sys.modules:
+                setattr(sys.modules[parent], child, mod)
     for name, p in package_paths.items():
         m = sys.modules.get(name)
         if m is not None and isinstance(getattr(m, "__path__", None), list):

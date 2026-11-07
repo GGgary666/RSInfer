@@ -325,8 +325,18 @@ class Coordinator:
     # ------------------------------------------------------------- one change
 
     async def _run(self, item: Queued) -> ChangeResult:
+        cid = self.log.begin(item.cs)
+        try:
+            return await self._run_begun(item, cid)
+        except Exception as e:  # noqa: BLE001 - a begun change always ends with a durable outcome
+            diags = [diag(COMPONENT, "internal", f"{type(e).__name__}: {e}", code="change.internal_error")]
+            if self.recovery_required:
+                diags.append(diag(COMPONENT, "internal", "the change failed inside its transaction; restart the "
+                                  "engine", code="change.recovery_required"))
+            return self._done(cid, self._result("failed", cid, item.cs, None, None, diags))
+
+    async def _run_begun(self, item: Queued, cid: int) -> ChangeResult:
         cs = item.cs
-        cid = self.log.begin(cs)
         old = self.identity
         t0 = time.monotonic()
         if self.recovery_required:
@@ -345,11 +355,19 @@ class Coordinator:
                 COMPONENT, "check", f"{len(missing)} file or artifact contents are not in the blob store",
                 code="change.missing_blobs", hint="upload them before submitting")]))
         inp = PlanInput(cs, self.identity, self.manifest, new_manifest, self.sup.status())
-        checked = await self.checker.check(inp)
+        try:
+            checked = await self.checker.check(inp)
+        except Exception as e:  # noqa: BLE001 - the checks come from a unit (core.manifest)
+            checked = fail(COMPONENT, "check", f"the static checks raised {type(e).__name__}: {e}",
+                           code="change.check_crashed")
         if isinstance(checked, Failed):
             return self._done(cid, self._result("failed", cid, cs, None, None, checked.diagnostics))
         # CHECKED -> PLANNED
-        planned = await self.planner.plan(inp)
+        try:
+            planned = await self.planner.plan(inp)
+        except Exception as e:  # noqa: BLE001 - the plan comes from a unit (core.deps)
+            planned = fail(COMPONENT, "plan", f"the impact analysis raised {type(e).__name__}: {e}",
+                           code="change.plan_crashed")
         if isinstance(planned, Failed):
             return self._done(cid, self._result("failed", cid, cs, None, None, planned.diagnostics))
         plan = planned.value
@@ -374,6 +392,9 @@ class Coordinator:
         keepalive = asyncio.create_task(self._keepalive(run))
         try:
             return await self._transact(run, old, new_manifest)
+        except Exception:
+            self.recovery_required = True  # unexpected inside the transaction: participants may hold part of it
+            raise
         finally:
             keepalive.cancel()
             self._running = None

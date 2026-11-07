@@ -199,11 +199,8 @@ class Participant:
         try:
             # Keys of units this change brings are declared with those units, so they start with
             # the values asked for; the other values are taken at the epoch boundary.
-            new_units = [*a.stage, *(a.reload.units_to_add if a.reload else [])]
-            owners = {key: (u.id, decl) for u in new_units for key, decl in u.manifest.config.items()}
-            for_new = {k: ConfigEntry(owners[k][0], owners[k][1], v) for k, v in a.config.items() if k in owners}
+            for_new, c.config_now = new_unit_config(a)
             staged_ids = {u.id for u in a.stage}
-            c.config_now = {k: v for k, v in a.config.items() if k not in owners}
             c.config_new = {k: e for k, e in for_new.items() if e.owner not in staged_ids}
             if c.config_now:
                 r = self.rt.config.stage(c.config_now)
@@ -620,6 +617,15 @@ class Participant:
         self._note("timeout", reason, code, severity="error" if code == "change.coordinator_lost" else "warning")
         self._rollback(c)
         self._resume(c, rolled_back=True)
+
+
+def new_unit_config(actions: ProcActions) -> tuple[dict[str, ConfigEntry], dict[str, Any]]:
+    """Split a change's values: those of keys owned by the units it adds, declared together with
+    those units so they are built with them, and the others, for keys already declared here."""
+    new_units = [*actions.stage, *(actions.reload.units_to_add if actions.reload else [])]
+    owners = {key: (u.id, decl) for u in new_units for key, decl in u.manifest.config.items()}
+    for_new = {k: ConfigEntry(owners[k][0], owners[k][1], v) for k, v in actions.config.items() if k in owners}
+    return for_new, {k: v for k, v in actions.config.items() if k not in owners}
 
 
 def with_fresh_modules(rt: UnitRuntime, reverse: ReloadPlan, candidate_root: str | None,

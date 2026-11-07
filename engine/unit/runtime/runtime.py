@@ -115,6 +115,12 @@ class _PathBackup:
     staged_root: str | None
 
 
+
+def _in_tree(root: str, module: str) -> bool:
+    base = os.path.join(root, *module.split("."))
+    return os.path.isfile(base + ".py") or os.path.isfile(os.path.join(base, "__init__.py"))
+
+
 class _Abort(Exception):
     def __init__(self, diags: list[Diagnostic]) -> None:
         super().__init__("; ".join(str(d) for d in diags))
@@ -348,7 +354,21 @@ class UnitRuntime:
     def _prefer_root(self, root: str) -> None:
         """Packages imported before from elsewhere look in ``root`` first, so modules not loaded yet come
         from the snapshot. A no-op in processes started from the snapshot; in the control plane its own
-        framework code was imported where it was started, and its units must still come from snapshots."""
+        framework code was imported where it was started, and its units must still come from snapshots.
+
+        Modules that are not framework code, were loaded from elsewhere and are in the snapshot too are
+        dropped first, so they load from it as well: unit code and libraries never run from outside the
+        snapshot. (A control plane started on its own has loaded only framework code by now; one run
+        inside another process, such as a test, may find units or libraries already imported.)"""
+        for name, mod in list(sys.modules.items()):
+            file = getattr(mod, "__file__", None)
+            if file and not self.framework.contains(name) and not file.startswith(root + os.sep) \
+                    and _in_tree(root, name):
+                del sys.modules[name]
+                parent, _, child = name.rpartition(".")
+                parent_mod = sys.modules.get(parent) if parent else None
+                if parent_mod is not None and getattr(parent_mod, child, None) is mod:
+                    delattr(parent_mod, child)
         for name, mod in list(sys.modules.items()):
             path = getattr(mod, "__path__", None)
             if not isinstance(path, list):
@@ -853,12 +873,18 @@ class UnitRuntime:
                 setattr(parent_mod, child, mod)
 
     def _engine_packages(self) -> dict[str, list[str]]:
+        """Packages whose search path the code root decides: loaded from a snapshot, or loaded from
+        elsewhere with a snapshot on their ``__path__`` (``_prefer_root``: in the control plane,
+        ``core`` comes from where the process started, but its unit modules from snapshots)."""
         out: dict[str, list[str]] = {}
-        for name, mod in self._engine_modules().items():
+        for name, mod in list(sys.modules.items()):
             path = getattr(mod, "__path__", None)
-            if isinstance(path, list):
+            if isinstance(path, list) and (self._is_engine_module(mod) or any(self._in_root(e) for e in path)):
                 out[name] = path  # type: ignore[assignment]
         return out
+
+    def _in_root(self, entry: object) -> bool:
+        return isinstance(entry, str) and any(entry == r or entry.startswith(r + os.sep) for r in self._roots)
 
     def _backup_paths(self) -> _PathBackup:
         return _PathBackup(

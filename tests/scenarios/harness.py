@@ -129,8 +129,10 @@ async def start_agent(tmp: Path, host: str, control: str) -> asyncio.subprocess.
 
 
 @asynccontextmanager
-async def scenario(tmp: Path, *, ranks: tuple[str, ...] = HOSTS, **change_tun: Any) -> AsyncGenerator[Scenario]:
-    """A started engine. ``change_tun``: ``ChangeTunables`` fields for the coordinator."""
+async def scenario(tmp: Path, *, ranks: tuple[str, ...] = HOSTS, files: dict[str, str] | None = None,
+                   **change_tun: Any) -> AsyncGenerator[Scenario]:
+    """A started engine. ``files``: more ``engine/`` files of the workspace it starts from
+    (``{"core/x/unit.py": text}``). ``change_tun``: ``ChangeTunables`` fields for the coordinator."""
     zctx = zmq.asyncio.Context()
     tun = msgspec.structs.replace(ChangeTunables(coordinator_timeout_s=30.0, keepalive_interval_s=1.0), **change_tun)
     cp = ControlPlane(zctx, host=HostId("host-a"), bind=ADDRESS, state_dir=tmp / "control",
@@ -143,6 +145,9 @@ async def scenario(tmp: Path, *, ranks: tuple[str, ...] = HOSTS, **change_tun: A
     try:
         (await cp.sup.wait_for_hosts([HostId(h) for h in HOSTS], 20)).unwrap()
         workspace = build_workspace(tmp / "workspace")
+        for rel, text in (files or {}).items():
+            (workspace / "engine" / rel).parent.mkdir(parents=True, exist_ok=True)
+            (workspace / "engine" / rel).write_text(text)
         (tmp / "logs").mkdir()
         topo = topology(tmp, ranks)
         started = (await cp.boot(ingest(cp.blobs, workspace), topo, {"scn.log_dir": str(tmp / "logs")})).unwrap()

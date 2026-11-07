@@ -26,14 +26,14 @@ from core.change.blobs import BlobStore
 from core.change.config import ChangeTunables
 from core.change.coordinator import Coordinator, PlanInput
 from core.change.eventlog import EventLog
-from core.change.participant import with_fresh_modules
+from core.change.participant import new_unit_config, with_fresh_modules
 from core.change.state import IdentityManifest
 from core.change.types import EMPTY, ActionPlan, ChangeResult, ProcActions
 from core.common.ids import HostId, Identity, ProcId
 from core.common.manifest import discover
 from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
-from core.context.config import ConfigCommit, ConfigEntry
+from core.context.config import ConfigCommit, ConfigEntry, config_entries
 from core.control.protocol import API_REQUESTS
 from core.supervisor.protocol import ProcIntrospection
 from core.supervisor.supervisor import Supervisor, SupervisorTunables
@@ -152,8 +152,8 @@ class ControlPlane:
         if problems:
             return Failed(problems)
         specs = [UnitSpec(m) for m in manifests if CONTROL_ROLE in m.unit.process]
-        entries = {key: ConfigEntry(s.id, decl, config.get(key, decl.default))
-                   for s in specs for key, decl in s.manifest.config.items()}
+        # the keys they read from units of other roles too, with the values given or the defaults
+        entries = config_entries([s.manifest for s in specs], manifests, config)
         loaded = self.runtime.load_process_plan(ProcessPlan(self.proc, EMPTY, specs, entries, code_root=str(root)))
         problems = [*(loaded.diagnostics if isinstance(loaded, Failed) else []), *self.control_problems("boot")]
         if problems:
@@ -226,10 +226,15 @@ class _Planner:
 
 
 class _Local:
-    def __init__(self, change_id: int, actions: ProcActions, root: str) -> None:
+    def __init__(self, change_id: int, actions: ProcActions, root: str, for_new: dict[str, ConfigEntry],
+                 now: dict[str, Any]) -> None:
         self.change_id = change_id
         self.actions = actions
         self.root = root
+        self.for_new = for_new
+        """Values of keys owned by the units it adds: declared with them."""
+        self.now = now
+        """The other values: they change inside the reload."""
         self.reverse: ReloadPlan | None = None
         self.old_config: dict[str, Any] = {}
         self.modules_before: set[str] = set()
@@ -252,12 +257,13 @@ class ControlParticipant:
             root = self.cp.snapshot(files)
         except (OSError, ValueError) as e:
             return fail(COMPONENT, "prepare", f"cannot materialize the candidate: {e}", code="control.bad_source")
-        if actions.config:
-            r = self.rt.config.stage(actions.config)
+        for_new, now = new_unit_config(actions)
+        if now:  # keys of the units it adds are declared, with these values, inside the reload
+            r = self.rt.config.stage(now)
             if isinstance(r, Failed):
                 return r
             self.rt.config.discard_staged()  # validated; taken inside the reload at execute
-        self.change = _Local(change_id, actions, str(root))
+        self.change = _Local(change_id, actions, str(root), for_new, now)
         return Ok(None)
 
     def execute(self, change_id: int) -> Result[None]:
@@ -269,12 +275,15 @@ class ControlParticipant:
         if plan.new_code_root is None and c.root != self.rt.code_root:
             plan = msgspec.structs.replace(plan, new_code_root=c.root)
         c.root = plan.new_code_root or c.root
-        if a.stage:
+        if a.stage:  # the control plane is at a safe point now: its staged units are added in the reload
             plan = msgspec.structs.replace(plan, units_to_add=[*plan.units_to_add, *a.stage])
+        if c.for_new:
+            plan = msgspec.structs.replace(plan, config={**plan.config, **c.for_new})
         reverse = self.rt.reverse_plan(plan)
-        c.old_config = {k: self.rt.config.entries()[k].value for k in a.config if k in self.rt.config.entries()}
+        entries = self.rt.config.entries()
+        c.old_config = {k: entries[k].value for k in c.now if k in entries}
         c.modules_before = set(sys.modules)
-        r = self.rt.reload(plan, values=dict(a.config))
+        r = self.rt.reload(plan, values=dict(c.now))
         if isinstance(r, Failed):
             # the runtime put the old units back with the old values, unless its rollback failed
             c.old_config = {}
@@ -283,7 +292,7 @@ class ControlParticipant:
                                       "did not all come back", code="control.rollback_failed")]
             return r
         c.reverse = reverse
-        changed = {k: v for k, v in a.config.items() if c.old_config.get(k) != v}
+        changed = {k: v for k, v in c.now.items() if c.old_config.get(k) != v}
         hooks: ConfigCommit = self.rt.config.run_hooks(changed, skip_units=set(r.value.loaded))
         problems = [*hooks.hook_failures, *self.cp.control_problems("execute")]
         if problems:

@@ -82,6 +82,9 @@ CASES: list[tuple[str, dict[str, str], str]] = [
     ("graph outside a plan unit", change(**{"pkg/b/unit.py": USER + "        ctx.platform.graph()\n"}),
      "manifest.graph_outside_plan"),
     ("undeclared native extension", change(**{"pkg/b/_ext.so": "binary"}), "manifest.undeclared_native"),
+    ("code peeks at an undeclared key", change(**{"pkg/b/unit.py": USER + "        config.peek('unknown.value')\n"}),
+     "manifest.read_not_declared"),
+    ("code that does not parse", change(**{"pkg/b/unit.py": USER + "        self.x = (\n"}), "manifest.syntax_error"),
 ]
 
 
@@ -111,3 +114,21 @@ def test_a_role_listing_a_unit_for_another_role_is_refused(tmp_path: Path) -> No
     topo = Topology(TOPO.hosts, TOPO.mesh, TOPO.placement, [RoleSpec("sched", [UnitId("pkg.a")], hosts=[HostId("h")])])
     errors, _ = check(tmp_path, good(), topo)
     assert "manifest.wrong_role" in errors
+
+
+def test_a_declared_key_read_with_peek_is_used(tmp_path: Path) -> None:
+    """``config.peek`` reads a key without recording the read: the key still counts as read."""
+    peeks = USER.replace('config["pkg.k"]', 'config.peek("pkg.k")')
+    assert check(tmp_path, change(**{"pkg/b/unit.py": peeks})) == (set(), set())
+
+
+def test_code_that_does_not_parse_is_reported_with_its_line_and_checked_no_further(tmp_path: Path) -> None:
+    """A syntax error is a static check failure, not a crash of the checks. The checks that read code
+    skip that module: its imports and reads are unknown, so it gets no ``unused_read`` warning."""
+    broken = 'class Unit:\n    def __init__(self, ctx, config):\n        self.a = ctx.use("pkg.a@1"\n'
+    root = write_tree(tmp_path / "engine", change(**{"pkg/b/unit.py": broken, "pkg/lib.py": "x = [\n"}))
+    errors, warnings = check_tree(root, TOPO, FrameworkModules.default())
+    assert [(d.code, d.subject) for d in errors] == [("manifest.syntax_error", "pkg.b"),
+                                                     ("manifest.syntax_error", "pkg.lib")]
+    assert "pkg/b/unit.py, line 3" in errors[0].reason and "pkg/lib.py, line 1" in errors[1].reason
+    assert warnings == []

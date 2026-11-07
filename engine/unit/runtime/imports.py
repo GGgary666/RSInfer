@@ -48,7 +48,9 @@ def _imports_cached(path: str, mtime_ns: int, size: int, module: str, is_package
 
 
 def imports_of(path: Path, module: str, is_package: bool) -> frozenset[str]:
-    """Every module name ``path`` may import (some may be attributes, not modules)."""
+    """Every module name ``path`` may import (some may be attributes, not modules). Raises
+    ``SyntaxError`` if the file does not parse: callers reading candidate code check syntax
+    first (``core.manifest`` reports it as ``manifest.syntax_error``)."""
     st = path.stat()
     return _imports_cached(str(path), st.st_mtime_ns, st.st_size, module, is_package)
 

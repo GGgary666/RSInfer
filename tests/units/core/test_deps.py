@@ -137,7 +137,66 @@ def test_a_new_unit_that_reads_a_key_the_change_sets_is_added_inside_the_reload(
     pa = only(p)
     assert pa.stage == [] and pa.reload is not None and [u.id for u in pa.reload.units_to_add] == ["pkg.c"]
     assert pa.config == {"pkg.live": 5} and reloaded(pa) == []
-    assert not isinstance(p, Failed) and any("pkg.c reads ['pkg.live']" in n for n in p.notes)
+    assert not isinstance(p, Failed) and any("pkg.c is added at the safe point: it reads ['pkg.live']" in n for n in p.notes)
+
+
+SCHED_UNIT = {"pkg/s/unit.toml": manifest_toml("pkg.s", "pkg.s.unit:Unit", process=["sched"], config={
+    "pkg.other": {"type": "int", "default": 2, "binding": "live"}}), "pkg/s/unit.py": "class Unit:\n    pass\n"}
+
+
+def test_a_new_unit_reading_a_key_of_another_role_is_added_once_the_reload_declares_it(tmp_path: Path) -> None:
+    """The key was never declared in this process: staged during prepare, the unit would read an
+    undeclared key. The reload declares it first, at its owner's default or at the value set."""
+    c = {"pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", reads=["pkg.other"]),
+         "pkg/c/unit.py": "class Unit:\n    pass\n"}
+    for sub, config, value in (("default", {}, 2), ("set", {"pkg.other": 3}, 3)):
+        p = Case(tmp_path / sub, base={**BASE, **SCHED_UNIT}, new={**BASE, **SCHED_UNIT, **c}, config=config).plan()
+        pa = only(p)
+        assert pa.stage == [] and pa.reload is not None and [u.id for u in pa.reload.units_to_add] == ["pkg.c"]
+        entry = pa.reload.config["pkg.other"]
+        assert (entry.owner, entry.value) == ("pkg.s", value) and "pkg.other" not in pa.config
+        assert not isinstance(p, Failed) and any("only the reload declares here" in n for n in p.notes)
+
+
+LATE = {"pkg/d/unit.toml": manifest_toml("pkg.d", "pkg.d.unit:Unit", provides=["pkg.d@1"], config={
+            "pkg.dkey": {"type": "int", "default": 4, "binding": "startup"}}),
+        "pkg/d/unit.py": "from pkg import lib\n\nclass Unit:\n    pass\n"}
+NEEDS_D = {
+    "pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", requires=["pkg.d@1"]),
+    "pkg/c/unit.py": "class Unit:\n    pass\n",
+    "pkg/e/unit.toml": manifest_toml("pkg.e", "pkg.e.unit:Unit", reads=["pkg.dkey"]),
+    "pkg/e/unit.py": "class Unit:\n    pass\n",
+    "pkg/f/unit.toml": manifest_toml("pkg.f", "pkg.f.unit:Unit", optional=["pkg.d@1"]),
+    "pkg/f/unit.py": "class Unit:\n    pass\n",
+    "pkg/g/unit.toml": manifest_toml("pkg.g", "pkg.g.unit:Unit", requires=["pkg.c@1"]),
+    "pkg/g/unit.py": "class Unit:\n    pass\n",
+}
+
+
+def test_a_new_unit_that_needs_a_unit_added_at_the_safe_point_waits_for_it(tmp_path: Path) -> None:
+    """``pkg.d`` imports changed code, so it is added at the safe point; the new units that use its
+    service (required or optional) or read its key wait with it, and so does one that needs those."""
+    needs = {**NEEDS_D, "pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", provides=["pkg.c@1"],
+                                                          requires=["pkg.d@1"])}
+    p = Case(tmp_path, new={**BASE, **LATE, **needs, "pkg/lib.py": "def helper():\n    return 2\n"}).plan()
+    pa = only(p)
+    assert pa.stage == [] and pa.reload is not None
+    assert sorted(u.id for u in pa.reload.units_to_add) == ["pkg.c", "pkg.d", "pkg.e", "pkg.f", "pkg.g"]
+    assert not isinstance(p, Failed)
+    notes = "\n".join(p.notes)
+    for expected in ("pkg.c is added at the safe point: it uses ['pkg.d@1']",
+                     "pkg.e is added at the safe point: it reads ['pkg.dkey'], which only the reload declares",
+                     "pkg.f is added at the safe point: it uses ['pkg.d@1']",
+                     "pkg.g is added at the safe point: it uses ['pkg.c@1']",
+                     "pkg.d is added at the safe point: it imports changed code"):
+        assert expected in notes, notes
+
+
+def test_new_units_that_need_each_other_are_staged_together(tmp_path: Path) -> None:
+    """When the unit they need is staged too, its keys and services are ready during prepare."""
+    early = {**LATE, "pkg/d/unit.py": "class Unit:\n    pass\n"}
+    pa = only(Case(tmp_path, new={**BASE, **early, **{k: v for k, v in NEEDS_D.items() if "/g/" not in k}}).plan())
+    assert sorted(u.id for u in pa.stage) == ["pkg.c", "pkg.d", "pkg.e", "pkg.f"] and pa.reload is None
 
 
 def test_a_removed_unit_is_unloaded(tmp_path: Path) -> None:
