@@ -16,7 +16,7 @@ from msgspec.structs import replace
 from core.common.ids import HostId, Identity
 from core.common.result import Failed, Ok
 from core.nodeagent.agent import AgentTunables, NodeAgent, child_env
-from core.supervisor.protocol import ProcSpec, ProcStatusReport, Spawn, Spawned, Status, Stop
+from core.supervisor.protocol import Materialized, ProcSpec, ProcStatusReport, Spawn, Spawned, Status, Stop
 from tests.framework.cluster.harness import ENGINE, REPO, build_tree, cluster, proc, role, topology
 from platforms.base import PlatformInfo
 from unit.runtime import InstanceState, ProcessPlan
@@ -104,6 +104,26 @@ def test_materialize_reuses_blobs_and_never_leaves_half_snapshots(tmp_path: Path
             root = Path(c.agents["host-a"].root)
             assert not (root / identity3).exists()
             assert not list(root.glob(".tmp-*"))
+
+    run(main())
+
+
+def test_a_snapshot_is_written_once_and_never_rewritten(tmp_path: Path) -> None:
+    """stage2-contract.md §10.8: a snapshot path's content never changes once written, so an
+    in-process reload never imports stale bytecode (GPU probe P7). Materializing the same identity
+    again leaves the files alone, and the snapshot is read-only."""
+    async def main() -> None:
+        async with cluster(tmp_path, ["host-a"]) as c:
+            identity, files = c.ingest(build_tree(tmp_path / "v1"))
+            first = (await c.sup.materialize(HostId("host-a"), identity, files)).unwrap()
+            assert isinstance(first, Materialized)
+            snap = Path(first.path)
+            module = snap / "engine" / "toyc" / "units.py"
+            before = (module.stat().st_ino, module.stat().st_mtime_ns)
+            again = (await c.sup.materialize(HostId("host-a"), identity, files)).unwrap()
+            assert isinstance(again, Materialized) and again.path == first.path and again.fetched == 0
+            assert (module.stat().st_ino, module.stat().st_mtime_ns) == before
+            assert all(d.stat().st_mode & 0o222 == 0 for d in [snap, *(p for p in snap.rglob("*") if p.is_dir())])
 
     run(main())
 

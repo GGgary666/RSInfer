@@ -339,7 +339,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - 约束：快照路径下的内容写好以后永不改变。
 - 原地改写同一个 `.py`，同一秒内、长度不变时，会 import 到旧的字节码（P7）。
 - 现在的做法满足这条约束：每个身份一个快照目录；节点代理设了 `PYTHONDONTWRITEBYTECODE=1`；change-set 和 blob 都排除 `__pycache__`。控制面进程会往自己的快照目录写 `.pyc`，这不要紧，因为那里的源码不会再变。
-- 要补一条测试把这条约束固定下来。
+- 物化本身就保证了这一点：节点代理和控制面都按摘要给快照目录命名，先写临时目录再原子改名，已经存在就不重写；节点代理还把目录设成只读。测试 `tests/framework/cluster/test_cluster.py::test_a_snapshot_is_written_once_and_never_rewritten` 把它固定下来：同一身份再物化一次，文件不被改写，目录是只读的。
 
 ## 11. 测试和工具链
 
