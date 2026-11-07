@@ -1,5 +1,9 @@
 """Errors raised inside a process when a unit breaks the unit rules."""
 
+from __future__ import annotations
+
+from core.common.result import Failed
+
 
 class UnitRuleError(RuntimeError):
     """A unit used the runtime in a way its manifest does not allow."""
@@ -31,3 +35,11 @@ class RevocationError(UnitRuleError):
 
 class InjectedFault(RuntimeError):
     """Raised at a fault point configured by a test."""
+
+
+class StagingFailed(Exception):
+    """A sliced staging (``UnitRuntime.stage_in_slices``) failed; ``failed`` says why."""
+
+    def __init__(self, failed: Failed) -> None:
+        super().__init__("; ".join(str(d) for d in failed.diagnostics))
+        self.failed = failed

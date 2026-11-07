@@ -103,6 +103,7 @@ RECEIVED → CHECKED → PLANNED → PREPARING → PREPARED → PAUSING → EXEC
 - 协调者等 `Prepared` 的时限是配置项 `change.prepare_timeout_s`（默认 600 秒），超时就整体 abort。
 - **退路**：做不到分片的准备（实现太复杂，或者必须独占）就一次做完。这时准备期间主循环不跑步，停服时长等于准备时长，诊断里要写明。
 - 准备期间不能改变正在服务的东西：新增单元可以装上（[unit-runtime.md](unit-runtime.md) 6.3），新 graph 只能录在第二套 buffer 里；修改已有模块、切换 graph 都留到暂停期内。
+- **装新单元也分片**（2026-11-07）：第一片检查新单元、声明它们的配置键，不跑单元代码；之后每片装一个单元，两片之间主循环照常跑步、回请求。全部装好、都 ACTIVE 才算这一项准备完；有一个失败就全部撤掉。新单元自己的准备动作，在它装好以后再开始，也按它自己的分片走。（以前是一次装完，报 `change.prepare_one_shot`；单元构造函数慢的时候，停服时长就是所有新单元构造时间之和。）
 
 参照：sglang 的 EPLB 搬专家权重，就是在两次前向之间一层一层地搬（`expert_location_updater.py`）。
 

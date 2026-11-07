@@ -34,7 +34,7 @@ from core.context.flags import RuntimeFlags
 from core.context.resources import Resources
 from platforms.base import Platform
 from unit.runtime.context import UnitContext
-from unit.runtime.errors import InjectedFault, ServiceConflictError
+from unit.runtime.errors import InjectedFault, ServiceConflictError, StagingFailed
 from unit.runtime.imports import ImportGraph, scan_root
 from unit.runtime.proxy import Provision, ServiceProxy
 from unit.runtime.registry import leftovers, running_as
@@ -223,6 +223,31 @@ class UnitRuntime:
         """
         with self._operation():
             return self._stage(units, code_root, set(changed_modules), config or {})
+
+    def stage_in_slices(
+        self, units: list[UnitSpec], *, code_root: str | None = None,
+        changed_modules: Iterable[str] = (), config: dict[str, ConfigEntry] | None = None,
+    ) -> Generator[None]:
+        """``stage_new_units`` a slice at a time, for a sliced prepare (change.md §4.6): the first
+        ``next()`` checks the units and declares their keys (no unit code runs), each later one builds
+        one unit, and the caller's main loop runs in between. Raises ``StagingFailed`` (its ``failed``
+        holds the diagnostics) and leaves nothing staged if a check or a unit fails. Closed early, the
+        units built so far stay staged: ``discard_staged`` removes them."""
+        with self._operation():
+            r = self._stage_begin(units, code_root, set(changed_modules), config or {})
+        if isinstance(r, Failed):
+            raise StagingFailed(r)
+        while True:
+            yield
+            with self._operation():  # one unit per slice, in the order _settle() would load them
+                slot = self._next_ready()
+                if slot is not None:
+                    self._load(slot)
+                    continue
+                r = self._stage_finish()
+            if isinstance(r, Failed):
+                raise StagingFailed(r)
+            return
 
     def discard_staged(self) -> Result[None]:
         """Abort of a prepared change: remove staged units and their code."""
@@ -952,6 +977,15 @@ class UnitRuntime:
 
     def _stage(self, units: list[UnitSpec], code_root: str | None, changed: set[str],
                config: dict[str, ConfigEntry]) -> Result[None]:
+        r = self._stage_begin(units, code_root, changed, config)
+        if isinstance(r, Failed):
+            return r
+        self._settle()
+        return self._stage_finish()
+
+    def _stage_begin(self, units: list[UnitSpec], code_root: str | None, changed: set[str],
+                     config: dict[str, ConfigEntry]) -> Result[None]:
+        """Check the units, make their code importable and declare their keys; builds nothing."""
         errors: list[Diagnostic] = []
         for spec in units:
             if spec.id in self._slots:
@@ -988,7 +1022,10 @@ class UnitRuntime:
         if errors:
             self._discard_staged()
             return Failed(errors)
-        self._settle()
+        return Ok(None)
+
+    def _stage_finish(self) -> Result[None]:
+        """Every staged unit is active, or none stays staged."""
         bad = [s for s in self._slots.values() if s.staged and s.state is not InstanceState.ACTIVE]
         if bad:
             failure = Failed([

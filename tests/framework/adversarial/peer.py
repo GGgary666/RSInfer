@@ -75,7 +75,11 @@ class Peer:
         env = self.host.registry.wrap(msg, self.host.me)
         result = self.host.handlers[type(msg)](env, msg)
         if isinstance(result, Capture):
-            assert result.result is not None, "this test expects immediate safe-point completion"
+            for _ in range(SAFE_POINTS):  # a sliced prepare (staging builds one unit per safe point)
+                if result.result is not None:
+                    break
+                self.host.participant.tick()
+            assert result.result is not None, f"not done within {SAFE_POINTS} safe points"
             return result.result
         assert not isinstance(result, Deferred)
         return result
@@ -83,6 +87,10 @@ class Peer:
     def prepare(self, cid: int, fail: str = "") -> Prepare:
         return Prepare(cid, Identity("v1"), ProcActions(
             PROC, actions=[UnitAction(self.unit.id, "install", {"fail": fail})]), 60.0)
+
+
+SAFE_POINTS = 100
+"""How many safe points ``Peer.send`` runs for a reply that is not ready at once."""
 
 
 @pytest.fixture

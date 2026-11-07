@@ -86,6 +86,7 @@ class UnitRuntime:
     def load_process_plan(self, plan: ProcessPlan) -> Result[None]: ...
     def reload(self, plan: ReloadPlan) -> Result[ReloadReport]: ...       # 只在安全点调用
     def stage_new_units(self, units: list[UnitSpec]) -> Result[None]: ... # 准备阶段：后台装新增单元
+    def stage_in_slices(self, units: list[UnitSpec]) -> Generator[None]: ...  # 同上，每次 next() 装一个（2026-11-07）
     def snapshot(self) -> RuntimeSnapshot: ...  # 每个实例的状态、依赖指纹、登记过的东西
 ```
 

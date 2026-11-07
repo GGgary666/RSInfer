@@ -55,6 +55,7 @@ from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
 from core.context.config import ConfigCommit, ConfigEntry
 from core.ipc.rpc import Deferred
+from unit.runtime.errors import StagingFailed
 from unit.runtime.types import ReloadPlan, ReloadReport
 
 if TYPE_CHECKING:
@@ -65,7 +66,8 @@ COMPONENT = "change.participant"
 
 Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone",
                 "committed"]
-type _Slices = tuple[UnitAction, Iterator[object]]
+type _Slices = tuple[str, Iterator[object]]
+"""What is being prepared (for diagnostics), and the iterator that does one slice per ``next()``."""
 
 
 @dataclass
@@ -206,32 +208,19 @@ class Participant:
                 r = self.rt.config.stage(c.config_now)
                 if isinstance(r, Failed):
                     return r
-            if a.stage:
-                t0 = time.monotonic()
-                changed = a.reload.changed_modules if a.reload else []
-                r = self.rt.stage_new_units(a.stage, code_root=self._code_root_for(msg.identity),
-                                            changed_modules=changed,
-                                            config={k: e for k, e in for_new.items() if e.owner in staged_ids})
-                if isinstance(r, Failed):
-                    self.rt.config.discard_staged()
-                    return r
-                c.staged = True
-                c.prepare_diags.append(self._one_shot(f"staging {len(a.stage)} new unit(s)", t0))
-            # after staging: a unit staged now keeps its instance, so it prepares now
             touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
-            for ua in a.actions:
-                if ua.unit in touched:  # its instance is replaced at the safe point; prepare the new one there
-                    c.deferred.append(ua)
-                    continue
-                c.prepared_actions.append(ua)  # before the call: abort() also undoes a prepare that raised
-                t0 = time.monotonic()
-                out = self._handler(ua).prepare(ua.args)
-                if out is None:
-                    c.prepare_diags.append(self._one_shot(
-                        f"{ua.unit}.{ua.action}", t0,
-                        hint="return an iterator from prepare() to prepare in slices between steps"))
-                else:
-                    c.slicing.append((ua, iter(out)))
+            c.deferred = [ua for ua in a.actions if ua.unit in touched]  # prepared on the new instance
+            now = [ua for ua in a.actions if ua.unit not in touched]
+            if a.stage:  # one new unit per slice, the old version serving in between (§4.6)
+                changed = a.reload.changed_modules if a.reload else []
+                staging = self.rt.stage_in_slices(a.stage, code_root=self._code_root_for(msg.identity),
+                                                  changed_modules=changed,
+                                                  config={k: e for k, e in for_new.items() if e.owner in staged_ids})
+                c.staged = True  # an undo discards whatever it built
+                c.slicing.append((f"staging {len(a.stage)} new unit(s)", self._staging_then(c, staging, now)))
+            else:
+                for ua in now:
+                    self._start_prepare(c, ua)
         except Exception as e:  # noqa: BLE001 - a failing unit fails the change, not the process
             self._undo(c)
             return self._fail("prepare", e)
@@ -242,6 +231,25 @@ class Participant:
             return Ok(Prepared(c.id, list(c.prepare_diags)))
         reply = c.prepare_reply = self.host.rpc.defer()
         return reply
+
+    def _start_prepare(self, c: _Change, ua: UnitAction) -> None:
+        c.prepared_actions.append(ua)  # before the call: abort() also undoes a prepare that raised
+        t0 = time.monotonic()
+        out = self._handler(ua).prepare(ua.args)
+        if out is None:
+            c.prepare_diags.append(self._one_shot(
+                f"{ua.unit}.{ua.action}", t0,
+                hint="return an iterator from prepare() to prepare in slices between steps"))
+        else:
+            c.slicing.append((f"{ua.unit}.{ua.action}", iter(out)))
+
+    def _staging_then(self, c: _Change, staging: Iterator[None], actions: list[UnitAction]) -> Iterator[None]:
+        """The staging slices; then the other preparations start, each in its own slices: they may
+        use what the new units register (a graph rebuilt with the new kernel), and the new units'
+        own actions need their instances."""
+        yield from staging
+        for ua in actions:
+            self._start_prepare(c, ua)
 
     def _one_shot(self, what: str, since: float, hint: str = "") -> Diagnostic:
         took = time.monotonic() - since
@@ -258,7 +266,7 @@ class Participant:
                     c.slicing.remove(item)
         except Exception as e:  # noqa: BLE001
             if c.prepare_reply is not None:
-                c.prepare_reply.resolve(self._fail("prepare", e))
+                c.prepare_reply.resolve(e.failed if isinstance(e, StagingFailed) else self._fail("prepare", e))
             self._rollback(c)
             self._resume(c, rolled_back=True)
             return
@@ -285,13 +293,13 @@ class Participant:
             self.host.paused = True
 
     def _undo_actions(self, c: _Change) -> None:
-        for ua, it in c.slicing:
+        for what, it in c.slicing:
             close = getattr(it, "close", None)
             try:
                 if close is not None:
                     close()
             except Exception as e:  # noqa: BLE001
-                self._abort_failed(ua, e)
+                self.diagnostics.append(diag(COMPONENT, "abort", f"{what}: {e}", code="change.abort_failed"))
         c.slicing.clear()
         for ua in reversed(c.prepared_actions):  # before a reverse reload replaces the instances
             try:
