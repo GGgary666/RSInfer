@@ -22,6 +22,11 @@ TX_INVARIANTS = ["TypeOK", "DurableBeforeCommit", "CommitCompatible", "CommitBar
                  "RollbackPaused", "FailureFreezes", "HonestCommit", "HonestAbort"]
 PEER_INVARIANTS = ["TypeOK", "ClosedNotActive", "RollbackPaused", "ServingMatchesEffect", "CommitHasEffect",
                    "AtMostOnceExecute", "AtMostOnceAbort"]
+SEQUENCE_INVARIANTS = ["TypeOK", "ReceiptHasEvidence", "NoClosedReactivation", "CompletedFirstNotReopened", "NewTransactionPreserved",
+                       "FailedFirstBlocksSecond", "RollbackPaused", "ServingMatchesEffect", "CommitBarrier",
+                       "ExecutedEvidence", "HonestSecondCommit"]
+INCARNATION_INVARIANTS = ["TypeOK", "SingleLiveProcess", "EveryLiveProcessTracked", "NoStaleStopKillsSuccessor",
+                         "NoStaleReportChangesSuccessor", "GenerationNeverGoesBack", "RunningReportMatchesGeneration"]
 
 
 def cases() -> list[dict[str, Any]]:
@@ -31,7 +36,9 @@ def cases() -> list[dict[str, Any]]:
 
     def add(name, module, constants, overrides=None, expected=None):
         out.append({"name": name, "module": module, "constants": {**constants, **(overrides or {})},
-                    "invariants": TX_INVARIANTS if module == "Transaction" else PEER_INVARIANTS,
+                    "invariants": {"Transaction": TX_INVARIANTS, "Participant": PEER_INVARIANTS,
+                                   "SequentialTransactions": SEQUENCE_INVARIANTS,
+                                   "Incarnation": INCARNATION_INVARIANTS}[module],
                     "expected": expected})
 
     add("transaction", "Transaction", tx)
@@ -63,6 +70,30 @@ def cases() -> list[dict[str, Any]]:
                               ("NeverTwoCommits", {}), ("NeverCrossAbort", {}),
                               ("NeverUndoFailure", {"AbortFails": "TRUE"})]:
         add("witness-" + invariant, "Participant", peer, extra, invariant)
+    sequence = {"Peers": "{1, 2}", "RollbackFails": "{}", "RestartPeers": "FALSE", "Bug": '"None"'}
+    add("sequence", "SequentialTransactions", sequence)
+    add("sequence-rollback-fails", "SequentialTransactions", sequence, {"RollbackFails": "{2}"})
+    add("sequence-restart", "SequentialTransactions", sequence, {"RestartPeers": "TRUE"})
+    for bug, invariant, extra in [
+        ("OldAbortTouchesNew", "NewTransactionPreserved", {}),
+        ("OldReceiptCountsForNew", "ReceiptHasEvidence", {}),
+        ("IgnoreRecovery", "FailedFirstBlocksSecond", {"RollbackFails": "{2}"}),
+        ("RouteAcrossIncarnation", "CompletedFirstNotReopened", {"RestartPeers": "TRUE"}),
+    ]:
+        add("mutant-" + bug, "SequentialTransactions", sequence, {**extra, "Bug": json.dumps(bug)}, invariant)
+    for invariant, extra in [("NeverSecondCommit", {}), ("NeverLateThenCommit", {}),
+                              ("NeverRestartThenCommit", {"RestartPeers": "TRUE"}),
+                              ("NeverFailedRollback", {"RollbackFails": "{2}"})]:
+        add("witness-" + invariant, "SequentialTransactions", sequence, extra, invariant)
+    incarnation = {"Bug": '"None"'}
+    add("incarnation", "Incarnation", incarnation)
+    for bug, invariant in [("NoLifecycleLock", "SingleLiveProcess"),
+                           ("IgnoreStopGeneration", "NoStaleStopKillsSuccessor"),
+                           ("AcceptStaleReport", "NoStaleReportChangesSuccessor"),
+                           ("AllowOlderSpawn", "GenerationNeverGoesBack")]:
+        add("mutant-" + bug, "Incarnation", incarnation, {"Bug": json.dumps(bug)}, invariant)
+    for invariant in ["NeverReplacementRunning", "NeverSurvivedStaleStop"]:
+        add("witness-" + invariant, "Incarnation", incarnation, expected=invariant)
     return out
 
 
