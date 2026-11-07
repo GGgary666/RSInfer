@@ -208,19 +208,16 @@ class Participant:
                 r = self.rt.config.stage(c.config_now)
                 if isinstance(r, Failed):
                     return r
-            touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
-            c.deferred = [ua for ua in a.actions if ua.unit in touched]  # prepared on the new instance
-            now = [ua for ua in a.actions if ua.unit not in touched]
             if a.stage:  # one new unit per slice, the old version serving in between (§4.6)
                 changed = a.reload.changed_modules if a.reload else []
                 staging = self.rt.stage_in_slices(a.stage, code_root=self._code_root_for(msg.identity),
                                                   changed_modules=changed,
                                                   config={k: e for k, e in for_new.items() if e.owner in staged_ids})
                 c.staged = True  # an undo discards whatever it built
-                c.slicing.append((f"staging {len(a.stage)} new unit(s)", self._staging_then(c, staging, now)))
+                c.slicing.append((f"staging {len(a.stage)} new unit(s)",
+                                  self._staging_then(c, staging, list(a.actions))))
             else:
-                for ua in now:
-                    self._start_prepare(c, ua)
+                self._prepare_or_defer(c, a.actions)
         except Exception as e:  # noqa: BLE001 - a failing unit fails the change, not the process
             self._undo(c)
             return self._fail("prepare", e)
@@ -244,12 +241,23 @@ class Participant:
             c.slicing.append((f"{ua.unit}.{ua.action}", iter(out)))
 
     def _staging_then(self, c: _Change, staging: Iterator[None], actions: list[UnitAction]) -> Iterator[None]:
-        """The staging slices; then the other preparations start, each in its own slices: they may
-        use what the new units register (a graph rebuilt with the new kernel), and the new units'
-        own actions need their instances."""
+        """The staging slices; then the preparations start, each in its own slices: they may use
+        what the new units register (a graph rebuilt with the new kernel), the new units' own actions
+        need their instances, and which actions wait for the reload depends on the staged units too."""
         yield from staging
+        self._prepare_or_defer(c, actions)
+
+    def _prepare_or_defer(self, c: _Change, actions: list[UnitAction]) -> None:
+        """Prepare each action now, unless the reload at the safe point replaces its unit's instance:
+        then it is prepared on the new instance there. Decided on the units present now, so after
+        staging a new unit that uses a reloaded provider counts (the reload rebuilds it with it)."""
+        a = c.actions
+        touched = self.rt.units_touched_by(a.reload) if a.reload else set[UnitId]()
         for ua in actions:
-            self._start_prepare(c, ua)
+            if ua.unit in touched:
+                c.deferred.append(ua)
+            else:
+                self._start_prepare(c, ua)
 
     def _one_shot(self, what: str, since: float, hint: str = "") -> Diagnostic:
         took = time.monotonic() - since

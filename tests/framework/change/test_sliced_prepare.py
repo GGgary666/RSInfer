@@ -7,12 +7,21 @@ import re
 from pathlib import Path
 from typing import Any
 
-from core.change.coordinator import PlanInput
-from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
-from core.common.ids import ProcId, UnitId
-from tests.framework.change.engine import ALL, SCHED, W1, Engine, engine, reload_everywhere, run, wait_until
-from tests.framework.support import spec
+import msgspec
+import pytest
 
+from core.change.coordinator import PlanInput
+from core.change.protocol import Execute, Pause, Prepare
+from core.change.types import ActionPlan, ChangeSet, ProcActions, UnitAction
+from core.common.ids import Identity, ProcId, UnitId
+from core.common.result import Ok, Result
+from core.ipc.rpc import Deferred
+from core.supervisor.protocol import ProcSpec
+from tests.framework.change.engine import ALL, SCHED, W1, Engine, engine, reload_everywhere, run, wait_until
+from tests.framework.change.harness import Capture
+from tests.framework.support import PROC, events, spec, write_tree
+from unit.runtime import ProcessPlan, ReloadPlan
+from unit.runtime.host import ProcessHost
 
 def op_everywhere(args: dict[ProcId, dict[str, Any]]) -> Any:
     def script(inp: PlanInput) -> ActionPlan:
@@ -129,3 +138,75 @@ def test_new_units_are_staged_one_per_safe_point_while_the_old_version_serves(tm
             assert {f"toyc.k{i}" for i in range(5)} <= {u.unit for u in (await e.status(W1)).units}
 
     run(main())
+
+
+CONSUMER = """
+from tests.framework.support import events
+
+
+class Consumer:
+    def __init__(self, ctx, config):
+        self.instance = ctx.instance
+        self.provider = ctx.use("review.provider@1")
+        self.ready = False
+        ctx.on_action("work", self)
+
+    def prepare(self, args):
+        events.append(("prepare", str(self.instance)))
+        self.ready = True
+
+    def execute(self, args):
+        events.append(("execute", str(self.instance)))
+        assert self.ready, "execute ran on a new instance that never prepared"
+
+    def abort(self):
+        self.ready = False
+
+    def commit(self):
+        pass
+"""
+PROVIDER = """
+class Provider:
+    def __init__(self, ctx, config):
+        ctx.provide("review.provider@1", self)
+"""
+
+
+def test_an_action_of_a_staged_unit_whose_provider_reloads_is_prepared_on_its_new_instance(
+        tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A change stages B, which uses A, and reloads A: the reload rebuilds B with A. Which actions
+    wait for the reload is decided once staging built B, so B's action is prepared on the instance
+    that executes it, not on the staged one the reload replaces (found in review of #15)."""
+    provider = spec(f"{pkg}.provider", f"{pkg}.provider:Provider", provides=["review.provider@1"])
+    consumer = spec(f"{pkg}.consumer", f"{pkg}.consumer:Consumer", requires=["review.provider@1"])
+    v1 = write_tree(tmp_path / "snapshots" / "v1" / "engine", {f"{pkg}/provider.py": PROVIDER})
+    write_tree(tmp_path / "snapshots" / "v2" / "engine", {
+        f"{pkg}/provider.py": PROVIDER + "\n# the new provider version\n", f"{pkg}/consumer.py": CONSUMER})
+    plan = ProcessPlan(PROC, Identity("v1"), [provider], code_root=str(v1))
+    host = ProcessHost(ProcSpec(PROC, Identity("v1"), plan, "unused", "127.0.0.1"))
+    monkeypatch.setattr(host.rpc, "defer", Capture)
+    host.runtime.load_process_plan(plan).unwrap()
+
+    def send(msg: msgspec.Struct) -> Result[msgspec.Struct]:
+        result = host.handlers[type(msg)](host.registry.wrap(msg, host.me), msg)
+        if isinstance(result, Capture):
+            for _ in range(20):  # safe points, as the main loop would run them
+                if result.result is not None:
+                    return result.result
+                host.participant.tick()
+            raise AssertionError("prepare did not finish")
+        assert not isinstance(result, Deferred)
+        return result
+
+    try:
+        actions = ProcActions(PROC, stage=[consumer], actions=[UnitAction(consumer.id, "work")],
+                              reload=ReloadPlan(changed_modules=[f"{pkg}.provider"], units_to_reload=[provider]))
+        assert isinstance(send(Prepare(1, Identity("v2"), actions, 30)), Ok)
+        assert isinstance(send(Pause(1, None)), Ok)
+        result = send(Execute(1))
+        assert isinstance(result, Ok), result
+        prepared = [inst for kind, inst in events if kind == "prepare"]
+        executed = [inst for kind, inst in events if kind == "execute"]
+        assert prepared and executed and prepared[-1] == executed[-1], events
+    finally:
+        host.shutdown()
