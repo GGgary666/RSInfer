@@ -15,6 +15,7 @@
 | [nodeagent.md](nodeagent.md) | 节点代理 `core.nodeagent` | 每台机器一个独立进程 |
 | [supervisor.md](supervisor.md) | 进程管家 `core.supervisor` | 控制面进程 |
 | [change.md](change.md) | 变更事务 `core.change` | 控制面进程 |
+| [control-plane.md](control-plane.md) | 控制面进程 `core.control`，以及控制面单元 `core.identity`、`core.manifest`、`core.deps`、`core.api` | 控制面进程 |
 
 前四个和单元在同一个 Python 进程里，只能用 Python；后三个是独立进程，只通过版本化消息交互，以后可以单独换成 Rust（v0 全部 Python）。
 
