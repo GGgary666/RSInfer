@@ -31,5 +31,5 @@ class Unit:
         placement = [(i + wanted) % 4 for i in range(4)]
         identity = self.control.identity
         cs = ChangeSet(base=identity, source="internal", computed_under=identity, state_only=True,
-                       state=[StateRequest(UnitId("scn.memory"), "migrate", {"placement": placement})])
+                       state=[StateRequest(UnitId("scn.memory"), "relocate", {"placement": placement})])
         self.journal.write(f"balancer submitted {placement}: {self.control.submit(cs)}")

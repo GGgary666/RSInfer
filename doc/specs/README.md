@@ -65,7 +65,7 @@ optional = []                       # 可选；用 ctx.get() 取，可能为 Non
 
 [capabilities]
 accept_config = true                # 能原地接受新配置
-actions = []                        # 状态单元才有：refit | grow | migrate | invalidate
+actions = []                        # 状态单元才有：refit | grow | relocate | invalidate（2026-11-07 由 migrate 改名）
 graph_capturable = true             # kernel solution 才有意义
 native_extensions = []              # 用到的 .so；改了它们走“重启进程”
 changes_kv_numerics = false         # 模型、层单元才有意义

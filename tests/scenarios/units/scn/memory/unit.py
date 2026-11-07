@@ -17,10 +17,10 @@ class Unit:
         self.table = [0, 1, 2, 3]
         self.journal = Journal(config["scn.log_dir"], ctx)
         ctx.provide("scn.memory@1", self)
-        ctx.on_action("migrate", Migrate(self))
+        ctx.on_action("relocate", Relocate(self))
 
 
-class Migrate:
+class Relocate:
     """EPLB: a new placement, written into the same buffer (same address, new contents)."""
 
     def __init__(self, memory: Unit) -> None:

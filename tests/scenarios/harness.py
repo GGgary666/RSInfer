@@ -164,7 +164,7 @@ async def scenario(tmp: Path, *, ranks: tuple[str, ...] = HOSTS, files: dict[str
         zctx.destroy(linger=0)
 
 
-STATE_ACTIONS = frozenset({"refit", "grow", "migrate", "invalidate"})
+STATE_ACTIONS = frozenset({"refit", "grow", "relocate", "invalidate"})
 
 
 def rungs(plan: ActionPlan | None, proc: ProcId | None = None) -> set[int]:

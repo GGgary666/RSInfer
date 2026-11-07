@@ -204,7 +204,7 @@ ol.ladder li{margin:4px 0}
       <tr><td>1</td><td>原地接受新配置</td><td>单元注册了配置钩子，键是每步现读的</td><td>chunk 大小、EPLB 周期</td></tr>
       <tr><td>2</td><td>重载单元</td><td>单元代码变了；依赖它的单元跟着重载</td><td>换一个策略、改调度逻辑、改 worker 主循环</td></tr>
       <tr><td>3</td><td>重建派生产物</td><td>派生产物按值或按地址依赖了变化的东西</td><td>重录用到新 kernel 的 graph</td></tr>
-      <tr><td>4</td><td>状态动作</td><td>状态单元管的内容变了，由状态单元自己提供的动作处理</td><td>refit（换权重）、grow（扩 KV 池）、migrate（EPLB 搬专家）、invalidate（让 KV 失效）</td></tr>
+      <tr><td>4</td><td>状态动作</td><td>状态单元管的内容变了，由状态单元自己提供的动作处理</td><td>refit（换权重）、grow（扩 KV 池）、relocate（EPLB 搬专家）、invalidate（让 KV 失效）</td></tr>
       <tr><td>5</td><td>重启进程</td><td>进程级的东西变了，卸不掉</td><td>native 扩展（.so）、并行拓扑变了、NVSHMEM 首次初始化、进程崩溃</td></tr>
       <tr><td>6</td><td>重启引擎</td><td>框架本体变了，或者平台升级</td><td>单元运行时的代码、torch / CUDA 版本</td></tr>
     </table>
@@ -217,7 +217,7 @@ ol.ladder li{margin:4px 0}
       <tr><td class="nw"><b>P1 用数据描述</b></td><td>并行拓扑（mesh：有哪些维度、各多大）、进程拓扑（有哪些进程角色、各装哪些单元）、张量的格式和放置、每层的状态声明，都写成数据，由单元来解释，不在代码里假设。新模型、新并行方式大多只是新数据加新单元。</td><td>进程管家、通信组、权重存储、状态种类、模型规格</td></tr>
       <tr><td class="nw"><b>P2 开放记录</b></td><td>跨单元传的记录（StepPlan、决策快照、StepResult）不是固定的结构体，由各单元各自贡献分段。新单元加自己的分段，不用改别人。</td><td>调度逻辑、worker 主循环、决策点</td></tr>
       <tr><td class="nw"><b>P3 按 rank 索引</b></td><td>凡是和 rank 有关的接口都按 rank 索引。TP 只是“每个 rank 都一样”的特例。</td><td>StepPlan、账本（按调度域分）、决策快照</td></tr>
-      <tr><td class="nw"><b>P4 能力声明</b></td><td>单元声明自己支持哪些动作（refit、grow、migrate、原地接受配置）、能不能被录进 graph、需要什么平台能力、会不会改变 KV 数值。框架按声明推导动作，不在框架里写死一张表。</td><td>所有单元的清单</td></tr>
+      <tr><td class="nw"><b>P4 能力声明</b></td><td>单元声明自己支持哪些动作（refit、grow、relocate、原地接受配置）、能不能被录进 graph、需要什么平台能力、会不会改变 KV 数值。框架按声明推导动作，不在框架里写死一张表。</td><td>所有单元的清单</td></tr>
       <tr><td class="nw"><b>P5 联合协议</b></td><td>几个单元一起决定的事（准入、前缀命中长度、分桶对齐），走“各自给出约束 → 机制合并”的流程，不由某一个单元说了算。</td><td>账本、分桶决策点</td></tr>
       <tr><td class="nw"><b>P6 变更来源统一</b></td><td>agent 的 apply、配置、单元自己发起的改动（比如 EPLB）、运维操作，都是 change-set，走同一条流程。</td><td>core.change</td></tr>
       <tr><td class="nw"><b>P7 位置透明</b></td><td>凡是跨进程的东西都不假设在同一台机器：拉起进程走节点代理，通道按两端是否同机选后端（共享内存或 TCP / RDMA），代码从本机按身份物化的快照目录加载，地址和路径来自拓扑数据，事务参与者按“机器 + 进程”寻址。单机只是多机的特例，就像 TP 只是“每个 rank 都一样”的特例。</td><td>框架本体：进程管家、节点代理、进程间传输、单元运行时、变更事务</td></tr>
@@ -427,7 +427,7 @@ const MODS = [
    one:'回答“改了这个，哪些东西要跟着动、怎么动”。',
    does:['代码层面：从 import 图和单元的依赖声明，算出要重载哪些单元（被改的单元 + 依赖它的单元）',
          '派生产物层面：任何单元都可以登记派生产物（plan、graph、缓存的映射表、实测曲线……），以及它依赖了什么、怎么依赖的（实时 / 按地址 / 按值）；上游变了，就通知产物的主人重建哪些',
-         '状态层面：按各单元声明的能力，选出最便宜的状态动作（refit、grow、migrate、invalidate）',
+         '状态层面：按各单元声明的能力，选出最便宜的状态动作（refit、grow、relocate、invalidate）',
          '合成一份动作计划；<code>apply --dry-run</code> 返回的就是它'],
    nodo:['不执行动作'],
    borrow:['Cordis HMR 的 import 图分析（<code>analyzeChanges</code>）'],
@@ -608,7 +608,7 @@ const MODS = [
    does:['每层声明自己存的部分：寿命（整个请求 / 滑动窗口 / 每请求一个 slot）× 每项对应几个 token × 形状 × 放在哪（显存 / host）× 自有还是借用别的层的 × 快照对齐 × 分区',
          'Qwen3.8：paged KV + GDN 的 recurrent / conv state',
          'DS 1017：压缩 block KV、indexer K、每序列 state slot（分可持久和可丢弃两区）、nextn KV、Engram 大表；专家放置表和负载计数也登记成状态',
-         '每种实现 allocate / free / snapshot / invalidate（必须有），以及可选的 migrate / refit / grow，并声明自己支持哪些',
+         '每种实现 allocate / free / snapshot / invalidate（必须有），以及可选的 relocate / refit / grow，并声明自己支持哪些',
          '同一份声明也交给账本，账本里的记账插件按它记账'],
    nodo:['不记账（账本在调度宿主）'],
    borrow:['sglang <code>mem_cache/kv/decl.py</code>（lifetime × geometry）和 <code>mem_cache/README.md</code> 的分层规则','mini-sglang <code>kvcache/base.py</code>'],
@@ -912,7 +912,7 @@ const GLOSS = [
   ['capture / replay','录 CUDA graph / 回放 CUDA graph。'],
   ['派生产物','由别的东西“算出来”的东西，比如 plan、graph、缓存的映射表。上游变了它可能要重建。'],
   ['definition / solution','kernel 的“算什么”和“怎么算”。一个 definition 可以有多个 solution，至少有一个 PyTorch 参照实现。'],
-  ['refit / grow / migrate','refit：布局不变只换内容；grow：只扩容，地址不变；migrate：按迁移函数换布局或搬位置。'],
+  ['refit / grow / relocate','refit：布局不变只换内容；grow：只扩容，地址不变；relocate：换布局或搬位置（如 EPLB 搬专家）。状态单元的代码换版本时把内容带过去，是另一回事：迁移函数（[state] migrate，见 specs/state-changes.md）。'],
 ];
 
 const DECISIONS = [

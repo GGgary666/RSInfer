@@ -260,12 +260,12 @@ def test_a_mesh_change_restarts_the_ranks_and_starts_new_ones(tmp_path: Path) ->
 
 def test_state_requests_become_the_state_units_own_actions(tmp_path: Path) -> None:
     s = {**BASE, "pkg/s/unit.toml": manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state",
-                                                  capabilities='actions = ["migrate"]'),
+                                                  capabilities='actions = ["relocate"]'),
          "pkg/s/unit.py": "class Unit:\n    pass\n"}
     units = ("pkg.a", "pkg.b", "pkg.s")
     pa = only(Case(tmp_path / "1", base=s, new=s, units=units,
-                   state=[StateRequest(UnitId("pkg.s"), "migrate", {"to": [1]})]).plan())
-    assert pa.actions == [UnitAction(UnitId("pkg.s"), "migrate", {"to": [1]})] and pa.reload is None
+                   state=[StateRequest(UnitId("pkg.s"), "relocate", {"to": [1]})]).plan())
+    assert pa.actions == [UnitAction(UnitId("pkg.s"), "relocate", {"to": [1]})] and pa.reload is None
     bad = Case(tmp_path / "2", base=s, new=s, units=units, state=[StateRequest(UnitId("pkg.s"), "refit")]).plan()
     assert isinstance(bad, Failed) and bad.diagnostics[0].code == "deps.bad_state_request"
 
