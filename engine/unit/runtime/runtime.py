@@ -241,8 +241,9 @@ class UnitRuntime:
             yield
             with self._operation():  # one unit per slice, in the order _settle() would load them
                 slot = self._next_ready()
-                if slot is not None:
-                    self._load(slot)
+                # A unit of this process that waited for a staged one may fail without failing the
+                # staging (as in _settle); once a staged unit failed, staging fails: build no more.
+                if slot is not None and (self._load(slot) or not slot.staged):
                     continue
                 r = self._stage_finish()
             if isinstance(r, Failed):
