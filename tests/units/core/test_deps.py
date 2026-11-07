@@ -192,6 +192,38 @@ def test_a_new_unit_that_needs_a_unit_added_at_the_safe_point_waits_for_it(tmp_p
         assert expected in notes, notes
 
 
+def test_a_new_unit_waits_for_a_service_a_running_unit_provides_only_once_reloaded(tmp_path: Path) -> None:
+    """``pkg.a`` runs now without ``pkg.extra@1``; its new manifest adds it, so only the reloaded
+    ``pkg.a`` provides it. The new units that use it (required or optional) wait for the reload,
+    and so does one that needs them; a new unit using a service ``pkg.a`` provides now is staged."""
+    a_extra = manifest_toml("pkg.a", "pkg.a.unit:Unit", provides=["pkg.a@1", "pkg.extra@1"], config={
+        "pkg.live": {"type": "int", "default": 1, "binding": "live"},
+        "pkg.plan": {"type": "int", "default": 8, "binding": "plan"},
+        "pkg.start": {"type": "int", "default": 0, "binding": "startup"},
+    })
+    users = {
+        "pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", provides=["pkg.c@1"], requires=["pkg.extra@1"]),
+        "pkg/c/unit.py": "class Unit:\n    pass\n",
+        "pkg/f/unit.toml": manifest_toml("pkg.f", "pkg.f.unit:Unit", optional=["pkg.extra@1"]),
+        "pkg/f/unit.py": "class Unit:\n    pass\n",
+        "pkg/g/unit.toml": manifest_toml("pkg.g", "pkg.g.unit:Unit", requires=["pkg.c@1"]),
+        "pkg/g/unit.py": "class Unit:\n    pass\n",
+        "pkg/h/unit.toml": manifest_toml("pkg.h", "pkg.h.unit:Unit", requires=["pkg.a@1"]),
+        "pkg/h/unit.py": "class Unit:\n    pass\n",
+    }
+    p = Case(tmp_path, new={**BASE, "pkg/a/unit.toml": a_extra, **users}).plan()
+    pa = only(p)
+    assert [u.id for u in pa.stage] == ["pkg.h"]
+    assert pa.reload is not None and reloaded(pa) == ["pkg.a"]
+    assert sorted(u.id for u in pa.reload.units_to_add) == ["pkg.c", "pkg.f", "pkg.g"]
+    assert not isinstance(p, Failed)
+    notes = "\n".join(p.notes)
+    for expected in ("pkg.c is added at the safe point: it uses ['pkg.extra@1'], provided only once the reload ran",
+                     "pkg.f is added at the safe point: it uses ['pkg.extra@1']",
+                     "pkg.g is added at the safe point: it uses ['pkg.c@1']"):
+        assert expected in notes, notes
+
+
 def test_new_units_that_need_each_other_are_staged_together(tmp_path: Path) -> None:
     """When the unit they need is staged too, its keys and services are ready during prepare."""
     early = {**LATE, "pkg/d/unit.py": "class Unit:\n    pass\n"}

@@ -647,3 +647,81 @@ def test_a_syntax_error_is_a_static_check_failure_and_the_change_ends_failed(tmp
             assert (await s.apply()).status == "committed"
 
     run(main())
+
+
+LOGS_WITH_EXTRA = """[unit]
+id = "scn.logs"
+kind = "logic"
+process = ["sched", "worker"]
+entry = "scn.logs.unit:Unit"
+
+[provides]
+services = ["scn.extra@1"]
+
+[config]
+"scn.log_dir" = { type = "str", default = "", binding = "startup" }
+"""
+LOGS_WITH_EXTRA_CODE = """from typing import Any
+
+
+class Extra:
+    def value(self) -> str:
+        return "extra from the reloaded scn.logs"
+
+
+class Unit:
+    def __init__(self, ctx: Any, config: Any) -> None:
+        self.directory = config["scn.log_dir"]
+        ctx.provide("scn.extra@1", Extra())
+"""
+EXTRA_USER_TOML = """[unit]
+id = "scn.extra_user"
+kind = "logic"
+process = ["worker"]
+entry = "scn.extra_user.unit:Unit"
+
+[requires]
+{dependency} = ["scn.extra@1"]
+
+[reads]
+config = ["scn.log_dir"]
+"""
+EXTRA_USER = """from typing import Any
+
+from ..journal import Journal
+
+
+class Unit:
+    def __init__(self, ctx: Any, config: Any) -> None:
+        extra = ctx.{fetch}("scn.extra@1")
+        self.extra = extra
+        Journal(config["scn.log_dir"], ctx).write(f"extra user got {{extra.value() if extra is not None else None}}")
+"""
+
+
+@pytest.mark.parametrize("dependency", ["services", "optional"])
+@pytest.mark.covers(edges=("call",), ladder=(2,), kinds=("logic",))
+def test_a_new_unit_using_a_service_a_running_unit_gains_waits_for_its_reload(tmp_path: Path,
+                                                                               dependency: str) -> None:
+    """``scn.logs`` runs without ``scn.extra@1``; the change adds that service to it and, at the same
+    time, a new unit that uses it. Staged during prepare the user would find no provider: a required
+    service would leave it pending and abort the change, an optional one would be ``None`` for good.
+    It is added in the reload, after ``scn.logs`` was rebuilt, and gets the new service."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.write("scn/logs/unit.toml", LOGS_WITH_EXTRA)
+            s.write("scn/logs/unit.py", LOGS_WITH_EXTRA_CODE)
+            s.write("scn/extra_user/__init__.py", "")
+            s.write("scn/extra_user/unit.toml", EXTRA_USER_TOML.format(dependency=dependency))
+            s.write("scn/extra_user/unit.py", EXTRA_USER.format(fetch="use" if dependency == "services" else "get"))
+            r = await s.apply()
+            await everyone_on(s, r)
+            assert r.plan is not None
+            for p in (W0, W1):
+                assert s.lines(p, "extra user got") == ["extra user got extra from the reloaded scn.logs"]
+                pa = next(pa for pa in r.plan.procs if pa.proc == p)
+                assert pa.stage == [] and pa.reload is not None
+                assert [u.id for u in pa.reload.units_to_add] == ["scn.extra_user"]
+
+    run(main())

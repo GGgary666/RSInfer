@@ -163,28 +163,33 @@ class _Planner:
         s = self.w.new_tree.units[uid]
         return not (self.new_graph.imports_closure([s.manifest.unit.entry_module]) & self.changed)
 
-    def staging(self, intro: ProcIntrospection, added: list[UnitId], changed_keys: dict[str, Any]
-                ) -> tuple[list[UnitId], dict[UnitId, str]]:
+    def staging(self, intro: ProcIntrospection, added: list[UnitId], target: set[UnitId],
+                changed_keys: dict[str, Any]) -> tuple[list[UnitId], dict[UnitId, str]]:
         """Which new units load during prepare (rung 0); the others are added inside the reload at the
         safe point, which declares new keys and applies new values before it builds them. A unit loads
         early only if what it needs is ready then: its code imports no changed module, every key it
-        owns or reads is declared with its final value, and every service it uses is provided. Returns
-        the early units and why each other one waits."""
+        owns or reads is declared with its final value, and every service it uses is provided: by the
+        units running now, as they are now, or by new units loaded with it. Returns the early units and
+        why each other one waits."""
         declared = set(intro.config)
         here = [UnitId(u.unit) for u in intro.units]
-        provided_now = {name for u in here for name in self._provides(u)}
+        provided_now = {name for u in here for name in self._provides_now(u)}
+        staying = {u for u in here if u in target}  # their candidate versions serve once the reload ran
         early = {u for u in added if self.stageable(u)}
         why = {u: "it imports changed code" for u in added if u not in early}
         while True:  # deferring one unit can defer those that need it
             late = {u: r for u in sorted(early) if (r := self._not_ready(u, early, declared, changed_keys,
-                                                                          provided_now, set(why)))}
+                                                                          provided_now, set(why) | staying))}
             if not late:
                 return sorted(early), why
             early -= set(late)
             why.update(late)
 
     def _not_ready(self, uid: UnitId, early: set[UnitId], declared: set[str], changed_keys: dict[str, Any],
-                   provided_now: set[str], late: set[UnitId]) -> str:
+                   provided_now: set[str], after_reload: set[UnitId]) -> str:
+        """Why ``uid`` cannot be built during prepare, or ``""``. ``after_reload``: the units whose
+        services exist only once the reload ran: new units added in it, and the units running now,
+        whose candidate versions may provide services their running versions do not."""
         m = self.w.new_tree.units[uid].manifest
         taken = sorted(k for k in m.config if k in declared)
         if taken:
@@ -197,14 +202,20 @@ class _Planner:
         if undeclared:
             return f"it reads {undeclared}, which only the reload declares here"
         needs = sorted(name for name in [*m.requires.services, *m.requires.optional]
-                       if name not in provided_now and not any(name in self._provides(u) for u in early)
-                       and any(name in self._provides(u) for u in late))
+                       if name not in provided_now and not any(name in self._provides_new(u) for u in early)
+                       and any(name in self._provides_new(u) for u in after_reload))
         if needs:
-            return f"it uses {needs}, provided by units added at the safe point"
+            return f"it uses {needs}, provided only once the reload ran"
         return ""
 
-    def _provides(self, uid: UnitId) -> list[str]:
-        s = self.w.new_tree.units.get(uid) or self.base_tree.units.get(uid)
+    def _provides_now(self, uid: UnitId) -> list[str]:
+        """Services a running unit provides now: its version in the running identity's tree."""
+        s = self.base_tree.units.get(uid)
+        return list(s.manifest.provides.services) if s is not None else []
+
+    def _provides_new(self, uid: UnitId) -> list[str]:
+        """Services a unit provides after the change: a new unit, or the candidate version of a running one."""
+        s = self.w.new_tree.units.get(uid)
         return list(s.manifest.provides.services) if s is not None else []
 
     def natives_touch(self, units: list[UnitId]) -> bool:
@@ -278,7 +289,7 @@ class _Planner:
             if r.unit in target:
                 actions.append(UnitAction(r.unit, r.action, dict(r.args)))
 
-        early, why = self.staging(intro, added, changed_keys)
+        early, why = self.staging(intro, added, target, changed_keys)
         for u, reason in sorted(why.items()):
             w.notes.append(f"{intro.proc}: {u} is added at the safe point: {reason}")
         stage = [UnitSpec(w.new_tree.units[u].manifest) for u in early]
