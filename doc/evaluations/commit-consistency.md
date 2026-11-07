@@ -35,7 +35,7 @@ C 仍仅增加两行：提交时立即恢复，提交阶段超时后重新暂停
 复现最新 A/B 共同的 8 个用例，在各自 worktree 中运行：
 
 ```sh
-uv run --frozen --python 3.12 pytest tests/change/test_commit_consistency.py -q \
+uv run --frozen --python 3.12 pytest tests/framework/change/test_commit_consistency.py -q \
   -k 'lost_commit_is_retried or no_participant_serves or lost_detector or query_timeout'
 ```
 
@@ -117,7 +117,7 @@ AssertionError: served before all participants committed:
 在任意一个对应 worktree 中执行：
 
 ```sh
-uv run --frozen --python 3.12 pytest tests/change/test_commit_consistency.py -q
+uv run --frozen --python 3.12 pytest tests/framework/change/test_commit_consistency.py -q
 ```
 
 预期 A/C 的退出码为 1，B 的退出码为 0。B 的静态检查：
@@ -131,7 +131,7 @@ uv run --frozen --python 3.12 pyright
 ```sh
 git worktree add --detach /tmp/agxinfer-commit-C-initial a2fd1c8
 cd /tmp/agxinfer-commit-C-initial
-uv run --frozen --python 3.12 pytest tests/change/test_commit_consistency.py -q
+uv run --frozen --python 3.12 pytest tests/framework/change/test_commit_consistency.py -q
 # 3 passed
 ```
 

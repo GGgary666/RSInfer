@@ -21,10 +21,10 @@
 
 C 从 B 构造四种错误：停止未确认时仅报告 aborted 而不冻结；回滚失败虽然返回 Failed 却解除暂停并清空事务；丢弃过期 fault 时重置公平性计数；环境清理误删合法自定义变量。这些错误全部通过初始测试，分别被加强后的行为断言捕获。A、C 仅保存在本地，PR 只提交 B。
 
-初始测试：`tests/adversarial/test_failure_boundaries.py`。加强测试：`tests/adversarial/test_failure_boundary_adversaries.py`。同一份测试在 A/B/C 上运行，不包含 xfail 或按实现分支跳过的逻辑。测试使用真实协调者、参与者和运行时，在通信或 hook 边界注入故障；不等价于 Linux 多进程网络分区实验。
+初始测试：`tests/framework/adversarial/test_failure_boundaries.py`。加强测试：`tests/framework/adversarial/test_failure_boundary_adversaries.py`。同一份测试在 A/B/C 上运行，不包含 xfail 或按实现分支跳过的逻辑。测试使用真实协调者、参与者和运行时，在通信或 hook 边界注入故障；不等价于 Linux 多进程网络分区实验。
 
 ```sh
-uv run pytest tests/adversarial/test_failure_boundaries.py tests/adversarial/test_failure_boundary_adversaries.py -q
+uv run pytest tests/framework/adversarial/test_failure_boundaries.py tests/framework/adversarial/test_failure_boundary_adversaries.py -q
 uv run pyright
 uv run pytest
 ```

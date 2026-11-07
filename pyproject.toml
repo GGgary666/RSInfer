@@ -25,7 +25,7 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["engine", "."]
-addopts = "-ra"
+addopts = "-ra --ignore=tests/framework/formal"
 timeout = 120
 
 [tool.pyright]

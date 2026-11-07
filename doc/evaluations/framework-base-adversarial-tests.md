@@ -129,14 +129,14 @@ Prepare → Pause → Execute 抛错并自行撤销
 
 ```sh
 uv sync --python 3.12
-uv run pytest tests/adversarial -q --tb=short
+uv run pytest tests/framework/adversarial -q --tb=short
 uv run pyright
 ```
 
 可单独运行真实 RPC 用例：
 
 ```sh
-uv run pytest tests/adversarial/test_transaction_boundaries.py -q -k cross_real_rpc
+uv run pytest tests/framework/adversarial/test_transaction_boundaries.py -q -k cross_real_rpc
 ```
 
 本机结果：

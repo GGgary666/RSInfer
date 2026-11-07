@@ -62,7 +62,7 @@ A/B/C 最终测试文件逐字相同，Git blob ID 为 `692ebffaa37de0121c39c536
 在各自 worktree 中运行同一条命令：
 
 ```sh
-uv run --frozen --python 3.12 pytest tests/ipc/test_shm_ring_wrap.py -q
+uv run --frozen --python 3.12 pytest tests/framework/ipc/test_shm_ring_wrap.py -q
 ```
 
 B 应通过，A/C 应失败。检查生产代码差异：
@@ -79,6 +79,6 @@ git diff a5ef0d8 05b47ff -- engine
 ```sh
 git worktree add --detach /tmp/agxinfer-shm-C-initial 703b6a9
 cd /tmp/agxinfer-shm-C-initial
-uv run --frozen --python 3.12 pytest tests/ipc/test_shm_ring_wrap.py -q
+uv run --frozen --python 3.12 pytest tests/framework/ipc/test_shm_ring_wrap.py -q
 # 2 passed
 ```
