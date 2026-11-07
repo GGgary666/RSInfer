@@ -4,7 +4,7 @@
 
 ## 目录结构规则（最重要）
 
-- **不要新增、删除、重命名或移动顶层目录**（`engine/`、`tests/`、`doc/`、`.github/`），除非用户明确要求。
+- **如无必要，尽量不要新增、删除、重命名或移动顶层目录**（`engine/`、`tests/`、`doc/`、`.github/`），除非用户明确要求。
 - **新增或移动任何目录之前，先判断它是不是某个已有目录的子集。** 是子集就放进那个目录，不要和它并列。
   - 例：formal 测试首先是测试，而且测的是框架本体，所以在 `tests/framework/formal/`，不是顶层的 `formal-tests/`。
   - 例：将来给单元写的测试是测试但不是框架本体的测试，所以放在 `tests/` 下、与 `tests/framework/` 并列（如 `tests/units/`），不要混进 `tests/framework/`。
@@ -92,10 +92,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 - `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。
 - 生成物不进仓库：`tests/framework/formal/.tools/`、`.runs/` 已被忽略。
 
-已知与环境有关的失败（master 上就有，CI 的 Ubuntu 系统 Python 下不出现）：
-
-- `ipc/test_streams.py::test_slow_consumer_blocks_the_producer[tcp]`：只在 macOS 上偶发失败。
-- `unit_runtime/test_reload.py::test_undeclared_native_module_restarts_process_and_reports_manifest`：在 uv 托管的 Python（python-build-standalone，macOS 和 Linux 都一样）下失败。原因是标准库扩展模块是静态编进去的，遍历 `sys.modules` 会先碰到没有 `__spec__` 的 `typing.io`。
+已知与环境有关的失败：`ipc/test_streams.py::test_slow_consumer_blocks_the_producer[tcp]` 在 macOS 上偶发失败，Linux 和 CI 上正常。
 
 ## 约定
 

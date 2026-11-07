@@ -229,7 +229,8 @@ def test_declared_native_extension_change_restarts_process_without_unloading(wor
 
 def test_undeclared_native_module_restarts_process_and_reports_manifest(world: World) -> None:
     ext = next((n for n, m in sys.modules.items()
-                if isinstance(getattr(m.__spec__, "loader", None), importlib.machinery.ExtensionFileLoader)),
+                if isinstance(getattr(getattr(m, "__spec__", None), "loader", None),
+                              importlib.machinery.ExtensionFileLoader)),
                None)
     if ext is None:
         pytest.skip("no extension module loaded")
