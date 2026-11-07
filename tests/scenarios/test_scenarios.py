@@ -16,10 +16,11 @@ import pytest
 
 from core.change.types import ChangeResult
 from core.common.ids import UnitId
-from core.common.result import Failed
+from core.common.result import Failed, Result, fail
 from core.supervisor.protocol import ProcIntrospection
 from tests.scenarios.harness import ALL, SCHED, W0, W1, Scenario, generations, rungs, scenario, topology
 from unit.runtime import DerivedArtifact
+from unit.runtime.types import ReloadPlan, ReloadReport
 
 
 def run(coro: Coroutine[Any, Any, None]) -> None:
@@ -330,5 +331,102 @@ def test_a_control_plane_unit_is_reloaded_in_the_control_plane(tmp_path: Path) -
             assert {u.unit: u.generation for u in st.control_units}["core.api"] == 2
             s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = 2")
             assert (await s.apply()).status == "committed"
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), ladder=(2,), kinds=("framework",))
+def test_a_control_plane_change_that_loses_a_control_service_is_rolled_back(tmp_path: Path) -> None:
+    """A new ``core.api`` that loads but no longer provides ``ctrl.api@1`` would leave the engine
+    without a control interface; the control plane checks its services before the change commits,
+    so the change aborts and the old unit serves again."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            before = (await s.status()).identity
+            s.edit("core/api/unit.py", 'ctx.provide("ctrl.api@1", Api(ctx))', "self.api = Api(ctx)")
+            r = await s.apply()
+            assert r.status == "aborted", r.diagnostics
+            assert "control.unit_missing" in {d.code for d in r.diagnostics}
+            st = await s.status()  # the control interface still answers
+            assert st.identity == before and not st.recovery_required
+            s.edit("core/api/unit.py", "self.api = Api(ctx)", 'ctx.provide("ctrl.api@1", Api(ctx))')
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = 2")
+            assert (await s.apply()).status == "committed"
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_a_failed_rollback_in_the_control_plane_requires_recovery(tmp_path: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the old control-plane units cannot be reloaded when a change aborts, the new ones keep
+    serving under the old identity: the engine needs recovery and refuses further changes, as when
+    a process does not confirm its rollback."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            before = (await s.status()).identity
+            s.edit("core/api/unit.py", "len(coord.queue), rows", "len(coord.queue) + 100, rows")
+            reload = s.cp.runtime.reload
+            calls = 0
+
+            def reverse_fails(plan: ReloadPlan, *, values: dict[str, Any] | None = None) -> Result[ReloadReport]:
+                nonlocal calls
+                calls += 1
+                if calls == 2:  # the reverse reload of the abort
+                    return fail("unit.runtime", "rollback", "injected", code="escalate.restart_process")
+                return reload(plan, values=values)
+
+            monkeypatch.setattr(s.cp.runtime, "reload", reverse_fails)
+            s.cp.coord.faults.add("after_execute")
+            r = await s.apply()
+            assert calls == 2 and r.status == "failed"
+            assert {"control.rollback_failed", "change.recovery_required"} <= {d.code for d in r.diagnostics}
+            st = await s.status()
+            assert st.identity == before and st.recovery_required and st.queued == 100  # the new core.api
+            refused = await s.apply(files=False, config={"scn.chunk": 4})
+            assert refused.status == "failed" and "change.recovery_required" in {d.code for d in refused.diagnostics}
+
+    run(main())
+
+
+READER_TOML = """[unit]
+id = "scn.reader"
+kind = "logic"
+process = ["worker"]
+entry = "scn.reader.unit:Unit"
+
+[reads]
+config = ["scn.log_dir", "scn.max_batch"]
+"""
+READER = """from typing import Any
+
+from ..journal import Journal
+
+
+class Unit:
+    def __init__(self, ctx: Any, config: Any) -> None:
+        Journal(config["scn.log_dir"], ctx).write(f"reader built with max_batch {config['scn.max_batch']}")
+"""
+
+
+@pytest.mark.covers(edges=("decl",), ladder=(1, 2, 3), kinds=("logic",))
+def test_a_new_unit_is_built_with_the_values_of_its_change(tmp_path: Path) -> None:
+    """A unit added together with a new value of a key it reads is not staged during prepare (it
+    would be built under the old value) but added inside the reload, under the new value."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.write("scn/reader/__init__.py", "")
+            s.write("scn/reader/unit.toml", READER_TOML)
+            s.write("scn/reader/unit.py", READER)
+            r = await s.apply(config={"scn.max_batch": 16})
+            await everyone_on(s, r)
+            assert r.plan is not None
+            for p in (W0, W1):
+                assert rungs(r.plan, p) == {1, 2, 3}
+                assert s.lines(p, "reader built") == ["reader built with max_batch 16"]
+            assert any("scn.reader reads ['scn.max_batch']" in n for n in r.plan.notes)
 
     run(main())

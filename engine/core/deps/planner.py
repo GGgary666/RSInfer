@@ -242,8 +242,20 @@ class _Planner:
             if r.unit in target:
                 actions.append(UnitAction(r.unit, r.action, dict(r.args)))
 
-        stage = [UnitSpec(w.new_tree.units[u].manifest) for u in added if self.stageable(u)]
-        add_at_safe_point = [UnitSpec(w.new_tree.units[u].manifest) for u in added if not self.stageable(u)]
+        # a unit staged during prepare is built under the old values; one that reads a key this change
+        # sets is added inside the reload instead, which builds it under the new values
+        early: list[UnitId] = []
+        for u in added:
+            if not self.stageable(u):
+                continue
+            reads = sorted(w.new_tree.units[u].manifest.readable_keys() & set(changed_keys))
+            if reads:
+                w.notes.append(f"{intro.proc}: {u} reads {reads}, which this change sets; adding it at the "
+                               "safe point")
+            else:
+                early.append(u)
+        stage = [UnitSpec(w.new_tree.units[u].manifest) for u in early]
+        add_at_safe_point = [UnitSpec(w.new_tree.units[u].manifest) for u in added if u not in early]
         # keys new to this process: those of added units come with the units (participant), the others
         # (declared anew by a reloaded unit, or read from another role) are declared by the reload
         added_set = set(added)

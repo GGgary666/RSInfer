@@ -19,10 +19,10 @@ from tests.scenarios.harness import AGENT_TUNABLES, ENGINE, PROC_TUNABLES, build
 ENV = {**os.environ, "PYTHONPATH": str(ENGINE)}
 
 
-def client(control: str, *args: str) -> Any:
+def client(control: str, *args: str, exit_code: int = 0) -> Any:
     out = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, *args],
                          env=ENV, capture_output=True, text=True, timeout=60)
-    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.returncode == exit_code, out.stdout + out.stderr
     return json.loads(out.stdout)
 
 
@@ -30,7 +30,8 @@ def client(control: str, *args: str) -> Any:
 def test_2_serve_starts_the_engine_and_the_client_drives_it(tmp_path: Path) -> None:
     """``python -m core.control serve --spawn-agents``: the startup change runs the static checks,
     computes the identity, and the supervisor starts every process of the topology through node
-    agents; ``python -m core.control.client`` then drives it. SIGTERM stops everything."""
+    agents; ``python -m core.control.client`` then drives it; its exit code says whether the change committed.
+    SIGTERM stops everything."""
     workspace = build_workspace(tmp_path / "workspace")
     (tmp_path / "logs").mkdir()
     topo = tmp_path / "topology.json"
@@ -73,6 +74,13 @@ def test_2_serve_starts_the_engine_and_the_client_drives_it(tmp_path: Path) -> N
         assert client(control, "status")["identity"] == applied["new_identity"]
         logs = client(control, "logs")
         assert [c["source"] for c in logs["changes"]] == ["startup", "apply", "apply"]
+
+        # the control plane answers, but the change failed: scripts must see it in the exit code
+        queue = workspace / "engine/core/change/queue.py"
+        queue.write_text(queue.read_text().replace('"""Change queue', '"""The change queue'))
+        failed = client(control, "apply", "--source", str(workspace), exit_code=1)["result"]
+        assert failed["status"] == "failed" and failed["plan"]["restart_engine"]
+        assert client(control, "status")["identity"] == applied["new_identity"]
     finally:
         serve.send_signal(signal.SIGTERM)
         try:

@@ -27,6 +27,8 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 - **协调者的三个接口**改成每次变更时向服务要：`ctrl.manifest@1`（静态检查）、`ctrl.deps@1`（动作计划）、`ctrl.identity@1`（身份）。服务不在（单元没装上或者失败了）就 `Failed(control.unit_missing)`，什么都不动。
 - **控制端口**：沿用进程管家已有的控制端点。`core.control.protocol` 定义 API 消息，宿主把它们转给 `ctrl.api@1`（`core.api` 单元）。客户端：`python -m core.control.client --control <地址> status|apply|check|introspect|logs`。
 - **控制面单元的重载**：动作计划里多一段 `ActionPlan.control`（给控制面进程的 `ProcActions`）。协调者在 Execute 阶段、所有参与者都执行完之后在本进程执行它；撤回时按反向计划恢复。
+  - 执行完、提交前检查：四个控制面单元都 ACTIVE，而且 `ctrl.identity@1`、`ctrl.manifest@1`、`ctrl.deps@1`、`ctrl.api@1` 都有人提供（和启动时同一个检查）。不满足就撤回，否则提交以后控制接口就没了。
+  - 撤回没能把旧的控制面单元装回来（反向重载失败、装回来以后服务不全），和远端参与者没确认撤回一样：协调者进入“需要恢复”，拒绝后续变更。
 - **控制面单元从哪里加载**：控制面进程自己的框架代码来自启动它的地方（工作区或仓库），控制面单元来自快照。为此单元运行时装进程计划时，会让已经导入的包先去快照目录里找还没加载的模块（`UnitRuntime._prefer_root`）；从快照启动的进程里这一步什么都不做。
 
 ## 2. `core.identity`：系统身份
@@ -63,7 +65,7 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 | 状态单元管的内容（内部变更里的状态请求） | 状态单元自己的动作（如 `migrate`） | 4 |
 | 被派生产物按值依赖的配置键或单元代码 | 产物主人的重建动作（准备阶段在第二套 buffer 里做） | 3 |
 | 单元代码或清单 | 重载这个单元（依赖它的单元由运行时跟着重载） | 2 |
-| 新增单元 | 准备阶段装上（import 了改动模块的，到安全点再装） | 0 / 2 |
+| 新增单元 | 准备阶段装上；import 了改动模块的，或者读了这次变更改的配置键的，到安全点随重载一起装（在准备阶段装会拿到旧值） | 0 / 2 |
 | 读它的单元注册了钩子（`ctx.on_config`），键不是 `startup` 绑定 | 原地接受新值 | 1 |
 | 读它的单元没注册钩子，或者键是 `startup` 绑定 | 重载读它的单元 | 2 |
 
@@ -79,6 +81,7 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 - `status`：当前身份、状态版本、是否需要恢复、进程表。
 - `check`：只做静态检查（场景⑥“不过就直接拒绝，不占 GPU”）。
 - `apply [--dry-run]`：客户端先问控制面缺哪些 blob、只上传缺的，再提交文件清单；`core.api` 算出和当前清单的差异，组成 change-set 交给协调者。
+- 命令行客户端的退出码：控制面答复了但变更没提交（`failed`、`aborted`、`dropped`）也是 1；只有 `committed`，或者 dry-run 的 `planned`，是 0。
 - `introspect`：每个进程的单元、读取记录、派生产物。
 - `logs`：事件日志里的变更记录。
 - 单元自己发起的内部变更（如 EPLB）：进程宿主给单元提供宿主服务 `proc.control@1`，它把 change-set 发到控制面，由 `core.api` 放进队列。

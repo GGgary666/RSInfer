@@ -59,6 +59,7 @@ from unit.runtime.types import ReloadPlan, ReloadReport
 
 if TYPE_CHECKING:
     from unit.runtime.host import ProcessHost
+    from unit.runtime.runtime import UnitRuntime
 
 COMPONENT = "change.participant"
 
@@ -319,20 +320,8 @@ class Participant:
             c.staged = False
 
     def _with_fresh_modules(self, undo: _Undo) -> ReloadPlan:
-        """The reverse reload, also dropping modules first imported from the candidate snapshot
-        during the change; otherwise they stay loaded from a snapshot that is about to go."""
         assert undo.reverse_reload is not None
-        if undo.candidate_root is None:
-            return undo.reverse_reload
-        candidate = Path(undo.candidate_root).resolve()
-        fresh: set[str] = set()
-        for name, mod in list(sys.modules.items()):
-            file = getattr(mod, "__file__", None)
-            if name not in undo.modules_before and file and file.endswith(".py") \
-                    and not self.rt.framework.contains(name) and Path(file).resolve().is_relative_to(candidate):
-                fresh.add(name)
-        changed = sorted({*undo.reverse_reload.changed_modules, *fresh})
-        return msgspec.structs.replace(undo.reverse_reload, changed_modules=changed)
+        return with_fresh_modules(self.rt, undo.reverse_reload, undo.candidate_root, undo.modules_before)
 
     def _abort_failed(self, ua: UnitAction, e: Exception) -> None:
         self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}", code="change.abort_failed"))
@@ -631,6 +620,23 @@ class Participant:
         self._note("timeout", reason, code, severity="error" if code == "change.coordinator_lost" else "warning")
         self._rollback(c)
         self._resume(c, rolled_back=True)
+
+
+def with_fresh_modules(rt: UnitRuntime, reverse: ReloadPlan, candidate_root: str | None,
+                       modules_before: set[str]) -> ReloadPlan:
+    """The reverse reload, also dropping modules first imported from the candidate snapshot
+    during the change; otherwise they stay loaded from a snapshot that is about to go, and a
+    later change that adds the same module again would find the aborted version cached."""
+    if candidate_root is None:
+        return reverse
+    candidate = Path(candidate_root).resolve()
+    fresh: set[str] = set()
+    for name, mod in list(sys.modules.items()):
+        file = getattr(mod, "__file__", None)
+        if name not in modules_before and file and file.endswith(".py") \
+                and not rt.framework.contains(name) and Path(file).resolve().is_relative_to(candidate):
+            fresh.add(name)
+    return msgspec.structs.replace(reverse, changed_modules=sorted({*reverse.changed_modules, *fresh}))
 
 
 class _Failed(Exception):

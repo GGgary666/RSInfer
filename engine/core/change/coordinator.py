@@ -90,7 +90,9 @@ class LocalParticipant(Protocol):
 
     def commit(self, change_id: int) -> None: ...
 
-    def abort(self, change_id: int) -> list[Diagnostic]: ...
+    def abort(self, change_id: int) -> list[Diagnostic]:
+        """Undo the change here; an error among the diagnostics means the undo did not finish."""
+        ...
 
 
 class AcceptAll:
@@ -595,7 +597,10 @@ class Coordinator:
         self.log.decide(run.id, "abort")  # before any Abort leaves
         out: list[Diagnostic] = []
         if run.plan.control is not None and self.local is not None:
-            out += self.local.abort(run.id)
+            local = self.local.abort(run.id)
+            if any(d.severity == "error" for d in local):  # the old control-plane units are not all back
+                self.recovery_required = True
+            out += local
         if self._take("skip_abort"):
             self.recovery_required = True
             out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))

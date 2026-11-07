@@ -127,6 +127,19 @@ def test_a_new_unit_is_staged_unless_it_imports_changed_code(tmp_path: Path) -> 
     assert pa.stage == [] and pa.reload is not None and [u.id for u in pa.reload.units_to_add] == ["pkg.c"]
 
 
+def test_a_new_unit_that_reads_a_key_the_change_sets_is_added_inside_the_reload(tmp_path: Path) -> None:
+    """Staged during prepare it would be built under the old value; inside the reload it gets the new one."""
+    c = {"pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", requires=["pkg.a@1"], reads=["pkg.live"]),
+         "pkg/c/unit.py": "class Unit:\n    pass\n"}
+    pa = only(Case(tmp_path / "1", new={**BASE, **c}).plan())
+    assert [u.id for u in pa.stage] == ["pkg.c"]
+    p = Case(tmp_path / "2", new={**BASE, **c}, config={"pkg.live": 5}).plan()
+    pa = only(p)
+    assert pa.stage == [] and pa.reload is not None and [u.id for u in pa.reload.units_to_add] == ["pkg.c"]
+    assert pa.config == {"pkg.live": 5} and reloaded(pa) == []
+    assert not isinstance(p, Failed) and any("pkg.c reads ['pkg.live']" in n for n in p.notes)
+
+
 def test_a_removed_unit_is_unloaded(tmp_path: Path) -> None:
     new = {k: v for k, v in BASE.items() if not k.startswith("pkg/b/")}
     pa = only(Case(tmp_path, new=new).plan())

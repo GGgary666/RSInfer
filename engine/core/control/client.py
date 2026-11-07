@@ -2,6 +2,7 @@
 
 ``python -m core.control.client --control <address> status|check|apply|introspect|logs``
 
+``apply`` exits 1 unless the change committed (or, with ``--dry-run``, was planned).
 ``apply`` and ``check`` take a workspace (``--source``): the client hashes its
 ``engine/`` tree, asks the control plane which contents it lacks, uploads only
 those, and sends the whole file list; ``core.api`` works out the diff.
@@ -113,10 +114,14 @@ class ControlClient:
 
 
 def _print(r: Result[msgspec.Struct]) -> int:
+    """Print the reply; the exit code is 0 only if the request did what it asked for: a change
+    that was refused, failed or rolled back exits 1 although the control plane answered."""
     if isinstance(r, Failed):
         print(json.dumps({"failed": msgspec.to_builtins(r.diagnostics)}, indent=2))
         return 1
     print(json.dumps(msgspec.to_builtins(r.value), indent=2, default=str))
+    if isinstance(r.value, ApiApplied) and r.value.result.status not in ("committed", "planned"):
+        return 1
     return 0
 
 
