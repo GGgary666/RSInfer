@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -89,12 +91,20 @@ def dependents(graph: Graph, k: int) -> set[int]:
     return out
 
 
-def start(root: Path, graph: Graph) -> tuple[UnitRuntime, list[UnitSpec], UnitSpec]:
+@contextmanager
+def start(root: Path, graph: Graph) -> Generator[tuple[UnitRuntime, list[UnitSpec], UnitSpec]]:
+    """A runtime for one example, unloaded however the example ends. Hypothesis aborts an example at a
+    draw when it runs out of data; a runtime left loaded keeps catalog items owned by instance ids the
+    next example reuses (every runtime here is ``PROC``, so ``toyrand.u0#1`` again), and the leak check,
+    which looks in every live registry of the process, would blame the next example's unit for them."""
     units, cat = build(graph)
     rt = UnitRuntime(PROC)
-    rt.load_process_plan(ProcessPlan(PROC, Identity("x"), [cat, *units], code_root=str(root))).unwrap()
-    assert all(s is InstanceState.ACTIVE for s in rt.snapshot().states().values())
-    return rt, units, cat
+    try:
+        rt.load_process_plan(ProcessPlan(PROC, Identity("x"), [cat, *units], code_root=str(root))).unwrap()
+        assert all(s is InstanceState.ACTIVE for s in rt.snapshot().states().values())
+        yield rt, units, cat
+    finally:
+        rt.unload_all()
 
 
 def catalog_items(rt: UnitRuntime) -> Counter[object]:
@@ -118,52 +128,68 @@ settings.load_profile("ci")
 @given(graph=graphs(), data=st.data())
 def test_reload_propagates_exactly_to_transitive_users(root: Path, graph: Graph, data: st.DataObject) -> None:
     events.clear()
-    rt, units, _ = start(root, graph)
-    k = data.draw(st.integers(0, len(graph) - 1))
-    before_gen = {u.unit: u.generation for u in rt.snapshot().units}
-    before_items = catalog_items(rt)
-    events.clear()
+    with start(root, graph) as (rt, units, _):
+        k = data.draw(st.integers(0, len(graph) - 1))  # may abort the example: start() unloads rt
+        before_gen = {u.unit: u.generation for u in rt.snapshot().units}
+        before_items = catalog_items(rt)
+        events.clear()
 
-    report = rt.reload(ReloadPlan(units_to_reload=[units[k]])).unwrap()
+        report = rt.reload(ReloadPlan(units_to_reload=[units[k]])).unwrap()
 
-    expected = {uid(i) for i in dependents(graph, k)}
-    assert set(report.unloaded) == expected
-    assert set(report.loaded) == expected
-    assert_users_unloaded_first(graph, report.unloaded)
-    unload_events = [u for kind, u in events if kind == "unload"]
-    assert unload_events == report.unloaded
-    after_gen = {u.unit: u.generation for u in rt.snapshot().units}
-    for unit, g in before_gen.items():
-        assert after_gen[unit] == g + (1 if unit in expected else 0)
-    assert catalog_items(rt) == before_items
-    rt.unload_all().unwrap()
+        expected = {uid(i) for i in dependents(graph, k)}
+        assert set(report.unloaded) == expected
+        assert set(report.loaded) == expected
+        assert_users_unloaded_first(graph, report.unloaded)
+        unload_events = [u for kind, u in events if kind == "unload"]
+        assert unload_events == report.unloaded
+        after_gen = {u.unit: u.generation for u in rt.snapshot().units}
+        for unit, g in before_gen.items():
+            assert after_gen[unit] == g + (1 if unit in expected else 0)
+        assert catalog_items(rt) == before_items
+        rt.unload_all().unwrap()
 
 
 @settings(max_examples=60)
 @given(graph=graphs())
 def test_removing_units_restores_registries(root: Path, graph: Graph) -> None:
     events.clear()
-    rt, units, _ = start(root, graph)
-    assert sum(catalog_items(rt).values()) == sum(n for _, n in graph)
+    with start(root, graph) as (rt, units, _):
+        assert sum(catalog_items(rt).values()) == sum(n for _, n in graph)
 
-    report = rt.reload(ReloadPlan(units_to_remove=[u.id for u in units])).unwrap()
+        report = rt.reload(ReloadPlan(units_to_remove=[u.id for u in units])).unwrap()
 
-    assert_users_unloaded_first(graph, report.unloaded)
-    assert catalog_items(rt) == Counter()
-    snap = rt.snapshot()
-    assert [u.unit for u in snap.units] == [f"{PKG}.cat"]
-    assert set(snap.services) == {"cat@1"}
-    assert not [d for d in snap.diagnostics if d.code == "unit.leak"]
-    rt.unload_all().unwrap()
+        assert_users_unloaded_first(graph, report.unloaded)
+        assert catalog_items(rt) == Counter()
+        snap = rt.snapshot()
+        assert [u.unit for u in snap.units] == [f"{PKG}.cat"]
+        assert set(snap.services) == {"cat@1"}
+        assert not [d for d in snap.diagnostics if d.code == "unit.leak"]
+        rt.unload_all().unwrap()
 
 
 @settings(max_examples=40)
 @given(graph=graphs())
 def test_unload_all_orders_users_first(root: Path, graph: Graph) -> None:
     events.clear()
-    rt, _, _ = start(root, graph)
-    events.clear()
-    rt.unload_all().unwrap()
+    with start(root, graph) as (rt, _, _):
+        events.clear()
+        rt.unload_all().unwrap()
     unloaded = [u for kind, u in events if kind == "unload"]
     assert set(unloaded) == {uid(i) for i in range(len(graph))}
     assert_users_unloaded_first(graph, unloaded)
+
+
+def test_an_aborted_example_leaves_nothing_for_the_next_one(root: Path) -> None:
+    """The flake this file had (``test_removing_units_restores_registries`` reported a leak about
+    once in seven full runs): an example aborted after ``start()`` kept its runtime loaded until the
+    cyclic GC ran, and the next example's ``toyrand.u0#1`` was blamed for its catalog item. With the
+    GC held off, an aborted example must still leave no registration behind."""
+    gc.disable()
+    try:
+        with pytest.raises(RuntimeError), start(root, [(frozenset(), 1)]):
+            raise RuntimeError("aborted, as Hypothesis aborts an example at a draw")
+        with start(root, [(frozenset(), 0)]) as (rt, units, _):
+            rt.reload(ReloadPlan(units_to_remove=[u.id for u in units])).unwrap()
+            assert not [d for d in rt.snapshot().diagnostics if d.code == "unit.leak"]
+    finally:
+        gc.enable()
