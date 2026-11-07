@@ -13,6 +13,7 @@ import msgspec
 from core.change.types import ProcActions
 from core.common.ids import Identity
 from core.common.result import Diagnostic
+from core.supervisor.protocol import UnitBrief
 from unit.runtime.types import ReloadReport
 
 
@@ -37,7 +38,9 @@ class Drain(msgspec.Struct, frozen=True):
 
 class Drained(msgspec.Struct, frozen=True):
     change_id: int
-    aborted_requests: int
+    outcomes: dict[str, int] = {}
+    """What the draining units did with the requests left at the deadline, by their own policy
+    (``{"aborted": 2, "requeued": 5}``); empty if everything finished in time."""
 
 
 class Pause(msgspec.Struct, frozen=True):
@@ -85,6 +88,9 @@ class Resumed(msgspec.Struct, frozen=True):
     rolled_back: bool = False
     snapshots: list[Identity] = []
     """Snapshots the process still loads code from; its node agent must keep them."""
+    units: list[UnitBrief] | None = None
+    """The units it runs now (in-place changes reload units after the check-in; ``status`` shows
+    these). ``None``: not reported; ``[]``: it runs no unit."""
 
 
 class KeepAlive(msgspec.Struct, frozen=True):

@@ -11,7 +11,7 @@ services = ["scn.memory@1"]
 config = ["scn.log_dir"]
 
 [capabilities]
-actions = ["migrate"]
+actions = ["relocate"]
 
 [state]
 drain_on_reload = false

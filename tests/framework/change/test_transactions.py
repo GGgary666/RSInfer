@@ -11,8 +11,9 @@ from core.change.coordinator import PlanInput
 from core.change.types import EMPTY, ActionPlan, ChangeMeta, ChangeResult, ChangeSet, ProcActions, UnitAction
 from core.common.ids import Identity, ProcId, UnitId
 from core.supervisor import desired_procs
-from tests.framework.change.engine import ALL, SCHED, W0, W1, Script, engine, reload_everywhere, run
+from tests.framework.change.engine import ALL, SCHED, UNITS, W0, W1, Script, engine, reload_everywhere, run
 from tests.framework.cluster.harness import process_plan
+from unit.runtime import ReloadPlan
 
 
 def test_startup_is_a_change(tmp_path: Path) -> None:
@@ -145,7 +146,9 @@ def test_queue_order_and_stale_internal_changes(tmp_path: Path) -> None:
     run(main())
 
 
-def test_drain_waits_then_aborts_the_rest_at_the_timeout(tmp_path: Path) -> None:
+def test_drain_waits_then_the_unit_settles_the_rest_at_the_deadline(tmp_path: Path) -> None:
+    """The drain waits until the unit says it is done, or until the deadline; then the unit settles
+    what is left by its own policy (this toy ends them) and the result says what it did."""
     async def main() -> None:
         async with engine(tmp_path) as e:
             def drain(args: dict[str, object], timeout: float) -> Script:
@@ -154,10 +157,10 @@ def test_drain_waits_then_aborts_the_rest_at_the_timeout(tmp_path: Path) -> None
 
             e.planner.script = drain({"ticks": 3}, 5.0)
             r = await e.coord.submit(ChangeSet(base=e.coord.identity))
-            assert r.status == "committed" and r.aborted_requests == 0 and "drain" in r.timings
+            assert r.status == "committed" and r.drain_outcomes == {} and "drain" in r.timings
             e.planner.script = drain({"never": True}, 0.3)
             r = await e.coord.submit(ChangeSet(base=e.coord.identity))
-            assert r.status == "committed" and r.aborted_requests == 3
+            assert r.status == "committed" and r.drain_outcomes == {"aborted": 3}
             assert "drain timeout" in e.c.log_of(SCHED)
 
     run(main())
@@ -212,5 +215,28 @@ def test_config_value_change_is_taken_in_place(tmp_path: Path) -> None:
             for p in ALL:
                 assert "chunk 4096" in e.c.log_of(p)
                 assert {u.unit: u.generation for u in (await e.status(p)).units} == gens[p]
+
+    run(main())
+
+
+def test_status_tells_a_process_that_runs_no_unit_from_one_that_did_not_say(tmp_path: Path) -> None:
+    """``Resumed`` reports the units a process runs once a change confirmed there; ``status`` shows
+    them. A process left with no unit reports an empty list, and status shows that, not the units it
+    checked in with. A reply that says nothing (``None``) leaves the record as it was."""
+
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            def row(p: ProcId) -> list[str]:
+                return [u.unit for u in next(s for s in e.c.sup.status() if s.proc == p).units]
+
+            assert row(W1) == sorted(UNITS)
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(W1, reload=ReloadPlan(units_to_remove=[
+                UnitId(u) for u in UNITS]))])
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status == "committed", r.diagnostics
+            assert row(W1) == [] and (await e.status(W1)).units == []
+            assert row(W0) == sorted(UNITS)
+            e.c.sup.runs_units(W0, None)
+            assert row(W0) == sorted(UNITS)
 
     run(main())

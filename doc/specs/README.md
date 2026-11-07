@@ -16,6 +16,7 @@
 | [supervisor.md](supervisor.md) | 进程管家 `core.supervisor` | 控制面进程 |
 | [change.md](change.md) | 变更事务 `core.change` | 控制面进程 |
 | [control-plane.md](control-plane.md) | 控制面进程 `core.control`，以及控制面单元 `core.identity`、`core.manifest`、`core.deps`、`core.api` | 控制面进程 |
+| [state-changes.md](state-changes.md) | 状态单元的变更：排空与版本迁移（只有规格，实现在阶段 2） | 调度宿主、worker、控制面 |
 
 前四个和单元在同一个 Python 进程里，只能用 Python；后三个是独立进程，只通过版本化消息交互，以后可以单独换成 Rust（v0 全部 Python）。
 
@@ -64,7 +65,7 @@ optional = []                       # 可选；用 ctx.get() 取，可能为 Non
 
 [capabilities]
 accept_config = true                # 能原地接受新配置
-actions = []                        # 状态单元才有：refit | grow | migrate | invalidate
+actions = []                        # 状态单元才有：refit | grow | relocate | invalidate（2026-11-07 由 migrate 改名）
 graph_capturable = true             # kernel solution 才有意义
 native_extensions = []              # 用到的 .so；改了它们走“重启进程”
 changes_kv_numerics = false         # 模型、层单元才有意义

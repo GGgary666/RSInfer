@@ -29,7 +29,7 @@ class ChangeMeta(msgspec.Struct, frozen=True):
 
 class StateRequest(msgspec.Struct, frozen=True):
     """Ask the state units ``unit`` to change what they hold, through their own action
-    (``migrate`` for EPLB): state contents, not part of what the system is."""
+    (``relocate`` for EPLB): state contents, not part of what the system is."""
 
     unit: UnitId
     action: str
@@ -55,7 +55,7 @@ class ChangeSet(msgspec.Struct, frozen=True):
 
 
 class UnitAction(msgspec.Struct, frozen=True):
-    """A unit-provided action (rebuild graphs, refit, grow, migrate, drain, ...)."""
+    """A unit-provided action (rebuild graphs, refit, grow, relocate, drain, ...)."""
 
     unit: UnitId
     action: str
@@ -109,7 +109,8 @@ class ChangeResult(msgspec.Struct, frozen=True):
     new_identity: Identity | None
     plan: ActionPlan | None
     timings: dict[str, float]
-    aborted_requests: int = 0
+    drain_outcomes: dict[str, int] = {}
+    """Requests the drain did not see finish, by what the draining units did with them (§4.2)."""
     restarted: list[ProcId] = []
     reports: dict[str, ReloadReport] = {}
     """Per participant (``str(ProcId)``): what its unit runtime actually did."""

@@ -14,11 +14,14 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import pytest
 
-from core.change.types import ChangeResult
+from core.change.coordinator import PlanInput
+from core.change.types import ActionPlan, ChangeResult, ProcActions, UnitAction
 from core.common.ids import UnitId
-from core.common.result import Failed, Result, fail
+from core.common.result import Failed, Ok, Result, fail
+from core.control.host import ControlTunables
 from core.supervisor.protocol import ProcIntrospection
 from tests.scenarios.harness import ALL, SCHED, W0, W1, Scenario, generations, rungs, scenario, topology
 from unit.runtime import DerivedArtifact
@@ -723,5 +726,100 @@ def test_a_new_unit_using_a_service_a_running_unit_gains_waits_for_its_reload(tm
                 pa = next(pa for pa in r.plan.procs if pa.proc == p)
                 assert pa.stage == [] and pa.reload is not None
                 assert [u.id for u in pa.reload.units_to_add] == ["scn.extra_user"]
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_an_action_the_control_plane_cannot_run_fails_the_change(tmp_path: Path,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control plane runs reloads, added and removed units and config values for its own units.
+    A plan that also gives them a unit action (or a drain, or a restart) is refused, not skipped:
+    skipped, the change would commit without it."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            before = (await s.status()).identity
+            real = s.cp.coord.planner
+
+            class WithControlAction:
+                async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
+                    r = await real.plan(inp)
+                    assert not isinstance(r, Failed), r
+                    control = ProcActions(s.cp.proc, actions=[UnitAction(UnitId("core.api"), "rebuild", {})])
+                    return Ok(msgspec.structs.replace(r.value, control=control))
+
+            monkeypatch.setattr(s.cp.coord, "planner", WithControlAction())
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = 2")
+            r = await s.apply()
+            assert r.status == "aborted" and "control.unsupported_action" in {d.code for d in r.diagnostics}
+            assert (await s.status()).identity == before
+            monkeypatch.setattr(s.cp.coord, "planner", real)
+            assert (await s.apply()).status == "committed"
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_the_control_plane_keeps_only_the_snapshots_it_needs(tmp_path: Path) -> None:
+    """Every candidate the control-plane units analyse is materialized locally. They are kept by
+    ``control.snapshot_retention`` (most recently used) and while its units load code from them."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            root = s.cp.state_dir / "snapshots"
+            s.cp.tun = ControlTunables(snapshot_retention=1)
+            for i in range(4):
+                s.write("scn/policy_fcfs/notes.txt", f"candidate {i}\n")
+                checked = await s.client.check(await s.change())
+                assert not isinstance(checked, Failed), checked
+            code_root = Path(str(s.cp.runtime.code_root)).resolve().parent
+            dirs = {d.resolve() for d in root.iterdir() if d.is_dir() and not d.name.startswith(".tmp-")}
+            assert code_root in dirs and len(dirs) <= 2  # the one in use, and the most recent
+            # a change reads two snapshots (base and candidate) across awaits: none goes under it
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = 2")
+            await everyone_on(s, await s.apply())
+            dirs = {d.resolve() for d in root.iterdir() if d.is_dir() and not d.name.startswith(".tmp-")}
+            assert Path(str(s.cp.runtime.code_root)).resolve().parent in dirs and len(dirs) <= 3
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), ladder=(2,), kinds=("logic",))
+def test_status_shows_the_units_a_change_reloaded(tmp_path: Path) -> None:
+    """``status`` reports each process's units as of the last change it confirmed, not as of its
+    check-in: after an in-place reload it shows the new generation, as ``introspect`` does."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.edit("scn/policy_fcfs/unit.py", "VERSION = 1", "VERSION = 2")
+            await everyone_on(s, await s.apply())
+            row = next(p for p in (await s.status()).procs if p.proc == str(SCHED))
+            assert {u.unit: u.generation for u in row.units}["scn.policy_fcfs"] == 2
+            assert {u.unit: u.generation for u in row.units} == await generations(s, SCHED)
+
+    run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_a_snapshot_being_analysed_survives_other_requests(tmp_path: Path) -> None:
+    """An analysis may read its snapshot across awaits (an asynchronous check; ``core.deps`` asks the
+    processes in between). Other requests end meanwhile and prune; the snapshot it holds with
+    ``analysing`` is kept, and goes once it is let go (found in review of #16)."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.cp.tun = ControlTunables(snapshot_retention=1)
+            s.write("scn/policy_fcfs/notes.txt", "held\n")
+            held = (await s.change()).files
+            assert held is not None
+            with s.cp.analysing(held) as root:
+                for i in range(2):  # two more candidates, each check prunes when it ends
+                    s.write("scn/policy_fcfs/notes.txt", f"other {i}\n")
+                    checked = await s.client.check(await s.change())
+                    assert not isinstance(checked, Failed), checked
+                assert (root / "scn/policy_fcfs/notes.txt").read_text() == "held\n"
+            assert (await s.client.status()) is not None  # a request ends: it prunes again
+            assert not root.exists()
 
     run(main())

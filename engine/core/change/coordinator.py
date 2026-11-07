@@ -137,7 +137,7 @@ class _Run:
     reports: dict[str, ReloadReport] = field(default_factory=dict[str, ReloadReport])
     diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     """Reported by participants along the way (e.g. one-shot prepares)."""
-    aborted_requests: int = 0
+    drain_outcomes: dict[str, int] = field(default_factory=dict[str, int])
     _t: float = field(default_factory=time.monotonic)
 
     def lap(self, phase: str) -> None:
@@ -267,7 +267,7 @@ class Coordinator:
         return ChangeResult(
             status=status, change_id=cid, old_identity=old if old is not None else self.identity,
             new_identity=new, plan=run.plan if run else plan, timings=dict(run.timings) if run else {},
-            aborted_requests=run.aborted_requests if run else 0,
+            drain_outcomes=dict(run.drain_outcomes) if run else {},
             restarted=list(run.restarted) if run else [], reports=dict(run.reports) if run else {},
             state_version=self.state_version, diagnostics=diags,
         )
@@ -478,7 +478,10 @@ class Coordinator:
                 (pa.proc, self._call(pa.proc, Drain(run.id, drain_timeout),
                                      timeout=drain_timeout + self.sup.tun.rpc_timeout_s))
                 for pa in draining])
-            run.aborted_requests = sum(d.aborted_requests for d in drained.values() if isinstance(d, Drained))
+            for d in drained.values():
+                if isinstance(d, Drained):
+                    for outcome, n in d.outcomes.items():
+                        run.drain_outcomes[outcome] = run.drain_outcomes.get(outcome, 0) + n
             run.lap("drain")
         leaders = [pa for pa in run.prepared if pa.leads_epochs]
         followers = [pa for pa in run.prepared if not pa.leads_epochs]
@@ -588,6 +591,7 @@ class Coordinator:
                 run, [pa.proc for pa in run.prepared] + run.restarted + run.spawned, resume=True, deadline=deadline)
             for proc, ack in resumed.items():
                 self.sup.uses_snapshots(proc, ack.snapshots)
+                self.sup.runs_units(proc, ack.units)
         run.lap("commit")
         if errors:  # never infer that a lost process has stopped serving
             unconfirmed = sorted({d.subject for d in errors})
@@ -615,6 +619,7 @@ class Coordinator:
                 if isinstance(r, Ok) and isinstance(r.value, Resumed) \
                         and r.value.change_id == run.id and r.value.rolled_back:
                     self.sup.uses_snapshots(pa.proc, r.value.snapshots)
+                    self.sup.runs_units(pa.proc, r.value.units)
                 else:
                     self.recovery_required = True
                     if isinstance(r, Failed):

@@ -143,9 +143,9 @@ class Op:
         self.left -= 1
         return not self.never and self.left <= 0
 
-    def abort_remaining(self):
+    def drain_deadline(self):
         log(self.config, self.ctx, "drain timeout")
-        return 3
+        return {"aborted": 3}  # this toy's policy: the requests left end at the deadline
 
 
 class Tunable:

@@ -16,6 +16,8 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -93,13 +95,27 @@ def materialize(blobs: BlobStore, files: dict[str, str], root: Path) -> Path:
     return target / "engine"
 
 
+class ControlTunables(msgspec.Struct, frozen=True):
+    """``control.*`` config items."""
+
+    snapshot_retention: int = 8
+    """Local snapshots kept for analysis (the most recently used), besides those the control-plane
+    units load code from. Enough for the analyses that can run at once (a change's base and candidate,
+    a ``check``); older ones are deleted, and materialized again if needed."""
+
+
 class ControlPlane:
     def __init__(
         self, zctx: zmq.asyncio.Context, *, host: HostId, bind: str, state_dir: Path,
         sup_tun: SupervisorTunables | None = None, change_tun: ChangeTunables | None = None,
-        proc_tunables: dict[str, float | int] | None = None,
+        proc_tunables: dict[str, float | int] | None = None, control_tun: ControlTunables | None = None,
     ) -> None:
         self.proc = ProcId(host, CONTROL_ROLE, 0)
+        self.tun = control_tun or ControlTunables()
+        self._pins: dict[Path, int] = {}
+        """Snapshots analyses are reading (``analysing``), with how many hold each."""
+        if self.tun.snapshot_retention < 1:
+            raise ValueError("control.snapshot_retention must be at least 1")
         self.state_dir = state_dir
         self.blobs = BlobStore(state_dir / "blobs")
         self.log = EventLog(state_dir / "events.sqlite", self.blobs)
@@ -109,6 +125,7 @@ class ControlPlane:
         self.local = ControlParticipant(self)
         self.coord = Coordinator(self.sup, self.log, planner=_Planner(self), checker=_Checker(self),
                                  identity_fn=self._identity, tun=change_tun, local=self.local)
+        self.coord.on_result.append(self._after_change)
         for name, obj in [(HOST_CHANGE, self.coord), (HOST_SUPERVISOR, self.sup), (HOST_BLOBS, self.blobs),
                           (HOST_EVENTS, self.log), (HOST_SELF, self)]:
             self.runtime.provide_host(name, obj)
@@ -132,8 +149,53 @@ class ControlPlane:
     # -------------------------------------------------------- for the units
 
     def snapshot(self, files: dict[str, str]) -> Path:
-        """A local copy of a file list to analyse (``core.manifest``, ``core.deps``)."""
-        return materialize(self.blobs, files, self.state_dir / "snapshots")
+        """A local copy of a file list. Not kept while it is read: an analysis that reads it across
+        awaits uses ``analysing``."""
+        engine = materialize(self.blobs, files, self.state_dir / "snapshots")
+        os.utime(engine.parent)  # most recently used: retention keeps it
+        return engine
+
+    @contextmanager
+    def analysing(self, files: dict[str, str]) -> Generator[Path]:
+        """``snapshot(files)``, kept while the block runs: pruning skips it, however long the analysis
+        awaits in between (an asynchronous check, ``core.deps`` asking the processes)."""
+        engine = self.snapshot(files)
+        d = engine.parent.resolve()
+        self._pins[d] = self._pins.get(d, 0) + 1
+        try:
+            yield engine
+        finally:
+            if self._pins[d] == 1:
+                del self._pins[d]
+            else:
+                self._pins[d] -= 1
+
+    def _after_change(self, result: ChangeResult) -> None:
+        del result
+        self.prune_snapshots()
+
+    def prune_snapshots(self) -> list[Path]:
+        """Keep the ``control.snapshot_retention`` most recently used snapshots and every one the
+        control-plane units load code from (modules unchanged by in-place changes stay loaded from
+        older snapshots, as in a process host); delete the others. Returns what it deleted.
+
+        Never under a reader: snapshots held by ``analysing`` are kept, and nothing is pruned while a
+        change runs (its candidate is read from prepare to execute). It runs after each change and
+        after each API request."""
+        root = self.state_dir / "snapshots"
+        if self.coord.busy or not root.is_dir():
+            return []
+        dirs = [d.resolve() for d in root.iterdir() if d.is_dir() and not d.name.startswith(".tmp-")]
+        loaded = [Path(f).resolve() for m in list(sys.modules.values())
+                  if isinstance(f := getattr(m, "__file__", None), str)]
+        in_use = {d for d in dirs if any(f.is_relative_to(d) for f in loaded)}
+        if self.runtime.code_root is not None:
+            in_use.add(Path(self.runtime.code_root).resolve().parent)
+        recent = set(sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True)[:self.tun.snapshot_retention])
+        removed = [d for d in dirs if d not in in_use and d not in recent and d not in self._pins]
+        for d in removed:
+            shutil.rmtree(d, ignore_errors=True)
+        return removed
 
     def introspect_self(self) -> ProcIntrospection:
         return introspection(self.runtime, self.proc, self.coord.identity)
@@ -188,7 +250,10 @@ class ControlPlane:
             api = self.service(API)
         except _Missing as e:
             return e.failed()
-        return await api.handle(msg)
+        try:
+            return await api.handle(msg)
+        finally:
+            self.prune_snapshots()
 
 
 class _Missing(Exception):
@@ -253,6 +318,15 @@ class ControlParticipant:
 
     async def prepare(self, change_id: int, identity: Identity, actions: ProcActions,
                       files: dict[str, str]) -> Result[None]:
+        # It runs reloads, added and removed units and config values; anything else is refused,
+        # never skipped (a skipped action would let the change commit without it).
+        unsupported = [f"{ua.unit}.{ua.action}" for ua in [*actions.actions, *actions.drain]]
+        if actions.restart is not None:
+            unsupported.append("restart")
+        if unsupported:
+            return fail(COMPONENT, "prepare", f"the control plane does not run {unsupported} for its own units",
+                        code="control.unsupported_action",
+                        hint="control-plane units have no unit actions or drains; restarting it restarts the engine")
         try:
             root = self.cp.snapshot(files)
         except (OSError, ValueError) as e:

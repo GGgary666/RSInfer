@@ -90,6 +90,8 @@ class _Proc:
     spec: ProcSpec
     state: ProcState = "DECLARED"
     checkin: CheckIn | None = None
+    units: list[UnitBrief] = field(default_factory=list[UnitBrief])
+    """What it runs: from its check-in, then from each change it confirmed (``Resumed``)."""
     exit_code: int | None = None
     local_pid: int | None = None
     checked_in: asyncio.Event = field(default_factory=asyncio.Event)
@@ -210,6 +212,7 @@ class Supervisor:
             return fail(COMPONENT, "check_in", f"runs {msg.identity}, expected {rec.spec.identity}",
                         subject=str(msg.proc), code="supervisor.wrong_identity")
         rec.checkin = msg
+        rec.units = list(msg.units)
         rec.state = "RUNNING"
         rec.checked_in.set()
         return Ok(CheckedIn())
@@ -263,7 +266,7 @@ class Supervisor:
 
     def status(self) -> list[ProcStatus]:
         return [
-            ProcStatus(p, rec.state, rec.spec.identity, rec.checkin.units if rec.checkin else [], rec.exit_code)
+            ProcStatus(p, rec.state, rec.spec.identity, list(rec.units), rec.exit_code)
             for p, rec in sorted(self.procs.items())
         ]
 
@@ -438,6 +441,13 @@ class Supervisor:
                                            plan=msgspec.structs.replace(plan, identity=identity))
         rec.snapshots.add(identity)
         self._previous.pop(proc, None)
+
+    def runs_units(self, proc: ProcId, units: Iterable[UnitBrief] | None) -> None:
+        """What a process reported it runs once a change committed or rolled back there. ``None``:
+        it did not say, so the record stays; an empty list: it runs no unit."""
+        rec = self.procs.get(proc)
+        if rec is not None and units is not None:
+            rec.units = list(units)
 
     def uses_snapshots(self, proc: ProcId, snapshots: Iterable[Identity]) -> None:
         """What a process reported it still loads code from (after a commit or an abort)."""

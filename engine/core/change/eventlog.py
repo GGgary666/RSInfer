@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS changes (
     plan_json TEXT,
     timings_json TEXT,
     diagnostics_json TEXT,
-    aborted_requests INTEGER NOT NULL DEFAULT 0,
+    drain_json TEXT,
     content_purged INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     finished_at REAL
@@ -69,7 +69,7 @@ class ChangeRecord(msgspec.Struct, frozen=True):
     plan: dict[str, Any] | None
     timings: dict[str, float] | None
     diagnostics: list[dict[str, Any]] | None
-    aborted_requests: int
+    drain_outcomes: dict[str, int] | None
     content_purged: bool
 
 
@@ -78,6 +78,10 @@ class EventLog:
         self.blobs = blobs
         self.db = sqlite3.connect(path)
         self.db.executescript(_SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(changes)")}
+        if "drain_json" not in columns:  # a log written before drain outcomes replaced aborted_requests
+            self.db.execute("ALTER TABLE changes ADD COLUMN drain_json TEXT")
+            self.db.commit()
 
     # -- changes ----------------------------------------------------------
 
@@ -95,11 +99,11 @@ class EventLog:
     def finish(self, result: ChangeResult) -> None:
         self.db.execute(
             "UPDATE changes SET status = ?, new_identity = ?, state_version = ?, plan_json = ?,"
-            " timings_json = ?, diagnostics_json = ?, aborted_requests = ?, finished_at = ? WHERE id = ?",
+            " timings_json = ?, diagnostics_json = ?, drain_json = ?, finished_at = ? WHERE id = ?",
             (result.status, result.new_identity, result.state_version,
              _json.encode(result.plan).decode() if result.plan is not None else None,
              _json.encode(result.timings).decode(), _json.encode(result.diagnostics).decode(),
-             result.aborted_requests, time.time(), result.change_id),
+             _json.encode(result.drain_outcomes).decode(), time.time(), result.change_id),
         )
         self.db.commit()
 
@@ -127,12 +131,12 @@ class EventLog:
     def changes(self) -> list[ChangeRecord]:
         rows = self.db.execute(
             "SELECT id, source, status, base, new_identity, state_version, changeset_hash, config_json,"
-            " plan_json, timings_json, diagnostics_json, aborted_requests, content_purged FROM changes ORDER BY id"
+            " plan_json, timings_json, diagnostics_json, drain_json, content_purged FROM changes ORDER BY id"
         ).fetchall()
         return [
             ChangeRecord(r[0], r[1], r[2], r[3], r[4], r[5], r[6], json.loads(r[7]),
                          json.loads(r[8]) if r[8] else None, json.loads(r[9]) if r[9] else None,
-                         json.loads(r[10]) if r[10] else None, r[11], bool(r[12]))
+                         json.loads(r[10]) if r[10] else None, json.loads(r[11]) if r[11] else None, bool(r[12]))
             for r in rows
         ]
 

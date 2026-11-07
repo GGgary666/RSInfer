@@ -19,7 +19,9 @@ from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 UnitKind = Literal["logic", "state"]
 Binding = Literal["live", "plan", "startup"]
 ConfigType = Literal["int", "float", "str", "bool", "list", "dict", "any"]
-StateAction = Literal["refit", "grow", "migrate", "invalidate"]
+StateAction = Literal["refit", "grow", "relocate", "invalidate"]
+"""``relocate``: move contents within the same version (EPLB moves experts between ranks). Carrying
+contents to a new version of the unit's code is ``[state] migrate`` (doc/specs/state-changes.md)."""
 
 _SERVICE_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*@[0-9]+$")
 _UNIT_ID_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from typing import Any
 
 from core.change.coordinator import PlanInput
@@ -11,7 +12,7 @@ from core.common.framework import FrameworkModules
 from core.common.ids import ProcId
 from core.common.result import Diagnostic, Failed, Ok, Result, diag
 from core.deps.planner import World, plan
-from core.sourcetree import read_tree
+from core.sourcetree import Tree, read_tree
 from core.supervisor.protocol import Introspect, ProcIntrospection
 
 
@@ -24,8 +25,13 @@ class Planner:
         self._framework = FrameworkModules.default()
 
     async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
-        new_tree = read_tree(self._host.snapshot(inp.new.files))
-        base_tree = read_tree(self._host.snapshot(inp.base.files)) if inp.base.files else None
+        with ExitStack() as held:  # the trees are read lazily while planning, across the awaits below
+            new_tree = read_tree(held.enter_context(self._host.analysing(inp.new.files)))
+            base_tree = read_tree(held.enter_context(self._host.analysing(inp.base.files))) \
+                if inp.base.files else None
+            return await self._plan(inp, new_tree, base_tree)
+
+    async def _plan(self, inp: PlanInput, new_tree: Tree, base_tree: Tree | None) -> Result[ActionPlan]:
         running = [s.proc for s in inp.procs if s.state == "RUNNING"]
         replies = await asyncio.gather(*(self._sup.call(p, Introspect()) for p in running))
         intro: dict[ProcId, ProcIntrospection] = {}
