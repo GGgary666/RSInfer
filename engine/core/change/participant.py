@@ -302,7 +302,11 @@ class Participant:
         if c.undo_diags:
             self.change = c
             c.phase = "undone"
-            self.host.paused = True
+            quiesced = self.host.quiesce()
+            if isinstance(quiesced, Failed):
+                c.undo_diags += quiesced.diagnostics
+                self.diagnostics += quiesced.diagnostics
+            self.host.paused = True  # even so: this process must stop stepping until recovered
 
     def _undo_actions(self, c: _Change) -> None:
         for what, it in c.slicing:
@@ -411,10 +415,21 @@ class Participant:
         epoch = self.host.epoch
         if c.pause_after is not None and epoch is not None and epoch < c.pause_after:
             return  # keep stepping until the agreed epoch is done
+        # The steps the loop has started (device work, results not taken yet) finish first:
+        # what Execute unloads must not still be in use. Paused reports the epoch they reach.
+        t0 = time.monotonic()
+        quiesced = self.host.quiesce()
+        c.deadline += time.monotonic() - t0  # as in _advance: not the coordinator's silence
+        if isinstance(quiesced, Failed):
+            c.phase = "prepared"  # still serving; the coordinator aborts
+            if c.pause_reply is not None:
+                c.pause_reply.resolve(quiesced)
+                c.pause_reply = None
+            return
         self.host.paused = True
         c.phase = "paused"
         if c.pause_reply is not None:
-            c.pause_reply.resolve(Ok(Paused(c.id, epoch)))
+            c.pause_reply.resolve(Ok(Paused(c.id, self.host.epoch)))
             c.pause_reply = None
 
     # ----------------------------------------------------------- execute
