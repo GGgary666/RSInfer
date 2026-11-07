@@ -140,6 +140,26 @@ def test_new_units_are_staged_one_per_safe_point_while_the_old_version_serves(tm
     run(main())
 
 
+def in_process_host(plan: ProcessPlan, monkeypatch: pytest.MonkeyPatch) -> ProcessHost:
+    """A process host without its main loop: ``deliver`` hands it messages and runs its safe points."""
+    host = ProcessHost(ProcSpec(PROC, Identity("v1"), plan, "unused", "127.0.0.1"))
+    monkeypatch.setattr(host.rpc, "defer", Capture)
+    host.runtime.load_process_plan(plan).unwrap()
+    return host
+
+
+def deliver(host: ProcessHost, msg: msgspec.Struct, safe_points: int = 20) -> Result[msgspec.Struct]:
+    result = host.handlers[type(msg)](host.registry.wrap(msg, host.me), msg)
+    if isinstance(result, Capture):
+        for _ in range(safe_points):  # back to back, as a main loop with instant steps would run them
+            if result.result is not None:
+                return result.result
+            host.participant.tick()
+        raise AssertionError("no reply within the safe points")
+    assert not isinstance(result, Deferred)
+    return result
+
+
 CONSUMER = """
 from tests.framework.support import events
 
@@ -182,21 +202,10 @@ def test_an_action_of_a_staged_unit_whose_provider_reloads_is_prepared_on_its_ne
     v1 = write_tree(tmp_path / "snapshots" / "v1" / "engine", {f"{pkg}/provider.py": PROVIDER})
     write_tree(tmp_path / "snapshots" / "v2" / "engine", {
         f"{pkg}/provider.py": PROVIDER + "\n# the new provider version\n", f"{pkg}/consumer.py": CONSUMER})
-    plan = ProcessPlan(PROC, Identity("v1"), [provider], code_root=str(v1))
-    host = ProcessHost(ProcSpec(PROC, Identity("v1"), plan, "unused", "127.0.0.1"))
-    monkeypatch.setattr(host.rpc, "defer", Capture)
-    host.runtime.load_process_plan(plan).unwrap()
+    host = in_process_host(ProcessPlan(PROC, Identity("v1"), [provider], code_root=str(v1)), monkeypatch)
 
     def send(msg: msgspec.Struct) -> Result[msgspec.Struct]:
-        result = host.handlers[type(msg)](host.registry.wrap(msg, host.me), msg)
-        if isinstance(result, Capture):
-            for _ in range(20):  # safe points, as the main loop would run them
-                if result.result is not None:
-                    return result.result
-                host.participant.tick()
-            raise AssertionError("prepare did not finish")
-        assert not isinstance(result, Deferred)
-        return result
+        return deliver(host, msg)
 
     try:
         actions = ProcActions(PROC, stage=[consumer], actions=[UnitAction(consumer.id, "work")],
@@ -208,5 +217,45 @@ def test_an_action_of_a_staged_unit_whose_provider_reloads_is_prepared_on_its_ne
         prepared = [inst for kind, inst in events if kind == "prepare"]
         executed = [inst for kind, inst in events if kind == "execute"]
         assert prepared and executed and prepared[-1] == executed[-1], events
+    finally:
+        host.shutdown()
+
+
+SLOW_SLICES = """
+import time
+
+
+class Unit:
+    def __init__(self, ctx, config):
+        ctx.on_action("work", self)
+
+    def prepare(self, args):
+        for _ in range(2):
+            time.sleep(0.4)  # a slice longer than the coordinator's whole lease
+            yield
+
+    def execute(self, args):
+        pass
+
+    def abort(self):
+        pass
+
+    def commit(self):
+        pass
+"""
+
+
+def test_time_spent_preparing_does_not_count_against_the_coordinators_lease(
+        tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """While a slice runs, the coordinator's keepalives wait in the socket until the next safe point.
+    A slice longer than the lease must not make the participant think the coordinator is gone and
+    withdraw (found in review of #15: staging moved one-shot prepares into the slices)."""
+    unit = spec(f"{pkg}.slow", f"{pkg}.slow:Unit")
+    v1 = write_tree(tmp_path / "snapshots" / "v1" / "engine", {f"{pkg}/slow.py": SLOW_SLICES})
+    host = in_process_host(ProcessPlan(PROC, Identity("v1"), [unit], code_root=str(v1)), monkeypatch)
+    try:
+        r = deliver(host, Prepare(1, Identity("v1"), ProcActions(PROC, actions=[UnitAction(unit.id, "work")]), 0.3))
+        assert isinstance(r, Ok), r
+        assert not [d for d in host.participant.diagnostics if d.code == "change.coordinator_lost"]
     finally:
         host.shutdown()

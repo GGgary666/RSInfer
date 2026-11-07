@@ -266,6 +266,7 @@ class Participant:
 
     def _advance(self, c: _Change) -> None:
         """One slice of every unfinished preparation; ``Prepared`` once all are done."""
+        t0 = time.monotonic()
         try:
             for item in list(c.slicing):
                 try:
@@ -278,6 +279,9 @@ class Participant:
             self._rollback(c)
             self._resume(c, rolled_back=True)
             return
+        # Work done for the coordinator does not count against its lease (as in on_prepare): its
+        # keepalives wait in the socket while a slice runs, and are read at the next safe point.
+        c.deadline += time.monotonic() - t0
         if not c.slicing:
             c.phase = "prepared"
             c.renew()
