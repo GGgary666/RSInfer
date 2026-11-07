@@ -26,6 +26,7 @@
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
 | `.github/workflows/ci.yml` | CI：`uv sync --python 3.12`、`uv run pyright`、`uv run pytest`（Ubuntu） |
+| `.github/workflows/notify.yml`、`.github/scripts/notify.py` | PR 合进 `master` 后由 LLM 判断是否值得通知，值得就发一句话摘要到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
 ### `engine/`
