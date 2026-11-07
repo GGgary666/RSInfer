@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -223,8 +224,13 @@ class Agent:
     root: Path
 
     def kill(self) -> None:
+        """The machine goes silent: the agent dies first, so it cannot report its processes' exits
+        (killing the group at once gives no order; on macOS a worker may die first and be reported),
+        then whatever it started."""
         if self.process.returncode is None:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
 
 
 @dataclass
