@@ -164,9 +164,11 @@ class EventLog:
 
     # -- retention ----------------------------------------------------------
 
-    def prune(self, keep: list[Identity], retention: int, extra: Iterable[str] = (), *, grace_s: float = 0.0) -> int:
+    def prune(self, keep: list[Identity], retention: int, extra: Iterable[str] = (), *, grace_s: float = 0.0,
+              limit: int | None = None) -> int:
         """Delete blobs not referenced by ``keep``, the ``retention`` most recent identities, or
-        ``extra``, and older than ``grace_s`` (an agent uploads before it submits)."""
+        ``extra``, and older than ``grace_s`` (an agent uploads before it submits); at most ``limit``
+        of them. Returns how many were deleted: ``limit`` means there may be more."""
         recent = [r[0] for r in self.db.execute(
             "SELECT identity FROM identities ORDER BY created_at DESC, rowid DESC LIMIT ?", (retention,))]
         kept = sorted({*keep, *recent})
@@ -183,12 +185,17 @@ class EventLog:
             if base in kept or new in kept:
                 live.add(h)
         removed = 0
-        for h in self.blobs.hashes() - live:
+        for h in sorted(self.blobs.hashes() - live):
+            if limit is not None and removed >= limit:
+                break
             if grace_s > 0 and self.blobs.age(h) < grace_s:
                 continue
             self.blobs.delete(h)
             removed += 1
-        for (cid,) in self.db.execute("SELECT id FROM changes").fetchall():
+        if not removed:
+            return 0
+        # records already marked stay marked: a deleted blob does not come back under its hash
+        for (cid,) in self.db.execute("SELECT id FROM changes WHERE content_purged = 0").fetchall():
             cs = self.changeset(cid)
             # The changeset metadata may survive after its file or artifact contents are gone.
             if cs is None or self.blobs.missing(

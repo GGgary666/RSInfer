@@ -10,4 +10,4 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --python 3.12
       - run: uv run pyright
-      - run: uv run pytest
+      - run: uv run pytest -n auto

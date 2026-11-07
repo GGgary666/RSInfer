@@ -31,7 +31,7 @@
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12`、`uv run pyright`、`uv run pytest`（Ubuntu） |
+| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行） |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
@@ -106,7 +106,8 @@
 ```sh
 uv sync --python 3.12
 uv run pyright                       # strict；检查 engine/ 和 tests/（含 formal）
-uv run pytest                        # 默认测试；不收集 tests/framework/formal
+uv run pytest                        # 默认测试；不收集 tests/framework/formal；串行
+uv run pytest -n 8                   # 全量并行（pytest-xdist）：约 30 秒，串行约 165 秒
 uv run pytest tests/framework/ipc -q # 只跑某个目录
 # 起一个引擎（单机：--spawn-agents 在本机给拓扑里每台主机起节点代理），再用客户端操作它
 PYTHONPATH=engine uv run python -m core.control serve --source <工作区> --topology <topology.json> \
@@ -116,7 +117,7 @@ PYTHONPATH=engine uv run python -m core.control.client --control <地址> status
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```
 
-- 每次提交前跑 `uv run pyright` 和 `uv run pytest`。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
+- 每次提交前跑 `uv run pyright` 和 `uv run pytest`（全量用 `-n 8` 并行；只跑一两个文件时别加 `-n`，起 worker 要 5 秒左右）。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
 - `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。
 - `pyproject.toml` 的 `timeout = 120` 是 pytest-timeout 给**单个测试**的上限，不是整个套件的。不要给 pytest 或 CI job 加总时长上限。
 - 生成物不进仓库：`tests/framework/formal/.tools/`、`.runs/` 已被忽略。

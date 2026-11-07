@@ -26,6 +26,7 @@ import msgspec
 
 from core.change.config import ChangeTunables
 from core.change.eventlog import EventLog
+from core.change.faults import Faults
 from core.change.protocol import (
     Abort,
     Commit,
@@ -161,24 +162,20 @@ class Coordinator:
         if self.tun.commit_attempts < 1 or self.tun.commit_retry_interval_s < 0 \
                 or not 0 < self.tun.commit_ack_timeout_s < float("inf"):
             raise ValueError("commit limits must be positive and finite; retry interval must be nonnegative")
+        if self.tun.blob_prune_batch < 1 or self.tun.blob_prune_interval_s < 0:
+            raise ValueError("change.blob_prune_batch must be positive, change.blob_prune_interval_s nonnegative")
         self.recovery_required = False
         self.identity: Identity = EMPTY
         self.manifest = IdentityManifest()
         self.state_version = 0
         self.queue = ChangeQueue()
-        self.faults: set[str] = set()
-        """Fault points for tests. One-shot: ``after_check``, ``after_prepare``, ``after_pause``,
-        ``after_execute``; ``vanish_during_prepare`` and ``vanish_after_prepare`` (the coordinator
-        goes silent: no keepalives, no ``Abort``, queries about the change unanswered);
-        ``skip_abort`` (decides abort, sends no ``Abort``); ``delay_commit`` (decides commit, then
-        stays quiet for twice the participants' lease before sending ``Commit``). While set: ``no_decisions``
-        (``QueryDecision`` is never answered)."""
+        self._prune_due_at = 0.0
+        self.faults = Faults()
+        """Fault points for tests (``core.change.faults.POINTS``)."""
         self.busy = False
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._running: _Run | None = None
-        self._silent: set[int] = set()
-        self._quiet = False
         self._background: set[asyncio.Task[Any]] = set()
         self.on_result: list[Callable[[ChangeResult], None]] = []
 
@@ -250,7 +247,7 @@ class Coordinator:
                 self.busy = False
             self._deliver(item.data["future"], result)
             try:
-                self.prune_blobs()
+                await self.prune_if_due()
             except Exception as e:  # noqa: BLE001 - retention must not stop the queue
                 self.log.event(None, "prune_failed", {"error": f"{type(e).__name__}: {e}"})
 
@@ -275,14 +272,8 @@ class Coordinator:
             state_version=self.state_version, diagnostics=diags,
         )
 
-    def _take(self, point: str) -> bool:
-        if point in self.faults:
-            self.faults.discard(point)
-            return True
-        return False
-
     def _fault(self, point: str) -> None:
-        if self._take(point):
+        if self.faults.take(point):
             raise _Abort([diag(COMPONENT, point, f"fault injected at {point}", code="change.injected_fault")])
 
     def _spawn(self, coro: Coroutine[Any, Any, object]) -> None:
@@ -302,7 +293,7 @@ class Coordinator:
 
     async def _on_query(self, env: Envelope, msg: msgspec.Struct) -> Result[msgspec.Struct]:
         assert isinstance(msg, QueryDecision)
-        if "no_decisions" in self.faults or msg.change_id in self._silent:
+        if self.faults.armed("no_decisions") or self.faults.silent(msg.change_id):
             return fail(COMPONENT, "query", "the coordinator does not answer (injected)", code="change.injected_fault")
         return Ok(Decision(msg.change_id, self.decision_of(msg.change_id)))
 
@@ -312,13 +303,13 @@ class Coordinator:
         interval = self.tun.keepalive_interval_s
         while True:
             await asyncio.sleep(interval)
-            if run.id in self._silent or self._quiet:
+            if self.faults.silent(run.id) or self.faults.quiet:
                 continue
             for p in procs:
                 self._spawn(self._call(p, KeepAlive(run.id), timeout=interval))
 
     def _vanish(self, run: _Run, phase: str) -> ChangeResult:
-        self._silent.add(run.id)
+        self.faults.silence(run.id)
         return self._done(run.id, self._result("aborted", run.id, run.cs, None, run, [diag(
             COMPONENT, phase, "coordinator vanished (injected)", code="change.injected_fault")]))
 
@@ -404,7 +395,7 @@ class Coordinator:
         try:
             self._fault("after_check")
             await self._prepare(run, new_manifest)
-            if self._take("vanish_after_prepare"):
+            if self.faults.take("vanish_after_prepare"):
                 raise _Vanish("prepare")
             self._fault("after_prepare")
             await self._pause(run)
@@ -458,11 +449,8 @@ class Coordinator:
         run.asked = list(participants)
         calls = [self._call(pa.proc, Prepare(run.id, run.identity, pa, self.tun.coordinator_timeout_s),
                             timeout=self.tun.prepare_timeout_s) for pa in participants]
-        if self._take("vanish_during_prepare"):
-            sent = [asyncio.create_task(c) for c in calls]
-            await asyncio.sleep(0.1)  # the Prepares are on their way; nothing else follows
-            for t in sent:
-                t.cancel()
+        if self.faults.take("vanish_during_prepare"):
+            await self.faults.send_then_vanish(calls)
             raise _Vanish("prepare")
         results = await asyncio.gather(*calls)
         for pa, r in zip(participants, results, strict=True):
@@ -585,12 +573,8 @@ class Coordinator:
             self.local.commit(run.id)
         self.log.event(run.id, "commit_decided", {"identity": run.identity,
                        "participants": [str(pa.proc) for pa in run.prepared]})
-        if self._take("delay_commit"):
-            self._quiet = True
-            try:
-                await asyncio.sleep(2 * self.tun.coordinator_timeout_s)
-            finally:
-                self._quiet = False
+        if self.faults.take("delay_commit"):
+            await self.faults.hold(2 * self.tun.coordinator_timeout_s)
         for proc in run.stopped:  # decided: they are not coming back
             self.sup.forget(proc)
         deadline = time.monotonic() + self.tun.commit_ack_timeout_s
@@ -622,7 +606,7 @@ class Coordinator:
             if any(d.severity == "error" for d in local):  # the old control-plane units are not all back
                 self.recovery_required = True
             out += local
-        if self._take("skip_abort"):
+        if self.faults.take("skip_abort"):
             self.recovery_required = True
             out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))
         else:
@@ -667,14 +651,32 @@ class Coordinator:
 
     # ------------------------------------------------------------ retention
 
-    def prune_blobs(self) -> int:
+    def prune_blobs(self, limit: int | None = None) -> int:
         """Blob retention (§5.1): keeps the current identity, the one being prepared, the
         ``change.blob_retention`` most recent ones, the contents of queued changes, and
-        every blob younger than ``change.blob_grace_s``. Runs after every change; returns
-        how many blobs were deleted."""
+        every blob younger than ``change.blob_grace_s``. Deletes at most ``limit`` blobs;
+        returns how many it deleted."""
         keep = [self.identity, *([self._running.identity] if self._running else [])]
         queued = {h for item in self.queue.items() for h in _blobs_of(item.cs)}
-        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s)
+        return self.log.prune(keep, self.tun.blob_retention, queued, grace_s=self.tun.blob_grace_s, limit=limit)
+
+    async def prune_if_due(self) -> int:
+        """Retention between changes, without holding up the control plane: at most every
+        ``change.blob_prune_interval_s``, in batches of ``change.blob_prune_batch`` with the event
+        loop free in between (RPCs and heartbeats go on). A queued change goes first; the rest
+        is pruned after it. Each batch decides afresh what to keep."""
+        if time.monotonic() < self._prune_due_at:
+            return 0
+        removed = 0
+        while True:
+            n = self.prune_blobs(limit=self.tun.blob_prune_batch)
+            removed += n
+            if n < self.tun.blob_prune_batch:
+                self._prune_due_at = time.monotonic() + self.tun.blob_prune_interval_s
+                return removed
+            await asyncio.sleep(0)
+            if len(self.queue):
+                return removed  # still due: the next pass carries on
 
     # ------------------------------------------------------------- startup
 

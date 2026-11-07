@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -62,11 +63,15 @@ class Loop:
 
 
 class Stubborn:
-    """A loop stuck inside a step: it never reaches a safe point again."""
+    """A loop stuck inside a step: it never reaches a safe point again. It logs once it is stuck,
+    so a test can wait until the process no longer answers (before that, it still does)."""
     def __init__(self, ctx, config):
+        self.ctx, self.config = ctx, config
         ctx.provide("proc.loop@1", self)
 
     def step(self):
+        from toyc.logutil import log
+        log(self.config, self.ctx, "stubborn: stuck in step")
         time.sleep(3600)
 ''',
     "toyc/logutil.py": '''
@@ -180,7 +185,8 @@ SPECS: dict[str, UnitSpec] = {
     "toyc.versioned": spec("toyc.versioned", "toyc.versioned:Versioned", process=ALL_ROLES,
                            reads=["toyc.log_dir"]),
     "toyc.loop": spec("toyc.loop", "toyc.units:Loop", provides=["proc.loop@1"], process=["sched", "worker"]),
-    "toyc.stubborn": spec("toyc.stubborn", "toyc.units:Stubborn", provides=["proc.loop@1"], process=["worker"]),
+    "toyc.stubborn": spec("toyc.stubborn", "toyc.units:Stubborn", provides=["proc.loop@1"], process=["worker"],
+                          reads=["toyc.log_dir"]),
 }
 
 FAST = {
@@ -218,8 +224,13 @@ class Agent:
     root: Path
 
     def kill(self) -> None:
+        """The machine goes silent: the agent dies first, so it cannot report its processes' exits
+        (killing the group at once gives no order; on macOS a worker may die first and be reported),
+        then whatever it started."""
         if self.process.returncode is None:
-            os.killpg(self.process.pid, signal.SIGKILL)
+            self.process.kill()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGKILL)
 
 
 @dataclass

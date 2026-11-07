@@ -15,6 +15,7 @@ from core.common.framework import FrameworkModules
 from core.common.ids import Identity
 from core.common.result import Failed, Ok
 from tests.framework.support import PROC, events, spec, write_tree
+from unit.runtime.errors import StagingFailed
 from unit.runtime import (
     ESCALATE_ENGINE,
     ESCALATE_PROCESS,
@@ -416,3 +417,64 @@ def test_unit_code_imported_from_elsewhere_is_loaded_again_from_the_snapshot(wor
     assert sys.modules[f"{world.pkg}.helper"] is not stale
     assert sys.modules[f"{world.pkg}.helper"].__file__ == str(world.v1 / world.pkg / "helper.py")
     assert all(sys.modules[n] is m for n, m in framework_before.items())
+
+
+STAGED = '''
+from tests.framework.support import events
+
+
+class Bad:
+    def __init__(self, ctx, config):
+        raise RuntimeError("cannot build")
+
+
+class Good:
+    def __init__(self, ctx, config):
+        events.append(("built", ctx.id))
+        ctx.provide("good@1", self)
+
+
+class Waiting:
+    """Already in the process, waiting for a service a staged unit brings; it fails once built."""
+    def __init__(self, ctx, config):
+        ctx.use("good@1")
+        raise RuntimeError("the waiting unit fails")
+'''
+
+
+def staged_world(w: World, snapshot: Snapshot) -> Path:
+    files = {f"{w.pkg}/{n}.py": src for n, src in {
+        "catalog": CATALOG, "helper": "VALUE = 1\n", "policy": POLICY.format(pkg=w.pkg), "user": USER,
+        "other": OTHER}.items()}
+    return snapshot("v3", {**files, f"{w.pkg}/staged.py": STAGED})
+
+
+def test_sliced_staging_stops_at_the_first_staged_unit_that_fails(world: World, snapshot: Snapshot) -> None:
+    """Review of #15: once a new unit failed the staging fails, so no further one is built."""
+    v3 = staged_world(world, snapshot)
+    rt = start(world)
+    before = unit_state(rt)
+    bad = spec(f"{world.pkg}.a_bad", f"{world.pkg}.staged:Bad")  # built first: slots go in id order
+    good = spec(f"{world.pkg}.b_good", f"{world.pkg}.staged:Good", provides=["good@1"])
+    slices = rt.stage_in_slices([bad, good], code_root=str(v3))
+    next(slices)  # checks and declarations
+    with pytest.raises(StagingFailed) as e:
+        next(slices)  # builds a_bad, which fails: the staging fails in the same slice
+    assert any(d.subject == bad.id for d in e.value.failed.diagnostics)
+    assert ("built", good.id) not in events
+    assert unit_state(rt) == before
+
+
+def test_a_waiting_unit_that_fails_does_not_fail_the_staging(world: World, snapshot: Snapshot) -> None:
+    """A unit already in the process may wait for a service a staged unit brings. If it fails once
+    built, that is its failure, not the staging's: the same as when staging builds all at once."""
+    v3 = staged_world(world, snapshot)
+    rt = UnitRuntime(PROC)
+    waiting = spec(f"{world.pkg}.waiting", f"{world.pkg}.staged:Waiting", requires=["good@1"])
+    rt.load_process_plan(ProcessPlan(PROC, Identity("v3"), [world.catalog, waiting], code_root=str(v3))).unwrap()
+    good = spec(f"{world.pkg}.b_good", f"{world.pkg}.staged:Good", provides=["good@1"])
+    for _ in rt.stage_in_slices([good], code_root=str(v3)):
+        pass
+    snap = rt.snapshot()
+    assert snap.unit(good.id).staged and snap.unit(good.id).state is InstanceState.ACTIVE
+    assert snap.unit(waiting.id).state is InstanceState.FAILED

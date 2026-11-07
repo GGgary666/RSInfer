@@ -233,8 +233,12 @@ def test_a_hung_participant_ends_the_commit_with_recovery_not_a_hang(tmp_path: P
             cs = e.code_change()
             slow = restart_w1(e, init_delay_s=2.0)
             e.planner.script = lambda inp: slow(inp) if inp.cs.files else ActionPlan()
+            w1 = e.c.sup.local_pid(W1)
             change = asyncio.ensure_future(e.coord.submit(cs))
             await wait_until(lambda: "op execute" in e.ops(W0))
+            # W0 logs "op execute" before its Executed is on the wire; the coordinator relaunches W1
+            # only once every Executed is in, so wait for that, then hang W0 during the commit.
+            await wait_until(lambda: e.c.sup.local_pid(W1) != w1)
             hung = e.c.sup.local_pid(W0)
             assert hung is not None
             os.kill(hung, signal.SIGSTOP)  # like a rank stuck in NCCL: its agent still sees it running

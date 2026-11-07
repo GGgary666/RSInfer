@@ -112,9 +112,15 @@ def test_stop_kills_a_process_that_does_not_respond(tmp_path: Path) -> None:
     async def main() -> None:
         async with cluster(tmp_path, ["host-a"]) as c:
             identity, files = c.ingest(build_tree(tmp_path))
-            topo = topology(tmp_path, ["host-a"], ["host-a"], [role("worker", ["toyc.stubborn"])])
+            topo = topology(tmp_path, ["host-a"], ["host-a"], [role("worker", ["toyc.tunable", "toyc.stubborn"])])
             (await c.sup.apply_topology(topo, identity, files, c.plan_for(identity))).unwrap()
             w = proc("host-a", "worker", 0)
+            # Running is not stuck yet: a SIGTERM that arrives before the first step() is honoured at
+            # the safe point (exit code 0). Stop it once it no longer reaches safe points.
+            deadline = time.monotonic() + 20
+            while "stubborn: stuck in step" not in c.log_of(w):
+                assert time.monotonic() < deadline, "the stubborn loop never started its step"
+                await asyncio.sleep(0.05)
             t0 = time.monotonic()
             (await c.sup.stop(w, timeout_s=0.5)).unwrap()
             assert time.monotonic() - t0 < 5
