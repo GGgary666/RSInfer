@@ -6,16 +6,16 @@ be rewritten in another language.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import msgspec
 
-from core.common.ids import HostId, Identity, ProcId
+from core.common.ids import HostId, Identity, ProcId, UnitId
 from core.common.messages import SchemaRegistry
 from core.common.result import Diagnostic
 from core.ipc.stream import StreamAddress
 from platforms.base import PlatformInfo
-from unit.runtime.types import InstanceState, ProcessPlan
+from unit.runtime.types import DerivedArtifact, InstanceState, ProcessPlan
 
 # ---------------------------------------------------------------- spawning
 
@@ -190,6 +190,33 @@ class ProcStatusReport(msgspec.Struct, frozen=True):
     diagnostics: list[Diagnostic] = []
 
 
+class Introspect(msgspec.Struct, frozen=True):
+    """What ``core.deps`` asks every running process before it plans."""
+
+
+class ReadRecord(msgspec.Struct, frozen=True):
+    """A config key a unit read, and when: ``runtime`` (every step), ``startup`` (once,
+    while loading) or ``plan_build`` (into a derived artifact, by value)."""
+
+    key: str
+    unit: UnitId
+    phase: str
+    hooked: bool = False
+    """The unit takes new values of this key in place (``ctx.on_config``)."""
+    artifact: str = ""
+    """For ``plan_build``: the artifact being built."""
+
+
+class ProcIntrospection(msgspec.Struct, frozen=True):
+    proc: ProcId
+    identity: Identity
+    units: list[UnitBrief]
+    reads: list[ReadRecord] = []
+    artifacts: list[DerivedArtifact] = []
+    config: dict[str, Any] = {}
+    """Current values of the keys declared in this process."""
+
+
 MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("proc.spec@1", ProcSpec),
     ("agent.register@1", Register),
@@ -212,13 +239,16 @@ MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("proc.found@1", Found),
     ("proc.status@1", Status),
     ("proc.status_report@1", ProcStatusReport),
+    ("proc.introspect@1", Introspect),
+    ("proc.introspection@1", ProcIntrospection),
 ]
 
 
 def register_all(registry: SchemaRegistry) -> SchemaRegistry:
     from core.change.protocol import MESSAGES as CHANGE_MESSAGES
+    from core.control.protocol import MESSAGES as CONTROL_MESSAGES
 
-    for name, type_ in [*MESSAGES, *CHANGE_MESSAGES]:
+    for name, type_ in [*MESSAGES, *CHANGE_MESSAGES, *CONTROL_MESSAGES]:
         registry.register(name, type_)
     return registry
 

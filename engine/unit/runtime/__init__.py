@@ -12,8 +12,9 @@ from unit.runtime.errors import (
     UnitRuleError,
 )
 from unit.runtime.registry import Registry, current_instance
-from unit.runtime.runtime import ESCALATE_ENGINE, ESCALATE_PROCESS, UnitRuntime
+from unit.runtime.runtime import ESCALATE_ENGINE, ESCALATE_PROCESS, HOST_UNIT, UnitRuntime
 from unit.runtime.types import (
+    DerivedArtifact,
     InstanceInfo,
     InstanceState,
     ProcessPlan,
@@ -26,6 +27,8 @@ from unit.runtime.types import (
 __all__ = [
     "ESCALATE_ENGINE",
     "ESCALATE_PROCESS",
+    "HOST_UNIT",
+    "DerivedArtifact",
     "InactiveContextError",
     "InjectedFault",
     "InstanceInfo",

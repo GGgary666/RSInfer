@@ -55,10 +55,11 @@ from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, Severity, diag, fail
 from core.context.config import ConfigCommit, ConfigEntry
 from core.ipc.rpc import Deferred
-from unit.runtime.types import ReloadPlan, ReloadReport, UnitSpec
+from unit.runtime.types import ReloadPlan, ReloadReport
 
 if TYPE_CHECKING:
     from unit.runtime.host import ProcessHost
+    from unit.runtime.runtime import UnitRuntime
 
 COMPONENT = "change.participant"
 
@@ -198,11 +199,8 @@ class Participant:
         try:
             # Keys of units this change brings are declared with those units, so they start with
             # the values asked for; the other values are taken at the epoch boundary.
-            new_units = [*a.stage, *(a.reload.units_to_add if a.reload else [])]
-            owners = {key: (u.id, decl) for u in new_units for key, decl in u.manifest.config.items()}
-            for_new = {k: ConfigEntry(owners[k][0], owners[k][1], v) for k, v in a.config.items() if k in owners}
+            for_new, c.config_now = new_unit_config(a)
             staged_ids = {u.id for u in a.stage}
-            c.config_now = {k: v for k, v in a.config.items() if k not in owners}
             c.config_new = {k: e for k, e in for_new.items() if e.owner not in staged_ids}
             if c.config_now:
                 r = self.rt.config.stage(c.config_now)
@@ -319,20 +317,8 @@ class Participant:
             c.staged = False
 
     def _with_fresh_modules(self, undo: _Undo) -> ReloadPlan:
-        """The reverse reload, also dropping modules first imported from the candidate snapshot
-        during the change; otherwise they stay loaded from a snapshot that is about to go."""
         assert undo.reverse_reload is not None
-        if undo.candidate_root is None:
-            return undo.reverse_reload
-        candidate = Path(undo.candidate_root).resolve()
-        fresh: set[str] = set()
-        for name, mod in list(sys.modules.items()):
-            file = getattr(mod, "__file__", None)
-            if name not in undo.modules_before and file and file.endswith(".py") \
-                    and not self.rt.framework.contains(name) and Path(file).resolve().is_relative_to(candidate):
-                fresh.add(name)
-        changed = sorted({*undo.reverse_reload.changed_modules, *fresh})
-        return msgspec.structs.replace(undo.reverse_reload, changed_modules=changed)
+        return with_fresh_modules(self.rt, undo.reverse_reload, undo.candidate_root, undo.modules_before)
 
     def _abort_failed(self, ua: UnitAction, e: Exception) -> None:
         self.diagnostics.append(diag(COMPONENT, "abort", f"{ua.unit}.{ua.action}: {e}", code="change.abort_failed"))
@@ -484,17 +470,7 @@ class Participant:
         return plan
 
     def _reverse(self, plan: ReloadPlan) -> ReloadPlan:
-        """The reload that puts this process back: old specs, and the config they had."""
-        old_reload = [s for u in plan.units_to_reload if (s := self.rt.spec_of(u.id)) is not None]
-        removed: list[UnitSpec] = [s for u in plan.units_to_remove if (s := self.rt.spec_of(u)) is not None]
-        added = [UnitId(s.id) for s in plan.units_to_add]
-        staged = [UnitId(u.unit) for u in self.rt.snapshot().units if u.staged]
-        owners = {*(s.id for s in old_reload), *(s.id for s in removed)}
-        config = {k: e for k, e in self.rt.config.entries().items() if e.owner in owners or k in plan.config}
-        return ReloadPlan(
-            changed_modules=plan.changed_modules, units_to_reload=old_reload, units_to_add=removed,
-            units_to_remove=sorted(set(added) | set(staged)), new_code_root=self.rt.code_root, config=config,
-        )
+        return self.rt.reverse_plan(plan)
 
     # ---------------------------------------------------- commit / abort
 
@@ -641,6 +617,32 @@ class Participant:
         self._note("timeout", reason, code, severity="error" if code == "change.coordinator_lost" else "warning")
         self._rollback(c)
         self._resume(c, rolled_back=True)
+
+
+def new_unit_config(actions: ProcActions) -> tuple[dict[str, ConfigEntry], dict[str, Any]]:
+    """Split a change's values: those of keys owned by the units it adds, declared together with
+    those units so they are built with them, and the others, for keys already declared here."""
+    new_units = [*actions.stage, *(actions.reload.units_to_add if actions.reload else [])]
+    owners = {key: (u.id, decl) for u in new_units for key, decl in u.manifest.config.items()}
+    for_new = {k: ConfigEntry(owners[k][0], owners[k][1], v) for k, v in actions.config.items() if k in owners}
+    return for_new, {k: v for k, v in actions.config.items() if k not in owners}
+
+
+def with_fresh_modules(rt: UnitRuntime, reverse: ReloadPlan, candidate_root: str | None,
+                       modules_before: set[str]) -> ReloadPlan:
+    """The reverse reload, also dropping modules first imported from the candidate snapshot
+    during the change; otherwise they stay loaded from a snapshot that is about to go, and a
+    later change that adds the same module again would find the aborted version cached."""
+    if candidate_root is None:
+        return reverse
+    candidate = Path(candidate_root).resolve()
+    fresh: set[str] = set()
+    for name, mod in list(sys.modules.items()):
+        file = getattr(mod, "__file__", None)
+        if name not in modules_before and file and file.endswith(".py") \
+                and not rt.framework.contains(name) and Path(file).resolve().is_relative_to(candidate):
+            fresh.add(name)
+    return msgspec.structs.replace(reverse, changed_modules=sorted({*reverse.changed_modules, *fresh}))
 
 
 class _Failed(Exception):

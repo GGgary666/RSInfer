@@ -80,6 +80,20 @@ class InstanceInfo(msgspec.Struct, frozen=True):
     error: str | None = None
 
 
+class DerivedArtifact(msgspec.Struct, frozen=True):
+    """A product one unit builds from others (a plan, a graph, a cached table), registered with
+    ``ctx.derived``: what it depends on by value, and the action of its owner that rebuilds it."""
+
+    owner: UnitId
+    name: str
+    rebuild: str
+    """The owner's ``ctx.on_action`` name that rebuilds it (in prepare, next to the old one)."""
+    config: list[str] = []
+    """Config keys recorded into it by value."""
+    units: list[UnitId] = []
+    """Units whose code it was built with (e.g. the kernels in a graph)."""
+
+
 class RuntimeSnapshot(msgspec.Struct, frozen=True):
     proc: ProcId
     code_root: str | None

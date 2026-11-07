@@ -1,0 +1,8 @@
+[unit]
+id = "scn.native"
+kind = "logic"
+process = ["worker"]
+entry = "scn.native.unit:Unit"
+
+[capabilities]
+native_extensions = ["scn/native/_ext.so"]

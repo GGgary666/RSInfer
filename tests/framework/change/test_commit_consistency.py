@@ -26,6 +26,7 @@ from tests.framework.change.harness import Capture, Harness, OLD, harness as har
 from unit.runtime.host import ProcessHost
 
 
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
 @pytest.mark.parametrize("drop_reply", [False, True], ids=["lost-request", "lost-reply"])
 def test_lost_commit_is_retried_until_every_participant_serves_new_version(harness: Harness, drop_reply: bool) -> None:
     h = harness

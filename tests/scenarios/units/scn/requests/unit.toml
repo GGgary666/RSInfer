@@ -1,0 +1,11 @@
+[unit]
+id = "scn.requests"
+kind = "state"
+process = ["sched"]
+entry = "scn.requests.unit:Unit"
+
+[provides]
+services = ["scn.requests@1"]
+
+[state]
+drain_on_reload = false

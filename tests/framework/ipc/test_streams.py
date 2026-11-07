@@ -41,6 +41,7 @@ def test_backend_is_chosen_by_host_id_not_address() -> None:
     assert backend_for(HostId("host-a"), HostId("host-b")) == "tcp"
 
 
+@pytest.mark.covers(edges=("data",))
 def test_ordered_and_lossless_across_ring_wraps(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str]) -> None:
     rhost, whost = hosts
     reader, addr = open_reader(zctx, local=HostId(rhost), peer=HostId(whost), bind_host=BIND,

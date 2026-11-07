@@ -14,7 +14,7 @@ from typing import Any, Literal
 import msgspec
 
 from core.common.ids import UnitId
-from core.common.result import Failed, Ok, Result, diag, fail
+from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 
 UnitKind = Literal["logic", "state"]
 Binding = Literal["live", "plan", "startup"]
@@ -176,3 +176,20 @@ def parse_manifest(text: str, *, source: str = "<string>") -> Result[UnitManifes
 
 def load_manifest(path: Path) -> Result[UnitManifest]:
     return parse_manifest(path.read_text(), source=str(path))
+
+
+MANIFEST_FILE = "unit.toml"
+
+
+def discover(root: Path) -> tuple[list[UnitManifest], list[Diagnostic]]:
+    """Every ``unit.toml`` under a code root, read without importing anything. The control
+    plane uses it to load its own units; ``core.manifest`` does the full checks."""
+    manifests: list[UnitManifest] = []
+    problems: list[Diagnostic] = []
+    for path in sorted(root.rglob(MANIFEST_FILE)):
+        r = load_manifest(path)
+        if isinstance(r, Failed):
+            problems += r.diagnostics
+        else:
+            manifests.append(r.value)
+    return manifests, problems

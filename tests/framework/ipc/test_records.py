@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import msgspec
+import pytest
 
 from core.common.result import Failed, Ok
 from core.ipc import RecordBuilder, decode_record, encode_record, read_sections
@@ -20,6 +21,7 @@ class Spec(msgspec.Struct, frozen=True):
     draft_len: int
 
 
+@pytest.mark.covers(edges=("data",))
 def test_new_sections_do_not_disturb_old_readers() -> None:
     old = RecordBuilder("sched.step_plan@1", epoch=7).add("sched.batch@1", Batch([1, 2])).build()
     new = (RecordBuilder("sched.step_plan@1", epoch=8)

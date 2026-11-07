@@ -1,27 +1,14 @@
 from __future__ import annotations
 
 import itertools
-import sys
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.framework.support import events, write_tree
+from tests.framework.support import write_tree
 
 _counter = itertools.count()
-
-
-@pytest.fixture(autouse=True)
-def _isolate_imports() -> Generator[None]:
-    """Each test gets back the sys.path and sys.modules it started with."""
-    path = list(sys.path)
-    modules = set(sys.modules)
-    events.clear()
-    yield
-    sys.path[:] = path
-    for name in set(sys.modules) - modules:
-        del sys.modules[name]
 
 
 @pytest.fixture

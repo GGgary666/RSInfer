@@ -1,0 +1,8 @@
+[unit]
+id = "scn.kernels"
+kind = "logic"
+process = ["worker"]
+entry = "scn.kernels.unit:Unit"
+
+[provides]
+services = ["scn.kernels@1"]

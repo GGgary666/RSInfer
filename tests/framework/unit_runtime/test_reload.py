@@ -11,9 +11,10 @@ from types import ModuleType
 
 import pytest
 
+from core.common.framework import FrameworkModules
 from core.common.ids import Identity
 from core.common.result import Failed, Ok
-from tests.framework.support import PROC, events, spec
+from tests.framework.support import PROC, events, spec, write_tree
 from unit.runtime import (
     ESCALATE_ENGINE,
     ESCALATE_PROCESS,
@@ -356,3 +357,62 @@ def test_modified_modules_cannot_be_staged(world: World) -> None:
     again = spec(f"{world.pkg}.policy2", f"{world.pkg}.policy:Policy", provides=["pol2@1"], requires=["cat@1"])
     r = rt.stage_new_units([again], code_root=str(world.v2))
     assert isinstance(r, Failed) and r.has_code("unit.stage_existing_module")
+
+
+def test_a_package_imported_from_elsewhere_follows_the_code_root(world: World, tmp_path: Path) -> None:
+    """In the control plane, ``core`` (framework code: the package itself) was imported from where the process started, before any
+    snapshot existed; its ``__path__`` points into the snapshot (``_prefer_root``), not its
+    ``__file__``. Reload must still switch, back up and restore that ``__path__``: a changed
+    module, a new module and a changed sub-package ``__init__`` all come from the new snapshot,
+    and a rollback puts the old search path back."""
+    start_dir = write_tree(tmp_path / "start", {f"{world.pkg}/__init__.py": ""})
+    sys.path.insert(0, str(start_dir))
+    __import__(world.pkg)
+    default = FrameworkModules.default()
+    rt = start(world, framework=FrameworkModules(default.prefixes | {world.pkg}, default.exact | {world.pkg}))
+    package = sys.modules[world.pkg]
+    assert package.__file__ is not None and package.__file__.startswith(str(start_dir))
+    assert ask(rt, world) == 1
+
+    files = {f"{world.pkg}/{n}.py": src for n, src in {
+        "catalog": CATALOG, "policy": POLICY.format(pkg=world.pkg), "user": USER, "other": OTHER}.items()}
+    v3 = write_tree(tmp_path / "v3" / "engine", {
+        **files, f"{world.pkg}/helper.py": "VALUE = 3\n", f"{world.pkg}/fresh.py": "FRESH = True\n",
+        f"{world.pkg}/sub/__init__.py": "MARK = 3\n"})
+    v2_with_sub = write_tree(world.v2, {f"{world.pkg}/sub/__init__.py": "MARK = 2\n"})
+    rt.reload(ReloadPlan(changed_modules=[f"{world.pkg}.helper"], units_to_reload=[world.policy],
+                         new_code_root=str(v2_with_sub))).unwrap()
+    assert ask(rt, world) == 2
+    assert sys.modules[f"{world.pkg}.helper"].__file__ == str(world.v2 / world.pkg / "helper.py")
+    assert __import__(f"{world.pkg}.sub", fromlist=["MARK"]).MARK == 2
+    path_before = list(package.__path__)
+    assert path_before[0] == str(world.v2 / world.pkg)
+
+    rt.faults.add("after_load")
+    r = rt.reload(ReloadPlan(changed_modules=[f"{world.pkg}.helper", f"{world.pkg}.sub"],
+                             units_to_reload=[world.policy], new_code_root=str(v3)))
+    assert isinstance(r, Failed) and r.has_code("unit.rolled_back") and not r.has_code(ESCALATE_PROCESS)
+    assert list(package.__path__) == path_before and ask(rt, world) == 2
+
+    rt.reload(ReloadPlan(changed_modules=[f"{world.pkg}.helper", f"{world.pkg}.sub"],
+                         units_to_reload=[world.policy], new_code_root=str(v3))).unwrap()
+    assert ask(rt, world) == 3
+    assert sys.modules[f"{world.pkg}.helper"].__file__ == str(v3 / world.pkg / "helper.py")
+    assert __import__(f"{world.pkg}.fresh", fromlist=["FRESH"]).__file__ == str(v3 / world.pkg / "fresh.py")
+    assert __import__(f"{world.pkg}.sub", fromlist=["MARK"]).MARK == 3
+    assert package.__path__[0] == str(v3 / world.pkg) and str(world.v2 / world.pkg) not in package.__path__
+
+
+def test_unit_code_imported_from_elsewhere_is_loaded_again_from_the_snapshot(world: World, tmp_path: Path) -> None:
+    """A control plane inside another process (a test) may find a unit's library already imported
+    from outside any snapshot. The first load drops it, so units run the snapshot's version; framework
+    code stays as it was loaded."""
+    start_dir = write_tree(tmp_path / "start", {f"{world.pkg}/helper.py": "VALUE = 0\n"})
+    sys.path.insert(0, str(start_dir))
+    stale = __import__(f"{world.pkg}.helper", fromlist=["VALUE"])
+    framework_before = {n: m for n, m in sys.modules.items() if n.startswith(("core.common", "unit.runtime"))}
+    rt = start(world)
+    assert ask(rt, world) == 1
+    assert sys.modules[f"{world.pkg}.helper"] is not stale
+    assert sys.modules[f"{world.pkg}.helper"].__file__ == str(world.v1 / world.pkg / "helper.py")
+    assert all(sys.modules[n] is m for n, m in framework_before.items())

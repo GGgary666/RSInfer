@@ -1,0 +1,11 @@
+[unit]
+id = "core.manifest"
+kind = "logic"
+process = ["control"]
+entry = "core.manifest.unit:Unit"
+
+[provides]
+services = ["ctrl.manifest@1"]
+
+[requires]
+services = ["ctrl.self@1"]

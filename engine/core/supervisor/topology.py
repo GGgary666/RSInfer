@@ -52,6 +52,8 @@ class RoleSpec(msgspec.Struct, frozen=True):
     hosts: list[HostId] = []
     """For roles that are not per rank: process ``i`` runs on ``hosts[i]``."""
     env: dict[str, str] = {}
+    leads_epochs: bool = False
+    """Its processes decide epochs (the scheduler host); they pause first in a change."""
 
 
 class Topology(msgspec.Struct, frozen=True):

@@ -10,6 +10,7 @@ modules = [
     "core.nodeagent",
     "core.supervisor",
     "core.change",
+    "core.control",
     "unit",
     "unit.runtime",
     "platforms",

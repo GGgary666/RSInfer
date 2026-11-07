@@ -1,0 +1,21 @@
+[unit]
+id = "scn.plan"
+kind = "logic"
+process = ["worker"]
+entry = "scn.plan.unit:Unit"
+
+[provides]
+services = ["scn.plan@1"]
+
+[requires]
+services = ["scn.memory@1", "scn.kernels@1"]
+
+[config]
+"scn.kernel" = { type = "str", default = "basic", binding = "plan" }
+"scn.max_batch" = { type = "int", default = 8, binding = "plan" }
+
+[reads]
+config = ["scn.log_dir"]
+
+[capabilities]
+captures_graph = true

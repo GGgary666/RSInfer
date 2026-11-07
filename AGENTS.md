@@ -48,20 +48,35 @@
 | `engine/core/nodeagent/` | 每台机器一个的节点代理（`python -m core.nodeagent`） | `nodeagent.md` |
 | `engine/core/supervisor/` | 进程管家、拓扑、管家与节点代理之间的消息 | `supervisor.md` |
 | `engine/core/change/` | 变更事务：协调者、参与者、事件日志、blob 存储、队列 | `change.md` |
+| `engine/core/control/` | 控制面进程（`python -m core.control serve`）、控制接口的消息和客户端（`python -m core.control.client`） | `control-plane.md` |
 | `engine/unit/runtime/` | 单元运行时：加载 / 重载 / 撤销、`ProcessHost`、注册表、静态 import 图 | `unit-runtime.md` |
 | `engine/platforms/` | 平台接口 `base.py`；CI 用的 `fake/` | `platform.md` |
 
-将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，但它们不属于框架本体，不要列进 `framework.toml`。
+控制面单元（单元，不属于框架本体，不在 `framework.toml` 里）：
+
+| 路径 | 内容 | 规格 |
+|---|---|---|
+| `engine/core/identity/` | 系统身份 `core.identity` | `control-plane.md` §2 |
+| `engine/core/manifest/` | 清单与静态检查 `core.manifest` | `control-plane.md` §3 |
+| `engine/core/deps/` | 影响分析（动作计划、dry-run）`core.deps` | `control-plane.md` §4 |
+| `engine/core/api/` | 控制接口 `core.api` | `control-plane.md` §5 |
+| `engine/core/sourcetree.py` | 读源码树（清单、模块）的库，`core.manifest` 和 `core.deps` 共用；不是单元 | |
+
+每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
 ### `tests/`
 
-- `tests/__init__.py`：让 `tests` 成为包。所有测试辅助代码都用 `tests.framework.…` 绝对导入。
+- `tests/__init__.py`：让 `tests` 成为包。所有测试辅助代码都用 `tests.…` 绝对导入。
+- `tests/conftest.py`：autouse 的 `_isolate_imports`，对所有测试生效：每个测试后恢复 `sys.path`、`sys.modules` 和各个包的 `__path__`（toy unit 被导入进全进程共享的 `sys.modules`；进程内的控制面会让包先去快照里找模块）。
 - `tests/framework/`：框架本体（`engine/framework.toml` 列出的模块）的测试。
-  - `conftest.py`：autouse 的 `_isolate_imports`（每个测试后恢复 `sys.path` / `sys.modules`，因为 toy unit 被导入进全进程共享的 `sys.modules`），以及 `pkg`、`snapshot` fixture。
+  - `conftest.py`：`pkg`、`snapshot` fixture。
   - `support/`：通用工具 `spec`、`manifest_toml`、`write_tree`、`PROC`、`events`、`GENERIC_UNIT`。
   - `unit_runtime/`、`context/`、`ipc/`、`platforms/`、`change/`、`cluster/`：按组件划分。`ipc/test_location_transparency.py` 扫描整个 `engine/`，禁止写死本机地址或用 PID 当地址（P7）。
   - `adversarial/`：对抗与故障边界测试，对应 `doc/evaluations/` 的记录。
   - `formal/`：TLA+ 有限模型（`models/`）、runner（`run.py`）、对真实实现的轨迹回放和契约测试。细节见 `tests/framework/formal/README.md`。
+- `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。
+- `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
+  - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
 
   | 模块 | 提供 |
@@ -71,6 +86,8 @@
   | `framework/change/harness.py` | 进程内 Coordinator + 两个真实 `ProcessHost`，可在传输边界丢请求 / 回执（`Harness`、`Capture`、`OLD`、`harness`） |
   | `framework/adversarial/peer.py` | 单个真实 `ProcessHost`，逐条投递参与者消息（`Peer`、`peer`） |
   | `framework/ipc/peers.py` | IPC 测试在子进程中运行的代码 |
+  | `scenarios/harness.py` | 进程内的控制面（带控制面单元）+ 两台假主机，通过控制接口改工作区、`apply`（`Scenario`、`async with scenario(...)`、`build_workspace`、`rungs`） |
+  | `scenarios/coverage.py` | 覆盖检查要数的东西：6 种边、动作阶梯 0–6、3 种模块 |
 
 - 被多个测试文件共用的代码放进上面这类辅助模块（同目录或 `support/`），**不要从另一个 `test_*.py` 里导入**。fixture 以 `from … import harness as harness` 的形式在测试文件中重新导出。
 
@@ -78,7 +95,7 @@
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
 - `doc/archive/`：旧版文档，不再维护。
@@ -91,6 +108,10 @@ uv sync --python 3.12
 uv run pyright                       # strict；检查 engine/ 和 tests/（含 formal）
 uv run pytest                        # 默认测试；不收集 tests/framework/formal
 uv run pytest tests/framework/ipc -q # 只跑某个目录
+# 起一个引擎（单机：--spawn-agents 在本机给拓扑里每台主机起节点代理），再用客户端操作它
+PYTHONPATH=engine uv run python -m core.control serve --source <工作区> --topology <topology.json> \
+    --state-dir <目录> --host <HostId> --bind <地址> [--config <config.json>] --spawn-agents
+PYTHONPATH=engine uv run python -m core.control.client --control <地址> status|check|apply|introspect|logs
 # formal 全流程：需要 Java 11+；首次 --bootstrap 下载并校验 TLC 1.7.4
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```
@@ -106,5 +127,6 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 
 - 文档用中文；代码、注释、docstring 用英文。
 - 测试不用 `xfail`，也不按平台或缺少工具自动 `skip`。
+- 测试用 `@pytest.mark.covers(edges=..., ladder=..., kinds=...)` 声明自己走到了哪些边、动作阶梯的哪几级、哪些模块种类，并在测试里断言；`tests/scenarios/test_coverage.py` 要求每一项至少有一个测试覆盖。
 - 框架代码不写死本机地址、路径或 PID（P7）；超时、心跳之类的可调参数一律做成带默认值的配置项（`doc/specs/README.md`）。
 - 框架本体对外返回 `Ok` / `Failed`，不靠异常跨进程边界。

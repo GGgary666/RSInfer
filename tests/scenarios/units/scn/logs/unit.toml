@@ -1,0 +1,8 @@
+[unit]
+id = "scn.logs"
+kind = "logic"
+process = ["sched", "worker"]
+entry = "scn.logs.unit:Unit"
+
+[config]
+"scn.log_dir" = { type = "str", default = "", binding = "startup" }
