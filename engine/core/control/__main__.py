@@ -24,7 +24,7 @@ from core.change.config import ChangeTunables
 from core.common.ids import HostId
 from core.common.result import Failed
 from core.common.tunables import load_tunables
-from core.control.host import ControlPlane, ingest
+from core.control.host import ControlPlane, ControlTunables, ingest
 from core.supervisor.supervisor import SupervisorTunables
 from core.supervisor.topology import Topology
 
@@ -53,6 +53,7 @@ async def serve(args: argparse.Namespace) -> int:
         sup_tun=load_tunables(SupervisorTunables, "supervisor", tun),
         change_tun=load_tunables(ChangeTunables, "change", tun),
         proc_tunables=json.loads(args.proc_tunables),
+        control_tun=load_tunables(ControlTunables, "control", tun),
     )
     await cp.start()
     agents = await _spawn_agents(topo, cp.address, args.platform, args.agent_tunables) if args.spawn_agents else []
@@ -95,7 +96,7 @@ def main(argv: list[str]) -> int:
     s.add_argument("--config", type=Path, help="config values as a JSON file")
     s.add_argument("--spawn-agents", action="store_true", help="start a node agent for every host here")
     s.add_argument("--platform", default='{"name": "fake"}', help="platform info for spawned node agents")
-    s.add_argument("--tunables", default="{}", help="supervisor.* and change.* tunables as JSON")
+    s.add_argument("--tunables", default="{}", help="supervisor.*, change.* and control.* tunables as JSON")
     s.add_argument("--proc-tunables", default="{}", help="host.*, ipc.*, change.* tunables for processes")
     s.add_argument("--agent-tunables", default="{}", help="nodeagent.* tunables for spawned node agents")
     args = ap.parse_args(argv)

@@ -144,7 +144,8 @@ class UnitContext:
 
         ``handler`` has ``prepare(args)``, ``execute(args)``, ``commit()`` and
         ``abort()``; draining units also ``start_drain(args)``, ``drained()`` and
-        ``abort_remaining() -> int``. ``prepare`` runs before the pause while the old
+        ``drain_deadline() -> dict[str, int]`` (at the deadline, settle what is left by the unit's
+        own policy and say how many requests went which way). ``prepare`` runs before the pause while the old
         version keeps serving, the rest at the epoch boundary. ``prepare`` either does
         everything at once (returns ``None``; serving stops meanwhile) or returns an
         iterator whose every ``next()`` does one small slice between two steps

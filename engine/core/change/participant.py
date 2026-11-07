@@ -109,7 +109,7 @@ class _Change:
     report: ReloadReport | None = None
     drain_reply: Deferred | None = None
     drain_deadline: float = 0.0
-    aborted_requests: int = 0
+    drain_outcomes: dict[str, int] = field(default_factory=dict[str, int])
     pause_reply: Deferred | None = None
     pause_after: int | None = None
 
@@ -358,7 +358,7 @@ class Participant:
             reply = c.drain_reply = self.host.rpc.defer()
             return reply
         if c.phase != "prepared":
-            return Ok(Drained(c.id, c.aborted_requests))
+            return Ok(Drained(c.id, dict(c.drain_outcomes)))
         try:
             for ua in c.actions.drain:
                 self._handler(ua).start_drain(ua.args)
@@ -374,7 +374,11 @@ class Participant:
         try:
             done = all(self._handler(ua).drained() for ua in c.actions.drain)
             if not done and time.monotonic() >= c.drain_deadline:
-                c.aborted_requests = sum(int(self._handler(ua).abort_remaining()) for ua in c.actions.drain)
+                # The deadline passed: each unit settles what is left by its own policy (end them,
+                # send them back to the queue, ...) and says how many went which way.
+                for ua in c.actions.drain:
+                    for outcome, n in (self._handler(ua).drain_deadline() or {}).items():
+                        c.drain_outcomes[outcome] = c.drain_outcomes.get(outcome, 0) + int(n)
                 done = True
         except Exception as e:  # noqa: BLE001
             if c.drain_reply is not None:
@@ -382,7 +386,7 @@ class Participant:
             return
         if done and c.drain_reply is not None:
             c.phase = "drained"
-            c.drain_reply.resolve(Ok(Drained(c.id, c.aborted_requests)))
+            c.drain_reply.resolve(Ok(Drained(c.id, dict(c.drain_outcomes))))
             c.drain_reply = None
 
     def on_pause(self, env: Envelope, msg: Pause) -> Result[msgspec.Struct] | Deferred:
@@ -533,7 +537,7 @@ class Participant:
         if c is None and self._initial_resume_pending and self.host.identity == msg.identity:
             self.host.paused = False
             self._initial_resume_pending = False
-            done = Resumed(msg.change_id, msg.identity, snapshots=self._snapshots())
+            done = Resumed(msg.change_id, msg.identity, snapshots=self._snapshots(), units=self.host.unit_briefs())
             self.finished[msg.change_id] = done
             return Ok(done)
         if c is None or c.id != msg.change_id or c.phase != "committed" or c.identity != msg.identity:
@@ -565,7 +569,7 @@ class Participant:
             return Failed(list(c.undo_diags))
         self.host.paused = False
         self.change = None
-        reply = Resumed(c.id, self.host.identity, rolled_back, self._snapshots())
+        reply = Resumed(c.id, self.host.identity, rolled_back, self._snapshots(), self.host.unit_briefs())
         self.finished[c.id] = reply
         return Ok(reply)
 

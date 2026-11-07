@@ -109,7 +109,8 @@ class ChangeResult(msgspec.Struct, frozen=True):
     new_identity: Identity | None
     plan: ActionPlan | None
     timings: dict[str, float]
-    aborted_requests: int = 0
+    drain_outcomes: dict[str, int] = {}
+    """Requests the drain did not see finish, by what the draining units did with them (§4.2)."""
     restarted: list[ProcId] = []
     reports: dict[str, ReloadReport] = {}
     """Per participant (``str(ProcId)``): what its unit runtime actually did."""

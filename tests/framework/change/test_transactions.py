@@ -145,7 +145,9 @@ def test_queue_order_and_stale_internal_changes(tmp_path: Path) -> None:
     run(main())
 
 
-def test_drain_waits_then_aborts_the_rest_at_the_timeout(tmp_path: Path) -> None:
+def test_drain_waits_then_the_unit_settles_the_rest_at_the_deadline(tmp_path: Path) -> None:
+    """The drain waits until the unit says it is done, or until the deadline; then the unit settles
+    what is left by its own policy (this toy ends them) and the result says what it did."""
     async def main() -> None:
         async with engine(tmp_path) as e:
             def drain(args: dict[str, object], timeout: float) -> Script:
@@ -154,10 +156,10 @@ def test_drain_waits_then_aborts_the_rest_at_the_timeout(tmp_path: Path) -> None
 
             e.planner.script = drain({"ticks": 3}, 5.0)
             r = await e.coord.submit(ChangeSet(base=e.coord.identity))
-            assert r.status == "committed" and r.aborted_requests == 0 and "drain" in r.timings
+            assert r.status == "committed" and r.drain_outcomes == {} and "drain" in r.timings
             e.planner.script = drain({"never": True}, 0.3)
             r = await e.coord.submit(ChangeSet(base=e.coord.identity))
-            assert r.status == "committed" and r.aborted_requests == 3
+            assert r.status == "committed" and r.drain_outcomes == {"aborted": 3}
             assert "drain timeout" in e.c.log_of(SCHED)
 
     run(main())
