@@ -14,7 +14,13 @@
   - 绝对导入 `tests.framework.…`，包括写在字符串里的代码（toy unit 源码、子进程的 `python -c "..."`）；
   - 用 `Path(__file__).parents[n]` 算出的路径：`tests/framework/cluster/harness.py` 的 `REPO`、`ipc/test_shm_ring_wrap.py`、`ipc/test_location_transparency.py`、`formal/run.py` 和 `formal/test_*.py`；
   - `pyproject.toml`（`testpaths`、`addopts`、pyright `include`）和 `.github/workflows/ci.yml`；
-  - 文档里的路径（`README.md`、`doc/`、`tests/framework/formal/README.md`）和本文件的目录地图。
+  - 本文件的目录地图。其他文档不必逐个追改（见下一节）。
+
+## 文档是开发笔记
+
+- `doc/` 下的文档和各目录的 README 是带日期的开发笔记，记录的是写下当时的想法，不是必须一直保持正确的规范。
+- 改代码时**不要**连带更新所有引用到它的文档，也不要为了让旧文档保持最新花大量精力。需要记录新的结论时，写一份带日期的新文档；新文档可以取代旧文档。
+- 只有两类文档需要和代码保持一致：这次改动直接对应的文档（例如你正在写的设计或评估记录），以及本文件。
 
 ## 目录地图
 
@@ -26,7 +32,7 @@
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
 | `.github/workflows/ci.yml` | CI：`uv sync --python 3.12`、`uv run pyright`、`uv run pytest`（Ubuntu） |
-| `.github/workflows/notify.yml`、`.github/scripts/notify.py` | PR 合进 `master` 后由 LLM 判断是否值得通知，值得就发一句话摘要到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
+| `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
 ### `engine/`
@@ -74,7 +80,7 @@
 - `doc/roadmap.md`：阶段和验收。
 - `doc/specs/`：框架本体七个组件的规格；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
-- `doc/evaluations/`：历次修复 / 对抗测试的评估记录。里面的提交号、SHA-256、通过数是历史数据，不要改；路径变动时只更新命令。
+- `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
 - `doc/archive/`：旧版文档，不再维护。
 - `doc/figures/`：图片。
 
@@ -91,6 +97,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 
 - 每次提交前跑 `uv run pyright` 和 `uv run pytest`。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
 - `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。
+- `pyproject.toml` 的 `timeout = 120` 是 pytest-timeout 给**单个测试**的上限，不是整个套件的。不要给 pytest 或 CI job 加总时长上限。
 - 生成物不进仓库：`tests/framework/formal/.tools/`、`.runs/` 已被忽略。
 
 已知与环境有关的失败：`ipc/test_streams.py::test_slow_consumer_blocks_the_producer[tcp]` 在 macOS 上偶发失败，Linux 和 CI 上正常。
