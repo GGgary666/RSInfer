@@ -1,0 +1,19 @@
+ROW {"it": 0, "decode_ok": true, "import_ms": 3592.7, "decode_first_call_ms": 638.4, "capture_ms": 3.5, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 1, "decode_ok": true, "import_ms": 1076.3, "decode_first_call_ms": 117.8, "capture_ms": 5068.1, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 2, "decode_ok": true, "import_ms": 1094.4, "decode_first_call_ms": 7.4, "capture_ms": 362.5, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 3, "decode_ok": true, "import_ms": 1109.9, "decode_first_call_ms": 78.1, "capture_ms": 4024.1, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 4, "decode_ok": true, "import_ms": 1039.9, "decode_first_call_ms": 24.5, "capture_ms": 4521.4, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 5, "decode_ok": true, "import_ms": 1033.8, "decode_first_call_ms": 7.0, "capture_ms": 218.2, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 6, "decode_ok": true, "import_ms": 1166.7, "decode_first_call_ms": 66.7, "capture_ms": 4264.7, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 7, "decode_ok": true, "import_ms": 1074.9, "decode_first_call_ms": 58.3, "capture_ms": 263.3, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 8, "decode_ok": true, "import_ms": 1145.4, "decode_first_call_ms": 87.5, "capture_ms": 3933.6, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+ROW {"it": 9, "decode_ok": true, "import_ms": 1082.8, "decode_first_call_ms": 13.4, "capture_ms": 395.5, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}
+RESULT {"mode": "fla", "iterations": 10, "error": null, "all_ok": true, "first": {"it": 0, "decode_ok": true, "import_ms": 3592.7, "decode_first_call_ms": 638.4, "capture_ms": 3.5, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}, "last": {"it": 9, "decode_ok": true, "import_ms": 1082.8, "decode_first_call_ms": 13.4, "capture_ms": 395.5, "new_ops": 62, "alloc_mb": 205.8, "reserved_mb": 216.0}, "threads": 66}
+ROW {"started": "first chunk_gated_delta_rule call"}
+RESULT {"mode": "fla_prefill", "ok": true, "first_call_ms": 28866.5, "second_call_ms": 1.4}
+RESULT {"mode": "fla_stale_graph", "ok_before_purge": true, "ok_after_purge": true, "error": null, "fla_modules_left": 3}
+ROW {"it": 0, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 706.7, "plan_and_first_run_ms": 72.3, "capture_ms": 24.1, "replan_ms": 0.4, "new_ops": 2, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 1, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 118.0, "plan_and_first_run_ms": 19.2, "capture_ms": 1.9, "replan_ms": 0.3, "new_ops": 2, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 2, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 110.8, "plan_and_first_run_ms": 17.8, "capture_ms": 1.5, "replan_ms": 0.3, "new_ops": 2, "alloc_mb": 648.7, "reserved_mb": 662.0}
+ROW {"it": 3, "short_ok": true, "replan_long_then_replay_ok": true, "eager_long_ok": true, "replay_bitwise_equals_eager": true, "import_ms": 109.3, "plan_and_first_run_ms": 23.5, "capture_ms": 1.8, "replan_ms": 0.3, "new_ops": 2, "alloc_mb": 648.7, "reserved_mb": 662.0}
+RESULT {"mode": "flashinfer", "iterations": 4, "error": null, "threads": 66}

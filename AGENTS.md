@@ -98,6 +98,7 @@
 - `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、状态单元的变更（`state-changes.md`：排空与版本迁移，只有规格）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
+  - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
 - `doc/archive/`：旧版文档，不再维护。
 - `doc/figures/`：图片。
 

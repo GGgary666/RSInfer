@@ -1,0 +1,22 @@
+# First run of p5 (before fla_prefill became its own bounded mode); killed by hand after
+# about 15 minutes. Nothing was printed (the old main printed only at the end), so the
+# state below was read with py-spy 0.4 (`py-spy dump --pid <pid> --locals`) at 02:19-02:21.
+
+fla_mode locals: it=0, rows=[], imp=3051.1 (ms), first=998.1 (ms, first decode call incl.
+Triton JIT), cap=102.5 (ms, capture), dec_ok=True, pre_first=None (prefill not returned)
+
+Main thread, sampled 5 times 3 s apart, always:
+    CudaDriver.clear_cache (triton/backends/nvidia/driver.py:576)
+    do_bench (triton/testing.py:178)
+    Autotuner._bench (triton/runtime/autotuner.py:170)
+    Autotuner.run (triton/runtime/autotuner.py:192)
+    CachedAutotuner.run (fla/ops/utils/cache.py:378)
+    Heuristics.run (triton/runtime/autotuner.py:395)
+    chunk_fwd_o (fla/ops/common/chunk_o.py:567)
+    chunk_gated_delta_rule_fwd (fla/ops/gated_delta_rule/chunk.py:111)
+    chunk_gated_delta_rule (fla/ops/gated_delta_rule/chunk.py:571)
+    fla_mode (p5_kernel_reload.py:137)
+Autotuner locals: key=(16, 48, 128, 128, 64, False, bf16, bf16, bf16, bf16, fp32, ...),
+pruned_configs=[2 configs], benchmarking the first one.
+GPU utilization 100 % the whole time; the Triton cache directory stopped growing (60 entries).
+After the kill the GPU went back to 0 % / 1 MiB.

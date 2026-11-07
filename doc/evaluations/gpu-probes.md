@@ -1,0 +1,471 @@
+# GPU 探针（阶段 1′）：真 CUDA graph、单元重载、显存扩容与契约
+
+- 日期：2026-11-08
+- 对应：[roadmap](../roadmap.md) 阶段 1′ 的三个问题和“契约探针”；[platform.md](../specs/platform.md)（假 graph 的绑定规则、grow）、[unit-runtime.md](../specs/unit-runtime.md)（卸载顺序、代码重载）、[state-changes.md](../specs/state-changes.md)（导出导入、排空）。
+- 脚本和原始输出在 [gpu-probes/](gpu-probes/)：`run.sh` 依次跑完全部探针（P8 要 4 张卡，其余各要 1 张），`logs/` 是本文引用的输出。探针用完就扔，不进骨架。
+- 本文只记录结论和建议。规格里要改的地方列在最后一节，规格文件本身这次没有改。
+- 同日按 PR #17 的评审修订了以下几处：
+  - cuBLAS workspace 的清理时机；
+  - P6 实际验证到哪一步；
+  - P8 的对比没有算权重搬运；
+  - 快照目录真正需要的不变量；
+  - 整段预留 view 的风险；
+  - 后台 capture 的限制。
+
+  新加的待测项列在“没有覆盖的”一节。
+- 同日又补测了评审提出的大部分待测项，新增 P9–P11：
+  - 按真实规模和真实 batch 大小列表重录；
+  - GPU 忙时分片重录（最后切到新版本之前 GPU 已经被同步过，切换协议本身没有测到）；
+  - 换中间层的权重；
+  - capture 的各阶段耗时，以及其他线程同时有 CUDA 工作的情况；
+  - 用真实权重改 TP。
+
+  “接进真实的单元运行时”按发起人的决定，留到阶段 2 再做。
+
+## 结论
+
+1. **问题 1（卸掉、重新 import、装上以后，decode graph 能不能正确重录和 replay）：能。** 玩具单元连续 30 轮、fla 的 GatedDeltaNet decode 连续 10 轮、flashinfer 的 paged decode 连续 4 轮，每轮都正确。
+2. **问题 2（按规定顺序卸载，会不会读到已释放的显存）：按规定顺序不会；顺序一错，真 graph 不报错，悄悄读到垃圾数据。** 所以“先卸使用方、再卸持有方”必须由运行时保证，`cuda_sm100` 平台也要像假 graph 一样在 replay 前自己检查依赖。
+3. **问题 3（同一进程反复重载会不会留下撤不掉的东西）：有三处，都有明确的办法。**
+   - `torch.library` 的注册不随模块消失，不撤销就重新 import 会报“重复注册”。
+   - 每个用过 cuBLAS 的 stream 各缓存一份 workspace（约 8 MB），PyTorch 的 stream 池有 32 个，所以最多涨约 270 MB 就停。全程复用一个 stream 就完全不涨。
+   - `torch._C._cuda_clearCublasWorkspaces()` 能把这些 workspace 全部还回去，但它清的是整个进程的全局缓存，还活着的 graph 可能正在用其中的地址。P3 只在没有任何 graph 的时候清过，所以它不能用在单个单元的卸载上，见“对契约的影响”第 2 条。
+   - graph 删了但输出 tensor 还被引用着，它的私有显存池就不会释放。
+
+   另外，fla 和 flashinfer 反复卸载、重新 import，显存和注册的算子数都不再增长。
+4. **假 graph 的绑定模型和真 graph 一致，但真 graph 还依赖三样假 graph 没有表达的东西：**
+   - kernel 代码：模块卸掉、引用全丢以后，旧 graph 照样跑旧 kernel，不报错；
+   - view 的 shape：graph 里写死，后来扩出来的显存它看不见；
+   - 共享显存池：旧 graph 不按录制顺序回放，会覆盖新 graph 的输出。
+5. **VMM 扩容（grow）可行：** 地址不变，扩容前录的 graph 能读到新映射的页，不用重录、不用排空，也不等其他 stream 上正在跑的 kernel。每 1 GiB 约 0.4–5 ms。
+6. **契约探针验证的是接口形态。** sglang 的 attention backend 接口和 Qwen3.8 的混合状态（paged KV + 每请求一个 GDN 槽位）可以按单元接口的形态组织起来。在真 kernel 上，同一份调度分别用 eager 和 graph replay 跑 160 步，token 和 logits 逐位一致。graph 那一遍中途还做了三件事：
+   - KV 池扩容两次，没有重录；
+   - 原地 refit 一次输出头 `lm` 的权重；
+   - 16 个请求都没跑完时换了一次 backend 代码，没有排空，重录耗时 23–104 ms。
+
+   有三个边界：
+   - 这些“单元”是手工组织的普通 Python 对象，没有经过 `UnitRuntime`、`ProcessHost` 和 `Participant`。
+   - 换代码时 GPU 上没有在跑的工作，上一步的结果已经取回 host。P9 补测了 GPU 忙时的分片重录，但最后切到新版本时 GPU 仍是同步过的，见 P9。
+   - refit 的 `lm` 不影响已有的 KV 和 GDN 状态。换中间层的权重由 P9 补测：必须让旧状态失效并重算。
+7. **契约要改两处：**
+   - replay 前的检查不能逐个 tensor 比对：55 项依赖每步约 38 µs，真模型会有几百项。
+   - capture 前的 warm-up 会真的改状态，状态单元要给 plan 单元提供 scratch 槽位。
+8. **代码重载不能原地改写文件。** 同一秒内重写、长度不变的 `.py` 会 import 到旧字节码。引擎现在每个身份一个快照目录，快照写好以后内容不再变，刚好避开了这个问题。真正要写进契约的不变量是“快照路径下的内容写好以后不再改变”。
+9. **工具链：** fla 0.6.0 的 chunk prefill 在 torch 2.8 / Triton 3.3.1 上 autotune 挂住，换到 torch 2.11 / Triton 3.6 就正常。v0 的 Qwen3.8 工具链应当按后者这一档选。
+10. **TP 和 NCCL：**
+    - 含 NCCL all_reduce 的 decode 步可以录进 graph 并正确 replay，原地 refit 以后也正确。
+    - 同一个进程里反复新建、销毁通信器 8 次，显存和线程数都不增长。
+    - 在同一组进程里从 TP4 换到 TP2（新建通信器、重新切权重、重录）只要约 1 s。停掉旧进程、起新进程要 8–16 s，主要花在 CUDA context（4–10 s）和 NCCL 初始化（2–4 s）上。
+    - 这个对比**没有算权重搬运**。探针里每个 rank 的 host 内存里都有完整权重，restart 时读的也只是本地盘上 256 MiB 的文件。换成 Qwen3.8-27B（bf16 约 55.6 GB）时，两条路都要搬十几到几十 GB 的权重，总时间会主要花在这上面。
+    - 4 个进程同时创建 CUDA context 比单个进程慢得多（单进程 0.85–3.6 s）。持久模式是开着的，原因没有查。
+    - **用真实权重补测（P11，Qwen3.8-27B，文本模型加 MTP 共 50.9 GiB）：**
+      - 进程内 TP4 → TP2：新建通信器 0.38 s，经 NVLink 把缺的 12.7 GiB 从退出的 rank 拿过来 0.32 s（约 40 GiB/s），拼成 TP2 的分片 18 ms。权重这部分一共约 0.7 s。
+      - 重启 2 个进程（页缓存是冷的）：从启动到权重就位要 35 s，其中读 checkpoint 就占了 20 s。
+      - 两边都还没有算 KV / GDN 状态的处理和 graph 的重录。
+    - 进程内改 TP 是一个值得验证的优化方向，但还不能改默认的动作推导，见“对契约的影响”第 11 条。
+11. **按真实规模重录，代价是秒级（P9）。** 模型按 Qwen3.8-27B 的尺寸搭（64 层，46 GiB 随机权重），decode graph 按 sglang 默认的 36 个 batch 大小录。
+    - 启动时一次录完要 6.9–15.7 s。
+    - 服务时把 36 个 batch 大小拆到 36 个步边界上一个一个录：每次让在途请求多停约 0.2 s（平时一步 30.6 ms），合计约 6.6 s。第一次运行碰上了离群值，单次最长 5.2 s，合计 28 s。
+    - 每次录之前先等在途的那一步做完（约 30 ms），这条路径是在 GPU 忙的情况下测到的，全程 86 步的 token 和 eager 一致。
+    - 但最后切到新版本时，脚本刚做完显存统计，统计里调用了 `torch.cuda.synchronize()`，所以 GPU 已经空了。“停止提交、确认最后一步的完成事件、等在途工作做完、激活新版本”这个切换协议本身，还没有在 GPU 忙时验证过。
+    - **秒级的离群值来自 `torch.cuda.graph` 每次进入都要做的 `empty_cache()`**，观测到一次 5.7 s。所以平台的 capture 不应每录一次都清一次显存缓存。
+12. **capture 期间同一进程里不能有别的 CUDA 工作（P10）。**
+    - 在本探针的工作负载下（另一个线程同时做显存分配、matmul、比对和 stream 同步），默认的 `global` 模式会让 capture 和那个线程都明确报错。
+    - 但 `global` 只检查 CUDA 标记为 capture-unsafe 的 API 调用，不能完整检测所有并发的 CUDA 工作或显存冲突。引擎仍然要自己保证 capture 只在暂停窗口里做，不能指望 CUDA 自动报错来兜底。
+    - `thread_local` 和 `relaxed` 模式下，这次测试没有出错。但 PyTorch 文档把这种用法列为可能静默出错，所以契约仍按“暂停窗口里录”来写。
+13. **换了中间层的权重，旧的 KV 和 GDN 状态必须失效（P9 refit）。**
+    - 原地换掉第 3、4 层的权重以后，接着用旧状态生成，40 步的 token 全都和“新权重从头读同样的 token 历史”的结果不同。
+    - 清掉状态、按 token 历史用新权重重算一遍以后，token 和 logits 与对照逐位一致。这印证了 v0-plan 的默认做法：模型代码或权重变了，就让 KV 失效。
+
+## 环境
+
+- 一台 8 卡 SM100 级节点，卡间全互联 NVLink。P8、P11 各用 4 张卡，其余探针各用一张，用的都是空闲卡（`nvidia-smi` 上没有进程、显存为 0）。PyTorch 报告 capability 10.0、148 SM、约 178 GiB 可用。驱动 580.105.08，CUDA 13.0，Python 3.12.3。
+- 第一轮的 P1、P4 输出里带有设备名，提交进 `logs/` 时删掉了这个字段；脚本现在改为输出 capability 和 SM 数。
+- 两套软件栈。P1、P2、P7 只在 A 上跑过；P9、P11 和 P10 的 phases 只在 B 上跑过；其余在 A、B 上各跑一遍：
+
+| | A：容器自带 | B：节点上已有、跑过 Qwen3.8 vLLM 服务的 venv |
+|---|---|---|
+| torch | 2.8.0a0+34c6371d24.nv25.08 | 2.11.0+cu130 |
+| Triton | 3.3.1 | 3.6.0 |
+| cuda-python | 13.0.0 | 13.3.1 |
+| fla | 0.6.0（`pip install --no-deps --target` 到临时目录） | 同左 |
+| flashinfer | 0.7.3 + apache-tvm-ffi 0.1.15（同上） | 0.6.14（venv 自带） |
+| NCCL（torch 自带） | 2.27.7 | 2.28.9 |
+
+- B 只用它的 Python 解释器：设置了 `PYTHONDONTWRITEBYTECODE=1`，Triton 和 flashinfer 的缓存目录都指向自己的临时目录，没有改动这个 venv 和它的缓存。
+- 对照用的 sglang 源码是 0.5.23 的 wheel，只读。
+
+## 各探针的结果
+
+### P1 真 CUDA graph 依赖什么（`p1_graph_binding.py`，A）
+
+| 录制后做了什么 | replay 的结果 |
+|---|---|
+| 权重原地 `copy_` 新值 | 读到新值 |
+| 输入 buffer 改内容 | 读到新值 |
+| 改录制时用到的 Python 标量 | 仍然用旧值（录制时写死了） |
+| 把引用换成另一个地址的 tensor | 仍然读旧地址，不报错 |
+| 释放 graph 依赖的 buffer，再让别的数据占用这块显存 | 读到垃圾，不报错 |
+| graph 里的 Triton kernel，原地改它的输入 | 正确 |
+
+这次输出里的 `pool_mb` 不能直接读成“删了 graph 还剩约 100 MB”。原因有两个：
+- 脚本里的变量 `_` 还引用着第二个 graph 的输出（64 MiB），所以它的私有池没有释放；
+- 两个 capture stream 各有一份 cuBLAS workspace。
+
+P3 把这两件事分开重测了。
+
+### P2 同一进程反复重载一个单元（`p2_unit_reload.py`，A）
+
+测试单元在 import 时注册一个 `torch.library` 算子、建一个模块级 stream、定义一个 Triton kernel。
+
+| 模式 | 结果 |
+|---|---|
+| `destroy`：卸载时调用 `LIB._destroy()` | 30 轮全对。第一轮重录 728 ms，之后每轮 29 ms，卸载 26–100 ms。allocated 从 48.9 MB 涨到 170.8 MB，reserved 从 78 MB 涨到 378 MB |
+| `keep`：不撤销注册 | 第 2 轮重新 import 时报 `RuntimeError: Tried to register an operator ... multiple times` |
+
+显存为什么涨，在 P3 查清了：这个单元自己也建了一个 stream，所以每轮从 stream 池里取两个，用来 warm-up 的只有一半，30 轮里实际碰到 16 个不同的 warm-up stream。
+
+### P3 显存残留的来源（`p3_residue.py`，A、B 结果完全相同）
+
+每种模式 80 轮，每轮做一遍“warm-up、capture、replay、核对、全部删掉”，然后读 caching allocator 的统计。
+
+| 模式 | 用到的 stream 数 | allocated（MB），第 0 轮 → 第 79 轮 | reserved（MB） | 第 32 轮以后的增长 |
+|---|---|---|---|---|
+| `p2_like`：每轮新建一个 stream 做 warm-up（和 P2 一样） | 32 | 48.9 → 292.6 | 78 → 678 | 0 |
+| `p2_like_clear_ws`：同上，卸载后清掉 cuBLAS workspace | 32 | 24.5 → 24.5 | 38 → 38 | 0 |
+| `p2_like_no_cublas`：同上，但 graph 里没有 matmul | 32 | 24.5 → 24.5 | 38 → 38 | 0 |
+| `shared`：warm-up 和 capture 全程用同一个 stream | 1 | 40.8 → 40.8 | 58 → 58 | 0 |
+
+- **增长全部来自每个 stream 一份的 cuBLAS workspace**，前 32 轮里每多一个 stream 约多 8 MB。PyTorch 的 stream 池每种优先级 32 个、循环复用，所以碰满 32 个以后就不再涨。
+- `p2_like_clear_ws` 每轮都是先删掉本轮的 graph 和输出，再清 workspace。“卸掉一个单元、其他 graph 继续服务”这种情况没有测。PyTorch 的 `clearCublasWorkspaces()` 直接清空两张进程级的全局表（handle 加 stream → workspace），所以在那种情况下清理，可能让其他 graph 用到已释放或已被复用的显存。
+- 碎片（inactive split）从 29 MB 涨到 385 MB，也是这些 workspace 散落在各处造成的。清掉 workspace 或者全程用一个 stream，碎片都不涨。
+
+graph 私有池（`pools` 模式，数值是相对基线的增量，单位 MB；两个 4096×4096 fp32 输入，各 64 MiB）：
+
+| 状态 | allocated | reserved |
+|---|---|---|
+| 录 g1：`(a@b).relu()` | 64 | 130 |
+| 再录 g2，各用各的池 | 128 | 258 |
+| 删掉 g1，但还留着它的输出 o1 | 128 | 194 |
+| 再删 o1 | 64 | 130 |
+| 删掉 g2 和 o2 | 0 | 0 |
+| g3、g4 共享一个池 | 128 | 194 |
+| 全部删掉 | 0 | 0 |
+| 清掉 cuBLAS workspace | −8.1 | −20 |
+
+**共享池有正确性风险。** g5、g6 共享一个池，按 g5、g6 的顺序录制，录 g6 之前把 g5 的输出删掉了，于是 g6 的输出落在了 g5 原来的输出上（`overlaps = true`）。之后先回放 g6、再回放 g5，**g6 的输出被 g5 覆盖**（`clobbered = true`）。在后台准备新版本时，旧 graph 还在回放，新 graph 正在录制，正好就是这个顺序。
+
+### P4 用 VMM 给 KV 池扩容（`p4_vmm_grow.py`）
+
+先预留 64 GiB 虚拟地址，按 1 GiB 一块映射物理显存（`cuMemCreate`、`cuMemMap`、`cuMemSetAccess`），再通过 `__cuda_array_interface__` 包成 torch tensor。
+
+| 检查项 | A | B |
+|---|---|---|
+| 映射粒度 | 2 MiB | 2 MiB |
+| 映射 1 GiB 耗时（第一次 / 第二次 / 另一个 stream 正忙时） | 0.99 / 5.21 / 0.33 ms | 0.38 / 0.36 / 0.42 ms |
+| 映射 8 GiB；解除映射 8 GiB | 0.94 ms；3.6 ms | 6.08 ms；10.21 ms |
+| 映射后设备空闲显存减少 / torch 的 reserved 是否变化 | 1024 MiB / 不变 | 同左 |
+| 扩容前后基址不变 | 是 | 是 |
+| 扩容前录的 graph（Triton kernel 按“基址 + 页号”访问）能读到新映射的页 | 是 | 是 |
+| 扩容前录的 graph（对整个 view 做 `sum`）只算原来那一段 | 是 | 是 |
+| 映射时另一个 stream 上的 kernel 还没跑完（映射没有等它） | 是，还剩 158 ms | 是，还剩 147 ms |
+| 解除末尾没用到的映射后，graph 仍然正确，显存全部还回 | 是 | 是 |
+| 只剩 view 引用时，持有方对象仍然活着；最后一个 view 释放后才解除映射 | 是 | 是 |
+
+没有故意去测“解除映射以后再回放 graph”。那样会触发 GPU 页错误，在共享节点上会留下 Xid 记录。
+
+### P5 Qwen3.8 用到的 kernel 库反复重载（`p5_kernel_reload.py`）
+
+形状按 Qwen3.8-27B 的 TP1：
+- GatedDeltaNet：16 个 key 头、48 个 value 头，head dim 128，batch 32，递归状态放在一个 64 槽的池里。
+- full attention：24 个 q 头、4 个 kv 头，head dim 256，page 16，batch 16。
+
+每轮的做法：把 `fla` 或 `flashinfer` 从 `sys.modules` 里全部移走，再 import，然后 capture 并 replay，结果和 fp32 参照实现比对。
+
+| 模式 | A（torch 2.8 / Triton 3.3.1） | B（torch 2.11 / Triton 3.6） |
+|---|---|---|
+| `fla`：decode 重载 10 轮 | 全对。import 第一轮 2.9 s、之后 0.77 s；第一次调用第一轮 991 ms（编译）、之后 6–7 ms；capture 87–186 ms。注册的算子数固定为 +52，allocated 固定为 205.8 MB | 全对。import 3.6 s / 1.1 s；第一次调用 638 ms / 7–118 ms；capture 0.2–5 s，波动很大，原因没查。算子数固定为 +62，allocated 固定为 205.8 MB |
+| `fla_prefill`：第一次 chunk 调用 | **挂住**。autotune 在 `chunk_fwd_o` 两个候选 config 里的第一个上，跑了 15 分钟以上没有返回，GPU 一直 100%，用 py-spy 看到的栈见 `logs/p5_kernel_reload_run1_hang.log`。第二次跑到 600 s 超时（见 `logs/p5_kernel_reload.log`） | 正确。第一次调用 28.9 s（编译加 autotune），第二次 1.4 ms |
+| `fla_stale_graph`：capture 后把 fla 全部移出 `sys.modules`、丢掉所有引用、gc，再回放旧 graph | 旧 graph 仍然正确执行，fla 模块剩 0 个 | 同左 |
+| `flashinfer`：重载 4 轮，JIT 缓存目录一开始是空的 | 全对。第一轮 plan 加第一次运行 19.6 s（JIT 编译），之后 25–27 ms。import 0.5 s / 0.3 s，capture 55–90 ms，重新 plan 0.2–0.4 ms。算子数固定为 +5，allocated 固定为 648.7 MB | 全对。缓存目录已被 P6 预热，第一次 plan 加运行 72 ms，之后 18–24 ms。import 0.7 s / 0.11 s，重新 plan 0.3 ms。算子数固定为 +2，allocated 固定为 648.7 MB |
+
+flashinfer 那一行两边的结论相同：
+- 用短序列（1–64）的 plan 录 graph，换成长序列（1000–4000）重新 `plan` 后直接回放，结果正确，并且和同一个 wrapper 的 eager 输出逐位相同。
+- 每轮重新 import 以后，显存和注册的算子数都不增长，也不再重新编译（第一次运行 18–27 ms）。
+
+B 的 `fla_stale_graph` 第一遍统计 fla 模块数的条件写错了（把 `flash_attn` 等也算了进去），修正后单独重跑，见 `logs/p5_kernel_reload_B_stale_graph_rerun.log`。
+
+### P6 契约探针：截断的 Qwen3.8 decoder（`p6_contract.py`）
+
+8 层，排列和 Qwen3.8 一样：3 层 GatedDeltaNet 加 1 层 full attention，重复两次。头数和 head dim 用 Qwen3.8 的真实值，hidden 1024，词表 4096，batch 16。按单元来拆：
+
+| 单元 | 种类 | 内容 | 来源 |
+|---|---|---|---|
+| `kv.paged` | 状态 | 每个 attention 层的 K、V 各占一段 VMM 区间。view 覆盖整个预留区间，物理显存按 2 MiB 的整数倍映射，所以第 0 页可以留作 scratch 页 | sglang `KvVmmArena` / `KvVmmBufferOwner.ensure_prefix`（0.5.23 已经用 VMM 给 KV 扩容） |
+| `gdn.slots` | 状态 | 每个 GDN 层一份 conv state `[槽, 10240, 3]` bf16 和递归状态 `[槽, 48, 128, 128]` fp32，每个请求固定占一个槽，最后一个槽留作 scratch 槽 | sglang `MambaPool` / `HybridReqToTokenPool` |
+| `weights` | 状态 | 全部权重 | |
+| `backend` | 逻辑，中途换代码 | attention：flashinfer decode。每步在 graph 外算好 page 表并调用 `plan`，结果写进固定地址的 buffer；graph 内只做 KV 写入和 `run`。GDN：conv 更新加 fla 的 `fused_recurrent`，按槽号 gather/scatter | sglang `AttentionBackend` 的 `init_forward_metadata_out_graph` / `_in_graph` 分工 |
+| `plan` | 逻辑，录 graph | capture 时记下 52 个按地址的依赖和 3 个按值的依赖（backend 版本、backend 实例、batch 大小），每次 replay 前逐项检查 | |
+
+同一份请求调度（每个请求长 8–200 个 token，跑完就换新请求）先 eager 跑一遍，再用 graph replay 跑一遍。graph 那一遍：
+- 页不够时给 KV 池扩容，不重录；
+- 第 50 步原地 refit `lm` 权重，不重录；
+- 第 90 步 16 个请求都在途时换 backend 代码，新代码里 KV 写入改用 `index_put_`，换完重录。
+
+| 结果 | A | B |
+|---|---|---|
+| 160 步的 token 一致 / logits 逐位一致 | 是 / 是 | 是 / 是 |
+| KV 池扩容次数和耗时（每次 4 段 × 4 MiB） | 2 次：49.8、4.7 ms | 2 次：0.5、16.4 ms |
+| 换代码时在途的请求 / 换代码加重录的耗时 / 换完后的版本号 | 16 / 104 ms / 2 | 16 / 23 ms / 2 |
+| 换代码后旧 graph 被检查出过期的依赖 | backend 的 5 个元数据 buffer、GDN 的槽号 buffer、`backend.version`、`backend.instance` | 同左 |
+| 把 `kv.k0` 换成新分配的 tensor（模拟一次不用 VMM 的扩容）后被检查出的依赖 | `kv.k0` | 同左 |
+| replay 前检查 55 项依赖的耗时（中位数） | 39 µs | 38 µs |
+| 每步耗时中位数：graph / eager | 1.61 / 4.65 ms | 1.53 / 4.41 ms |
+
+**第一遍 A 上出现过一个问题。** 当时换代码的做法是原地改写同一个文件，结果过期依赖里没有 `backend.version`：import 到的其实还是旧代码，见 `logs/p6_contract_run1_inplace_rewrite.log`。改成每个版本一个目录以后就正常了。原因由 P7 确认。
+
+**P6 能说明什么、不能说明什么。**
+
+能说明：保留请求状态、换 backend 代码、重录以后，可以接着正确执行。
+
+不能说明的有以下几点：
+- **没有走真实的单元运行时。** 状态、backend、plan 都是手工组织的普通 Python 对象，没有经过 `UnitRuntime`、`ProcessHost`、`Participant` 的加载、重载、依赖登记和资源释放。
+- **换代码时 GPU 是空闲的。** 每一步都用 `nxt.tolist()` 和 `logits.cpu()` 把结果取回 host，所以第 90 步换代码时，GPU 上已经没有在跑的工作。“16 个请求在途”只是说这些请求还没有跑完。GPU 上还有工作时要怎么停止提交、等它完成、重录、切换、恢复，没有测。
+- **capture 是同步做的，只有一个 batch 大小。** P6 只录 batch 16 一种，在两步之间同步录。真引擎要录几十个 batch 大小，P6 里录一次就要 16–159 ms（B 上 fla decode 的 capture 还在 0.2–5 s 之间波动），全部重录可能要几秒。
+- **不能让旧版本一边服务、一边在后台 capture 新 graph。** PyTorch 规定，capture 进行时同一进程里（任何线程）不能有不在 capture 里的 CUDA 工作，否则可能出现静默的数值错误；分开 stream 和显存池也不够。所以同一进程里的重录只能放在步与步之间的暂停窗口里，一次录一个 batch 大小，每次都让在途请求停一次 capture 的时间。暂停窗口实际要多长，还要实测。
+- **refit 只换了输出头。** 换的 `lm` 不影响已有的 KV 和 GDN 状态，所以 P6 只说明“同地址更新能被 graph 读到”。换中间层的权重时，还要处理旧 KV、旧 GDN 状态和前缀缓存的失效。
+
+### P7 原地改写文件后重新 import（`p7_stale_bytecode.py`，只用 CPU）
+
+先后写入 `VERSION = 1`、`2`、`3`，前两次在同一秒内，第三次隔 1.1 秒，每次写完都移出 `sys.modules` 并重新 import。三次实际 import 到的是 `1, 1, 3`。原因是 CPython 判断 `.pyc` 是否过期只看源文件的 mtime（整秒）和大小。关掉字节码缓存以后，import 到的是 `1, 2`。
+
+### P8 TP 与 NCCL（`p8_tp_nccl.py`，4 张卡）
+
+模型是一层 TP 的 MLP：hidden 4096，ffn 16384，batch 32，bf16。W1 按列切，W2 按行切，最后做一次 all_reduce。参照结果用完整权重在单卡上算。
+
+A、B 的两次完整运行是在同一台机器上同时跑的，各用 4 张卡，CUDA context 和 NCCL 的初始化会互相拖慢。所以又让 B 在机器上只有它一个任务时单独跑了一遍 restart。A 的 c10d 会打印 `localhost` 的 IPv6 连接警告（errno 97），不影响结果。
+
+**inproc：4 个 rank 进程从头到尾不退出**
+
+| 检查项 | A（NCCL 2.27.7） | B（NCCL 2.28.9） |
+|---|---|---|
+| CUDA context 创建（4 个进程同时） | 12.4–12.9 s | 12.6–13.0 s |
+| `init_process_group` 加第一次 all_reduce | 6.0–6.4 s | 5.2–5.5 s |
+| 每个 rank 上通信器占的显存（按设备空闲显存的变化算） | 约 1060 MiB | 0.4–1.1 GiB |
+| 含 all_reduce 的 graph：capture 后 replay | 正确，相对误差 5.2e-3（bf16 的量级） | 同左 |
+| 原地 refit W2 后直接 replay | 正确 | 同左 |
+| “新建通信器、capture、replay、删 graph、销毁通信器”循环 8 次 | 每次都正确。新建加第一次 all_reduce 1.7–2.7 s，capture 34–59 ms。空闲显存不减少，线程数固定在 262–263 | 每次都正确。2.3–3.6 s，capture 4–11 ms。同左 |
+| 同一组进程里从 TP4 换到 TP2：给 rank 0、1 新建通信器，按 TP2 重新切权重，重录 | 新建加第一次 all_reduce 0.73–0.75 s，重新切分并拷到卡上 89–92 ms，capture 42–46 ms。结果正确，和 TP4 的输出不是逐位相同 | 0.78–0.81 s，65–105 ms，4.5–45 ms。同左 |
+| 按“先使用方、后通信器”的顺序拆掉 TP4：先删 graph、输出和分片，再销毁通信器 | rank 2、3 的空闲显存回来 458–714 MiB，TP2 的 graph 仍然正确 | 442–698 MiB，同左 |
+
+**restart：停掉 4 个 rank 进程，再起 2 个新进程跑 TP2**
+
+这就是现在的动作推导对 TP 变更给出的做法。权重从本地盘 mmap 读，只有 2 × 128 MiB。下表是每个 rank 的耗时，格式为“TP4 / TP2”：
+
+| 阶段 | A | B | B 单独跑 |
+|---|---|---|---|
+| spawn 到进入 main（含 import torch） | 1.4 / 1.3 s | 1.4 / 1.3 s | 1.3 / 1.3 s |
+| CUDA context | 9.2 / 6.6 s | 10.0 / 8.2 s | 5.3 / 4.1 s |
+| NCCL init 加第一次 all_reduce | 4.1 / 2.2 s | 4.1 / 2.2 s | 2.5 / 1.8 s |
+| 读权重、切分、拷到卡上 | 0.06–0.17 / 0.07–0.09 s | 0.06–0.12 / 0.08–0.09 s | 0.07–0.08 / 0.16–0.17 s |
+| capture | 0.19–0.32 / 0.21–0.23 s | 0.19–0.23 / 0.18–0.21 s | 0.17–0.19 / 0.72–0.75 s |
+| **spawn 到第一步算对** | **15.2 / 10.5 s** | **16.0 / 12.1 s** | **9.4 / 8.2 s** |
+
+作为对照，机器空闲时单个进程在单卡上创建 CUDA context：A、B 各连续测 3 次，在 0.85–3.6 s 之间；另外 A 有一次单独测到 9.7 s。GPU 的持久模式（persistence mode）是开着的，几个进程同时创建 context 为什么慢这么多，没有查。
+
+**这组对比没有算权重搬运。**
+- inproc 的“重新切分”是从每个 rank 已经放在 host 内存里的完整权重上切下一块，再拷到卡上；restart 读的是本地盘上 256 MiB 的文件。两边都没有真实规模的权重搬运。
+- 换成 Qwen3.8-27B（bf16 约 55.6 GB）：
+  - 进程内 TP4 → TP2，留下的每个 rank 还要多拿约 14 GB，来源是盘、共享存储，或者经 NVLink 从退出的 rank 拿；
+  - 重启进程，每个 rank 要读约 28 GB。
+- 两条路的总时间都会主要花在搬权重上。“约 1 s 对 8–16 s”只是不含权重的那部分开销。真实权重下的数字见 P11。
+
+### P9 按真实规模重录、GPU 忙时换版本、换中间层权重（`p9_recapture.py`，B）
+
+**recapture：模型和流程**
+
+- **模型**：尺寸按 Qwen3.8-27B 来，64 层（48 层 GDN、16 层 full attention），hidden 5120，MLP 17408，词表 248320，随机权重 46.4 GiB。每层是 P6 的 backend 加一个 MLP。
+- **graph**：按 sglang 默认的 36 个 batch 大小（1、2、4、8、12、16、24，再每隔 8 个到 256）各录一个。同一版本的 graph 共用一个显存池，新旧版本各用各的池。
+- **服务**：64 个请求一直在途。host 最多往前多排 2 步；下一步的输入 token 在 GPU 上直接从上一步的输出拷过去，host 不等结果；每步的元数据都用 pinned 内存、按 stream 顺序拷进去。
+- **流程**：
+  1. v1 录完全部 36 个；
+  2. v1 服务 30 步；
+  3. 加载 v2 的代码；
+  4. 之后每个步边界先等在途的工作做完，再录一个 v2 的 batch 大小，共 36 次，期间 v1 照常服务；
+  5. 切到 v2，再服务 20 步；
+  6. 删掉 v1。
+- **对照**：同一份调度用 eager 跑一遍。
+
+**结果**（跑了两遍，第二遍加了分阶段计时，表里先写第二遍，括号里是第一遍）：
+
+| 项 | 结果 |
+|---|---|
+| 86 步的 token 和 eager 一致 | 是（两遍都是）。参照里一共出现 5454 种不同的 token |
+| 每步耗时（batch 64）：eager / graph | 39.2 / 30.6 ms |
+| 启动时一次录完 36 个 batch 大小 | 15.7 s（6.9 s）。单个 120 ms–6.1 s，中位数 208 ms（175 ms） |
+| 显存池 | 一个版本 5.3 GiB；新旧两版同时在时 10.85 GiB；删掉 v1 后 5.63 GiB |
+| 加载 v2 的代码 | 4.6 ms |
+| 分片重录，每片先等在途的工作做完 | 30.6 ms，也就是一步 |
+| 每片录一个 batch 大小 | 中位数 179 ms，最长 268 ms，合计 6.6 s（中位数 243 ms，最长 5.2 s，合计 28.3 s） |
+| 分片期间请求看到的步间隔 | 中位数 211 ms，最长 299 ms（274 ms，最长 5.24 s）；平时 30.6 ms |
+| 切到 v2 那一步的步间隔 | 34.6 ms（43.4 ms）。切换前脚本统计显存时调用了 `torch.cuda.synchronize()`，所以这一步开始时 GPU 是空闲的，这个数也包含了那次同步和统计 |
+
+第二遍里每次 capture 各阶段的耗时，格式为“中位数 / 最长”，单位 ms：
+
+| 阶段 | 启动时 | 服务中分片 |
+|---|---|---|
+| 准备 scratch 元数据（plan） | 8.9 / 101 | 5.2 / 22 |
+| 两遍 warm-up（真实执行两次前向） | 129 / 340 | 109 / 173 |
+| `torch.cuda.empty_cache()` | 11.5 / **5697** | 7.5 / 39 |
+| `torch._C._host_emptyCache()` | 0.5 / 6.2 | 0.05 / 0.13 |
+| 录制本身 | 46 / 149 | 47 / 62 |
+
+- **秒级的离群值出在 `empty_cache()` 上。** `torch.cuda.graph` 每次进入都会做一遍 `synchronize`、`empty_cache` 和 `host_emptyCache`，脚本把它们提前单独计时，所以表里能分开看。
+- 第一遍没有分阶段计时，它的离群值（2.7–5.2 s）和第二遍 `empty_cache` 的离群值在同一量级，推测是同一个原因。
+- 不算离群值，录一个 batch 大小的时间大头是 warm-up 的两次前向，真正录制只要约 47 ms。
+- **验证到了哪一步**：
+  - 已验证：异步服务时，每个分片录之前先等在途的工作做完，再录。
+  - 没有验证：最后切到 v2 的入口面对还没做完的 GPU 工作时怎么处理，原因见上表最后一行。要验证的话，应当把显存统计移出切换边界，显式做“停止提交、查询最后一步的完成事件、等在途工作、激活 v2”，并记下等待前是否真的还有没完成的事件、等了多久、最后用的是哪个版本。
+
+**refit：在途时换中间层的权重**
+
+用 8 层的小模型，batch 16：
+1. 前 40 步用旧权重；
+2. 第 40 步原地换掉第 3 层（full attention）和第 4 层（GDN）的全部权重，graph 不重录；
+3. 再跑 40 步。
+
+对照是“新权重从头读同样的 token 历史，再接着生成”：前 40 步按历史 token 喂入，第 41 步喂入旧权重已经生成的最后一个 token。
+
+| 换完以后的做法 | 和对照比 |
+|---|---|
+| 接着用旧的 KV 和 GDN 状态 | 40 步的 token 全都不同，第一步 logits 的最大差 0.86 |
+| 清掉状态，用新权重按 token 历史重算一遍（40 次 decode replay），再接着生成 | token 和 logits 逐位一致；重算耗时 70 ms |
+
+### P10 capture 的开销和限制（`p10_capture_internals.py`）
+
+**phases（B）**：P5 的 fla decode 重载循环跑 10 轮，把 capture 拆开计时。下表是第 2–10 轮的范围，单位 ms：
+
+| warm-up 第 1 次 | warm-up 第 2 次 | `empty_cache` | `host_emptyCache` | `gc.collect` | `torch.cuda.graph` 上下文 |
+|---|---|---|---|---|---|
+| 0.8–60 | 0.3 | 1.1–97 | ≤ 0.1 | 117–155 | 1.2–106 |
+
+- torch 2.11 的 `torch.cuda.graph` 不再调用 `gc.collect`（除非打开 `force_cudagraph_gc`），所以表里的 `gc.collect` 那一列不算在 capture 里。
+- P5 在 B 上 0.2–5 s 的 capture 耗时这次没有复现。结合 P9，最可能的原因是 `empty_cache` 偶尔要几秒。另外 P5 的 B 那一遍运行时，同机还有其他探针在跑。两点都没有单独确认。
+
+**threads（A、B）**：主线程录一段含 2000 个 matmul 的 graph，同时另一个线程在另一个 stream 上不停地分配显存、做 matmul、同步，并把结果和录制之前用同一 kernel 算出的值逐位比对。
+
+| `capture_error_mode` | A | B |
+|---|---|---|
+| `global`（默认） | capture 失败（`cudaErrorStreamCaptureInvalidated`），另一个线程报 `operation not permitted when stream is capturing` | 同左 |
+| `thread_local` | capture 成功，replay 正确。另一个线程在录制期间跑了 1373 次，全程 18138 次，没有一次错 | 同左。录制期间 1334 次，全程 18712 次，0 次错 |
+| `relaxed` | 同上。录制期间 1389 次，0 次错 | 同上。录制期间 1306 次，0 次错 |
+
+这张表只说明，在这个工作负载下 `global` 模式能把问题报出来。另一个线程里的同步属于 CUDA 标记为 capture-unsafe 的 API，`global` 检查的就是这类调用；它不是对所有并发 CUDA 工作或显存冲突的完整检测（见 PyTorch `torch.cuda.graph` 的 `capture_error_mode` 说明）。
+
+第一遍 threads 用的是带容差的比对，而容器设了 `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`，matmul 走 TF32，所以几乎每次都被判成错（`logs/p10_capture_internals_B_phases.log` 里的 threads 行就是那一遍）。改成和同一 kernel 的结果逐位比对以后重跑，才得到上表。
+
+### P11 用真实权重改 TP（`p11_tp_real_weights.py`，B，4 张卡）
+
+- **权重**：Qwen3.8-27B checkpoint 里视觉以外的部分，即文本模型加 MTP，共 866 个张量、50.89 GiB，其中 554 个按第 0 维切分，其余复制。
+- **TP2 用 rank 0 和 2**：这样留下的每个 rank 只缺一个四分之一（rank 1 → 0，rank 3 → 2）。
+- **对照数据**：拼好以后抽 12 个以上的张量，和直接从 checkpoint 读出的 TP2 分片逐位比对。
+- **日志**：去掉了重复的 c10d IPv6 警告行。
+
+| 每个 rank | restart：起 2 个新进程跑 TP2 | inproc：4 个进程从 TP4 换到 TP2 |
+|---|---|---|
+| 开始前 checkpoint 在页缓存里的比例 | 0.0（冷） | 0.983（刚被 restart 读过） |
+| spawn 到进入 main | 1.2–1.4 s | — |
+| CUDA context | 7.1–7.3 s | 5.0–5.4 s |
+| NCCL init 加第一次 all_reduce | 6.9–7.0 s | 3.1–3.6 s |
+| 读权重 | 25.45 GiB，19.8–19.9 s，每个 rank 1.28 GiB/s | TP4 分片 12.72 GiB，11.0–12.1 s（页缓存是热的） |
+| 切换 | — | 新建 2-rank 通信器 0.38 s；经 NVLink 收 12.72 GiB 0.31–0.32 s，约 40 GiB/s；拼成 TP2 分片 17–19 ms；抽查全部一致；rank 1、3 还回 12.61 GiB |
+| 另一种拿到缺的四分之一的办法：从 checkpoint 再读一遍 | — | 7.1–7.2 s（页缓存是热的） |
+| 权重就位 | spawn 后 35.3 s | 切换只要约 0.7 s |
+
+读这张表要注意四点：
+- **读权重的方式很简单**：safetensors 按张量顺序读切片，再从 pageable 内存拷到卡上。页缓存热的时候每个 rank 也只有约 1.1 GiB/s，瓶颈在读取方式，不在存储。优化过的读取方式会快不少，存储本身的带宽没有测。
+- **NVLink 传输没有调优**：在 4-rank 的默认通信组上逐块（512 MiB）顺序 send/recv，NCCL 提示这种不成批的 P2P 会被串行执行。
+- 两边都没有算 KV / GDN 状态的处理，也没有算 graph 的重录；重录的代价见 P9。
+- 两种模式是先后跑的，机器上没有别的任务。
+
+## 对契约的影响（建议，规格还没改）
+
+1. **`cuda_sm100` 平台要做 replay 前检查，但不能逐个 tensor 比对。**
+   - 硬件不提供任何保护（P1）。旧 graph 在模块卸掉以后照样能回放，跑的是旧 kernel（P5 `fla_stale_graph`）。
+   - 逐个比对 55 项每步约 38 µs，占一个 1.5 ms 小模型 decode 步的 2.5%。64 层的真模型依赖会上百项。
+   - 建议改成每个状态单元、每个提供缓冲区的逻辑单元各维护一个**绑定代数**：只要换了地址、shape 或 dtype，代数就加一。replay 前只比对这些代数和少量按值依赖。逐个 tensor 比对只在测试和调试模式下打开。
+   - 代码版本（单元实例 id 或身份）要作为按值依赖记进 graph。
+2. **stream 由平台统一管理，单元不能自己建 stream。**
+   - 平台提供数量有限、可以复用的 stream，按用途分开：执行、拷贝、capture。这样不会限制 CPU/GPU 的 overlap。
+   - warm-up 和 capture 用同一个 stream（P3 `shared`）。
+   - 静态检查可以禁止单元调用 `torch.cuda.Stream()`。
+   - **cuBLAS workspace 不能在单元卸载时清理。** `_cuda_clearCublasWorkspaces()` 清的是整个进程的全局缓存，还活着的 graph 和在途的工作可能正在用其中的地址（P3）。只有在确认没有任何 graph 或工作还会用到这些 workspace 时才能清，例如进程退出时。stream 数量固定以后，workspace 本来也就不会增长。
+3. **`torch.library` 注册必须通过 `ctx.effect` 登记撤销函数**（P2）。这已经符合 unit-runtime.md §5，可以加一条植入缺陷测试。
+4. **graph 的输出也是 graph 的一部分。**
+   - plan 单元释放 graph 时要连输出一起放掉，否则私有池不会释放（P3）。
+   - 新版本的 graph 不能和仍可能回放的旧 graph 共享池（P3 的覆盖问题）。所以新旧两套 graph 同时存在时，显存峰值是两套池之和。
+   - **同一进程里的 capture 不能和服务并行。** PyTorch 规定，capture 进行时同一进程里不能有其他 CUDA 工作。P10 的工作负载下，默认的 `global` 模式会明确报错，但它只检查 capture-unsafe 的 API 调用，不能当成完整的保护；暂停边界要由引擎自己保证。所以 4.7 里的“后台准备”对 graph 来说，只能在步与步之间的暂停窗口里一次录一个 batch 大小。另一种做法是放到别的进程里录，但那样就要跨进程共享状态的地址，代价另算。
+   - **暂停窗口实测下来（P9，Qwen3.8-27B 尺寸）**：每个窗口约 0.2 s，包括等在途的那一步（约 30 ms）、两次 warm-up 前向（约 110 ms）和录制（约 47 ms）。36 个 batch 大小合计约 6.6 s，一次录完也要 6.9 s 以上。所以带重录的变更，要么把一次几秒的停顿，要么把几十个约 0.2 s 的小停顿，算进对在途请求的影响。dry-run 应当把这个开销报出来。
+   - **平台的 capture 原语不应在每次录制前都调用 `empty_cache()`。** `torch.cuda.graph` 的入口每次都会调，P9 里观测到一次 5.7 s。可以改用 `CUDAGraph.capture_begin` / `capture_end`，自己控制什么时候清缓存（没有测）。warm-up 也可以考虑每个版本只做一次，不必每个 batch 大小都做两遍。
+5. **`grow` 的契约：**
+   - 物理映射按 2 MiB 粒度增长，地址不变（P4、P6）。
+   - 只有“按基址加页号访问”的 kernel 才能看到新映射的页；graph 里写死的 view shape 是按值依赖（P4）。
+   - **两种 view 要分开给：**
+     - 覆盖整个预留区间的 view，只交给按页号访问的 kernel，graph 扩容以后不用重录；
+     - eager 代码只能拿到覆盖已映射前缀的 view。
+   - 原因是：在整段 view 上做任何 eager 操作（`zero_()`、`sum()`、`clone()`，甚至调试时打印），都会碰到没有映射的地址。这会触发 illegal address，CUDA context 被污染，整个进程就丢了。P6 只通过按页号访问的 kernel 碰 KV，所以没有出事。
+   - **fake 平台要跟着改。** 现在 `FakeVirtualRange.view` 拒绝超出已映射部分的 view（`engine/platforms/fake/__init__.py`），按这条规则，graph 不重录就看不到扩出来的页。如果采纳这条建议，fake 平台应当允许整段 view，并在假 kernel 访问超出 `mapped` 的地址时报错，这样 CI 能抓到上面那种错误。
+   - grow 不会影响在途请求，也不等其他 stream 上的 kernel，不需要排空，和 v0-plan 4.5 的推导一致。
+   - state-changes.md §6.1 的“teardown 只放引用”在 VMM 上同样成立：最后一个 view 释放后，持有方才解除映射（P4）。
+6. **状态单元要提供 scratch 槽位或 scratch 页给 plan 单元 capture 用。** capture 前的 warm-up 会真的执行：GDN 的递归状态会被推进，KV 会被写入。运行中途重录（换代码以后）如果用在途请求的槽位来 warm-up，就会把它们的状态弄坏。sglang 用假 batch 来 capture，原因也在这里。这是 P6 里唯一需要增加的状态接口。
+7. **attention backend 的单元接口可以直接用 sglang 的分工：**
+   - graph 外：每步的 host 端准备，在原地写进本单元的固定 buffer。这些 buffer 是 graph 的按地址依赖。
+   - graph 内：形状固定的 GPU 操作。
+   - flashinfer 在 cuda-graph 模式下重新 `plan` 以后可以直接回放，同一 batch 大小内不同序列长度都正确（P5、P6）。所以 plan 的结果不是按值依赖，batch 大小才是。
+8. **代码重载的前提：新版本的代码在新路径下，绝不原地改写。** 要固定下来的不变量是：**快照路径下的内容写好以后不再改变**。为它补一条测试。
+   - 不需要要求快照目录里没有 `.pyc`。控制面进程从自己的快照目录 import 控制面单元（`ControlPlane.snapshot`），它没有设 `PYTHONDONTWRITEBYTECODE`，会在那里写 `__pycache__`。这没有问题：一个快照目录只属于一个身份，源文件写好以后不再变，`.pyc` 也就不会过期。
+   - P7 的问题只会出在源文件被原地改写的时候。`core.control.client` 和 `core.change.blobs` 排除 `__pycache__`，保证的是 change-set 不把工作区里的字节码带进快照。
+9. **Qwen3.8 的状态规模：**
+   - 每个请求在每个 GDN 层要 3 MiB 递归状态（48×128×128×fp32）加 60 KiB conv state。TP1 下 48 层合计约 147 MiB，256 个并发请求就是约 37 GiB。所以 `gdn.slots` 是一个固定槽位的池，大小要在启动时根据显存来定，也可以用同样的 VMM 办法扩槽位。
+   - config 里有 1 层 MTP（`mtp_num_hidden_layers = 1`），v0 的投机解码草稿可以用 MTP。
+10. **工具链：** v0 的 Qwen3.8 后端按 torch 2.11 / Triton 3.6 这一档来选。fla 0.6.0 在 Triton 3.3.1 上的 prefill 会挂住（P5）。
+11. **进程内改 TP 是一个待验证的优化方向，v0 的默认做法先不变。**
+    - P8 说明，保留 rank 进程和 CUDA context，只重建通信器、重新切权重、重录 graph，不含权重的那部分开销约 1 s；重启进程是 8–16 s。
+    - P11 用真实权重补测：进程内经 NVLink 把缺的四分之一拿过来只要约 0.7 s；重启进程到权重就位要 35 s，读 checkpoint 也要 7–20 s，视页缓存冷热而定。两条路都还要加上 P9 测的重录代价（6.6 s 以上）。差距确实值得以后去争取。
+    - 但还没有覆盖的有：
+      - KV 和 GDN 状态按新的切法怎么处理（P11 只搬了权重）；
+      - 中途失败以后怎么恢复；
+      - 扩大 world 的情况：c10d 的 `new_group` 只能在最初的进程集合里建组，TP2 → TP4 要加入新进程时，需要新的 rendezvous 或者直接用 NCCL 的 unique id 建通信器。
+    - 在这之前，TP 变更继续按现在的推导重启 rank 进程；提交确认不了时，照 change.md 4.8 已经定下的办法处理：冻结，再整体重启引擎。
+    - 现在就可以先记进规格的是：
+      - “通信器”是资源依赖图里的一类派生产物，graph 对它是按值依赖，拆除顺序是先 graph、后通信器；
+      - 每个 rank 每个通信器约占 0.4–1 GiB 显存，新旧两个同时存在时要算进显存峰值。
+    - 要不要采纳，由发起人决定。
+12. **换了权重（中间层）以后，KV / GDN 状态和前缀缓存都要失效，在途请求要按 token 历史重算（P9 refit）。** 这和 v0-plan 4.5 的默认推导一致。重算的代价是把所有在途请求的已有 token 重新 prefill 一遍；P9 是用 decode replay 重算的，真引擎应当用 prefill。只有能证明不影响已有状态的权重（例如 P6 里的输出头），才可以只做 refit、不排空。
+
+## 没有覆盖的
+
+- prefill 没有用 graph，P6、P9 的新请求都从 1 个 token 开始，不经过 prefill；P9 的状态重算也是用 decode 做的。
+- P9 用的是随机权重，P11 只搬了真实权重、没有跑模型。两者都没有 RoPE。
+- **接进真实的单元运行时。** 用 `UnitRuntime` / `ProcessHost` 去加载、重载 P6 里的这些单元，登记依赖、释放资源，再看 P6 的结论还成不成立。按发起人的决定，留到阶段 2 再做。
+- **GPU 忙时的最终切换协议。** “停止提交、查询最后一步的完成事件、等在途工作、激活新版本”这一串，P9 没有在 GPU 忙时测到（见 P9）。
+- **TP 变更时的 KV / GDN 状态。** 要么按新的切法搬动，要么失效重算，两种都没有测。
+- **读权重的方式和存储带宽。** P11 的读取方式是单线程、pageable 内存，没有测优化过的读取方式，也没有测存储本身能给多少带宽。
+- **不经过 `torch.cuda.graph` 的 capture。** 直接用 `capture_begin` / `capture_end`、不每次清缓存，没有测；warm-up 只做一次能不能保证正确，也没有测。
+- P5 在 B 上 capture 耗时的波动（0.2–5 s），只是推测和 `empty_cache` 或同机负载有关，没有确认。
+- TP 只测了单机 NVLink 上的一层 MLP（P8）和真实权重的搬运（P11）。没有测：
+  - 扩大 world；
+  - 跨机；
+  - custom all-reduce；
+  - 销毁通信器以后再回放依赖它的 graph（这和 P1 的“先释放持有方”是同一类错误，预计会挂住或出错，没有故意去触发）。
+- 没有测 GDN 状态在块边界打快照（前缀缓存要用），也没有测 MTP。
+- 只用了一台机器，每项只跑了一两次，耗时数字只能看量级。
+- 没有测“VMM 解除映射后再回放 graph”的故障形态（原因见 P4）。
+
+## 复现
+
+```sh
+pip install --no-deps --target /tmp/probe_deps fla-core flashinfer-python apache-tvm-ffi   # B 环境只需要 fla-core
+# MODEL 指向 Qwen3.8-27B 的 checkpoint 目录（P11 用），不设就跳过 P11
+GPU=0 GPUS=0,1,2,3 DEPS=/tmp/probe_deps MODEL=<checkpoint 目录> bash doc/evaluations/gpu-probes/run.sh   # 输出写到 gpu-probes/logs/
+```

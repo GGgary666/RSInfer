@@ -1,0 +1,1 @@
+RESULT {"refit_layers": ["3", "4"], "steps_before": 40, "steps_after": 40, "stale_tokens_after_refit_equal_fresh": false, "stale_first_step_max_logit_diff": 0.86328125, "stale_steps_with_different_tokens": 40, "recompute_tokens_after_refit_equal_fresh": true, "recompute_logits_bitwise_equal_fresh": true, "before_refit_stale_equals_recompute": true, "recompute_ms": 70.31}
