@@ -4,6 +4,15 @@
 - 对应：[roadmap](../roadmap.md) 阶段 1′ 的三个问题和“契约探针”；[platform.md](../specs/platform.md)（假 graph 的绑定规则、grow）、[unit-runtime.md](../specs/unit-runtime.md)（卸载顺序、代码重载）、[state-changes.md](../specs/state-changes.md)（导出导入、排空）。
 - 脚本和原始输出在 [gpu-probes/](gpu-probes/)：`run.sh` 依次跑完全部探针（P8 要 4 张卡，其余各要 1 张），`logs/` 是本文引用的输出。探针用完就扔，不进骨架。
 - 本文只记录结论和建议。规格里要改的地方列在最后一节，规格文件本身这次没有改。
+- 同日按 PR #17 的评审修订了以下几处：
+  - cuBLAS workspace 的清理时机；
+  - P6 实际验证到哪一步；
+  - P8 的对比没有算权重搬运；
+  - 快照目录真正需要的不变量；
+  - 整段预留 view 的风险；
+  - 后台 capture 的限制。
+
+  新加的待测项列在“没有覆盖的”一节。
 
 ## 结论
 
@@ -11,7 +20,8 @@
 2. **问题 2（按规定顺序卸载，会不会读到已释放的显存）：按规定顺序不会；顺序一错，真 graph 不报错，悄悄读到垃圾数据。** 所以“先卸使用方、再卸持有方”必须由运行时保证，`cuda_sm100` 平台也要像假 graph 一样在 replay 前自己检查依赖。
 3. **问题 3（同一进程反复重载会不会留下撤不掉的东西）：有三处，都有明确的办法。**
    - `torch.library` 的注册不随模块消失，不撤销就重新 import 会报“重复注册”。
-   - 每个用过 cuBLAS 的 stream 各缓存一份 workspace（约 8 MB），PyTorch 的 stream 池有 32 个，所以最多涨约 270 MB 就停。全程复用一个 stream 就完全不涨；`torch._C._cuda_clearCublasWorkspaces()` 能全部还回去。
+   - 每个用过 cuBLAS 的 stream 各缓存一份 workspace（约 8 MB），PyTorch 的 stream 池有 32 个，所以最多涨约 270 MB 就停。全程复用一个 stream 就完全不涨。
+   - `torch._C._cuda_clearCublasWorkspaces()` 能把这些 workspace 全部还回去，但它清的是整个进程的全局缓存，还活着的 graph 可能正在用其中的地址。P3 只在没有任何 graph 的时候清过，所以它不能用在单个单元的卸载上，见“对契约的影响”第 2 条。
    - graph 删了但输出 tensor 还被引用着，它的私有显存池就不会释放。
 
    另外，fla 和 flashinfer 反复卸载、重新 import，显存和注册的算子数都不再增长。
@@ -20,20 +30,27 @@
    - view 的 shape：graph 里写死，后来扩出来的显存它看不见；
    - 共享显存池：旧 graph 不按录制顺序回放，会覆盖新 graph 的输出。
 5. **VMM 扩容（grow）可行：** 地址不变，扩容前录的 graph 能读到新映射的页，不用重录、不用排空，也不等其他 stream 上正在跑的 kernel。每 1 GiB 约 0.4–5 ms。
-6. **契约探针通过：** sglang 的 attention backend 接口和 Qwen3.8 的混合状态（paged KV + 每请求一个 GDN 槽位）能装进单元接口。在真 kernel 上，同一份调度分别用 eager 和 graph replay 跑 160 步，token 和 logits 逐位一致。graph 那一遍中途还做了三件事：
+6. **契约探针验证的是接口形态。** sglang 的 attention backend 接口和 Qwen3.8 的混合状态（paged KV + 每请求一个 GDN 槽位）可以按单元接口的形态组织起来。在真 kernel 上，同一份调度分别用 eager 和 graph replay 跑 160 步，token 和 logits 逐位一致。graph 那一遍中途还做了三件事：
    - KV 池扩容两次，没有重录；
-   - 原地 refit 一次权重；
-   - 16 个请求都在途时换了一次 backend 代码，没有排空，重录耗时 23–104 ms。
+   - 原地 refit 一次输出头 `lm` 的权重；
+   - 16 个请求都没跑完时换了一次 backend 代码，没有排空，重录耗时 23–104 ms。
+
+   有三个边界：
+   - 这些“单元”是手工组织的普通 Python 对象，没有经过 `UnitRuntime`、`ProcessHost` 和 `Participant`。
+   - 换代码时 GPU 上没有在跑的工作，上一步的结果已经取回 host。
+   - refit 的 `lm` 不影响已有的 KV 和 GDN 状态；换中间层的权重还要让旧缓存和状态失效。
 7. **契约要改两处：**
    - replay 前的检查不能逐个 tensor 比对：55 项依赖每步约 38 µs，真模型会有几百项。
    - capture 前的 warm-up 会真的改状态，状态单元要给 plan 单元提供 scratch 槽位。
-8. **代码重载不能原地改写文件。** 同一秒内重写、长度不变的 `.py` 会 import 到旧字节码。引擎现在的做法刚好避开了：每个身份一个快照目录、`PYTHONDONTWRITEBYTECODE=1`、change-set 排除 `__pycache__`。这一条应当写进契约。
+8. **代码重载不能原地改写文件。** 同一秒内重写、长度不变的 `.py` 会 import 到旧字节码。引擎现在每个身份一个快照目录，快照写好以后内容不再变，刚好避开了这个问题。真正要写进契约的不变量是“快照路径下的内容写好以后不再改变”。
 9. **工具链：** fla 0.6.0 的 chunk prefill 在 torch 2.8 / Triton 3.3.1 上 autotune 挂住，换到 torch 2.11 / Triton 3.6 就正常。v0 的 Qwen3.8 工具链应当按后者这一档选。
 10. **TP 和 NCCL：**
     - 含 NCCL all_reduce 的 decode 步可以录进 graph 并正确 replay，原地 refit 以后也正确。
     - 同一个进程里反复新建、销毁通信器 8 次，显存和线程数都不增长。
-    - 在同一组进程里从 TP4 换到 TP2（新建通信器、重新切权重、重录）只要约 1 s。停掉旧进程、起新进程要 8–16 s，主要花在 CUDA context（4–10 s）和 NCCL 初始化（2–4 s）上，这还没有算真实权重的加载时间。
-    - 所以 TP 变更不一定非要重启 rank 进程，见下面“对契约的影响”第 11 条。
+    - 在同一组进程里从 TP4 换到 TP2（新建通信器、重新切权重、重录）只要约 1 s。停掉旧进程、起新进程要 8–16 s，主要花在 CUDA context（4–10 s）和 NCCL 初始化（2–4 s）上。
+    - 这个对比**没有算权重搬运**。探针里每个 rank 的 host 内存里都有完整权重，restart 时读的也只是本地盘上 256 MiB 的文件。换成 Qwen3.8-27B（bf16 约 55.6 GB）时，两条路都要搬十几到几十 GB 的权重，总时间会主要花在这上面。
+    - 4 个进程同时创建 CUDA context 比单个进程慢得多（单进程 0.85–3.6 s）。持久模式是开着的，原因没有查。
+    - 进程内改 TP 是一个值得验证的优化方向，但还不能改默认的动作推导，见“对契约的影响”第 11 条。
 
 ## 环境
 
@@ -95,6 +112,7 @@ P3 把这两件事分开重测了。
 | `shared`：warm-up 和 capture 全程用同一个 stream | 1 | 40.8 → 40.8 | 58 → 58 | 0 |
 
 - **增长全部来自每个 stream 一份的 cuBLAS workspace**，前 32 轮里每多一个 stream 约多 8 MB。PyTorch 的 stream 池每种优先级 32 个、循环复用，所以碰满 32 个以后就不再涨。
+- `p2_like_clear_ws` 每轮都是先删掉本轮的 graph 和输出，再清 workspace。“卸掉一个单元、其他 graph 继续服务”这种情况没有测。PyTorch 的 `clearCublasWorkspaces()` 直接清空两张进程级的全局表（handle 加 stream → workspace），所以在那种情况下清理，可能让其他 graph 用到已释放或已被复用的显存。
 - 碎片（inactive split）从 29 MB 涨到 385 MB，也是这些 workspace 散落在各处造成的。清掉 workspace 或者全程用一个 stream，碎片都不涨。
 
 graph 私有池（`pools` 模式，数值是相对基线的增量，单位 MB；两个 4096×4096 fp32 输入，各 64 MiB）：
@@ -181,6 +199,17 @@ B 的 `fla_stale_graph` 第一遍统计 fla 模块数的条件写错了（把 `f
 
 **第一遍 A 上出现过一个问题。** 当时换代码的做法是原地改写同一个文件，结果过期依赖里没有 `backend.version`：import 到的其实还是旧代码，见 `logs/p6_contract_run1_inplace_rewrite.log`。改成每个版本一个目录以后就正常了。原因由 P7 确认。
 
+**P6 能说明什么、不能说明什么。**
+
+能说明：保留请求状态、换 backend 代码、重录以后，可以接着正确执行。
+
+不能说明的有以下几点：
+- **没有走真实的单元运行时。** 状态、backend、plan 都是手工组织的普通 Python 对象，没有经过 `UnitRuntime`、`ProcessHost`、`Participant` 的加载、重载、依赖登记和资源释放。
+- **换代码时 GPU 是空闲的。** 每一步都用 `nxt.tolist()` 和 `logits.cpu()` 把结果取回 host，所以第 90 步换代码时，GPU 上已经没有在跑的工作。“16 个请求在途”只是说这些请求还没有跑完。GPU 上还有工作时要怎么停止提交、等它完成、重录、切换、恢复，没有测。
+- **capture 是同步做的，只有一个 batch 大小。** P6 只录 batch 16 一种，在两步之间同步录。真引擎要录几十个 batch 大小，P6 里录一次就要 16–159 ms（B 上 fla decode 的 capture 还在 0.2–5 s 之间波动），全部重录可能要几秒。
+- **不能让旧版本一边服务、一边在后台 capture 新 graph。** PyTorch 规定，capture 进行时同一进程里（任何线程）不能有不在 capture 里的 CUDA 工作，否则可能出现静默的数值错误；分开 stream 和显存池也不够。所以同一进程里的重录只能放在步与步之间的暂停窗口里，一次录一个 batch 大小，每次都让在途请求停一次 capture 的时间。暂停窗口实际要多长，还要实测。
+- **refit 只换了输出头。** 换的 `lm` 不影响已有的 KV 和 GDN 状态，所以 P6 只说明“同地址更新能被 graph 读到”。换中间层的权重时，还要处理旧 KV、旧 GDN 状态和前缀缓存的失效。
+
 ### P7 原地改写文件后重新 import（`p7_stale_bytecode.py`，只用 CPU）
 
 先后写入 `VERSION = 1`、`2`、`3`，前两次在同一秒内，第三次隔 1.1 秒，每次写完都移出 `sys.modules` 并重新 import。三次实际 import 到的是 `1, 1, 3`。原因是 CPython 判断 `.pyc` 是否过期只看源文件的 mtime（整秒）和大小。关掉字节码缓存以后，import 到的是 `1, 2`。
@@ -217,7 +246,14 @@ A、B 的两次完整运行是在同一台机器上同时跑的，各用 4 张�
 | capture | 0.19–0.32 / 0.21–0.23 s | 0.19–0.23 / 0.18–0.21 s | 0.17–0.19 / 0.72–0.75 s |
 | **spawn 到第一步算对** | **15.2 / 10.5 s** | **16.0 / 12.1 s** | **9.4 / 8.2 s** |
 
-作为对照，机器空闲时单个进程在单卡上创建 CUDA context：A、B 各连续测 3 次，在 0.85–3.6 s 之间；另外 A 有一次单独测到 9.7 s。
+作为对照，机器空闲时单个进程在单卡上创建 CUDA context：A、B 各连续测 3 次，在 0.85–3.6 s 之间；另外 A 有一次单独测到 9.7 s。GPU 的持久模式（persistence mode）是开着的，几个进程同时创建 context 为什么慢这么多，没有查。
+
+**这组对比没有算权重搬运。**
+- inproc 的“重新切分”是从每个 rank 已经放在 host 内存里的完整权重上切下一块，再拷到卡上；restart 读的是本地盘上 256 MiB 的文件。两边都没有真实规模的权重搬运。
+- 换成 Qwen3.8-27B（bf16 约 55.6 GB）：
+  - 进程内 TP4 → TP2，留下的每个 rank 还要多拿约 14 GB，来源是盘、共享存储，或者经 NVLink 从退出的 rank 拿；
+  - 重启进程，每个 rank 要读约 28 GB。
+- 两条路的总时间都会主要花在搬权重上。“约 1 s 对 8–16 s”只是不含权重的那部分开销。
 
 ## 对契约的影响（建议，规格还没改）
 
@@ -226,12 +262,24 @@ A、B 的两次完整运行是在同一台机器上同时跑的，各用 4 张�
    - 逐个比对 55 项每步约 38 µs，占一个 1.5 ms 小模型 decode 步的 2.5%。64 层的真模型依赖会上百项。
    - 建议改成每个状态单元、每个提供缓冲区的逻辑单元各维护一个**绑定代数**：只要换了地址、shape 或 dtype，代数就加一。replay 前只比对这些代数和少量按值依赖。逐个 tensor 比对只在测试和调试模式下打开。
    - 代码版本（单元实例 id 或身份）要作为按值依赖记进 graph。
-2. **capture 用的 stream 由平台提供，单元不能自己建 stream。** warm-up 和 capture 用同一个 stream（P3 `shared`）。单元运行时在卸载时调用 `_cuda_clearCublasWorkspaces()` 兜底。静态检查可以禁止单元调用 `torch.cuda.Stream()`。
+2. **stream 由平台统一管理，单元不能自己建 stream。**
+   - 平台提供数量有限、可以复用的 stream，按用途分开：执行、拷贝、capture。这样不会限制 CPU/GPU 的 overlap。
+   - warm-up 和 capture 用同一个 stream（P3 `shared`）。
+   - 静态检查可以禁止单元调用 `torch.cuda.Stream()`。
+   - **cuBLAS workspace 不能在单元卸载时清理。** `_cuda_clearCublasWorkspaces()` 清的是整个进程的全局缓存，还活着的 graph 和在途的工作可能正在用其中的地址（P3）。只有在确认没有任何 graph 或工作还会用到这些 workspace 时才能清，例如进程退出时。stream 数量固定以后，workspace 本来也就不会增长。
 3. **`torch.library` 注册必须通过 `ctx.effect` 登记撤销函数**（P2）。这已经符合 unit-runtime.md §5，可以加一条植入缺陷测试。
-4. **graph 的输出也是 graph 的一部分。** plan 单元释放 graph 时要连输出一起放掉，否则私有池不会释放（P3）。新版本的 graph 不能和仍可能回放的旧 graph 共享池（P3 的覆盖问题）。所以后台准备期间的显存峰值等于新旧两套池之和，这要算进 4.7 “后台准备不了就推迟到排空之后”的判断里。
+4. **graph 的输出也是 graph 的一部分。**
+   - plan 单元释放 graph 时要连输出一起放掉，否则私有池不会释放（P3）。
+   - 新版本的 graph 不能和仍可能回放的旧 graph 共享池（P3 的覆盖问题）。所以新旧两套 graph 同时存在时，显存峰值是两套池之和。
+   - **同一进程里的 capture 不能和服务并行。** PyTorch 规定，capture 进行时同一进程里不能有其他 CUDA 工作。所以 4.7 里的“后台准备”对 graph 来说，只能在步与步之间的暂停窗口里一次录一个 batch 大小。每个窗口要多长、整套重录要多少个窗口，要实测以后再定后台准备的契约（见“没有覆盖的”）。另一种做法是放到别的进程里录，但那样就要跨进程共享状态的地址，代价另算。
 5. **`grow` 的契约：**
-   - 状态单元的 view 覆盖整个预留区间，物理映射按 2 MiB 粒度增长，地址不变（P4、P6）。
-   - 只有“按基址加页号访问”的 kernel 才能看到新映射的页；graph 里写死的 view shape 是按值依赖，所以 view 一开始就要按预留区间的大小建（P4）。
+   - 物理映射按 2 MiB 粒度增长，地址不变（P4、P6）。
+   - 只有“按基址加页号访问”的 kernel 才能看到新映射的页；graph 里写死的 view shape 是按值依赖（P4）。
+   - **两种 view 要分开给：**
+     - 覆盖整个预留区间的 view，只交给按页号访问的 kernel，graph 扩容以后不用重录；
+     - eager 代码只能拿到覆盖已映射前缀的 view。
+   - 原因是：在整段 view 上做任何 eager 操作（`zero_()`、`sum()`、`clone()`，甚至调试时打印），都会碰到没有映射的地址。这会触发 illegal address，CUDA context 被污染，整个进程就丢了。P6 只通过按页号访问的 kernel 碰 KV，所以没有出事。
+   - **fake 平台要跟着改。** 现在 `FakeVirtualRange.view` 拒绝超出已映射部分的 view（`engine/platforms/fake/__init__.py`），按这条规则，graph 不重录就看不到扩出来的页。如果采纳这条建议，fake 平台应当允许整段 view，并在假 kernel 访问超出 `mapped` 的地址时报错，这样 CI 能抓到上面那种错误。
    - grow 不会影响在途请求，也不等其他 stream 上的 kernel，不需要排空，和 v0-plan 4.5 的推导一致。
    - state-changes.md §6.1 的“teardown 只放引用”在 VMM 上同样成立：最后一个 view 释放后，持有方才解除映射（P4）。
 6. **状态单元要提供 scratch 槽位或 scratch 页给 plan 单元 capture 用。** capture 前的 warm-up 会真的执行：GDN 的递归状态会被推进，KV 会被写入。运行中途重录（换代码以后）如果用在途请求的槽位来 warm-up，就会把它们的状态弄坏。sglang 用假 batch 来 capture，原因也在这里。这是 P6 里唯一需要增加的状态接口。
@@ -239,28 +287,35 @@ A、B 的两次完整运行是在同一台机器上同时跑的，各用 4 张�
    - graph 外：每步的 host 端准备，在原地写进本单元的固定 buffer。这些 buffer 是 graph 的按地址依赖。
    - graph 内：形状固定的 GPU 操作。
    - flashinfer 在 cuda-graph 模式下重新 `plan` 以后可以直接回放，同一 batch 大小内不同序列长度都正确（P5、P6）。所以 plan 的结果不是按值依赖，batch 大小才是。
-8. **代码重载的前提：新版本的代码在新路径下，绝不原地改写。** 快照目录里不能有 `.pyc`（P7）。`core.nodeagent` 现在设了 `PYTHONDONTWRITEBYTECODE=1`，`core.control.client` 和 `core.change.blobs` 也排除了 `__pycache__`，这几处要作为契约固定下来，并补一条测试。
+8. **代码重载的前提：新版本的代码在新路径下，绝不原地改写。** 要固定下来的不变量是：**快照路径下的内容写好以后不再改变**。为它补一条测试。
+   - 不需要要求快照目录里没有 `.pyc`。控制面进程从自己的快照目录 import 控制面单元（`ControlPlane.snapshot`），它没有设 `PYTHONDONTWRITEBYTECODE`，会在那里写 `__pycache__`。这没有问题：一个快照目录只属于一个身份，源文件写好以后不再变，`.pyc` 也就不会过期。
+   - P7 的问题只会出在源文件被原地改写的时候。`core.control.client` 和 `core.change.blobs` 排除 `__pycache__`，保证的是 change-set 不把工作区里的字节码带进快照。
 9. **Qwen3.8 的状态规模：**
    - 每个请求在每个 GDN 层要 3 MiB 递归状态（48×128×128×fp32）加 60 KiB conv state。TP1 下 48 层合计约 147 MiB，256 个并发请求就是约 37 GiB。所以 `gdn.slots` 是一个固定槽位的池，大小要在启动时根据显存来定，也可以用同样的 VMM 办法扩槽位。
    - config 里有 1 层 MTP（`mtp_num_hidden_layers = 1`），v0 的投机解码草稿可以用 MTP。
 10. **工具链：** v0 的 Qwen3.8 后端按 torch 2.11 / Triton 3.6 这一档来选。fla 0.6.0 在 Triton 3.3.1 上的 prefill 会挂住（P5）。
-11. **TP 变更可以不重启进程。** v0-plan 4.5 现在对 TP4 → TP2 推导出的是“重建所有 rank 进程”。P8 说明还有一条便宜得多的路：
-    - rank 进程和 CUDA context 都留着；
-    - 通信器作为派生产物重建：新建、第一次 all_reduce 约 0.8 s；
-    - 权重状态单元按新的切法重新加载；
-    - 依赖旧通信器的 graph 重录。
-
-    启动开销大约是重启进程的十分之一。建议这样落到规格里：
-    - 资源依赖图里加入“通信器”这类派生产物。graph 对它是按值依赖，拆除顺序是先 graph、后通信器。
-    - 重启进程只作为兜底。
-    - 新旧两个通信器会同时存在，每个 rank 每个通信器约 0.4–1 GiB，要算进准备阶段的显存峰值。
-    - 退出 TP 的 rank 拆掉 graph、分片和通信器以后，显存就还回来了。
-    - 有一点限制要注意：c10d 的 `new_group` 只能在最初的进程集合里建组，所以扩大 world（例如 TP2 → TP4 要加入新进程）不能这样做，需要新的 rendezvous 或者直接用 NCCL 的 unique id 建通信器。这种情况没有测。
+11. **进程内改 TP 是一个待验证的优化方向，v0 的默认做法先不变。**
+    - P8 说明，保留 rank 进程和 CUDA context，只重建通信器、重新切权重、重录 graph，不含权重的那部分开销约 1 s；重启进程是 8–16 s。这个差别值得以后去争取。
+    - 但 P8 只测了一层 MLP，权重已经在 host 内存里，也没有状态和失败处理。要把它变成默认的动作推导，还需要验证：
+      - 真实规模的权重怎么搬（见上面 P8 的说明）；
+      - KV 和 GDN 状态按新的切法怎么处理；
+      - 中途失败以后怎么恢复；
+      - 扩大 world 的情况：c10d 的 `new_group` 只能在最初的进程集合里建组，TP2 → TP4 要加入新进程时，需要新的 rendezvous 或者直接用 NCCL 的 unique id 建通信器。
+    - 在这之前，TP 变更继续按现在的推导重启 rank 进程；提交确认不了时，照 change.md 4.8 已经定下的办法处理：冻结，再整体重启引擎。
+    - 现在就可以先记进规格的是：
+      - “通信器”是资源依赖图里的一类派生产物，graph 对它是按值依赖，拆除顺序是先 graph、后通信器；
+      - 每个 rank 每个通信器约占 0.4–1 GiB 显存，新旧两个同时存在时要算进显存峰值。
+    - 要不要采纳，由发起人决定。
 
 ## 没有覆盖的
 
 - prefill 没有用 graph，P6 的新请求都从 1 个 token 开始，不经过 prefill。
 - 没有用真实权重，也没有 RoPE。
+- **接进真实的单元运行时。** 用 `UnitRuntime` / `ProcessHost` 去加载、重载 P6 里的这些单元，登记依赖、释放资源，再看 P6 的结论还成不成立。
+- **GPU 上还有工作时换代码。** 停止提交、等在跑的工作完成、重录、切换、恢复执行，这一串的边界和停顿要实测。
+- **按真实的 batch 大小列表重录。** 几十个 batch 大小全部重录要多久；分成每步之间录一个时，对在途请求的单步延迟影响多大；B 上 capture 耗时为什么波动这么大。
+- **换中间层的权重。** 这时旧的 KV、GDN 状态和前缀缓存都要失效，怎么处理没有测。
+- **真实规模权重下的 TP 变更。** 分别测进程内和重启两条路。
 - TP 只测了单机 NVLink 上的一层 MLP。没有测：
   - 扩大 world；
   - 跨机；
