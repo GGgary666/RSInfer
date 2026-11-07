@@ -19,3 +19,11 @@ for p in p5_kernel_reload p6_contract; do
   PYTHONPATH=$DEPS CUDA_VISIBLE_DEVICES=$GPU python $p.py > logs/$p.log 2>&1; echo "$p rc=$?"
 done
 CUDA_VISIBLE_DEVICES=${GPUS:-0,1,2,3} python p8_tp_nccl.py > logs/p8_tp_nccl.log 2>&1; echo "p8 rc=$?"
+for m in recapture refit; do
+  PYTHONPATH=$DEPS CUDA_VISIBLE_DEVICES=$GPU python p9_recapture.py $m > logs/p9_recapture_$m.log 2>&1; echo "p9 $m rc=$?"
+done
+PYTHONPATH=$DEPS CUDA_VISIBLE_DEVICES=$GPU python p10_capture_internals.py > logs/p10_capture_internals.log 2>&1; echo "p10 rc=$?"
+# p11 needs the Qwen3.8-27B checkpoint: MODEL=<dir with model.safetensors.index.json>
+if [ -n "${MODEL:-}" ]; then
+  CUDA_VISIBLE_DEVICES=${GPUS:-0,1,2,3} python p11_tp_real_weights.py --model "$MODEL" > logs/p11_tp_real_weights.log 2>&1; echo "p11 rc=$?"
+fi
