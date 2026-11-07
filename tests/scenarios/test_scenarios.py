@@ -799,3 +799,27 @@ def test_status_shows_the_units_a_change_reloaded(tmp_path: Path) -> None:
             assert {u.unit: u.generation for u in row.units} == await generations(s, SCHED)
 
     run(main())
+
+
+@pytest.mark.covers(edges=("ctrl",), kinds=("framework",))
+def test_a_snapshot_being_analysed_survives_other_requests(tmp_path: Path) -> None:
+    """An analysis may read its snapshot across awaits (an asynchronous check; ``core.deps`` asks the
+    processes in between). Other requests end meanwhile and prune; the snapshot it holds with
+    ``analysing`` is kept, and goes once it is let go (found in review of #16)."""
+
+    async def main() -> None:
+        async with scenario(tmp_path) as s:
+            s.cp.tun = ControlTunables(snapshot_retention=1)
+            s.write("scn/policy_fcfs/notes.txt", "held\n")
+            held = (await s.change()).files
+            assert held is not None
+            with s.cp.analysing(held) as root:
+                for i in range(2):  # two more candidates, each check prunes when it ends
+                    s.write("scn/policy_fcfs/notes.txt", f"other {i}\n")
+                    checked = await s.client.check(await s.change())
+                    assert not isinstance(checked, Failed), checked
+                assert (root / "scn/policy_fcfs/notes.txt").read_text() == "held\n"
+            assert (await s.client.status()) is not None  # a request ends: it prunes again
+            assert not root.exists()
+
+    run(main())

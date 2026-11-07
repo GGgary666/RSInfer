@@ -442,11 +442,12 @@ class Supervisor:
         rec.snapshots.add(identity)
         self._previous.pop(proc, None)
 
-    def runs_units(self, proc: ProcId, units: Iterable[UnitBrief]) -> None:
-        """What a process reported it runs once a change committed or rolled back there."""
-        rec, reported = self.procs.get(proc), list(units)
-        if rec is not None and reported:
-            rec.units = reported
+    def runs_units(self, proc: ProcId, units: Iterable[UnitBrief] | None) -> None:
+        """What a process reported it runs once a change committed or rolled back there. ``None``:
+        it did not say, so the record stays; an empty list: it runs no unit."""
+        rec = self.procs.get(proc)
+        if rec is not None and units is not None:
+            rec.units = list(units)
 
     def uses_snapshots(self, proc: ProcId, snapshots: Iterable[Identity]) -> None:
         """What a process reported it still loads code from (after a commit or an abort)."""

@@ -550,7 +550,7 @@ class Participant:
         c = self._current(msg.change_id)
         if isinstance(c, Failed):
             # Abort can overtake Prepare; remember the decision without touching another change.
-            reply = Resumed(msg.change_id, self.host.identity, rolled_back=True)
+            reply = Resumed(msg.change_id, self.host.identity, rolled_back=True, units=self.host.unit_briefs())
             self.finished[msg.change_id] = reply
             return Ok(reply)
         if c.phase == "committed":

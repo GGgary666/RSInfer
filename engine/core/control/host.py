@@ -16,6 +16,8 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +112,8 @@ class ControlPlane:
     ) -> None:
         self.proc = ProcId(host, CONTROL_ROLE, 0)
         self.tun = control_tun or ControlTunables()
+        self._pins: dict[Path, int] = {}
+        """Snapshots analyses are reading (``analysing``), with how many hold each."""
         if self.tun.snapshot_retention < 1:
             raise ValueError("control.snapshot_retention must be at least 1")
         self.state_dir = state_dir
@@ -145,10 +149,26 @@ class ControlPlane:
     # -------------------------------------------------------- for the units
 
     def snapshot(self, files: dict[str, str]) -> Path:
-        """A local copy of a file list to analyse (``core.manifest``, ``core.deps``)."""
+        """A local copy of a file list. Not kept while it is read: an analysis that reads it across
+        awaits uses ``analysing``."""
         engine = materialize(self.blobs, files, self.state_dir / "snapshots")
         os.utime(engine.parent)  # most recently used: retention keeps it
         return engine
+
+    @contextmanager
+    def analysing(self, files: dict[str, str]) -> Generator[Path]:
+        """``snapshot(files)``, kept while the block runs: pruning skips it, however long the analysis
+        awaits in between (an asynchronous check, ``core.deps`` asking the processes)."""
+        engine = self.snapshot(files)
+        d = engine.parent.resolve()
+        self._pins[d] = self._pins.get(d, 0) + 1
+        try:
+            yield engine
+        finally:
+            if self._pins[d] == 1:
+                del self._pins[d]
+            else:
+                self._pins[d] -= 1
 
     def _after_change(self, result: ChangeResult) -> None:
         del result
@@ -159,9 +179,9 @@ class ControlPlane:
         control-plane units load code from (modules unchanged by in-place changes stay loaded from
         older snapshots, as in a process host); delete the others. Returns what it deleted.
 
-        Only while no change runs: an analysis reads its snapshots across awaits (``core.deps`` asks
-        the processes in between), so they must not go under it. It runs after each change and after
-        each API request; a ``check`` reads its snapshot without awaiting, so it never overlaps."""
+        Never under a reader: snapshots held by ``analysing`` are kept, and nothing is pruned while a
+        change runs (its candidate is read from prepare to execute). It runs after each change and
+        after each API request."""
         root = self.state_dir / "snapshots"
         if self.coord.busy or not root.is_dir():
             return []
@@ -172,7 +192,7 @@ class ControlPlane:
         if self.runtime.code_root is not None:
             in_use.add(Path(self.runtime.code_root).resolve().parent)
         recent = set(sorted(dirs, key=lambda d: d.stat().st_mtime, reverse=True)[:self.tun.snapshot_retention])
-        removed = [d for d in dirs if d not in in_use and d not in recent]
+        removed = [d for d in dirs if d not in in_use and d not in recent and d not in self._pins]
         for d in removed:
             shutil.rmtree(d, ignore_errors=True)
         return removed

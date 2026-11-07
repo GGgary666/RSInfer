@@ -18,8 +18,8 @@ class Checker:
         self._framework = FrameworkModules.default()
 
     async def check(self, inp: PlanInput) -> Result[None]:
-        root = self._host.snapshot(inp.new.files)
-        errors, warnings = check_tree(root, inp.new.topology, self._framework)
+        with self._host.analysing(inp.new.files) as root:
+            errors, warnings = check_tree(root, inp.new.topology, self._framework)
         if errors:
             return Failed([*errors, *warnings])
         return Ok(None, warnings)

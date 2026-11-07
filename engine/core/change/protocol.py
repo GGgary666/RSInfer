@@ -88,9 +88,9 @@ class Resumed(msgspec.Struct, frozen=True):
     rolled_back: bool = False
     snapshots: list[Identity] = []
     """Snapshots the process still loads code from; its node agent must keep them."""
-    units: list[UnitBrief] = []
-    """The units it runs now: in-place changes reload units after the check-in, and ``status``
-    shows these."""
+    units: list[UnitBrief] | None = None
+    """The units it runs now (in-place changes reload units after the check-in; ``status`` shows
+    these). ``None``: not reported; ``[]``: it runs no unit."""
 
 
 class KeepAlive(msgspec.Struct, frozen=True):
