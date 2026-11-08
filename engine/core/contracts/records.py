@@ -53,8 +53,8 @@ class BatchPlan(msgspec.Struct, frozen=True):
     rows: Column
     """``i32``: rows of the persistent batch that run in this step."""
     num_tokens: Column
-    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step. Speculation comes
-    with its own section version (§4.4 rule 7), which says how drafts count here."""
+    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step. How speculation
+    counts drafts is decided in M2d, following the compatibility rules in spec §3."""
     positions: Column
     """``i32`` per row: position of the row's first token in this step."""
     tokens: Column

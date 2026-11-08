@@ -61,7 +61,7 @@
 | `engine/core/deps/` | 影响分析（动作计划、dry-run）`core.deps` | `control-plane.md` §4 |
 | `engine/core/api/` | 控制接口 `core.api` | `control-plane.md` §5 |
 | `engine/core/sourcetree.py` | 读源码树（清单、模块）的库，`core.manifest` 和 `core.deps` 共用；不是单元 | |
-| `engine/core/contracts/` | 只放实际跨单元/进程交接的数据和必要调用，不 import torch，不放内部算法和整对象镜像；修改原则见本文件末尾 | `stage2-contract.md` §3 |
+| `engine/core/contracts/` | 单元目录之外的共享接口库，避免 `manifest.cross_unit_import`；只放实际交接的数据和必要调用，不 import torch，不放内部算法和整对象镜像；修改原则见本文件末尾 | `stage2-contract.md` §3 |
 
 `engine/core/state/alloc/prefix.py` 保存账本内部的联合前缀匹配算法；当前仅有该辅助库，账本单元由后续实现补充。
 
@@ -78,7 +78,7 @@
   - `adversarial/`：对抗与故障边界测试，对应 `doc/evaluations/` 的记录。
   - `formal/`：TLA+ 有限模型（`models/`）、runner（`run.py`）、对真实实现的轨迹回放和契约测试。细节见 `tests/framework/formal/README.md`。
 - `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。`units/contracts/`：接口库 `core.contracts`（编码往返、每步计划的检查、单元能 import 它、每个模块只 import 到本接缝的模块）。
-- `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试，随算法移出共享接口测试。
+- `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
@@ -139,6 +139,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 - 改 `engine/core/contracts/`（理由见 `doc/specs/stage2-contract.md` §3）：
   - 只共享真正跨单元、跨进程交接的数据和必要调用。内部对象字段、算法、队列和辅助类型留在实现里，现有多余定义也应收缩；
   - 同一个 RSI agent 可以同时修改接口与全部使用者。沿用交接方式的算法/kernel/策略改动直接改实现；交接内容或语义变化时才更新共享定义，需要旧新版本并存时才新增版本；
+  - 原地改消息定义时，接收方必须兼容在途旧消息的格式和语义；否则先停止该流生产并排空，或使用新分段/版本。步循环的 `quiesce` 不替代前端流的处理；
   - 两位负责人审核仅为当前团队 PR 协作流程，不是运行时的人类审批要求；
   - 模块按实际交接边界隔离，只 import 所需定义；`__init__.py` 只留 docstring；
   - 新加模块或模块之间新加 import，要同时改 `tests/units/contracts/test_contracts.py` 的 `REACHES`。
