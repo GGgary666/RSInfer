@@ -31,7 +31,7 @@
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行） |
+| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行） |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
@@ -50,7 +50,7 @@
 | `engine/core/change/` | 变更事务：协调者、参与者、事件日志、blob 存储、队列 | `change.md` |
 | `engine/core/control/` | 控制面进程（`python -m core.control serve`）、控制接口的消息和客户端（`python -m core.control.client`） | `control-plane.md` |
 | `engine/unit/runtime/` | 单元运行时：加载 / 重载 / 撤销、`ProcessHost`、注册表、静态 import 图 | `unit-runtime.md` |
-| `engine/platforms/` | 平台接口 `base.py`；CI 用的 `fake/` | `platform.md` |
+| `engine/platforms/` | 平台接口 `base.py`；CI 用的 `fake/`；真张量、只做 eager 的 `torch_eager/`（CPU 或进程自己的 CUDA 卡）；合法平台名 `PLATFORMS`（`__init__.py`）。进程用哪个由拓扑里角色的 `platform` 决定 | `platform.md` |
 
 控制面单元（单元，不属于框架本体，不在 `framework.toml` 里）：
 
@@ -105,7 +105,7 @@
 ## 常用命令
 
 ```sh
-uv sync --python 3.12
+uv sync --python 3.12 --extra cpu    # CPU 版 torch（torch_eager、模型单元要）；SM100 上用 --extra gpu，两者互斥
 uv run pyright                       # strict；检查 engine/ 和 tests/（含 formal）
 uv run pytest                        # 默认测试；不收集 tests/framework/formal；串行
 uv run pytest -n 8                   # 全量并行（pytest-xdist）：约 30 秒，串行约 165 秒
@@ -119,7 +119,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 ```
 
 - 每次提交前跑 `uv run pyright` 和 `uv run pytest`（全量用 `-n 8` 并行；只跑一两个文件时别加 `-n`，起 worker 要 5 秒左右）。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
-- `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。
+- `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。`tests/gpu/`（要 SM100，手动跑）同样由 `addopts` 排除。
 - `pyproject.toml` 的 `timeout = 120` 是 pytest-timeout 给**单个测试**的上限，不是整个套件的。不要给 pytest 或 CI job 加总时长上限。
 - 生成物不进仓库：`tests/framework/formal/.tools/`、`.runs/` 已被忽略。
 

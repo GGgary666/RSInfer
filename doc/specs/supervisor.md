@@ -23,7 +23,8 @@ class Topology(msgspec.Struct):
     mesh: Mesh                     # 并行维度及大小，例如 {"tp": 2} 或 {"dp": 8, "ep": 8}
     placement: list[RankPlacement] # 每个 rank 在哪台机器、本机第几张卡、哪个 NVLink 域
     roles: list[RoleSpec]          # 进程角色：frontend / scheduler / worker / ...
-                                   # 每个角色：几个、放在哪台机器、装哪些单元、环境变量
+                                   # 每个角色：几个、放在哪台机器、装哪些单元、环境变量、
+                                   # 跑在哪个平台（platform、platform_options，2026-11-08）
     rendezvous: str                # 建通信组用的地址（来自数据，不写 localhost）
 ```
 
@@ -39,7 +40,7 @@ DECLARED → SPAWNING → RUNNING → STOPPING → STOPPED
                          └──心跳超时 / 退出──▶ LOST
 ```
 
-- 拉起：向目标机器的节点代理发 `Spawn(ProcSpec)`，`ProcSpec` 含角色、索引、身份（决定用哪个快照目录）、环境变量、GPU。
+- 拉起：向目标机器的节点代理发 `Spawn(ProcSpec)`，`ProcSpec` 含角色、索引、身份（决定用哪个快照目录）、环境变量、GPU，以及角色指定的平台（[platform.md](platform.md) §2.4）。平台在进程启动时选定，角色换平台就重启它的进程。
 - 进程起来以后向控制面报到，带上 `ProcId` 和自己装好的单元列表。
 - 报到时带上进程已经打开的数据通道读端地址。之后才打开的读端，用 `PublishEndpoint` 补登记。别的进程用 `Lookup` 查，只查得到 RUNNING 的进程的地址。进程要共享内存环的名字时，进程管家把 `AllocShm` 转给那台机器的节点代理（2026-11-08，[ipc.md](ipc.md) §6）。
 - 停止：先发 `Stop`（进程卸载全部单元后退出），超时后让节点代理强杀。

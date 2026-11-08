@@ -16,6 +16,7 @@ modules = [
     "platforms",
     "platforms.base",
     "platforms.fake",
+    "platforms.torch_eager",
 ]
 # Packages listed here match only the package's own __init__, not its children.
 exact = ["core", "unit", "platforms"]

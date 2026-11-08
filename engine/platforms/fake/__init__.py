@@ -21,7 +21,16 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from core.context.capture import ValueDep, observe_values
-from platforms.base import Buffer, DeviceInfo, Platform, PlatformInfo, StaleGraph, VirtualRange
+from platforms.base import (
+    Buffer,
+    DeviceInfo,
+    Platform,
+    PlatformInfo,
+    StaleGraph,
+    VirtualRange,
+    check_extent,
+    check_view,
+)
 
 _ADDRESS_STEP = 1 << 40
 """Each device owns a disjoint fake address space."""
@@ -78,6 +87,8 @@ class FakeVirtualRange:
     mapped: int = 0
 
     def view(self, offset: int, shape: tuple[int, ...], dtype: str) -> FakeBuffer:
+        check_extent(0, shape)
+        check_view(offset, _DTYPE_BYTES[dtype])
         nbytes = _size(shape, dtype)
         if offset + nbytes > self.mapped:
             raise ValueError(f"view [{offset}, {offset + nbytes}) beyond mapped {self.mapped}")
@@ -201,6 +212,7 @@ class FakePlatform:
 
     def alloc(self, nbytes: int, device: int, *, shape: tuple[int, ...] | None = None,
               dtype: str = "u8") -> FakeBuffer:
+        check_extent(nbytes, shape or ())
         if shape is None:
             shape = (nbytes // _DTYPE_BYTES[dtype],)
         nbytes = max(nbytes, _size(shape, dtype))
@@ -215,12 +227,17 @@ class FakePlatform:
         buf.freed = True
         self._used[buf.device] -= buf.nbytes
 
+    def tensor(self, buf: Buffer) -> Any:
+        raise TypeError("the fake platform has no tensors; run real kernels on torch_eager")
+
     def reserve(self, nbytes: int, device: int) -> FakeVirtualRange:
+        check_extent(nbytes)
         return FakeVirtualRange(device, self._take(nbytes, device, 0), nbytes)
 
     def map(self, vr: VirtualRange, offset: int, nbytes: int) -> None:
         if not isinstance(vr, FakeVirtualRange):
             raise TypeError(f"not a fake virtual range: {vr!r}")
+        check_extent(nbytes)
         if offset != vr.mapped:
             raise ValueError(f"map must extend the mapped prefix at {vr.mapped}, got {offset}")
         if offset + nbytes > vr.reserved:
@@ -230,8 +247,16 @@ class FakePlatform:
         self._used[vr.device] += nbytes
         vr.mapped += nbytes
 
+    def _check_device(self, device: int) -> None:
+        if not 0 <= device < len(self._devices):
+            raise ValueError(f"no device {device}")
+
     def stream(self, device: int) -> FakeStream:
+        self._check_device(device)
         return FakeStream(device, next(self._streams))
+
+    def synchronize(self, device: int) -> None:
+        self._check_device(device)
 
     def graph(self) -> FakeGraphRecorder:
         return FakeGraphRecorder(self)
