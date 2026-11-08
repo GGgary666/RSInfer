@@ -15,6 +15,7 @@ from core.change.state import IdentityManifest
 from core.change.types import ActionPlan, ChangeSet, ProcActions, StateRequest, UnitAction
 from core.common.framework import FrameworkModules
 from core.common.ids import HostId, Identity, ProcId, UnitId
+from core.common.manifest import parse_manifest
 from core.common.result import Failed
 from core.deps.planner import World, plan
 from core.sourcetree import read_tree
@@ -268,6 +269,22 @@ def test_state_requests_become_the_state_units_own_actions(tmp_path: Path) -> No
     assert pa.actions == [UnitAction(UnitId("pkg.s"), "relocate", {"to": [1]})] and pa.reload is None
     bad = Case(tmp_path / "2", base=s, new=s, units=units, state=[StateRequest(UnitId("pkg.s"), "refit")]).plan()
     assert isinstance(bad, Failed) and bad.diagnostics[0].code == "deps.bad_state_request"
+
+
+def test_a_state_unit_names_its_own_actions(tmp_path: Path) -> None:
+    """The framework keeps no list of action names (modules.html P4): a unit may offer one no other
+    unit has, without a change to the framework core. Only the form of the name is checked."""
+    s = {**BASE, "pkg/s/unit.toml": manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state",
+                                                  capabilities='actions = ["compact", "grow"]'),
+         "pkg/s/unit.py": "class Unit:\n    pass\n"}
+    units = ("pkg.a", "pkg.b", "pkg.s")
+    pa = only(Case(tmp_path / "1", base=s, new=s, units=units,
+                   state=[StateRequest(UnitId("pkg.s"), "compact", {"below": 0.5})]).plan())
+    assert pa.actions == [UnitAction(UnitId("pkg.s"), "compact", {"below": 0.5})] and pa.reload is None
+    for name in ["Compact", "", "compact now", "kv.compact"]:
+        bad = manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state", capabilities=f"actions = [{name!r}]")
+        r = parse_manifest(bad)
+        assert isinstance(r, Failed) and "bad action name" in r.diagnostics[0].reason, name
 
 
 def test_the_same_inputs_give_the_same_plan(tmp_path: Path) -> None:

@@ -19,12 +19,16 @@ from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 UnitKind = Literal["logic", "state"]
 Binding = Literal["live", "plan", "startup"]
 ConfigType = Literal["int", "float", "str", "bool", "list", "dict", "any"]
-StateAction = Literal["refit", "grow", "relocate", "invalidate"]
-"""``relocate``: move contents within the same version (EPLB moves experts between ranks). Carrying
-contents to a new version of the unit's code is ``[state] migrate`` (doc/specs/state-changes.md)."""
+StateAction = str
+"""Named by the state unit that offers and runs it (``ctx.on_action``); the framework keeps no list
+of them (modules.html P4). Common ones: ``refit`` (new contents, same layout), ``grow`` (more
+capacity, same addresses), ``relocate`` (move contents within the same version: EPLB moves experts
+between ranks), ``invalidate`` (drop the contents). Carrying contents to a new version of the
+unit's code is ``[state] migrate`` (doc/specs/state-changes.md)."""
 
 _SERVICE_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*@[0-9]+$")
 _UNIT_ID_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$")
+_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _ENTRY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -79,7 +83,7 @@ class Capabilities(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     accept_config: bool = False
     """Can take new config values in place (``ctx.on_config``)."""
     actions: list[StateAction] = []
-    """State units only."""
+    """State units only: the actions the unit offers, by its own names (``StateAction``)."""
     graph_capturable: bool = False
     """Kernel solutions only: may be recorded into a graph."""
     captures_graph: bool = False
@@ -137,6 +141,9 @@ def check_manifest(m: UnitManifest) -> list[str]:
             problems.append("[state] is only allowed on state units")
         if m.capabilities.actions:
             problems.append("capabilities.actions is only allowed on state units")
+    for name in m.capabilities.actions:
+        if not _ACTION_RE.match(name):
+            problems.append(f"bad action name {name!r}; expected lowercase letters, digits and '_'")
     for key, decl in m.config.items():
         if not check_value_type(decl.type, decl.default):
             problems.append(f"default of {key!r} is not of type {decl.type}")
