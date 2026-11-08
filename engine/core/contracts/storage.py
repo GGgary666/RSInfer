@@ -16,7 +16,7 @@ from core.contracts.tensor import Binding
 class StateStore(Protocol):
     """The storage unit of one state kind in a worker (``state.<kind>@1``). Holds the
     memory, never the accounting. Required: ``bind``, ``capacity``, ``scratch``, ``copy``,
-    ``invalidate``. ``grow``, ``refit``, ``relocate``, ``export_state`` / ``import_state``
+    ``clear``, ``invalidate``. ``grow``, ``refit``, ``relocate``, ``export_state`` / ``import_state``
     are optional; the unit declares the ones it has (``capabilities.actions``, ``[state] migrate``)."""
 
     def declare(self, decls: Sequence[StateDecl]) -> None:
@@ -36,6 +36,12 @@ class StateStore(Protocol):
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """Copy items on the step stream (``StateCopy``): snapshot and restore."""
+        ...
+
+    def clear(self, items: Sequence[int]) -> None:
+        """The items of a request that starts from position 0 and is not restored from a snapshot,
+        before that step (SGLang's ``MambaPool.clear_slots`` on ``mamba_clear_indices``). A kind
+        whose kernels never read what they did not write (paged KV) does nothing."""
         ...
 
     def invalidate(self) -> None:

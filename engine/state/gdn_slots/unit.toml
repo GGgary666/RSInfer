@@ -1,0 +1,11 @@
+[unit]
+id = "state.gdn_slots"
+kind = "state"
+process = ["worker"]
+entry = "state.gdn_slots.unit:Unit"
+
+[provides]
+services = ["state.gdn.slots@1"]
+
+[config]
+"state.gdn.slots" = { type = "int", default = 8, binding = "startup", doc = "Usable GDN state slots; slot 0 is padding" }
