@@ -7,7 +7,7 @@ weight store, so a refit changes contents in place and no graph needs recording 
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Literal, Protocol
 
 import msgspec
@@ -19,8 +19,6 @@ from core.contracts.tensor import Binding
 class Placement(msgspec.Struct, frozen=True):
     split: Literal["replicated", "rows", "columns"] = "replicated"
     """How TP splits the tensor across the ``tp`` mesh dimension."""
-    axis_size: int = 0
-    """For ``rows`` / ``columns``: the full size of the split axis, for the shard bounds."""
 
 
 class WeightDecl(msgspec.Struct, frozen=True):
@@ -56,5 +54,3 @@ class Assembly(msgspec.Struct, frozen=True):
     """One entry per layer: the layer kind's service, e.g. ``layers.gdn@1``, ``layers.attn@1``."""
     states: list[StateDecl]
     weights: list[WeightDecl]
-    config: Mapping[str, int | float | str] = {}
-    """The checkpoint config values the layers read (hidden size, head counts, ...)."""

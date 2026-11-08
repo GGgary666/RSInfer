@@ -1,6 +1,6 @@
 # 阶段 2 的单元契约：Qwen3.8-27B
 
-- 日期：2026-11-07
+- 日期：2026-11-07；2026-11-08 更新共享接口边界与 #21 状态
 - 状态：**草案**。GPU 相关的几节（§5.5、§8、§9、§10）等 @gaow0007 审过才算定稿；标“（待定）”的地方还没定。
 - 对应：[roadmap](../roadmap.md) 阶段 2；[v0-plan](../v0-plan.md) 5.10–5.13；[modules.html](../modules.html) 的单元清单；GPU 探针报告（PR #17，`doc/evaluations/gpu-probes.md`，含合并前补测的 P9–P11）；[state-changes.md](state-changes.md)；[change.md](change.md) 4.2、4.6、4.7。
 - 接口的代码形式在 `engine/core/contracts/`：本文写规则和理由，签名以那里为准。
@@ -30,14 +30,14 @@
 |---|---|---|
 | @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
 | @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_cpu`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
-| 本文和 `engine/core/contracts/` | 两边共有 | 改一个接口，接口两边各有一个人审过才合 |
+| 本文和 `engine/core/contracts/` | 两边共有 | 团队 PR 由双方 review；同一 RSI agent 可一起修改接口与全部使用者，不增加运行时审批 |
 
-分工的边界划在**有 CPU 替身的接口**上：
+分工的边界划在**可用 CPU 参照实现验证的接口**上：
 - 平台有 `torch_cpu` 和 `fake`；
 - kernel 有 PyTorch 参照实现；
 - graph 有 eager 路径。
 
-所以 @wutianyuan1 这边不用等 GPU 部分，就能把整条链路跑通；@gaow0007 按契约和契约测试实现，不需要了解引擎全局。这几块的契约测试由 @wutianyuan1 这边先写好。
+所以 @wutianyuan1 这边不用等 GPU 部分，就能把整条链路跑通；@gaow0007 按契约和契约测试实现，不需要了解引擎全局。这几块的契约测试由 @wutianyuan1 这边先写好。临时固定输出等替身只放测试夹具，真实实现可用后删除；参照 kernel 和真实 CPU eager 执行则保留用于数值对齐。
 
 ### 1.3 里程碑
 
@@ -54,6 +54,8 @@
 - 能服务流式请求。
 
 ### 1.4 分支和合并（2026-11-08，提议，待两人确认）
+
+以下是团队协作流程，不是 RSI 运行时的人工审批规则；个人分支的实际命名和启用另行决定。共享接口能否原地修改以 §3 为准。
 
 - 每人一条个人分支，`dev/wutianyuan1` 和 `dev/gaow0007`，都从 master 拉出。自己的 PR 合进自己的分支，自己审。CI 对所有分支的 push 和 PR 都跑；合进个人分支的 PR 不发PR 通知（`notify.yml` 只管 master）。
 - 两边共用的东西不走个人分支，直接 PR 到 master，两边各有一个人审过才合：
@@ -82,8 +84,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | 调度宿主 `sched`（`leads_epochs`） | `core.sched` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `sched.reqs@1`、`ledger@1`、各决策点 | |
 | | `policies.*` | 逻辑 | `policy.<决策点>@1` | | |
 | | `sched.reqs` | 状态 | `sched.reqs@1` | | |
-| | `core.state.alloc` | 状态 | `ledger@1` | `ledger.<kind>@1`（记账插件） | |
-| | 记账插件 `ledger.kv_paged`、`ledger.gdn_slots` | 逻辑 | `ledger.kv.paged@1`、`ledger.gdn.slots@1` | | |
+| | `core.state.alloc` | 状态 | `ledger@1` | 各类池先作为内部实现，按实际独立替换需求再拆分 | |
 | worker（每 rank 一个） | `core.worker` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `worker.batch@1`、`plan@1`、`model@1` | |
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
 | | `core.plan` | 逻辑，录 graph | `plan@1` | `model@1`、各 backend、各状态单元 | ✓ |
@@ -105,61 +106,28 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
   - `core.manifest`：单元不许自己建 stream（§10.4）。
 - 新平台 `platforms.torch_cpu` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
 
-## 3. 接口放在哪
+## 3. 最小共享交接面（2026-11-08 更新）
 
-- `engine/core/contracts/` 是一个库：不是单元，也不属于框架本体。先例是 `core/sourcetree.py`。
-  - 不能放进某个单元的目录：别的单元 import 它，会被 `core.manifest` 报 `manifest.cross_unit_import`。
-  - 放在单元目录之外，接口两边的单元都 import 它。接口一改，所有 import 它的单元在同一个 epoch 一起重载，这正是“改接口时两边一起重载”（modules.html ⑥）要的效果。
-- 不 import torch，因为 CI 不一定装 torch。张量的类型写作 `Tensor`（就是 `Any`），在 `tensor.py`。
-- 服务名带版本（`plan@1`）。签名不兼容的改动要升版本，旧版本和新版本可以在同一个 epoch 换掉。
-- 测试：`tests/units/contracts/`。现在测了：
-  - 列编码和记录的往返；
-  - `BatchPlan.check()`（§4.2）；
-  - 联合前缀匹配（§5.3）；
-  - 单元 import 契约时能通过 `core.manifest` 的检查；
-  - 每个模块只 import 到自己那条接缝的模块（§3.1）。
+按发起人的最新决定，共享定义只描述实际跨单元、跨进程交接的数据和必要调用。内部对象布局、算法、队列、缓存索引和辅助函数归实现所有。不能因为一个功能需要类型提示，就把整套业务对象搬进 contracts。
 
-### 3.1 一条接缝一个模块（2026-11-08）
+- 新增算法、换 kernel、改调度策略，沿用现有交接方式时直接改实现。
+- 交接内容或语义确实改变时，才更新共享定义；单个 RSI agent 可以同时修改接口及全部使用者。
+- 所有使用者在同一次变更中更新时，可以直接修改定义。需要不同版本并存时再新增分段或版本；不要求每个功能都新增文件、分段或 `@2`。
+- 两位负责人审核是当前团队的 PR 协作流程，不是 RSI 运行时的人类审批条件。`apply` 仍按依赖、暂停和变更协议执行。
+- `__init__.py` 不重新导出各模块。模块按真实交接边界隔离，避免无关重载；`REACHES` 测试记录实际依赖。
+- 修改前后用依赖分析确认影响范围。没有运行实例时可检查 ImportGraph；有实例时用 dry-run。它是工程检查，不是审批。
 
-- **为什么要拆。**
-  - `core.deps` 判断一个单元要不要重载，看的是它的入口模块传递 import 到的模块里有没有改过的；每个模块还算依赖自己的父包（`engine/unit/runtime/imports.py`）。
-  - 所以改了契约里的一个模块，import 得到它的单元全都在同一个 epoch 重载，不管它们用没用到改的那部分。
-- **重载的代价远不只是重新 import：**
-  - `core.plan` 重载以后，graph 不能在准备阶段分片重录，只能在暂停期内一次录完（§9.4）；
-  - 状态单元重载以后是一个空的新实例，默认要先排空（`drain_on_reload = true`，[state-changes.md](state-changes.md)），除非它实现了版本迁移；
-  - 权重存储重载又不能迁移的话，要重读权重。
-- **所以按接缝拆成下面这些模块，每个模块只 import 它这条接缝要的契约模块。** `__init__.py` 只留 docstring，因为包里每个模块都依赖它。
+当前保留：
 
-| 模块 | 内容 | 接缝 | 还会 import 到的契约模块 |
-|---|---|---|---|
-| `columns.py` | `Column` | 列编码（§4.5） | — |
-| `tensor.py` | `Tensor`、`Binding` | worker 里交出 buffer 的单元和用它的单元 | — |
-| `sampling.py` | `SamplingParams` | 前端 → 调度 → worker | — |
-| `requests.py` | `Requests`、`TokenEvents` 等 | 前端 ↔ 调度 | `columns`、`sampling` |
-| `records.py` | `RowDelta`、`BatchPlan`、`StateOps`、`Sampled` 等 | 调度 ↔ worker | `columns`、`sampling` |
-| `state.py` | `StateDecl` | 模型 → 存储单元和记账插件 | — |
-| `storage.py` | `StateStore`、`Scratch` 等 | 存储单元 ↔ worker 里用它的单元 | `state`、`tensor` |
-| `ledger.py` | `AccountingPlugin`、`common_prefix` 等 | 记账插件 ↔ `core.state.alloc` | `state` |
-| `kernels.py` | kernel 目录 | kernel 单元 ↔ 层 | — |
-| `model.py` | 权重存储、`Assembly` | 模型 ↔ 权重存储 | `state`、`tensor` |
-| `plan.py` | plan、backend、持久 batch | worker 里的 plan、backend、持久 batch | `records`、`columns`、`sampling`、`tensor` |
+| 模块 | 实际交接 |
+|---|---|
+| `requests`、`sampling`、`columns` | 前端、调度器和 worker 使用的消息与采样数据 |
+| `records` | 调度器发给 worker 的步计划和结果 |
+| `state`、`storage`、`tensor` | 模型向存储/账本提供的当前状态声明，以及 buffer 交接 |
+| `kernels`、`model` | kernel 注册和选择，以及模型向 plan/权重存储提供的数据 |
+| `plan` | worker 获取 plan，以及 backend 与持久 batch 的必要调用 |
 
-- **拆前拆后的对比。**
-  - 给 `TokenEvents` 加一个字段：拆开以前 `TokenEvents` 和 `BatchPlan` 在同一个文件里，`core.plan`、各 backend、`worker.batch` 都会跟着重载；拆开以后，只重载前端和调度宿主里用到它的单元。
-  - 改 `AccountingPlugin`：拆开以前它和 `StateStore` 在同一个文件里，worker 里的存储单元也会跟着重载（默认要排空）；拆开以后碰不到 worker。
-- 拆分只挪了位置，类和函数一字未改。
-- 上表最后一列由 `tests/units/contracts/test_contracts.py::test_each_contract_module_reaches_only_its_own_seam` 固定下来。新加一个模块，或者在两个模块之间新加一条 import，要同时改测试里的表：这等于决定了以后哪些单元一起重载。
-
-### 3.2 给 agent 的规矩（2026-11-08）
-
-开发本仓库的 agent 和以后改引擎的 RSI agent 都要遵守。
-
-1. **能新增就不修改。** 这样只有用到新东西的单元重载，原来的单元不动。
-   - 每步记录要带新的信息：加一个新分段（新的 `SECTION`），放进新模块，不往已有的记录类里加字段。收方只解码自己认识的分段，其余的忽略（[ipc.md](ipc.md) §3）。
-   - 接口签名不兼容：出新版本（`plan@2`），不在原地改 `@1` 的签名。
-2. **一条接缝一个模块，只 import 本接缝要的契约模块。** 不要为了顺手 import 别的接缝的类型。两条接缝确实要共用一个类型时，像 `SamplingParams` 一样把它单独放一个模块。
-3. **`__init__.py` 只留 docstring。**
-4. **改之前先 dry-run**（`python -m core.control.client apply --dry-run`）。看动作计划：会重载哪些单元、哪些进程要排空。要排空、要一次录完 graph、要重读权重的，先看能不能换成新增。
+本轮收缩：删除共享 `ledger.py`（账本插件尚是本组内部实现），`common_prefix` 移到 `core.state.alloc.prefix`；删除 graph 的内部 `GraphDep`、强制公开的重录流程、重复的可选状态动作 Protocol，以及未实际交接的状态/模型预留字段。请求表与账本的内部字段不建立共享镜像。状态声明先保留 request/slot，跨层借用、host 放置和分区等在实际实现需要交接时再加入。
 
 ## 4. 每步记录（两边最重要的接缝）
 
@@ -242,19 +210,17 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 ## 5. 状态
 
-代码：`core/contracts/state.py`（声明）、`storage.py`（存储单元）、`ledger.py`（记账插件）；`Binding` 在 `tensor.py`。
+代码：`core/contracts/state.py`（声明）、`storage.py`（存储单元）；`Binding` 在 `tensor.py`。账本实现与辅助算法在 `core/state/alloc/`，不放进共享 contracts。
 
 ### 5.1 声明
 
 每层声明自己要存的东西（`StateDecl`），存储单元和记账插件用同一份声明：
 - 种类；
 - 每个条目里有哪些张量（shape、dtype）；
-- 寿命：`request`（请求的每个 token 都要存）、`window`（只存最后几个 token）、`slot`（每请求一个固定大小的条目）；
+- 当前寿命：`request`（按 token 分页）或 `slot`（每请求固定条目）；
 - 每个条目对应几个 token；
-- 放在显存还是 host；
-- 借用哪一层的（借用的层自己不占条目）；
 - 每隔多少 token 打一次快照；
-- TP 时怎么切。
+- 每个 rank 实际交接的形状由该 rank 的模型/存储实现协商。
 
 ### 5.2 存储单元（worker 里，`state.<kind>@1`）
 
@@ -271,6 +237,8 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 ### 5.3 记账插件（调度宿主里，`ledger.<kind>@1`）
 
+2026-11-08 更新：以下是 M2d 前缀缓存的设计目标。池与联合准入算法归 `core.state.alloc` 实现所有，不预先要求拆成独立单元；共享 `AccountingPlugin` 已删除。需要独立替换插件时，再围绕实际交接提取必要接口。本 PR 只保留已有的 `common_prefix` 辅助算法，账本实现由后续 PR 提供。
+
 - 只管 id，不碰显存。
 - `reusable`（给定长度以内最长能从哪里恢复，按各自的对齐规则）、`admit`（带前缀接纳）、`need` / `take`（再要条目）、`snapshot`（规划时预留快照）、`publish`（结果回来后登记新块）、`cancel`（退回没发出去的那部分计划拿到的东西）、`release` / `retire`（延迟释放，§4.4 第 5 条）、`check`（不变量）。
 - `core.state.alloc` 做两件事：
@@ -285,7 +253,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
   - `block_hashes[i]` 覆盖前 (i+1)·B 个 token。B 是 `core.state.alloc` 的哈希块大小，默认等于 KV 页大小。
   - 每种状态的对齐（页大小、快照间隔）都必须是 B 的倍数，`declare` 时检查。
   - `limit` 是 prompt 长度减一，再向下对齐到 B：至少留一个 token 要算，才有 logits。
-- 契约测试在 `tests/units/contracts/`，覆盖不同的快照间隔、不同的最长命中、快照被淘汰的情况。`common_prefix` 逐个检查每种状态的答案：只看最小值的话，一个合法的答案会盖住另一个超出范围的答案。
+- 算法测试在 `tests/units/scheduler/test_prefix.py`，覆盖不同的快照间隔、不同的最长命中、快照被淘汰的情况。`common_prefix` 逐个检查每种状态的答案：只看最小值的话，一个合法的答案会盖住另一个超出范围的答案。
 
 **前缀缓存的生命周期**（2026-11-08，PR #19 评审）：
 - 前缀索引（块哈希 → 条目）由各记账插件自己持有，因为每种状态对齐和存前缀的方式都不同。`core.state.alloc` 只负责编排。
@@ -368,7 +336,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 ## 9. plan 单元和 CUDA graph（@gaow0007 审）
 
-代码：`core/contracts/plan.py` 的 `PlanService`、`Plan`、`GraphDep`。
+交接见 `core/contracts/plan.py`。graph 的依赖表、重录迭代器和缓存组织留在 plan 实现内部。
 
 ### 9.1 plan
 
@@ -526,19 +494,19 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 在 modules.html 思想实验一（16 步）的基础上，用本文的接口重新核对一遍：
 - 压缩 KV：每层压缩比不同，就是每层的 `tokens_per_item` 不同。
 - indexer K：另一种状态。
-- 跨层借用的 KV：`borrows`。
+- 跨层借用 KV：到 v0.1 实现时补充实际需要的声明。
 - 每序列一个 state slot，分可持久和可丢弃两区：两种 `slot` 状态。
 - nextn 层的 KV：再一层声明。
-- Engram 大表：`placement = "host"`。
+- Engram host 大表：到该单元实际加入时定义需要交接的放置数据。
 - 专家放置表和负载计数：权重存储的 `relocate`，加一种状态。
 - DP8 + EP8：每个 rank 一份 StepPlan（`OpenRecord.rank`）；账本按调度域分；同一个 EP 组的所有 rank 每步都要走，没请求的跑空 batch。
 - indexer 在 GPU 上选块：在 graph 内做。
 
-没有发现新的失效项。
+这些是后续实现的扩展方向；不为纸面覆盖预先固化所有字段，允许同一个 agent 同时更新交接定义和使用方。
 
 ### 12.4 包络失效日志
 
-1. **动作名是封闭的。** `capabilities.actions` 是一个固定的 Literal（refit | grow | relocate | invalidate），定义在框架本体 `core.common.manifest` 里。单元想要一个自己的动作名，就得改框架本体。这和“动作由单元声明、由单元执行”（modules.html 的 DS 修正表）不一致。建议改成开放的字符串，常用的几个写进文档。现在还没有单元需要，下次要动框架本体时一起改。
+1. **已解决：动作名开放（PR #21，2026-11-08 已合入 master）。** `capabilities.actions` 使用 `ActionName = str`，状态单元和逻辑单元都可以声明自己的动作名；框架只校验名称形式，具体动作由单元注册和执行。调度逻辑可声明 `drain`，新增算法动作无需修改框架枚举。`StateRequest` 仍只作用于状态单元；自动排空的依赖推导与调度动作实现继续按 `state-changes.md` 推进，#21 只解除声明限制。
 2. **块哈希的输入要开放。** 前缀复用的块哈希默认只算 token。会改变 KV 数值的东西（LoRA adapter、多模态输入的哈希）要能由单元贡献进来。实现前缀复用（M2d）时一起做。
 
 ## 13. 探针报告的建议怎么落地

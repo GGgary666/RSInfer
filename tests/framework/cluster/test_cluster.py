@@ -55,6 +55,11 @@ def test_cold_start_on_two_hosts_loads_only_snapshot_code(tmp_path: Path) -> Non
 
             worker = proc("host-b", "worker", 1)
             first = (await c.sup.call(worker, Status())).unwrap()
+            for _ in range(100):  # checked in, but a safe point (this Status) comes before the first step
+                if not isinstance(first, ProcStatusReport) or first.epoch is not None:
+                    break
+                await asyncio.sleep(0.05)
+                first = (await c.sup.call(worker, Status())).unwrap()
             await asyncio.sleep(0.2)
             second = (await c.sup.call(worker, Status())).unwrap()
             assert isinstance(first, ProcStatusReport) and isinstance(second, ProcStatusReport)

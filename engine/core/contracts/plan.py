@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal, Protocol
 
 import msgspec
@@ -21,27 +21,7 @@ class PlanKey(msgspec.Struct, frozen=True):
     """Padded batch size; 0 = eager (prefill always is in v0)."""
 
 
-class GraphDep(msgspec.Struct, frozen=True):
-    """One thing a recorded graph depends on, checked before every replay."""
-
-    kind: Literal["binding", "value"]
-    name: str
-    """``binding``: a provider's ``Binding`` (compared by generation); ``value``: a solution id,
-    a unit instance (its code version), a config key, the batch size."""
-    recorded: str
-    """The generation or value at capture, as text."""
-
-
 class Plan(Protocol):
-    @property
-    def key(self) -> PlanKey: ...
-    @property
-    def deps(self) -> Sequence[GraphDep]: ...
-
-    def stale(self) -> list[str]:
-        """Changed dependencies, without running. Cheap: generations and a few values."""
-        ...
-
     def run(self) -> None:
         """Replay the graph (or run eagerly) over the inputs already in the bound buffers.
         Raises ``platforms.base.StaleGraph`` if a dependency changed."""
@@ -56,21 +36,6 @@ class PlanService(Protocol):
         ...
 
     def get(self, key: PlanKey) -> Plan: ...
-
-    def rebuild(self, keys: Sequence[PlanKey]) -> Iterator[None]:
-        """Record new plans next to the serving ones, during prepare: an iterator that records
-        one bucket per ``next()`` (one slice per safe point, change.md 4.6). Each slice is a
-        pause window: it first waits for the step still running on the device, since nothing
-        else may run in the process while a graph is captured (GPU probe P10). Warm-up runs on
-        ``Scratch`` items only. The new graphs never share a memory pool with graphs that may
-        still replay; they replace the old ones at the epoch boundary.
-
-        Sliced only when the change reloads neither this unit nor one it uses: a new kernel
-        unit plus the config selecting it (scenario 4), or a new bucket set. When it reloads
-        one of them (code edited in place, the contracts library), the participant defers the
-        rebuild to the new instance at Execute and runs it in one go, inside the pause
-        (``change.prepare_one_shot``; stage2-contract.md §9.4)."""
-        ...
 
 
 class Backend(Protocol):

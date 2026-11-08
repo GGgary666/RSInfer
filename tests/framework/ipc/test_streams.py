@@ -14,7 +14,7 @@ import zmq
 
 from core.common.ids import HostId
 from core.ipc import PeerLost, StreamClosed, backend_for, open_reader, open_writer
-from tests.framework.ipc.peers import BIND, TUN, read_forever, write_records
+from tests.framework.ipc.peers import BIND, PATIENT, TUN, read_forever, write_records
 
 SPAWN = mp.get_context("spawn")
 
@@ -45,7 +45,7 @@ def test_backend_is_chosen_by_host_id_not_address() -> None:
 def test_ordered_and_lossless_across_ring_wraps(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str]) -> None:
     rhost, whost = hosts
     reader, addr = open_reader(zctx, local=HostId(rhost), peer=HostId(whost), bind_host=BIND,
-                               shm_name=shm_name(), tun=TUN)
+                               shm_name=shm_name(), tun=PATIENT)
     sizes = [(i * 7919) % 6000 for i in range(1500)]
     child = SPAWN.Process(target=write_records, args=(addr, whost, sizes, True, 0.0))
     child.start()
@@ -67,7 +67,7 @@ def test_ordered_and_lossless_across_ring_wraps(zctx: zmq.Context[zmq.Socket[byt
 def test_slow_consumer_blocks_the_producer(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str]) -> None:
     rhost, whost = hosts
     reader, addr = open_reader(zctx, local=HostId(rhost), peer=HostId(whost), bind_host=BIND,
-                               shm_name=shm_name(), tun=TUN)
+                               shm_name=shm_name(), tun=PATIENT)
     n, size = 400, 4096
     child = SPAWN.Process(target=write_records, args=(addr, whost, [size] * n, True, 0.0))
     child.start()
