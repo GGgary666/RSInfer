@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
@@ -79,7 +80,7 @@ def test_a_reloaded_kernel_unit_registers_again_and_an_unloaded_one_leaves_nothi
     names = [name for name, *_ in DEFINITIONS]
     assert [d.name for d in cat.definitions()] == sorted(names)
     x, w = torch.randn(3, 8), torch.randn(8)
-    assert torch.equal(cat.call("norm.gemma_rms@1", {}, x, w, 1e-6), ops.gemma_rms_norm(x, w, 1e-6))
+    assert torch.equal(cat.call("norm.gemma_rms@1", {}, x, w, 1e-6), cast(torch.Tensor, ops.gemma_rms_norm(x, w, 1e-6)))
     assert cat.select("norm.gemma_rms@1", {}).fallback
     rt.reload(ReloadPlan(units_to_reload=[spec(REFERENCE)])).unwrap()
     assert [d.name for d in cat.definitions()] == sorted(names)

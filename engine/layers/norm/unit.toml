@@ -1,0 +1,11 @@
+[unit]
+id = "layers.norm"
+kind = "logic"
+process = ["worker"]
+entry = "layers.norm.unit:Unit"
+
+[provides]
+services = ["layers.norm@1"]
+
+[requires]
+services = ["kernels.catalog@1"]
