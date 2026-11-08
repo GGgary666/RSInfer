@@ -58,25 +58,6 @@ def test_a_step_plan_round_trips_through_an_open_record() -> None:
                         {StateOps.SECTION: StateOps}).unwrap()
     assert got == {BatchPlan.SECTION: batch, RowDelta.SECTION: delta, StateOps.SECTION: ops}
     assert list(got[BatchPlan.SECTION].from_previous.values()) == [0, 1]
-    assert got[BatchPlan.SECTION].check() == []
-
-
-def batch_plan(num_tokens: list[int], from_previous: list[int], tokens: list[int], rows: int | None = None) -> BatchPlan:
-    n = len(num_tokens) if rows is None else rows
-    return BatchPlan(rows=Column.of("i32", list(range(n))), num_tokens=Column.of("i32", num_tokens),
-                     positions=Column.of("i32", [0] * len(num_tokens)), tokens=Column.of("i64", tokens),
-                     from_previous=Column.of("u8", from_previous), phase="mixed", bucket=0)
-
-
-def test_a_batch_plan_gives_each_row_its_tokens_and_a_previous_token_row_none() -> None:
-    """A prefill row of 3, a decode row on the previous token, a decode row with its token
-    given: ``tokens`` holds 3 + 0 + 1 values."""
-    assert batch_plan([3, 1, 1], [0, 1, 0], [5, 6, 7, 8]).check() == []
-    assert batch_plan([2, 1], [1, 0], [9]).check() == ["row 0 takes the previous token but computes 2 tokens"]
-    assert batch_plan([3, 1], [0, 1], [5, 6, 7, 8]).check() == [
-        "tokens has 4 values, the rows without from_previous take 3"]
-    assert batch_plan([1, 1], [1, 1], [], rows=3).check() == [
-        "num_tokens has 2 values for 3 rows", "positions has 2 values for 3 rows", "from_previous has 2 values for 3 rows"]
 
 
 def test_units_may_import_the_contracts_and_the_contracts_pass_the_rules(tmp_path: Path) -> None:

@@ -47,7 +47,9 @@ class RowDelta(msgspec.Struct, frozen=True):
 
 
 class BatchPlan(msgspec.Struct, frozen=True):
-    """What every row computes in this step."""
+    """What every row computes in this step. ``num_tokens``, ``positions`` and ``from_previous``
+    hold one value per row of ``rows``. Checking a plan against these rules is the worker's
+    code, not part of the contract (stage2-contract.md §3, §4.2)."""
 
     SECTION: ClassVar[str] = "sched.batch@1"
     rows: Column
@@ -59,7 +61,8 @@ class BatchPlan(msgspec.Struct, frozen=True):
     """``i32`` per row: position of the row's first token in this step."""
     tokens: Column
     """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order:
-    such a row takes the next ``num_tokens`` of them, a ``from_previous`` row none (``check``)."""
+    such a row takes the next ``num_tokens`` of them, a ``from_previous`` row none. So its
+    length is the sum of those rows' ``num_tokens``."""
     from_previous: Column
     """``u8`` per row: 1 = the row's single input token is the token the worker sampled for it
     the last time the row ran, resolved on the device without a host round trip. Only for a
@@ -69,26 +72,6 @@ class BatchPlan(msgspec.Struct, frozen=True):
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
     """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
-
-    def check(self) -> list[str]:
-        """How the columns fit together; empty if they do. Every per-row column has one value
-        per row, a ``from_previous`` row has ``num_tokens == 1`` and takes nothing from
-        ``tokens``, and ``tokens`` holds exactly the other rows' ``num_tokens``."""
-        n = len(self.rows)
-        errors = [f"{name} has {len(col)} values for {n} rows"
-                  for name, col in (("num_tokens", self.num_tokens), ("positions", self.positions),
-                                    ("from_previous", self.from_previous)) if len(col) != n]
-        if errors:
-            return errors
-        given = 0
-        for row, count, previous in zip(self.rows.values(), self.num_tokens.values(), self.from_previous.values()):
-            if previous and count != 1:
-                errors.append(f"row {row} takes the previous token but computes {count} tokens")
-            elif not previous:
-                given += int(count)
-        if len(self.tokens) != given:
-            errors.append(f"tokens has {len(self.tokens)} values, the rows without from_previous take {given}")
-        return errors
 
 
 class StateAssign(msgspec.Struct, frozen=True):
