@@ -302,7 +302,11 @@ class Participant:
         if c.undo_diags:
             self.change = c
             c.phase = "undone"
-            self.host.paused = True
+            quiesced = self.host.quiesce()
+            if isinstance(quiesced, Failed):
+                c.undo_diags += quiesced.diagnostics
+                self.diagnostics += quiesced.diagnostics
+            self.host.paused = True  # even so: this process must stop stepping until recovered
 
     def _undo_actions(self, c: _Change) -> None:
         for what, it in c.slicing:
@@ -408,14 +412,32 @@ class Participant:
         return reply
 
     def _check_pause(self, c: _Change) -> None:
-        epoch = self.host.epoch
-        if c.pause_after is not None and epoch is not None and epoch < c.pause_after:
-            return  # keep stepping until the agreed epoch is done
+        # The steps the loop has started (device work, results not taken yet) finish first:
+        # what Execute unloads must not still be in use, and finishing them may be what reaches
+        # the agreed epoch (the last step of a follower whose leader has stopped).
+        t0 = time.monotonic()
+        quiesced = self.host.quiesce()
+        c.deadline += time.monotonic() - t0  # as in _advance: not the coordinator's silence
+        if isinstance(quiesced, Failed):
+            c.phase = "prepared"  # still serving; the coordinator aborts
+            if c.pause_reply is not None:
+                c.pause_reply.resolve(quiesced)
+                c.pause_reply = None
+            return
+        if not self._reached(c.pause_after):
+            return  # keep stepping until the agreed epoch is done, then finish again
         self.host.paused = True
         c.phase = "paused"
         if c.pause_reply is not None:
-            c.pause_reply.resolve(Ok(Paused(c.id, epoch)))
+            c.pause_reply.resolve(Ok(Paused(c.id, self.host.epoch)))
             c.pause_reply = None
+
+    def _reached(self, after: int | None) -> bool:
+        """Whether this process has finished the epoch a Pause waits for. No epoch finished yet
+        is not there; a process without a loop numbers no epochs and is there at once."""
+        if after is None or not self.host.has_loop():
+            return True
+        return self.host.epoch is not None and self.host.epoch >= after
 
     # ----------------------------------------------------------- execute
 

@@ -9,6 +9,12 @@ of whichever unit provides ``proc.loop@1`` (the worker loop, the scheduler).
 Because the loop unit is looked up again every turn, it can itself be reloaded:
 reloads happen between two ``step()`` calls. ``step()`` must return promptly
 when there is nothing to do, returning the epoch it finished or ``None``.
+
+A loop may leave work running when ``step()`` returns: GPU work launched
+asynchronously, or the next step started before the last one's results are
+taken (overlap scheduling). Before the process stops stepping (a pause, a
+shutdown), the host calls the loop's ``quiesce()`` so that nothing an Execute
+unloads is still in use.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import traceback
 from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import msgspec
 import zmq
@@ -51,12 +57,23 @@ from platforms.base import Platform
 from unit.runtime.runtime import UnitRuntime
 
 LOOP_SERVICE = "proc.loop@1"
+EXIT_QUIESCE_FAILED = 4
+"""Exit code when the loop could not finish its steps: the units were left loaded."""
 
 type Handler = Callable[[Envelope, Any], Result[msgspec.Struct] | Deferred]
 
 
 class Loop(Protocol):
     def step(self) -> Epoch | None: ...
+
+
+class Quiescing(Protocol):
+    def quiesce(self) -> Epoch | None:
+        """Finish every step already started: its device work and its results. Return the
+        last epoch finished, or ``None`` if none was. Optional for a loop that leaves nothing
+        running when ``step()`` returns. Called before the process stops stepping, possibly
+        more than once: while a pause waits for its epoch, ``step()`` goes on in between."""
+        ...
 
 
 class HostTunables(msgspec.Struct, frozen=True):
@@ -153,7 +170,11 @@ class ProcessHost:
         """The identity this process serves; a committed change moves it."""
         self.epoch: Epoch | None = None
         self.paused = spec.start_paused
-        """Set by the change participant: no ``step()`` while a change executes."""
+        """Set by the change participant: no ``step()`` while a change executes. Normally set
+        after a successful ``quiesce()``; an undo that fails sets it even when quiesce failed,
+        so it says nothing about work in flight (``settled`` does)."""
+        self.settled = True
+        """No step has been started since the last successful ``quiesce()`` (or ever)."""
         self.stopping = False
         self.diagnostics: list[Diagnostic] = []
         self.participant = Participant(self, load_tunables(ChangeTunables, "change", dict(spec.tunables)))
@@ -208,33 +229,70 @@ class ProcessHost:
         for hook in list(self.safe_point_hooks):
             hook()
 
-    def run(self) -> int:
-        while not self.stopping:
-            self.safe_point()
-            if self.stopping:
-                break
-            loop: Loop | None = None if self.paused else self.runtime.lookup(LOOP_SERVICE)
-            if loop is None:
-                self.safe_point(self.tun.idle_poll_s)
-                continue
+    def has_loop(self) -> bool:
+        """Whether a loop unit steps in this process (it numbers epochs)."""
+        return self.runtime.lookup(LOOP_SERVICE) is not None
+
+    def quiesce(self) -> Result[None]:
+        """Let the loop unit finish the steps it has started. ``epoch`` moves to the last one
+        finished. Called before the process stops stepping; while a pause waits for its epoch it
+        is called at every safe point, and stepping goes on in between. Nothing to do once
+        ``settled``; a failure leaves it unsettled, so the next call tries again."""
+        if self.settled:
+            return Ok(None)
+        loop = self.runtime.lookup(LOOP_SERVICE)
+        quiesce = getattr(loop, "quiesce", None) if loop is not None else None
+        if quiesce is not None:
             try:
-                epoch = loop.step()
+                epoch = cast(Quiescing, loop).quiesce()
             except Exception as e:  # noqa: BLE001 - a unit bug must not kill the host
-                self.diagnostics.append(diag("host", "step", f"{type(e).__name__}: {e}",
-                                             subject=str(self.spec.proc), code="host.step_failed"))
                 traceback.print_exc()
-                time.sleep(self.tun.idle_poll_s)
-                continue
+                return fail("host", "quiesce", f"{type(e).__name__}: {e}", subject=str(self.spec.proc),
+                            code="host.quiesce_failed")
             if epoch is not None:
                 self.epoch = epoch
+        self.settled = True
+        return Ok(None)
+
+    def run(self) -> int:
+        while not self.stopping:
+            self.turn()
         return self.shutdown()
 
+    def turn(self) -> None:
+        """One turn of the main loop: a safe point, then one step unless paused or stopping."""
+        self.safe_point()
+        if self.stopping:
+            return
+        loop: Loop | None = None if self.paused else self.runtime.lookup(LOOP_SERVICE)
+        if loop is None:
+            self.safe_point(self.tun.idle_poll_s)
+            return
+        self.settled = False
+        try:
+            epoch = loop.step()
+        except Exception as e:  # noqa: BLE001 - a unit bug must not kill the host
+            self.diagnostics.append(diag("host", "step", f"{type(e).__name__}: {e}",
+                                         subject=str(self.spec.proc), code="host.step_failed"))
+            traceback.print_exc()
+            time.sleep(self.tun.idle_poll_s)
+            return
+        if epoch is not None:
+            self.epoch = epoch
+
     def shutdown(self) -> int:
-        self.runtime.unload_all()
+        quiesced = self.quiesce()
+        if isinstance(quiesced, Failed):
+            # Device work may still be running: unit teardown could free memory it uses. Leave
+            # the units loaded; exiting the process releases everything once the device is done.
+            self.diagnostics += quiesced.diagnostics
+            print(f"quiesce before shutdown failed, units not unloaded: {quiesced}", file=sys.stderr)
+        else:
+            self.runtime.unload_all()
         self.rpc.close()
         self.client.close()
         self.zctx.term()
-        return 0
+        return EXIT_QUIESCE_FAILED if isinstance(quiesced, Failed) else 0
 
     def request_stop(self, signum: int = 0, frame: FrameType | None = None) -> None:
         del signum, frame
