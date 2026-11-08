@@ -41,7 +41,7 @@ class OpenAICompletionRequest(BaseModel):
     messages: list[ChatMessage] | None = None
     max_tokens: int = Field(default=16, ge=1)
     temperature: float = Field(default=1.0, ge=0, allow_inf_nan=False)
-    top_k: int = -1
+    top_k: int = Field(default=-1, ge=-1, lt=2**31)
     top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     n: int = 1
     stream: bool = False
@@ -49,7 +49,7 @@ class OpenAICompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
-    seed: int | None = None
+    seed: int | None = Field(default=None, ge=-(2**63), lt=2**63)
 
 
 @dataclass
@@ -72,8 +72,8 @@ class RequestState:
     last_epoch: int = -1
     finished: bool = False
     abort_sent: bool = False
-    incarnation: int = 0
-    """The scheduler instance it was sent to."""
+    incarnation: int | None = None
+    """The scheduler instance it was sent to; ``None`` until it was."""
 
 
 class FrontendManager:
@@ -111,15 +111,19 @@ class FrontendManager:
             self.ack_map[reply.uid].append(reply)
             self.event_map[reply.uid].set()
 
+    def _lost(self, uid: int, state: RequestState) -> None:
+        state.finished = True
+        self._ack(UserReply(uid, "", True, error="the scheduler was replaced; this request was lost"))
+
     def _end_replaced(self) -> None:
-        """A new scheduler instance knows nothing of the requests sent to an earlier one."""
+        """A new scheduler instance knows nothing of the requests sent to an earlier one. Scans
+        only when the instance changed; a request not sent yet has no instance and stays."""
         if self.channel.incarnation == self.incarnation:
             return
         self.incarnation = self.channel.incarnation
         for uid, state in self.states.items():
-            if not state.finished and state.incarnation < self.incarnation:
-                state.finished = True
-                self._ack(UserReply(uid, "", True, error="the scheduler was replaced; this request was lost"))
+            if not state.finished and state.incarnation is not None and state.incarnation < self.incarnation:
+                self._lost(uid, state)
 
     async def listen(self) -> None:
         try:
@@ -201,12 +205,22 @@ class FrontendManager:
         new = NewRequest(uid, Column.of("i64", prompt),
                          SamplingParams(request.temperature, request.top_p, request.top_k, request.seed),
                          request.max_tokens, [] if request.ignore_eos else list(self.tokenizer.stop_token_ids))
-        sent = await self.channel.send(Requests(new=[new]))
+        try:
+            sent = await self.channel.send(Requests(new=[new]))
+        except asyncio.CancelledError:
+            self.forget(uid)  # the client went away while it was being sent
+            raise
+        except Exception as exc:  # noqa: BLE001 - this request alone fails, and says why
+            self.forget(uid)
+            raise HTTPException(500, f"the request could not be sent: {type(exc).__name__}: {exc}") from exc
         if sent is None:
             self.forget(uid)
             raise HTTPException(503, "no scheduler is reachable right now")
-        self.states[uid].incarnation = sent
+        state = self.states[uid]
+        state.incarnation = sent
         self._end_replaced()
+        if sent < self.incarnation:  # it went to an instance already known replaced
+            self._lost(uid, state)
         return uid
 
     async def wait_for_ack(self, uid: int) -> AsyncGenerator[UserReply]:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import httpx
 import pytest
@@ -148,23 +150,27 @@ def test_without_a_scheduler_a_request_fails_fast_and_the_frontend_stays_up() ->
 
 def test_a_replaced_scheduler_ends_what_it_lost_and_the_next_one_serves() -> None:
     """The scheduler's process is replaced: the new one has a new reader address, which the
-    supervisor names. The request in flight at the old one is lost, and ends with an error;
-    the next request goes to the new scheduler."""
+    supervisor names. The request in flight at the old one is lost and ends with an error;
+    requests sent while the frontend finds the new one all reach it and are served, none
+    mistaken for the old instance's (Codex and Antigravity on #26)."""
     supervisor = FakeSupervisor()
     old = ScriptScheduler(hold=True)
     supervisor.target = old.address
     front = Frontend(supervisor=supervisor)
     new: ScriptScheduler | None = None
     try:
-        with httpx.Client(base_url=front.url, timeout=10) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        with httpx.Client(base_url=front.url, timeout=10) as client, ThreadPoolExecutor(max_workers=9) as pool:
             lost = pool.submit(client.post, "/v1/completions", json={"model": "toy", "prompt": "wait"})
             old.new.get(timeout=2)
-            new = ScriptScheduler()
+            new = ScriptScheduler(text="new")
             supervisor.target = new.address
             old.close()
-            response = client.post("/v1/completions", json={"model": "toy", "prompt": "x", "max_tokens": 64})
-            assert response.status_code == 200, response.text
-            assert response.json()["choices"][0]["text"] == new.text
+            fresh = [pool.submit(client.post, "/v1/completions", json={"model": "toy", "prompt": str(i),
+                                                                         "max_tokens": 64}) for i in range(8)]
+            replies = [f.result(timeout=10) for f in fresh]
+            assert [r.status_code for r in replies] == [200] * 8, [r.text for r in replies]
+            assert all(r.json()["choices"][0]["text"] == "new" for r in replies)
+            assert new.new.qsize() == 8
             failed = lost.result(timeout=5)
             assert failed.status_code == 503
             assert "scheduler was replaced" in failed.json()["error"]["message"]
@@ -172,6 +178,60 @@ def test_a_replaced_scheduler_ends_what_it_lost_and_the_next_one_serves() -> Non
         front.close()
         if new is not None:
             new.close()
+        supervisor.close()
+
+
+def test_a_request_that_fails_to_go_out_frees_its_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever stops a request after it was registered, it alone fails: it does not keep a
+    place among ``frontend.max_requests`` (Codex on #26)."""
+    scheduler = ScriptScheduler()
+    front = Frontend(scheduler)
+    manager = front.server.manager
+    manager.max_requests = 2
+    send = manager.channel.send
+    failures = 0
+
+    async def failing(requests: Any) -> int | None:
+        nonlocal failures
+        if failures < 2:
+            failures += 1
+            raise RuntimeError("the send broke")
+        return await send(requests)
+
+    monkeypatch.setattr(manager.channel, "send", failing)
+    try:
+        with httpx.Client(base_url=front.url, timeout=10) as client:
+            for _ in range(2):
+                assert client.post("/v1/completions", json={"model": "toy", "prompt": "x"}).status_code == 500
+                assert not manager.states and not manager.ack_map and not manager.event_map
+            for _ in range(2):  # a seed msgpack cannot carry is refused before anything is registered
+                body = {"model": "toy", "prompt": "x", "seed": 2**100}
+                assert client.post("/v1/completions", json=body).status_code == 422
+            response = client.post("/v1/completions", json={"model": "toy", "prompt": "x", "max_tokens": 64})
+            assert response.status_code == 200, response.text
+            assert scheduler.new.qsize() == 1
+    finally:
+        front.close()
+        scheduler.close()
+
+
+def test_requests_waiting_for_a_scheduler_each_keep_their_own_deadline() -> None:
+    """With no scheduler published, every request waits ``io_timeout_s`` from when it was queued,
+    not behind the others: the I/O thread keeps going while sends wait (Codex on #26)."""
+    supervisor = FakeSupervisor()
+    front = Frontend(supervisor=supervisor, io_timeout_s=0.2)
+    try:
+        with httpx.Client(base_url=front.url, timeout=10) as client, ThreadPoolExecutor(max_workers=6) as pool:
+            def request(i: int) -> tuple[int, float]:
+                started = time.monotonic()
+                r = client.post("/v1/completions", json={"model": "toy", "prompt": str(i)})
+                return r.status_code, time.monotonic() - started
+
+            results = list(pool.map(request, range(6)))
+        assert [code for code, _ in results] == [503] * 6
+        assert max(elapsed for _, elapsed in results) < 0.6, results
+    finally:
+        front.close()
         supervisor.close()
 
 

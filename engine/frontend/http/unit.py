@@ -27,6 +27,7 @@ from .api import FrontendManager, create_app
 class Server:
     def __init__(self, manager: FrontendManager, host: str, port: int,
                  start_timeout: float, shutdown_timeout: float) -> None:
+        self.manager = manager
         self.app = create_app(manager)
         self.server = uvicorn.Server(uvicorn.Config(
             self.app, host=host, port=port, loop="asyncio", log_level="warning",
