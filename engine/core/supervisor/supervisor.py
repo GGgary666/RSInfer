@@ -331,7 +331,7 @@ class Supervisor:
         return ProcSpec(
             proc=d.proc, identity=identity, plan=plan_for(d), control=self.address,
             bind_address=topo.host(d.proc.host).address, env=dict(d.env), gpus=list(d.gpus),
-            tunables=dict(self.proc_tunables),
+            platform=d.platform, platform_options=dict(d.platform_options), tunables=dict(self.proc_tunables),
         )
 
     async def apply_topology(

@@ -103,7 +103,8 @@ def _desired(tree: Tree, topo: Topology) -> dict[ProcId, DesiredProc]:
     lists none)."""
     out: dict[ProcId, DesiredProc] = {}
     for proc, d in desired_procs(topo).items():
-        out[proc] = DesiredProc(proc, tree.role_units(topo, proc.role), d.gpus, d.env, d.rank)
+        out[proc] = DesiredProc(proc, tree.role_units(topo, proc.role), d.gpus, d.env, d.rank,
+                                d.platform, d.platform_options)
     return out
 
 
@@ -240,6 +241,9 @@ class _Planner:
             return f"the mesh changed {old.mesh.dims} -> {new.mesh.dims}"
         if (want.gpus, want.env, want.rank) != (had.gpus, had.env, had.rank):
             return "its placement changed"
+        if (want.platform, want.platform_options) != (had.platform, had.platform_options):
+            return f"its platform changed {had.platform} {had.platform_options} -> " \
+                   f"{want.platform} {want.platform_options}"
         if self.natives_touch(sorted({*want.units, *(UnitId(u.unit) for u in self.w.running[proc].units)})):
             return "a native extension it loads changed; it cannot be unloaded"
         return ""
