@@ -65,11 +65,13 @@ class BatchPlan(msgspec.Struct, frozen=True):
     rows: Column
     """``i32``: rows of the persistent batch that run in this step."""
     num_tokens: Column
-    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step (more with speculation)."""
+    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step. Speculation comes
+    with its own section version (§4.4 rule 7), which says how drafts count here."""
     positions: Column
     """``i32`` per row: position of the row's first token in this step."""
     tokens: Column
-    """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order."""
+    """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order:
+    such a row takes the next ``num_tokens`` of them, a ``from_previous`` row none (``check``)."""
     from_previous: Column
     """``u8`` per row: 1 = the row's single input token is the token the worker sampled for it
     the last time the row ran, resolved on the device without a host round trip. Only for a
@@ -79,6 +81,26 @@ class BatchPlan(msgspec.Struct, frozen=True):
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
     """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
+
+    def check(self) -> list[str]:
+        """How the columns fit together; empty if they do. Every per-row column has one value
+        per row, a ``from_previous`` row has ``num_tokens == 1`` and takes nothing from
+        ``tokens``, and ``tokens`` holds exactly the other rows' ``num_tokens``."""
+        n = len(self.rows)
+        errors = [f"{name} has {len(col)} values for {n} rows"
+                  for name, col in (("num_tokens", self.num_tokens), ("positions", self.positions),
+                                    ("from_previous", self.from_previous)) if len(col) != n]
+        if errors:
+            return errors
+        given = 0
+        for row, count, previous in zip(self.rows.values(), self.num_tokens.values(), self.from_previous.values()):
+            if previous and count != 1:
+                errors.append(f"row {row} takes the previous token but computes {count} tokens")
+            elif not previous:
+                given += int(count)
+        if len(self.tokens) != given:
+            errors.append(f"tokens has {len(self.tokens)} values, the rows without from_previous take {given}")
+        return errors
 
 
 class StateAssign(msgspec.Struct, frozen=True):
@@ -93,7 +115,9 @@ class StateAssign(msgspec.Struct, frozen=True):
 
 class StateCopy(msgspec.Struct, frozen=True):
     """Item copies of one state kind: restore a snapshot into a row's slot on a prefix hit
-    (``before`` the step), or snapshot a slot at a block boundary (``after`` it)."""
+    (``before`` the step), or snapshot a slot at a block boundary (``after`` it). ``after``
+    sees only the state at the end of the row's chunk in this step: a snapshot boundary the
+    chunk crosses inside it cannot be copied (§5.4)."""
 
     kind: str
     when: Literal["before", "after"]

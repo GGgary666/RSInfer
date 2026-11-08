@@ -112,7 +112,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
   - 放在单元目录之外，接口两边的单元都 import 它。接口一改，所有 import 它的单元在同一个 epoch 一起重载，这正是“改接口时两边一起重载”（modules.html ⑥）要的效果。
 - 不 import torch，因为 CI 不一定装 torch。张量的类型写作 `Tensor`（就是 `Any`）。
 - 服务名带版本（`plan@1`）。签名不兼容的改动要升版本，旧版本和新版本可以在同一个 epoch 换掉。
-- 测试：`tests/units/contracts/`。现在测了列编码和记录的往返、联合前缀匹配（§5.3），以及单元 import 契约时能通过 `core.manifest` 的检查。
+- 测试：`tests/units/contracts/`。现在测了列编码和记录的往返、`BatchPlan.check()`（§4.2）、联合前缀匹配（§5.3），以及单元 import 契约时能通过 `core.manifest` 的检查。
 
 ## 4. 每步记录（两边最重要的接缝）
 
@@ -147,6 +147,15 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 | 调度 → 前端 | `sched.tokens@1` | `sched.events@1`（`TokenEvents`） | 这一步各请求的新 token、结束原因，以及这一步跑在哪个身份下 |
 
 四条都走每步记录流：有序、不丢、单生产者、背压。
+
+`BatchPlan` 的 token 怎么按行拆（2026-11-08，PR #19 评审）：
+- `from_previous = 1` 的行只算 1 个 token，不从 `tokens` 里取；
+- 其余的行按行序，从 `tokens` 里依次各取 `num_tokens` 个；
+- 所以 `tokens` 的长度正好是这些行的 `num_tokens` 之和。
+
+`BatchPlan.check()` 检查这几条。worker 在测试和调试模式下对每份计划都查一遍。
+
+投机的草稿 token 不在这一版里。草稿放在哪、验证步的 `num_tokens` 怎么数，到 M2d 做投机时再定，随新版本的分段一起出（§4.4 第 7 条）。
 
 ### 4.3 持久 batch
 
@@ -216,7 +225,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 ### 5.3 记账插件（调度宿主里，`ledger.<kind>@1`）
 
 - 只管 id，不碰显存。
-- `need`、`take`、`release` / `retire`（延迟释放，§4.4 第 5 条）、`reusable`（给定长度以内最长能从哪里恢复，按各自的对齐规则）、`check`（不变量）。
+- `reusable`（给定长度以内最长能从哪里恢复，按各自的对齐规则）、`admit`（带前缀接纳）、`need` / `take`（再要条目）、`publish`（登记新块）、`release` / `retire`（延迟释放，§4.4 第 5 条）、`check`（不变量）。
 - `core.state.alloc` 做两件事：
   - 联合准入：一个请求要的每种状态都分得到，才接纳它；
   - 联合前缀匹配：找每种状态都能从那里恢复的最长前缀（`common_prefix`）。
@@ -229,13 +238,42 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
   - `block_hashes[i]` 覆盖前 (i+1)·B 个 token。B 是 `core.state.alloc` 的哈希块大小，默认等于 KV 页大小。
   - 每种状态的对齐（页大小、快照间隔）都必须是 B 的倍数，`declare` 时检查。
   - `limit` 是 prompt 长度减一，再向下对齐到 B：至少留一个 token 要算，才有 logits。
-- 契约测试在 `tests/units/contracts/`，覆盖不同的快照间隔、不同的最长命中、快照被淘汰的情况。
+- 契约测试在 `tests/units/contracts/`，覆盖不同的快照间隔、不同的最长命中、快照被淘汰的情况。`common_prefix` 逐个检查每种状态的答案：只看最小值的话，一个合法的答案会盖住另一个超出范围的答案。
+
+**前缀缓存的生命周期**（2026-11-08，PR #19 评审）：
+- 前缀索引（块哈希 → 条目）由各记账插件自己持有，因为每种状态对齐和存前缀的方式都不同。`core.state.alloc` 只负责编排。
+- 条目分三种：
+  - 空闲；
+  - 被请求持有：可以同时被几个请求持有；
+  - 已缓存：发布过，没有请求持有，可以淘汰。
+
+  插件只在要分出条目时才淘汰，按最久未用。被持有的条目、待拷贝的源条目都不淘汰。
+- **接纳**：先用 `common_prefix` 定下长度 L，再对每种状态调 `admit(request, block_hashes, L, new_tokens, step)`。
+  - 它返回两样东西：按表顺序排好的条目（先是复用的，再是新分的），放进 `StateAssign`；这一步之前要做的拷贝，放进 `StateCopy(before)`。
+  - 要么全给，要么返回 `None`、什么都不拿。只要有一种状态返回 `None`，这个请求就不接纳，已经接纳了它的那几种状态调 `release(request, step)`。
+  - KV：复用的页原地读，请求一直持有到 `release`。
+  - GDN：新分一个槽，拷贝源是缓存的快照。快照被持有到这一步的结果回来，所以拷贝跑完之前不会被淘汰。
+- **发布**：调度器规划一步时，这一步里跨过块边界的请求，都要调 `publish(request, block_hashes, upto, step)`。
+  - 新块要等这一步的结果回来，才能被别的请求命中。否则别的请求可能读到这一步还没写、甚至永远不会写的条目。
+  - KV：登记请求自己的页，不用拷贝。
+  - GDN：`upto` 正好是快照间隔的倍数时才打快照（§5.4）。插件分一个空闲或可淘汰的槽当目标，返回 `StateCopy(after)`；分不到就不打。
+- **结束**：`release(request, last_step)` 等最后一步的结果回来才生效。生效以后，发布过、又没有别的请求持有的条目变成已缓存，其余的回到空闲表。
+- **`Resync`**：
+  - 回了 `Resync` 的步，调 `retire(step, ran=False)`。它发布的东西作废，拷贝的目标槽放回空闲表。
+  - 接纳时的拷贝排在这种步里的请求，退回排队：调度器先 `release` 它，再按它的 token 历史重新接纳。
+- **契约测试**（M2d，两个记账插件）：请求 A 算完一段前缀、发布、结束；请求 B 命中这段前缀，拿到的是 A 的页和快照槽；B 的拷贝和使用没做完之前，这些条目不会被回收或淘汰。
 
 ### 5.4 Qwen3.8 的状态
 
 - `kv.paged`：16 层 full attention，每层的 K、V。24 个 q 头、4 个 kv 头，head dim 256。
 - `gdn.slots`：48 层 GDN，每层的 conv state `[槽, 10240, 3]` bf16 和 recurrent state `[槽, 48, 128, 128]` fp32。TP1 时每个请求约 147 MiB，256 个并发就是约 37 GiB（探针报告第 9 条）。所以槽位数在启动时由 `core.state.holder` 按显存定，以后可以像 KV 一样用 VMM 扩槽位。
 - 前缀复用：GDN 状态只在块边界有快照。快照占同一个池里的槽位，打快照、恢复快照都是条目拷贝（`StateCopy`）。所以 `gdn.slots` 的 `reusable` 只能对齐到快照边界。
+- **快照只能在一步的末尾打**（2026-11-08，PR #19 评审）：
+  - GDN 的状态在一步之内原地往前推，`StateCopy(after)` 只拷得到这一行在这一步 chunk 末尾的状态。
+  - 例：一个 256 token 的 chunk 跨过了 64、128、192。步末时这几处的状态已经没有了，不能把步末的状态当成它们存进缓存。
+  - 规则：chunk 的末尾正好落在快照边界上才打快照，chunk 里面跨过的边界不打。
+  - 想在哪里留快照，就由分块决策点把 chunk 切在那里。默认 chunk 长度取快照间隔的倍数，并把 prompt 里最后一个快照边界切成一个 chunk 的末尾。这样，共用同一段 system prompt 的后来请求能从最靠后的边界恢复。
+  - decode 每步只算一个 token，正好落在边界上的那一步打快照。开投机时，一步接受几个 token 事先不知道，所以 v0 开投机时 decode 期间不打快照。
 - MTP：config 里有 1 层 MTP，它的 KV 是 `kv.paged` 的另一层声明。
 
 ### 5.5 显存里怎么排（@gaow0007 定）
@@ -476,3 +514,4 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 2. `torch_cpu` 平台上的 graph：要不要模拟“录制时写死 Python 标量”。不模拟的话，这类错误只有 GPU 层才抓得到。
 3. 前端和调度之间的流在 M2a 用每步记录流。前端以后要不要拆成多个进程，到时再定。
 4. 采样放在 graph 里还是 graph 外，由 @gaow0007 在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。
+5. 投机的记录：草稿放在哪、验证步的 `num_tokens` 怎么数。M2d 定，出新版本的分段（§4.2）。
