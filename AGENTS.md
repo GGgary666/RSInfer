@@ -31,7 +31,7 @@
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行） |
+| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行）。PR 每次 push 只跑一遍；push 只在 `master`、`madoka/dev` 上触发。PR 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
@@ -82,6 +82,7 @@
 - `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。`units/contracts/`：接口库 `core.contracts`（编码往返、单元能 import 它、每个模块只 import 到本接缝的模块）。
 - `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
 - `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
+- `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
@@ -139,6 +140,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 - 测试用 `@pytest.mark.covers(edges=..., ladder=..., kinds=...)` 声明自己走到了哪些边、动作阶梯的哪几级、哪些模块种类，并在测试里断言；`tests/scenarios/test_coverage.py` 要求每一项至少有一个测试覆盖。
 - 框架代码不写死本机地址、路径或 PID（P7）；超时、心跳之类的可调参数一律做成带默认值的配置项（`doc/specs/README.md`）。
 - 框架本体对外返回 `Ok` / `Failed`，不靠异常跨进程边界。
+- 改框架本体要克制，能不改就不改，只改注释也算改：改了框架本体的变更，`apply` 直接以 `escalate.restart_engine` 失败，只能重启引擎；CI 也会因此多跑一遍 `tests/framework/`。单元需要的说明写在单元自己的代码和文档里。
 - 改 `engine/core/contracts/`（理由见 `doc/specs/stage2-contract.md` §3）：
   - 只共享真正跨单元、跨进程交接的数据和必要调用。内部对象字段、算法、队列和辅助类型留在实现里，现有多余定义也应收缩；
   - 同一个 RSI agent 可以同时修改接口与全部使用者。沿用交接方式的算法/kernel/策略改动直接改实现；交接内容或语义变化时才更新共享定义，需要旧新版本并存时才新增版本；
