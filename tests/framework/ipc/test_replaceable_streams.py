@@ -8,6 +8,7 @@ import signal
 import time
 import uuid
 
+import msgspec
 import pytest
 import zmq
 
@@ -73,10 +74,9 @@ def test_the_next_producer_takes_over_after_one_closes(zctx: zmq.Context[zmq.Soc
         reader.close()
 
 
-def test_a_killed_producer_is_replaced_once_it_is_known_dead(zctx: zmq.Context[zmq.Socket[bytes]],
-                                                             hosts: tuple[str, str]) -> None:
-    """The shm ring refuses a second producer while the first still proves it is alive, so two
-    never write it at once; once its heartbeat is ``peer_timeout_s`` old, the next one takes over."""
+def test_a_killed_producer_is_replaced(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str]) -> None:
+    """Shared memory: the kernel drops a producer's lock when its process ends, so the next one
+    takes over at once. TCP: the next one's records wait until the killed one is quiet."""
     reader, address = reader_for(zctx, hosts, tun=TUN)
     child = SPAWN.Process(target=write_records, args=(address, hosts[1], [10] * 3, False, 60.0))
     child.start()
@@ -84,17 +84,8 @@ def test_a_killed_producer_is_replaced_once_it_is_known_dead(zctx: zmq.Context[z
         assert len(take(reader, 3)) == 3
         assert child.pid is not None
         os.kill(child.pid, signal.SIGKILL)
-        if address.shm is not None:
-            with pytest.raises(RingBusy):
-                writer_for(zctx, hosts, address, TUN)
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                second = writer_for(zctx, hosts, address, TUN)
-                break
-            except RingBusy:
-                assert time.monotonic() < deadline
-                time.sleep(0.05)
+        child.join(10)
+        second = writer_for(zctx, hosts, address, TUN)  # no RingBusy: that process has ended
         second.write(b"b0", timeout=5)
         assert take(reader, 1) == [b"b0"]
         assert reader.writer_generation == 2
@@ -180,9 +171,9 @@ def test_records_a_producer_left_behind_keep_its_generation(zctx: zmq.Context[zm
         reader.close()
 
 
-def test_a_stalled_shm_producer_is_fenced_once_another_took_over(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
-    """A producer that stalls past ``peer_timeout_s`` is taken over. When it goes on, its writes
-    fail and never reach the reader, and its close does not mark its successor closed."""
+def test_a_stalled_shm_producer_keeps_its_ring_until_it_closes(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """A stall is not a death: a producer stopped past ``peer_timeout_s``, heartbeat and all, still
+    holds the ring, so nobody can take it over and be overwritten when it goes on."""
     hosts = BACKENDS["shm"]
     reader, address = reader_for(zctx, hosts, tun=TUN)
     events, go = SPAWN.Queue(), SPAWN.Event()
@@ -192,24 +183,102 @@ def test_a_stalled_shm_producer_is_fenced_once_another_took_over(zctx: zmq.Conte
     try:
         assert events.get(timeout=20) == "wrote old:0"
         assert take(reader, 1) == [b"old:0"]
-        os.kill(child.pid, signal.SIGSTOP)  # its heartbeat stops too
-        time.sleep(TUN.peer_timeout_s + 0.3)
-        successor = writer_for(zctx, hosts, address, TUN)
-        successor.write(b"new:0", timeout=5)
+        os.kill(child.pid, signal.SIGSTOP)
+        time.sleep(TUN.peer_timeout_s + 0.3)  # its heartbeat is stale now
+        with pytest.raises(RingBusy):
+            writer_for(zctx, hosts, address, TUN)
         os.kill(child.pid, signal.SIGCONT)
         go.set()
-        assert events.get(timeout=20) == "fenced"
+        assert events.get(timeout=20) == "wrote old:1"
         assert events.get(timeout=20) == "closed"
-        assert take(reader, 1) == [b"new:0"] and reader.writer_generation == 2
-        assert reader.read(timeout=0.3) is None  # old:1 was never written
-        with pytest.raises(RingBusy):  # the successor still owns the ring
-            writer_for(zctx, hosts, address, TUN)
-        successor.write(b"new:1", timeout=5)
-        assert take(reader, 1) == [b"new:1"]
+        successor = writer_for(zctx, hosts, address, TUN)
+        successor.write(b"new:0", timeout=5)
+        got: list[tuple[bytes, int]] = []
+        for _ in range(2):
+            got.append((take(reader, 1)[0], reader.writer_generation))
+        assert got == [(b"old:1", 1), (b"new:0", 2)]
         successor.close()
     finally:
         os.kill(child.pid, signal.SIGCONT)
         child.join(10)
+        reader.close()
+
+
+def test_no_producer_takes_over_between_a_producers_check_and_its_write(
+        zctx: zmq.Context[zmq.Socket[bytes]], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interleaving Codex found on #23: the producer passes its ownership check, then stalls
+    (heartbeat stopped) past ``peer_timeout_s`` before it writes. A successor trying to take the
+    ring over right then is refused, so the stalled write cannot overwrite a successor's record."""
+    hosts = BACKENDS["shm"]
+    reader, address = reader_for(zctx, hosts, tun=TUN)
+    stalled = writer_for(zctx, hosts, address, TUN)
+    check = getattr(stalled, "_check")
+    refused: list[str] = []
+
+    def check_then_stall() -> None:  # at every check, so also right before the bytes are written
+        check()
+        getattr(stalled, "_hb").stop()
+        time.sleep(TUN.peer_timeout_s + 0.2)
+        try:
+            writer_for(zctx, hosts, address, TUN).close()
+        except RingBusy as e:
+            refused.append(str(e))
+
+    monkeypatch.setattr(stalled, "_check", check_then_stall)
+    try:
+        stalled.write(b"old:late", timeout=5)
+        assert refused and len(refused) == 2  # at the check that opens the write, and right before the bytes
+        assert take(reader, 1) == [b"old:late"] and reader.writer_generation == 1
+        stalled.close()
+        successor = writer_for(zctx, hosts, address, TUN)
+        successor.write(b"new:0", timeout=5)
+        assert take(reader, 1) == [b"new:0"] and reader.writer_generation == 2
+        successor.close()
+    finally:
+        reader.close()
+
+
+def test_a_closed_tcp_producer_keeps_a_tail_longer_than_the_queue(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """Codex's case on #23: the old producer's tail and the new one's backlog both exceed
+    ``stream_hwm``. How many frames wait proves nothing; the reader waits for the close frame."""
+    hosts = BACKENDS["tcp"]
+    tun = msgspec.structs.replace(TUN, stream_hwm=4, peer_timeout_s=2.0)
+    reader, address = reader_for(zctx, hosts, tun=tun)
+    try:
+        first = writer_for(zctx, hosts, address, tun)
+        for i in range(24):
+            first.write(f"a{i}".encode(), timeout=5)
+        first.close()
+        second = writer_for(zctx, hosts, address, tun)
+        for i in range(12):
+            second.write(f"b{i}".encode(), timeout=5)
+        second.close()
+        got: list[tuple[bytes, int]] = []
+        for _ in range(36):
+            got.append((take(reader, 1)[0], reader.writer_generation))
+        assert got == [(f"a{i}".encode(), 1) for i in range(24)] + [(f"b{i}".encode(), 2) for i in range(12)]
+    finally:
+        reader.close()
+
+
+def test_two_tcp_producers_writing_at_once_are_reported(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """A later producer's frames wait for the current one to end; if it never does, the wait is
+    bounded (``stream_hold_bytes``) and the reader says what happened instead of growing."""
+    hosts = BACKENDS["tcp"]
+    tun = msgspec.structs.replace(PATIENT, stream_hold_bytes=2000)
+    reader, address = reader_for(zctx, hosts, tun=tun)
+    current = writer_for(zctx, hosts, address, tun)
+    later = writer_for(zctx, hosts, address, tun)
+    try:
+        current.write(b"a0", timeout=5)
+        assert take(reader, 1) == [b"a0"]
+        for _ in range(40):
+            later.write(b"x" * 100, timeout=5)
+        with pytest.raises(PeerLost, match="two producers"):
+            take(reader, 1)
+    finally:
+        current.abort()
+        later.abort()
         reader.close()
 
 

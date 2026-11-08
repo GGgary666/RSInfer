@@ -17,6 +17,7 @@ record just returned. The process host keeps such readers for its units
 
 from __future__ import annotations
 
+import fcntl
 import math
 import secrets
 import struct
@@ -166,6 +167,18 @@ class _Ring:
         last = self.f64(off)
         return last != 0.0 and time.monotonic() - last > timeout
 
+    def hold(self) -> bool | None:
+        """Take the producer's lock: an exclusive ``flock`` on the segment, held until this
+        mapping closes, released by the kernel when the process ends however it ends. ``False``:
+        a live producer holds it; ``None``: this platform's shared memory has no such lock."""
+        try:
+            fcntl.flock(self.shm._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        except BlockingIOError:
+            return False
+        except OSError:
+            return None
+        return True
+
     def close(self) -> None:
         self.buf.release()
         self.shm.close()
@@ -181,11 +194,15 @@ _RECORD = struct.Struct("<II")  # payload length (or _MARK: skip to the ring's e
 
 class ShmWriter:
     """The producer of a ring. Opening it makes this producer the ring's owner: its generation
-    goes into the header (``_O_WGEN``) and into every record it writes. A producer that was
-    taken over (it stalled past ``peer_timeout_s``, then went on) is fenced: before writing,
-    before publishing, before beating and before closing it checks that it still owns the
-    ring, and does nothing if not. A record it slips in after all is older than records the
-    reader already returned, and the reader drops it."""
+    goes into the header (``_O_WGEN``) and into every record it writes.
+
+    Ownership is the producer's lock on the segment (``_Ring.hold``): a new producer takes
+    the ring over only once the last one closed or its process ended, never while it can still
+    write, however long it stalls. Where shared memory has no such lock, a producer whose
+    heartbeat is ``peer_timeout_s`` old is taken over instead; the taken-over one is fenced as
+    far as it can be: before writing, before publishing, before beating and before closing it
+    checks that it still owns the ring. A stall between that check and its write can still
+    overwrite its successor's records there (doc/specs/ipc.md §6)."""
 
     def __init__(self, name: str, tun: IpcTunables) -> None:
         self._ring = r = _Ring.attach(name)
@@ -193,10 +210,12 @@ class ShmWriter:
         if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, tun.peer_timeout_s):
             r.close()
             raise PeerLost(f"{name}: the step-stream reader is gone")
-        if r.f64(_O_WBEAT) != 0.0 and not r.u64(_O_WCLOSED) and not r.peer_lost(_O_WBEAT, tun.peer_timeout_s):
+        held = r.hold()
+        alive = r.f64(_O_WBEAT) != 0.0 and not r.u64(_O_WCLOSED) and not r.peer_lost(_O_WBEAT, tun.peer_timeout_s)
+        if held is False or (held is None and alive):
             r.close()
             raise RingBusy(f"{name} has a live producer")
-        # The previous producer closed or died: what it published stays for the reader, and a
+        # The previous producer closed or ended: what it published stays for the reader, and a
         # half-written record is invisible (its length and the head are written last).
         self._gen = r.u64(_O_WGEN) + 1
         r.set_u64(_O_WGEN, self._gen)
@@ -428,9 +447,11 @@ class TcpReader:
     """The consumer end over TCP. ZMQ fair-queues the connections of several producers, so their
     frames may arrive interleaved. A replaceable reader keeps one current producer, in order:
     frames of earlier producers are dropped; frames of a later one wait until the current one
-    closed, went quiet for ``peer_timeout_s``, or the later one has ``stream_hwm`` frames
-    waiting. Then the later one becomes current. So a producer's own records are never mixed
-    with another's, and the tail of one that closed in order is not lost to its successor."""
+    closed (its close frame was read) or went quiet for ``peer_timeout_s``. Then the later one
+    becomes current. So a producer's own records are never mixed with another's, and the tail
+    of one that closed in order is not lost to its successor. Waiting frames are bounded by
+    ``ipc.stream_hold_bytes``: past that, two producers write at once, and ``read`` raises
+    ``PeerLost``."""
 
     def __init__(self, zctx: zmq.Context[zmq.Socket[bytes]], bind_host: str, tun: IpcTunables, *,
                  replaceable: bool = False) -> None:
@@ -449,6 +470,8 @@ class TcpReader:
         """When the current producer's last frame arrived."""
         self._ready: deque[bytes] = deque()
         self._later: dict[_Producer, list[tuple[int, int, bytes]]] = {}
+        self._held = 0
+        """Bytes in ``_later``."""
         self.writer_generation = 0
         """The producer of the record last returned: 1 for the first, one more per replacement."""
 
@@ -483,21 +506,24 @@ class TcpReader:
             raise PeerLost("a second producer writes to a single-producer step stream")
         elif producer > current:
             self._later.setdefault(producer, []).append((seq, kind, payload))
+            self._held += len(raw)
+            if self._held > self._tun.stream_hold_bytes:
+                raise PeerLost(f"a later producer wrote {self._held} bytes while the current one did not end: "
+                               "two producers write to this step stream at once")
         # else: an earlier producer's frame, queued before it was replaced
 
-    def _replace_if_due(self, force: bool = False) -> None:
-        """Make the earliest waiting producer current once the current one is done with."""
+    def _replace_if_due(self) -> None:
+        """Make the earliest waiting producer current once the current one closed or went quiet.
+        How many frames wait proves nothing: the current one's tail may still be queued."""
         while self._later and not self._ready:
-            waiting = sum(len(frames) for frames in self._later.values())
-            quiet = time.monotonic() - self._last > self._tun.peer_timeout_s
-            if not (self._closed or quiet or force or waiting >= self._tun.stream_hwm):
+            if not (self._closed or time.monotonic() - self._last > self._tun.peer_timeout_s):
                 return
             producer = min(self._later)
             frames = self._later.pop(producer)
+            self._held -= sum(_FRAME.size + len(payload) for _, _, payload in frames)
             self._adopt(producer)
             for seq, kind, payload in frames:
                 self._take(seq, kind, payload)
-            force = False
 
     def read(self, timeout: float | None = None) -> bytes | None:
         deadline = None if timeout is None else time.monotonic() + timeout

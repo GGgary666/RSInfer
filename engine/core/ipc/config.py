@@ -18,5 +18,8 @@ class IpcTunables(msgspec.Struct, frozen=True):
     stream_socket_buffer: int = 1 << 16
     shm_capacity: int = 1 << 22
     """Bytes in a same-host step-stream ring."""
+    stream_hold_bytes: int = 1 << 26
+    """What a replaceable TCP reader holds of a later producer while the current one has not
+    ended; more means two producers write at once."""
     close_timeout_s: float = 10.0
     """How long an orderly close waits for the consumer to take what is queued."""
