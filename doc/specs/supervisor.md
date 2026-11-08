@@ -41,6 +41,7 @@ DECLARED → SPAWNING → RUNNING → STOPPING → STOPPED
 
 - 拉起：向目标机器的节点代理发 `Spawn(ProcSpec)`，`ProcSpec` 含角色、索引、身份（决定用哪个快照目录）、环境变量、GPU。
 - 进程起来以后向控制面报到，带上 `ProcId` 和自己装好的单元列表。
+- 报到时带上进程已经打开的数据通道读端地址。之后才打开的读端，用 `PublishEndpoint` 补登记。别的进程用 `Lookup` 查，只查得到 RUNNING 的进程的地址。进程要共享内存环的名字时，进程管家把 `AllocShm` 转给那台机器的节点代理（2026-11-08，[ipc.md](ipc.md) §6）。
 - 停止：先发 `Stop`（进程卸载全部单元后退出），超时后让节点代理强杀。
 - 重启 = 停止 + 拉起。被重启进程里的状态单元会随之消失，由 `core.change` 事先安排排空。
 

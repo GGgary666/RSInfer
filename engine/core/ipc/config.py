@@ -7,6 +7,8 @@ import msgspec
 
 class IpcTunables(msgspec.Struct, frozen=True):
     rpc_timeout_s: float = 5.0
+    lookup_retry_s: float = 0.1
+    """How often a data-channel writer asks the supervisor again for a reader it has not found."""
     heartbeat_interval_s: float = 0.1
     """How often each end of a same-host step stream proves it is alive."""
     peer_timeout_s: float = 2.0

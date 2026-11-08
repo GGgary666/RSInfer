@@ -39,16 +39,22 @@ from core.common.messages import Envelope
 from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 from core.common.tunables import load_tunables
 from core.control.protocol import ChangeQueued, SubmitChange
+from core.ipc.channels import Channels
 from core.ipc.config import IpcTunables
 from core.ipc.rpc import Deferred, SyncRpcClient, SyncRpcServer
 from core.ipc.stream import StreamAddress
 from core.supervisor.protocol import (
+    AllocShm,
     CheckIn,
+    Found,
     Introspect,
+    Lookup,
     ProcIntrospection,
     ProcSpec,
     ProcStatusReport,
+    PublishEndpoint,
     ReadRecord,
+    ShmAllocated,
     Status,
     UnitBrief,
     control_registry,
@@ -92,6 +98,8 @@ def make_platform(spec: ProcSpec) -> Platform:
 
 CONTROL_LINK = "proc.control@1"
 """Host service: what a unit may ask of the control plane (submit an internal change)."""
+STREAMS = "proc.streams@1"
+"""Host service: the data channels the host keeps for its units (``core.ipc.channels``)."""
 
 
 class ControlLink:
@@ -179,6 +187,10 @@ class ProcessHost:
         self.diagnostics: list[Diagnostic] = []
         self.participant = Participant(self, load_tunables(ChangeTunables, "change", dict(spec.tunables)))
         self.runtime.provide_host(CONTROL_LINK, ControlLink(self))
+        self.checked_in = False
+        self.channels = Channels(self.zctx, local=spec.proc.host, bind=spec.bind_address, tun=self.ipc,
+                                 allocate=self._allocate_ring, lookup=self._lookup, publish=self._publish)
+        self.runtime.provide_host(STREAMS, self.channels)
 
     # ------------------------------------------------------------- startup
 
@@ -190,7 +202,9 @@ class ProcessHost:
             plan = msgspec.structs.replace(plan, code_root=str(Path(__file__).resolve().parents[2]))
         loaded = self.runtime.load_process_plan(plan)
         self.diagnostics += loaded.diagnostics
-        return self.check_in()
+        checked = self.check_in()
+        self.checked_in = isinstance(checked, Ok)
+        return checked
 
     def check_in(self) -> Result[msgspec.Struct]:
         msg = CheckIn(
@@ -204,6 +218,26 @@ class ProcessHost:
             module_files=loaded_engine_files(),
         )
         return self.client.call(self.spec.control, msg, timeout=self.tun.checkin_timeout_s)
+
+    def _allocate_ring(self, name: str) -> str:
+        """A ring name from this host's node agent, which removes the ring when the process is gone."""
+        r = self.client.call(self.spec.control, AllocShm(self.spec.proc, name), timeout=self.ipc.rpc_timeout_s)
+        allocated = r.unwrap()  # raises in the unit that asked: it cannot have the reader
+        assert isinstance(allocated, ShmAllocated)
+        return allocated.name
+
+    def _lookup(self, proc: ProcId, channel: str) -> StreamAddress | None:
+        r = self.client.call(self.spec.control, Lookup(proc, channel), timeout=self.ipc.rpc_timeout_s)
+        if isinstance(r, Failed) or not isinstance(r.value, Found):
+            return None  # the writer tries again later
+        return r.value.address
+
+    def _publish(self, channel: str, address: StreamAddress) -> None:
+        """Readers opened before the check-in go with it; later ones are sent on their own."""
+        self.endpoints[channel] = address
+        if self.checked_in:
+            msg = PublishEndpoint(self.spec.proc, self.spec.incarnation, channel, address)
+            self.client.call(self.spec.control, msg, timeout=self.ipc.rpc_timeout_s).unwrap()
 
     def unit_briefs(self) -> list[UnitBrief]:
         return [UnitBrief(u.unit, u.state, u.error, u.generation) for u in self.runtime.snapshot().units]
@@ -289,6 +323,7 @@ class ProcessHost:
             print(f"quiesce before shutdown failed, units not unloaded: {quiesced}", file=sys.stderr)
         else:
             self.runtime.unload_all()
+        self.channels.close()
         self.rpc.close()
         self.client.close()
         self.zctx.term()

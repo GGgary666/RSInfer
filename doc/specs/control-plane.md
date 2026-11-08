@@ -102,7 +102,7 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 
 - `UnitRuntime.provide_host(name, obj)`：宿主服务。
 - `ctx.derived(name, rebuild=..., units=[...])`：登记派生产物；它按值依赖的配置键由 `plan_scope(name)` 里的读取自动记下。
-- 进程宿主回答 `Introspect`；提供 `proc.control@1`。
+- 进程宿主回答 `Introspect`；提供 `proc.control@1` 和数据通道 `proc.streams@1`（[ipc.md](ipc.md) §6）。
 - `ChangeSet.state`：内部变更的状态请求（单元、动作、参数）。
 - `RoleSpec.leads_epochs`：哪个角色决定 epoch（调度宿主）。
 - `ActionPlan.control`：给控制面进程的动作。

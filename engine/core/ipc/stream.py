@@ -8,13 +8,20 @@ same ``StepWriter`` / ``StepReader``, and the backend is chosen by comparing
 
 A peer that stops proving it is alive for ``ipc.peer_timeout_s`` is reported
 as ``PeerLost``; the caller reports that to the control plane.
+
+A reader opened ``replaceable`` outlives its producers: when one closes or dies, the
+next one to connect takes over, and ``writer_generation`` counts them. The process host
+keeps such readers for its units (``core.ipc.channels``, doc/specs/ipc.md §6).
 """
 
 from __future__ import annotations
 
+import math
+import secrets
 import struct
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -36,6 +43,10 @@ class PeerLost(ConnectionError):
 
 class StreamClosed(EOFError):
     """The producer closed the stream in an orderly way."""
+
+
+class RingBusy(ConnectionError):
+    """A live producer already writes to this shared-memory ring."""
 
 
 class StreamAddress(msgspec.Struct, frozen=True):
@@ -92,11 +103,11 @@ class _Heartbeat(threading.Thread):
 
 # --------------------------------------------------------------------- shm
 
-_MAGIC = 0x41475852494E4731  # "AGXRING1"
-_HEADER = 64
+_MAGIC = 0x41475852494E4732  # "AGXRING2"
+_HEADER = 128
 _MARK = 0xFFFFFFFF
 # offsets in the header
-_O_MAGIC, _O_CAP, _O_HEAD, _O_TAIL, _O_WBEAT, _O_RBEAT, _O_WCLOSED, _O_RCLOSED = range(0, 64, 8)
+_O_MAGIC, _O_CAP, _O_HEAD, _O_TAIL, _O_WBEAT, _O_RBEAT, _O_WCLOSED, _O_RCLOSED, _O_WGEN = range(0, 72, 8)
 
 
 def _pad(n: int) -> int:
@@ -123,7 +134,7 @@ class _Ring:
     def create(cls, name: str, capacity: int) -> _Ring:
         shm = SharedMemory(name=name, create=True, size=_HEADER + capacity)
         assert shm.buf is not None
-        struct.pack_into("<QQQQddQQ", shm.buf, 0, _MAGIC, capacity, 0, 0, 0.0, 0.0, 0, 0)
+        struct.pack_into("<QQQQddQQQ", shm.buf, 0, _MAGIC, capacity, 0, 0, 0.0, 0.0, 0, 0, 0)
         return cls(shm, owner=True)
 
     @classmethod
@@ -166,8 +177,15 @@ class _Ring:
 
 class ShmWriter:
     def __init__(self, name: str, tun: IpcTunables) -> None:
-        self._ring = _Ring.attach(name)
+        self._ring = r = _Ring.attach(name)
         self._tun = tun
+        if r.f64(_O_WBEAT) != 0.0 and not r.u64(_O_WCLOSED) and not r.peer_lost(_O_WBEAT, tun.peer_timeout_s):
+            r.close()
+            raise RingBusy(f"{name} has a live producer")
+        # The previous producer closed or died: published records stay for the reader, and an
+        # unpublished half record is invisible (the length and head are written last).
+        r.set_u64(_O_WCLOSED, 0)
+        r.set_u64(_O_WGEN, r.u64(_O_WGEN) + 1)
         self._ring.beat(_O_WBEAT)
         self._hb = _Heartbeat(tun.heartbeat_interval_s, lambda: self._ring.beat(_O_WBEAT))
         self._hb.start()
@@ -178,6 +196,8 @@ class ShmWriter:
         size = _pad(4 + len(data))
         if size > cap:
             raise ValueError(f"record of {len(data)} bytes exceeds ring capacity {cap}")
+        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
+            raise PeerLost("step-stream reader is gone")  # before writing into a ring nobody reads
         deadline = None if timeout is None else time.monotonic() + timeout
         backoff = _Backoff()
         while True:
@@ -213,11 +233,15 @@ class ShmWriter:
         self._ring.set_u64(_O_WCLOSED, 1)
         self._ring.close()
 
+    def abort(self) -> None:
+        self.close()
+
 
 class ShmReader:
-    def __init__(self, name: str, tun: IpcTunables) -> None:
+    def __init__(self, name: str, tun: IpcTunables, *, replaceable: bool = False) -> None:
         self._ring = _Ring.create(name, tun.shm_capacity)
         self._tun = tun
+        self._replaceable = replaceable
         self.name = name
         self._ring.beat(_O_RBEAT)
         self._hb = _Heartbeat(tun.heartbeat_interval_s, lambda: self._ring.beat(_O_RBEAT))
@@ -239,13 +263,19 @@ class ShmReader:
                 data = bytes(r.buf[_HEADER + pos + 4:_HEADER + pos + 4 + n])
                 r.set_u64(_O_TAIL, tail + _pad(4 + n))
                 return data
-            if r.u64(_O_WCLOSED):
-                raise StreamClosed("producer closed the stream")
-            if r.peer_lost(_O_WBEAT, self._tun.peer_timeout_s):
-                raise PeerLost("step-stream writer is gone")
+            if not self._replaceable:
+                if r.u64(_O_WCLOSED):
+                    raise StreamClosed("producer closed the stream")
+                if r.peer_lost(_O_WBEAT, self._tun.peer_timeout_s):
+                    raise PeerLost("step-stream writer is gone")
             if deadline is not None and time.monotonic() > deadline:
                 return None
             backoff.wait()
+
+    @property
+    def writer_generation(self) -> int:
+        """Producers this ring has had; a new one takes over after the last closed or died."""
+        return self._ring.u64(_O_WGEN)
 
     def close(self) -> None:
         self._hb.stop()
@@ -255,7 +285,7 @@ class ShmReader:
 
 # --------------------------------------------------------------------- tcp
 
-_FRAME = struct.Struct("<QB")  # sequence number, kind (0 data, 1 close)
+_FRAME = struct.Struct("<QQB")  # producer id, sequence number, kind (0 data, 1 close)
 
 
 def _tune(sock: zmq.Socket[bytes], tun: IpcTunables) -> None:
@@ -303,11 +333,18 @@ class TcpWriter:
         self._sock.setsockopt(zmq.IMMEDIATE, 1)
         self._link = _Link(self._sock)
         self._sock.connect(address)
+        self._id = secrets.randbits(64)
         self._seq = 0
         self._tun = tun
 
+    @property
+    def connected(self) -> bool:
+        """The reader accepted the connection and has not dropped it."""
+        self._link.update()
+        return self._link.seen and not self._link.lost
+
     def _send(self, kind: int, data: bytes, timeout: float | None) -> None:
-        frame = _FRAME.pack(self._seq, kind) + data
+        frame = _FRAME.pack(self._id, self._seq, kind) + data
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             self._link.update()
@@ -337,30 +374,69 @@ class TcpWriter:
         self._link.close()
         self._sock.close(linger)
 
+    def abort(self) -> None:
+        """Drop the connection without delivering what is queued (the reader is gone or replaced)."""
+        self._link.close()
+        self._sock.close(0)
+
 
 class TcpReader:
-    def __init__(self, zctx: zmq.Context[zmq.Socket[bytes]], bind_host: str, tun: IpcTunables) -> None:
+    def __init__(self, zctx: zmq.Context[zmq.Socket[bytes]], bind_host: str, tun: IpcTunables, *,
+                 replaceable: bool = False) -> None:
         self._sock = zctx.socket(zmq.PULL)
         _tune(self._sock, tun)
         self._link = _Link(self._sock)
         self._sock.bind(f"tcp://{bind_host}:*")
         self.address = self._sock.getsockopt_string(zmq.LAST_ENDPOINT)
+        self._replaceable = replaceable
+        self._writer: int | None = None
         self._expect = 0
+        self._retired: deque[int] = deque(maxlen=16)
+        self.writer_generation = 0
+        """Producers this reader has taken records from."""
+
+    def _accept(self, writer: int, seq: int) -> bool:
+        """Whether a frame of ``writer`` is read; switches to a new producer at its first frame."""
+        if writer == self._writer:
+            return True
+        if writer in self._retired:
+            return False  # queued before its producer was replaced or closed
+        if self._writer is not None and not self._replaceable:
+            raise PeerLost("a second producer writes to a single-producer step stream")
+        if seq != 0:
+            raise PeerLost(f"step stream lost records: a new producer starts at #{seq}")
+        if self._writer is not None:
+            self._retired.append(self._writer)
+        self._writer, self._expect = writer, 0
+        self.writer_generation += 1
+        return True
 
     def read(self, timeout: float | None = None) -> bytes | None:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            if self._sock.poll(10, zmq.POLLIN):
+            # Never wait past the deadline: read(0) only looks.
+            wait_ms = 10 if deadline is None else min(10, max(0, math.ceil((deadline - time.monotonic()) * 1000)))
+            if self._sock.poll(wait_ms, zmq.POLLIN):
                 raw = self._sock.recv()
-                seq, kind = _FRAME.unpack_from(raw)
+                writer, seq, kind = _FRAME.unpack_from(raw)
+                if not self._accept(writer, seq):
+                    continue
                 if seq != self._expect:
                     raise PeerLost(f"step stream lost records: expected #{self._expect}, got #{seq}")
                 self._expect += 1
                 if kind == 1:
-                    raise StreamClosed("producer closed the stream")
+                    if not self._replaceable:
+                        raise StreamClosed("producer closed the stream")
+                    self._retired.append(writer)
+                    self._writer = None
+                    continue
                 return raw[_FRAME.size:]
             self._link.update()
-            if self._link.lost:
+            if self._link.lost and not self._replaceable:
+                # Data and monitor events come through separate queues: the last records may
+                # be ready after the empty poll, before the disconnect was seen.
+                if self._sock.poll(0, zmq.POLLIN):
+                    continue
                 raise PeerLost("step-stream writer disconnected")
             if deadline is not None and time.monotonic() > deadline:
                 return None
@@ -374,18 +450,19 @@ class TcpReader:
 
 def open_reader(
     zctx: zmq.Context[zmq.Socket[bytes]], *, local: HostId, peer: HostId, bind_host: str, shm_name: str,
-    tun: IpcTunables,
-) -> tuple[StepReader, StreamAddress]:
-    """The consumer end. ``shm_name`` comes from the node agent of this host."""
+    tun: IpcTunables, replaceable: bool = False,
+) -> tuple[ShmReader | TcpReader, StreamAddress]:
+    """The consumer end. ``shm_name`` comes from the node agent of this host. A ``replaceable``
+    reader takes the next producer when one closes or dies, instead of ending the stream."""
     if backend_for(local, peer) == "shm":
-        return ShmReader(shm_name, tun), StreamAddress(local, shm=shm_name)
-    reader = TcpReader(zctx, bind_host, tun)
+        return ShmReader(shm_name, tun, replaceable=replaceable), StreamAddress(local, shm=shm_name)
+    reader = TcpReader(zctx, bind_host, tun, replaceable=replaceable)
     return reader, StreamAddress(local, tcp=reader.address)
 
 
 def open_writer(
     zctx: zmq.Context[zmq.Socket[bytes]], *, local: HostId, address: StreamAddress, tun: IpcTunables,
-) -> StepWriter:
+) -> ShmWriter | TcpWriter:
     if backend_for(local, address.host) == "shm":
         if address.shm is None:
             raise ValueError(f"reader on {address.host} offers no shared-memory ring")
