@@ -3,8 +3,14 @@
 The math follows the HF ``qwen3_5`` model, dtype casts included; state layouts follow sglang:
 paged KV is ``[slots, kv_heads, head_dim]`` per layer (``MHATokenToKVPool``, NHD), GDN conv
 state ``[conv_dim, kernel - 1]`` and recurrent state ``[v_heads, v_dim, k_dim]`` per slot
-(``MambaPool``). Rows are computed one at a time and tokens in order, so a row's result does
-not depend on the other rows of the batch.
+(``MambaPool``).
+
+Batch invariance (``Definition.batch_invariant``): attention and sampling compute row by row,
+conv and the delta rule take one row and go token by token, and lookup and store only move
+data, so a row's result does not depend on the other rows. Norms, RoPE, activations, linear and
+gating run one torch op over the whole batch; PyTorch may take another path or accumulation
+order for another number of rows (fp32 ``linear`` on the CPU differs in the last bits between
+one row alone and the same row among others), so their rows are not batch invariant.
 """
 
 from __future__ import annotations
@@ -56,7 +62,7 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-    """``gemm.linear@1``: ``x @ weight.T + bias``."""
+    """``gemm.linear@1``: ``x @ weight.T + bias``, one GEMM over all rows (not batch invariant)."""
     return F.linear(x, weight, bias)
 
 

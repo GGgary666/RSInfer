@@ -1,6 +1,6 @@
 """kernels.reference against the HF ``qwen3_5`` model it follows, and the properties the engine
-relies on: a chunked prefill continues where the last chunk stopped, and rows do not affect
-each other."""
+relies on: a chunked prefill continues where the last chunk stopped, and the references that
+claim batch invariance give a row the same bits alone and among other rows."""
 
 from __future__ import annotations
 
@@ -9,8 +9,62 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from kernels.reference import ops
+from kernels.reference.unit import DEFINITIONS
 
 torch.manual_seed(0)
+
+ROW_COUNTS = (1, 2, 3, 5, 8, 13)
+BATCHED_INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.paged@1", "sample.seeded@1"}
+"""Batch invariant and checked below, row alone against the same row among others."""
+ONE_ROW = {"gdn.conv1d@1", "gdn.delta_rule@1"}
+"""Take one row; the layer calls them row by row."""
+
+
+def test_only_the_row_by_row_references_claim_batch_invariance() -> None:
+    """A new claim needs a check in the test below. Linear, norms, RoPE, activations and gating
+    run one op over the whole batch and do not claim it (fp32 linear differs in the last bits)."""
+    assert {name for name, *_, invariant in DEFINITIONS if invariant} == BATCHED_INVARIANT | ONE_ROW
+
+
+def test_the_batch_invariant_references_give_a_row_the_same_bits_alone_and_batched() -> None:
+    gen = torch.Generator().manual_seed(3)
+    for dtype in (torch.float32, torch.bfloat16):
+        table = torch.randn(100, 64, generator=gen).to(dtype)
+        for n in ROW_COUNTS:
+            ids = torch.randint(0, 100, (n,), generator=gen)
+            assert all(torch.equal(ops.embedding(ids, table)[r:r + 1], ops.embedding(ids[r:r + 1], table))
+                       for r in range(n))
+
+            heads, kv_heads, dim = 4, 2, 32
+            lengths = torch.randint(1, 9, (n,), generator=gen).tolist()
+            new = [min(length, q) for length, q in zip(lengths, torch.randint(1, 4, (n,), generator=gen).tolist())]
+            free = torch.randperm(sum(lengths), generator=gen) + 1  # scattered slots; slot 0 is padding
+            rows = list(torch.split(free, lengths))
+            caches = torch.zeros(sum(lengths) + 1, kv_heads, dim, dtype=dtype), \
+                torch.zeros(sum(lengths) + 1, kv_heads, dim, dtype=dtype)
+            k, v = torch.randn(sum(lengths), kv_heads, dim, generator=gen), torch.randn(sum(lengths), kv_heads, dim,
+                                                                                         generator=gen)
+            ops.kv_store(*caches, free, k, v)
+            for r in range(n):  # a row stored alone lands on the same bits
+                alone = torch.zeros_like(caches[0]), torch.zeros_like(caches[1])
+                start = sum(lengths[:r])
+                ops.kv_store(*alone, rows[r], k[start:start + lengths[r]], v[start:start + lengths[r]])
+                assert torch.equal(alone[0][rows[r]], caches[0][rows[r]])
+                assert torch.equal(alone[1][rows[r]], caches[1][rows[r]])
+            q = torch.randn(sum(new), heads, dim, generator=gen).to(dtype)
+            out = ops.paged_attention(q, *caches, rows, new, dim ** -0.5)
+            for r in range(n):
+                start = sum(new[:r])
+                alone_out = ops.paged_attention(q[start:start + new[r]], *caches, [rows[r]], [new[r]], dim ** -0.5)
+                assert torch.equal(out[start:start + new[r]], alone_out), (dtype, n, r)
+
+            logits = torch.randn(n, 50, generator=gen).to(dtype)
+            temp = torch.rand(n, generator=gen).tolist()
+            top_p, top_k = [0.9] * n, [20] * n
+            seeds, pos = list(range(n)), torch.randint(0, 100, (n,), generator=gen).tolist()
+            drawn = ops.sample(logits, temp, top_p, top_k, seeds, pos)
+            assert all(torch.equal(drawn[r:r + 1], ops.sample(logits[r:r + 1], [temp[r]], [top_p[r]], [top_k[r]],
+                                                              [seeds[r]], [pos[r]])) for r in range(n))
 
 
 def test_norms_match_hf() -> None:

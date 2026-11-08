@@ -327,9 +327,14 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - **实现（2026-11-08）**：
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
   - 选择：符合 shape 和平台能力的非参照 solution 里按 id 取第一个；没有就用参照实现，`Selected.fallback` 为真。`Definition.reference` 是参照 solution 的 id。
+  - definition 的名字和 solution 的 id 在目录里唯一，重复登记会报错，所以查找结果和登记顺序无关。重载时旧实例的登记先撤掉，新实例再登记，不会撞名。参照 solution 的 id 带版本（`reference.gemm.linear@1`），同一 definition 的新旧版本可以同时登记（2026-11-09）。
   - `kernels.reference`（`engine/kernels/reference/`）登记 Qwen3.8 要的全部 definition 和 PyTorch 参照：`norm.gemma_rms`、`norm.rms_gated`、`pos.rope_neox`、`act.silu_and_mul`、`gemm.linear`、`embed.lookup`、`kv.store`、`attn.paged`、`gdn.conv1d`、`gdn.gating`、`gdn.delta_rule`、`sample.seeded`（都是 `@1`）。
-  - 参照按 HF `qwen3_5` 的算法和 dtype 转换写，按行、按 token 顺序算，所以和 batch 怎么拼无关；conv 和 delta rule 可以接着上一块的状态继续算（HF 的 prefill 卷积不接受初始状态，这部分是补的）。采样按（seed, 位置）取随机数。
-  - 测试：`tests/units/kernels/`，对照 HF 的实现，以及分块等于不分块、单独算等于一起算。
+  - 参照按 HF `qwen3_5` 的算法和 dtype 转换写；conv 和 delta rule 可以接着上一块的状态继续算（HF 的 prefill 卷积不接受初始状态，这部分是补的）。采样按（seed, 位置）取随机数。
+  - **和 batch 怎么拼是否无关**（`Definition.batch_invariant`，默认否，2026-11-09 更正）：
+    - 声明为是的只有按构造成立的：attention 和采样逐行算，conv 和 delta rule 每次只接一行、逐 token 算，lookup 和 store 只搬数据。
+    - norm、RoPE、激活、linear、gating 是一个 torch 算子作用在整个 batch 上，PyTorch 会随行数换计算路径和累加顺序，不声明。实测 CPU fp32 的 linear，同一行单独算和放进 batch 里算，最后几位不同；两个 logit 很接近时，greedy 会选出不同的 token。
+    - 未决：§1 验收里的“批量对单条”和 §4.4 第 8 条的“开重叠对不开”要求完全一致，只靠这套参照做不到。M2d 之前要定：这些对比用逐行算的 solution，还是按容差比。
+  - 测试：`tests/units/kernels/`，对照 HF 的实现、分块等于不分块；声明和 batch 怎么拼无关的参照，单独算和放进 batch 里算逐位相同。
 
 ## 7. 层、模型、权重
 

@@ -28,8 +28,10 @@ class Definition(msgspec.Struct, frozen=True):
     """Id of the PyTorch reference solution (registered by ``kernels.reference``). Every
     definition has one; it runs on ``torch_eager`` in CI and is what a solution is tested against."""
     tolerance: Tolerance = Tolerance()
-    batch_invariant: bool = True
-    """The result for one row does not depend on the other rows of the batch."""
+    batch_invariant: bool = False
+    """The result for one row does not depend on the other rows of the batch, bit for bit.
+    Claimed only where it holds by construction: one torch op over the whole batch may take
+    another path or accumulation order for another number of rows."""
 
 
 class Solution(msgspec.Struct, frozen=True):

@@ -14,7 +14,7 @@ from core.contracts.kernels import Definition, Implementation, Solution
 from core.kernels.unit import KernelCatalog
 from core.manifest.checks import check_tree
 from kernels.reference import ops
-from kernels.reference.unit import DEFINITIONS
+from kernels.reference.unit import DEFINITIONS, reference_id
 from platforms.torch_eager import TorchEagerPlatform
 from tests.framework.support import PROC
 from unit.runtime import ProcessPlan, ReloadPlan, UnitRuntime, UnitSpec
@@ -46,6 +46,24 @@ def test_selection_takes_a_fitting_solution_and_falls_back_to_the_reference() ->
         cat.select("attn.paged@1", {})
 
 
+def test_two_versions_of_a_definition_each_run_their_own_reference() -> None:
+    """The reference id keeps the version, so ``@1`` and ``@2`` sit side by side; a name or id
+    registered twice is refused, since a lookup would take whichever came first."""
+    cat = KernelCatalog([])
+    for version, result in (("gemm.linear@1", 1), ("gemm.linear@2", 2)):
+        cat.register(Definition(version, "", reference_id(version)))
+        cat.register(Implementation(Solution(reference_id(version), version, "m:f"), lambda result=result: result))
+    assert (cat.call("gemm.linear@1", {}), cat.call("gemm.linear@2", {})) == (1, 2)
+    assert cat.solutions("gemm.linear@2") == ["reference.gemm.linear@2"]
+    with pytest.raises(ValueError, match="definition 'gemm.linear@1' is already registered"):
+        cat.register(Definition("gemm.linear@1", "", "other"))
+    with pytest.raises(ValueError, match="solution 'reference.gemm.linear@2' is already registered"):
+        cat.register(Implementation(Solution("reference.gemm.linear@2", "gemm.linear@2", "m:g"), lambda: 3))
+    undo = cat.register(Definition("attn.paged@1", "", "reference.attn.paged@1"))
+    undo()
+    cat.register(Definition("attn.paged@1", "", "reference.attn.paged@1"))  # free again once undone
+
+
 def test_the_kernel_units_pass_the_manifest_rules() -> None:
     errors, _ = check_tree(ENGINE, None, FrameworkModules.default())
     assert [e for e in errors if e.subject in (CATALOG, REFERENCE)] == []
@@ -65,6 +83,7 @@ def test_a_reloaded_kernel_unit_registers_again_and_an_unloaded_one_leaves_nothi
     assert cat.select("norm.gemma_rms@1", {}).fallback
     rt.reload(ReloadPlan(units_to_reload=[spec(REFERENCE)])).unwrap()
     assert [d.name for d in cat.definitions()] == sorted(names)
-    assert all(cat.solutions(n) == [f"reference.{n.partition('@')[0]}"] for n in names)
+    assert all(cat.solutions(n) == [f"reference.{n}"] for n in names)
+    assert {d.name for d in cat.definitions() if d.batch_invariant} == {n for n, *_, inv in DEFINITIONS if inv}
     rt.unload_all().unwrap()
     assert cat.definitions() == [] and cat.solutions("norm.gemma_rms@1") == []

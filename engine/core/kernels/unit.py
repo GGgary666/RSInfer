@@ -24,8 +24,14 @@ class KernelCatalog:
         self._implementations: Registry[Implementation] = Registry("kernels.implementations")
 
     def register(self, item: Definition | Implementation) -> Callable[[], None]:
+        """Names and ids are unique, so a lookup never depends on the order of registration. A
+        reload undoes the old instance's registrations before the new instance registers."""
         if isinstance(item, Definition):
+            if any(d.name == item.name for d in self._definitions):
+                raise ValueError(f"kernel definition {item.name!r} is already registered")
             return self._definitions.register(item)
+        if any(i.solution.id == item.solution.id for i in self._implementations):
+            raise ValueError(f"kernel solution {item.solution.id!r} is already registered")
         return self._implementations.register(item)
 
     def definition(self, name: str) -> Definition:
