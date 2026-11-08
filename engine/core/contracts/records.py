@@ -1,6 +1,7 @@
-"""Per-step records between the scheduler host, the workers and the frontend
-(stage2-contract.md §4). Each class is one section of an ``OpenRecord`` (doc/specs/ipc.md §3),
-named by ``SECTION``; a receiver decodes the sections it knows.
+"""Per-step records between the scheduler host and the workers (stage2-contract.md §4).
+Each class is one section of an ``OpenRecord`` (doc/specs/ipc.md §3), named by ``SECTION``;
+a receiver decodes the sections it knows. The records between the frontend and the
+scheduler host are in ``core.contracts.requests``.
 
 The epoch of a record is its step number, assigned by the scheduler (change.md 4.2 step 4).
 The scheduler may issue step ``N + 1`` before it has the result of step ``N`` (one step of
@@ -15,25 +16,12 @@ from typing import ClassVar, Literal
 import msgspec
 
 from core.contracts.columns import Column
+from core.contracts.sampling import SamplingParams
 
 STEP_PLAN = "sched.step_plan@1"
 """Schema of the scheduler -> worker record, one per rank (P3)."""
 STEP_RESULT = "worker.step_result@1"
 """Schema of the worker -> scheduler record."""
-REQUESTS = "frontend.requests@1"
-"""Schema of the frontend -> scheduler record."""
-TOKENS = "sched.tokens@1"
-"""Schema of the scheduler -> frontend record."""
-
-
-class SamplingParams(msgspec.Struct, frozen=True):
-    temperature: float = 1.0
-    top_p: float = 1.0
-    top_k: int = -1
-    seed: int | None = None
-    """Set by the scheduler at admission when the client gave none. The worker draws from
-    (seed, position) and keeps no random state: the same tokens however requests are batched,
-    and a rebuilt persistent batch samples what the old one would have (§4.3)."""
 
 
 # ------------------------------------------------------------------ scheduler -> worker
@@ -179,45 +167,3 @@ class Resync(msgspec.Struct, frozen=True):
 
     SECTION: ClassVar[str] = "worker.resync@1"
     reason: str = ""
-
-
-# ------------------------------------------------------------------ frontend <-> scheduler
-
-
-class NewRequest(msgspec.Struct, frozen=True):
-    request: int
-    """Assigned by the frontend; unique while the request lives."""
-    prompt: Column
-    """``i64`` token ids."""
-    sampling: SamplingParams = SamplingParams()
-    max_tokens: int = 256
-    stop_token_ids: list[int] = []
-
-
-class AbortRequest(msgspec.Struct, frozen=True):
-    request: int
-    reason: str = ""
-    """E.g. a stop string the detokenizer found, or the client went away."""
-
-
-class Requests(msgspec.Struct, frozen=True):
-    SECTION: ClassVar[str] = "frontend.batch@1"
-    new: list[NewRequest] = []
-    abort: list[AbortRequest] = []
-
-
-type FinishReason = Literal["stop", "length", "abort", "version_switch"]
-
-
-class TokenEvents(msgspec.Struct, frozen=True):
-    """New tokens of one step for the frontend; ``requests[i]`` owns
-    ``tokens[offsets[i]:offsets[i + 1]]``. With overlap a request may get one token past
-    its stop condition; the scheduler drops it before it gets here."""
-
-    SECTION: ClassVar[str] = "sched.events@1"
-    identity: str
-    """The identity the step ran under (the ``x-engine-identity`` header, v0-plan 5.8)."""
-    requests: Column
-    offsets: Column
-    tokens: Column
-    finished: dict[int, FinishReason] = {}

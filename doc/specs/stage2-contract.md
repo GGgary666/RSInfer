@@ -110,13 +110,60 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 - `engine/core/contracts/` 是一个库：不是单元，也不属于框架本体。先例是 `core/sourcetree.py`。
   - 不能放进某个单元的目录：别的单元 import 它，会被 `core.manifest` 报 `manifest.cross_unit_import`。
   - 放在单元目录之外，接口两边的单元都 import 它。接口一改，所有 import 它的单元在同一个 epoch 一起重载，这正是“改接口时两边一起重载”（modules.html ⑥）要的效果。
-- 不 import torch，因为 CI 不一定装 torch。张量的类型写作 `Tensor`（就是 `Any`）。
+- 不 import torch，因为 CI 不一定装 torch。张量的类型写作 `Tensor`（就是 `Any`），在 `tensor.py`。
 - 服务名带版本（`plan@1`）。签名不兼容的改动要升版本，旧版本和新版本可以在同一个 epoch 换掉。
-- 测试：`tests/units/contracts/`。现在测了列编码和记录的往返、`BatchPlan.check()`（§4.2）、联合前缀匹配（§5.3），以及单元 import 契约时能通过 `core.manifest` 的检查。
+- 测试：`tests/units/contracts/`。现在测了：
+  - 列编码和记录的往返；
+  - `BatchPlan.check()`（§4.2）；
+  - 联合前缀匹配（§5.3）；
+  - 单元 import 契约时能通过 `core.manifest` 的检查；
+  - 每个模块只 import 到自己那条接缝的模块（§3.1）。
+
+### 3.1 一条接缝一个模块（2026-11-08）
+
+- **为什么要拆。**
+  - `core.deps` 判断一个单元要不要重载，看的是它的入口模块传递 import 到的模块里有没有改过的；每个模块还算依赖自己的父包（`engine/unit/runtime/imports.py`）。
+  - 所以改了契约里的一个模块，import 得到它的单元全都在同一个 epoch 重载，不管它们用没用到改的那部分。
+- **重载的代价远不只是重新 import：**
+  - `core.plan` 重载以后，graph 不能在准备阶段分片重录，只能在暂停期内一次录完（§9.4）；
+  - 状态单元重载以后是一个空的新实例，默认要先排空（`drain_on_reload = true`，[state-changes.md](state-changes.md)），除非它实现了版本迁移；
+  - 权重存储重载又不能迁移的话，要重读权重。
+- **所以按接缝拆成下面这些模块，每个模块只 import 它这条接缝要的契约模块。** `__init__.py` 只留 docstring，因为包里每个模块都依赖它。
+
+| 模块 | 内容 | 接缝 | 还会 import 到的契约模块 |
+|---|---|---|---|
+| `columns.py` | `Column` | 列编码（§4.5） | — |
+| `tensor.py` | `Tensor`、`Binding` | worker 里交出 buffer 的单元和用它的单元 | — |
+| `sampling.py` | `SamplingParams` | 前端 → 调度 → worker | — |
+| `requests.py` | `Requests`、`TokenEvents` 等 | 前端 ↔ 调度 | `columns`、`sampling` |
+| `records.py` | `RowDelta`、`BatchPlan`、`StateOps`、`Sampled` 等 | 调度 ↔ worker | `columns`、`sampling` |
+| `state.py` | `StateDecl` | 模型 → 存储单元和记账插件 | — |
+| `storage.py` | `StateStore`、`Scratch` 等 | 存储单元 ↔ worker 里用它的单元 | `state`、`tensor` |
+| `ledger.py` | `AccountingPlugin`、`common_prefix` 等 | 记账插件 ↔ `core.state.alloc` | `state` |
+| `kernels.py` | kernel 目录 | kernel 单元 ↔ 层 | — |
+| `model.py` | 权重存储、`Assembly` | 模型 ↔ 权重存储 | `state`、`tensor` |
+| `plan.py` | plan、backend、持久 batch | worker 里的 plan、backend、持久 batch | `records`、`columns`、`sampling`、`tensor` |
+
+- **拆前拆后的对比。**
+  - 给 `TokenEvents` 加一个字段：拆开以前 `TokenEvents` 和 `BatchPlan` 在同一个文件里，`core.plan`、各 backend、`worker.batch` 都会跟着重载；拆开以后，只重载前端和调度宿主里用到它的单元。
+  - 改 `AccountingPlugin`：拆开以前它和 `StateStore` 在同一个文件里，worker 里的存储单元也会跟着重载（默认要排空）；拆开以后碰不到 worker。
+- 拆分只挪了位置，类和函数一字未改。
+- 上表最后一列由 `tests/units/contracts/test_contracts.py::test_each_contract_module_reaches_only_its_own_seam` 固定下来。新加一个模块，或者在两个模块之间新加一条 import，要同时改测试里的表：这等于决定了以后哪些单元一起重载。
+
+### 3.2 给 agent 的规矩（2026-11-08）
+
+开发本仓库的 agent 和以后改引擎的 RSI agent 都要遵守。
+
+1. **能新增就不修改。** 这样只有用到新东西的单元重载，原来的单元不动。
+   - 每步记录要带新的信息：加一个新分段（新的 `SECTION`），放进新模块，不往已有的记录类里加字段。收方只解码自己认识的分段，其余的忽略（[ipc.md](ipc.md) §3）。
+   - 接口签名不兼容：出新版本（`plan@2`），不在原地改 `@1` 的签名。
+2. **一条接缝一个模块，只 import 本接缝要的契约模块。** 不要为了顺手 import 别的接缝的类型。两条接缝确实要共用一个类型时，像 `SamplingParams` 一样把它单独放一个模块。
+3. **`__init__.py` 只留 docstring。**
+4. **改之前先 dry-run**（`python -m core.control.client apply --dry-run`）。看动作计划：会重载哪些单元、哪些进程要排空。要排空、要一次录完 graph、要重读权重的，先看能不能换成新增。
 
 ## 4. 每步记录（两边最重要的接缝）
 
-代码：`core/contracts/records.py`、`columns.py`。
+代码：`core/contracts/records.py`（调度 ↔ worker）、`requests.py`（前端 ↔ 调度）、`sampling.py`、`columns.py`。
 
 ### 4.1 为什么要先定这个
 
@@ -195,7 +242,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 ## 5. 状态
 
-代码：`core/contracts/state.py`。
+代码：`core/contracts/state.py`（声明）、`storage.py`（存储单元）、`ledger.py`（记账插件）；`Binding` 在 `tensor.py`。
 
 ### 5.1 声明
 
@@ -363,7 +410,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
     - 在目录里已有的 solution 之间换。
 
     新的值由重录动作的参数带进来。
-  - 不能分片：原地改了 `core.plan`、backend、模型、层、`core.kernels` 或 `worker.batch` 的代码，或者改了 `core.contracts`（所有 import 它的单元一起重载）。这时重录在暂停期内一次做完，P9 的尺寸下 36 个分桶要 6.9 s 以上。
+  - 不能分片：原地改了 `core.plan`、backend、模型、层、`core.kernels` 或 `worker.batch` 的代码，或者改了它们 import 到的 `core.contracts` 模块（import 得到这个模块的单元一起重载，§3.1）。这时重录在暂停期内一次做完，P9 的尺寸下 36 个分桶要 6.9 s 以上。
   - 不能分片时，v0 有两种做法，都不用改框架，M2c 由 @gaow0007 选定：
     1. 暂停期内只录最常用的几个分桶（按分桶的命中次数挑），其余分桶恢复后先走 eager。worker 循环在步与步之间调 `core.plan`，一个窗口补录一个分桶，每个窗口的代价和准备阶段分片一样，约 0.2 s。补录完之前，这些分桶的步慢一些，但结果不变，因为 graph 和 eager 逐位一致。补录不是变更：graph 是 eager 的缓存。
     2. 整段停下来全录完，dry-run 把停顿报出来。

@@ -12,7 +12,8 @@ from typing import Literal, Protocol
 
 import msgspec
 
-from core.contracts.state import Binding, StateDecl
+from core.contracts.state import StateDecl
+from core.contracts.tensor import Binding
 
 
 class Placement(msgspec.Struct, frozen=True):

@@ -9,9 +9,8 @@ from typing import Literal, Protocol
 
 import msgspec
 
-from core.contracts import Tensor
 from core.contracts.records import BatchPlan, RowDelta, StateOps
-from core.contracts.state import Binding
+from core.contracts.tensor import Binding, Tensor
 
 type Phase = Literal["prefill", "decode"]
 

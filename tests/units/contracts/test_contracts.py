@@ -1,8 +1,10 @@
 """core.contracts (doc/specs/stage2-contract.md): the stage-2 interface library. Columns and
-records survive the wire, and units on both sides of an interface may import it."""
+records survive the wire, units on both sides of an interface may import it, and each module
+reaches only the modules of its own seam."""
 
 from __future__ import annotations
 
+import ast
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -12,21 +14,22 @@ import pytest
 from core.common.framework import FrameworkModules
 from core.common.ids import HostId
 from core.contracts.columns import Column, DType, ragged
+from core.contracts.ledger import common_prefix
 from core.contracts.records import (
     STEP_PLAN,
     AddedRow,
     BatchPlan,
     RowDelta,
-    SamplingParams,
     StateAssign,
     StateCopy,
     StateOps,
 )
-from core.contracts.state import common_prefix
+from core.contracts.sampling import SamplingParams
 from core.ipc.records import RecordBuilder, decode_record, encode_record, read_sections
 from core.manifest.checks import check_tree
 from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 from tests.framework.support import manifest_toml, write_tree
+from unit.runtime.imports import ImportGraph, scan_root
 
 ENGINE = Path(__file__).resolve().parents[3] / "engine"
 TOPO = Topology([HostSpec(HostId("h"), "addr", "/snapshots")], Mesh({"tp": 1}), [RankPlacement(0, HostId("h"), 0)],
@@ -133,3 +136,36 @@ def test_units_may_import_the_contracts_and_the_contracts_pass_the_rules(tmp_pat
     })
     errors, _ = check_tree(root, TOPO, FrameworkModules.default())
     assert errors == []
+
+
+REACHES: dict[str, set[str]] = {
+    "columns": set(),
+    "tensor": set(),
+    "sampling": set(),
+    "requests": {"columns", "sampling"},  # frontend <-> scheduler
+    "records": {"columns", "sampling"},  # scheduler <-> worker
+    "state": set(),
+    "storage": {"state", "tensor"},  # storage unit <-> its users in the worker
+    "ledger": {"state"},  # accounting plugin <-> core.state.alloc
+    "kernels": set(),
+    "model": {"state", "tensor"},
+    "plan": {"columns", "records", "sampling", "tensor"},
+}
+"""Every contract module, and the other contract modules its imports reach (stage2-contract.md §3)."""
+
+
+def test_each_contract_module_reaches_only_its_own_seam() -> None:
+    """A unit reloads when any module its imports reach changes (``core.deps``), and every
+    module depends on its package. So the package file holds only its docstring, and a change
+    to one seam's module reaches no unit of another seam. A new module, or a new import between
+    two, is added to ``REACHES`` on purpose: it decides which units reload together."""
+    package = ENGINE / "core" / "contracts"
+    body = ast.parse((package / "__init__.py").read_text()).body
+    assert len(body) == 1 and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+    prefix = "core.contracts."
+    modules = {f"{prefix}{name}": path for name, path in scan_root(package).items()}
+    graph = ImportGraph({"core.contracts": package / "__init__.py", **modules})
+    reached = {name.removeprefix(prefix): {m.removeprefix(prefix) for m in graph.imports_closure([name])
+                                            if m.startswith(prefix) and m != name}
+               for name in modules}
+    assert reached == REACHES
