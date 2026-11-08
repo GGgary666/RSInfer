@@ -1,0 +1,15 @@
+[unit]
+id = "core.state.weights"
+kind = "state"
+process = ["worker"]
+entry = "core.state.weights.unit:Unit"
+
+[provides]
+services = ["state.weights@1"]
+
+[config]
+"weights.path" = { type = "str", default = "", binding = "startup", doc = "A safetensors file or a directory of them; empty: dummy weights" }
+"weights.dummy_seed" = { type = "int", default = 1234, binding = "startup", doc = "Seed of the dummy weights (initialize_dummy_weights)" }
+
+[capabilities]
+actions = ["refit"]

@@ -7,13 +7,18 @@ weight store, so a refit changes contents in place and no graph needs recording 
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Literal, Protocol
 
 import msgspec
 
 from core.contracts.state import StateDecl
-from core.contracts.tensor import Binding
+from core.contracts.tensor import Binding, Tensor
+
+type WeightLoader = Callable[[Iterable[tuple[str, Tensor]], Mapping[str, Tensor]], set[str]]
+"""A model's ``load_weights`` (SGLang's): checkpoint ``(name, tensor)`` pairs in, written into the
+declared tensors (name -> tensor), fused or renamed as the model's parameters are; returns the
+names it loaded."""
 
 
 class Placement(msgspec.Struct, frozen=True):
@@ -41,6 +46,13 @@ class WeightStore(Protocol):
     def version(self) -> str: ...
 
     def declare(self, decls: Sequence[WeightDecl]) -> None: ...
+    def register(self, loader: WeightLoader) -> Callable[[], None]:
+        """The model's loader (``ctx.register``), used by ``load`` and ``refit``."""
+        ...
+    def load(self) -> None:
+        """Fill every declared tensor not yet filled: from the checkpoint through the loader, or
+        dummy weights without one. Contents survive a reload of the model."""
+        ...
     def bind(self, prefix: str) -> Binding:
         """Views of every declared tensor under ``prefix``, this rank's shard."""
         ...
@@ -54,3 +66,16 @@ class Assembly(msgspec.Struct, frozen=True):
     """One entry per layer: the layer kind's service, e.g. ``layers.gdn@1``, ``layers.attn@1``."""
     states: list[StateDecl]
     weights: list[WeightDecl]
+
+
+class Model(Protocol):
+    """``model@1``: the forward of SGLang's ``*ForCausalLM`` with its ``LogitsProcessor``. The
+    backends of ``assembly.layers`` have prepared the step (``Backend.prepare``) before it runs."""
+
+    @property
+    def assembly(self) -> Assembly: ...
+
+    def forward(self, input_ids: Tensor, positions: Tensor, last_index: Tensor) -> Tensor:
+        """``input_ids``, ``positions`` ``[tokens]``; logits ``[rows, vocab]`` at ``last_index``,
+        each row's last token."""
+        ...
