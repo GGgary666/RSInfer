@@ -16,10 +16,10 @@ type Lifetime = Literal["request", "slot"]
 
 class StateDecl(msgspec.Struct, frozen=True):
     """What one layer stores. The model declares these; the storage unit allocates from them,
-    and the accounting plugin accounts by the same declaration."""
+    and the ledger's internal per-kind pool accounts by the same declaration."""
 
     kind: str
-    """The state kind (a storage unit plus its accounting plugin), e.g. ``kv.paged``, ``gdn.slots``."""
+    """The state kind shared by storage and ledger pools, e.g. ``kv.paged``, ``gdn.slots``."""
     layer: int
     tensors: dict[str, tuple[tuple[int, ...], str]]
     """Per item: name -> (shape, dtype); e.g. ``{"k": ((16, 4, 256), "bf16"), "v": ...}``. The
