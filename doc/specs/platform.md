@@ -62,6 +62,11 @@ class Platform(Protocol):
     def info(self) -> PlatformInfo: ...
 ```
 
+所有平台一致的约定（2026-11-08，PR #24 评审）：
+- `alloc` 至少给 `max(nbytes, shape 所需字节)`；不给 `shape` 时，取 `nbytes` 里放得下的整数个元素，多出来的字节也在。
+- 大小、偏移、维度都不能是负数（不支持 PyTorch 那种 `-1` 推断维度）；view 的偏移要按元素对齐。否则报 `ValueError`（`platforms.base.check_extent`、`check_view`）。
+- 每个带设备号的调用都检查设备号。
+
 ## 4. 验收测试（阶段 1，fake 平台）
 
 1. grow：映射新的物理区段后，已有 buffer 的地址不变，假 graph 仍然能 replay。
@@ -70,7 +75,7 @@ class Platform(Protocol):
 4. 只有 plan 单元能拿到 `graph()`：别的单元调用时静态检查报错。
 
 `torch_eager`（2026-11-08，`tests/framework/platforms/test_platforms.py`）：
-- 平台契约（分配、重复释放、grow 和 view 的范围、stream、`synchronize`、设备、平台信息）在 `fake` 和 `torch_eager` 上跑同一组测试。
+- 平台契约（分配大小、重复释放、负数和未对齐的参数、设备号、grow 和 view 的范围、stream、`synchronize`、设备、平台信息）在 `fake` 和 `torch_eager` 上跑同一组测试。
 - buffer 是清零的张量，地址就是 `data_ptr()`；释放以后拿不到张量。
 - grow 以后旧 view 和新 view 共用同一段内存。
 - 拓扑里的角色写 `torch_eager`，它的进程里的单元从 `ctx.platform` 拿到真张量（`tests/framework/cluster/test_cluster.py`）；换平台会重启进程（`tests/units/core/test_deps.py`）。

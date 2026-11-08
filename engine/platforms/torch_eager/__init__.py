@@ -14,13 +14,23 @@ units do not create streams (stage2-contract.md §10.4).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
-from platforms.base import Buffer, DeviceInfo, GraphRecorder, Platform, PlatformInfo, VirtualRange
+from platforms.base import (
+    Buffer,
+    DeviceInfo,
+    GraphRecorder,
+    Platform,
+    PlatformInfo,
+    VirtualRange,
+    check_extent,
+    check_view,
+)
 
 NAME = "torch_eager"
 
@@ -59,11 +69,11 @@ class TorchVirtualRange:
     mapped: int = 0
 
     def view(self, offset: int, shape: tuple[int, ...], dtype: str) -> TorchBuffer:
+        check_extent(0, shape)
+        check_view(offset, DTYPES[dtype].itemsize)
         nbytes = _size(shape, dtype)
-        if offset < 0 or offset + nbytes > self.mapped:
+        if offset + nbytes > self.mapped:
             raise ValueError(f"view [{offset}, {offset + nbytes}) beyond mapped {self.mapped}")
-        if offset % DTYPES[dtype].itemsize:
-            raise ValueError(f"view offset {offset} is not aligned to {dtype}")
         data = self.storage[offset:offset + nbytes].view(DTYPES[dtype]).view(shape)
         return TorchBuffer(self.device, self.base + offset, nbytes, shape, dtype, data)
 
@@ -108,10 +118,15 @@ class TorchEagerPlatform:
 
     def alloc(self, nbytes: int, device: int, *, shape: tuple[int, ...] | None = None,
               dtype: str = "u8") -> TorchBuffer:
+        check_extent(nbytes, shape or ())
+        itemsize = DTYPES[dtype].itemsize
         if shape is None:
-            shape = (nbytes // DTYPES[dtype].itemsize,)
-        data = torch.zeros(shape, dtype=DTYPES[dtype], device=self._device(device))
-        return TorchBuffer(device, data.data_ptr(), _size(shape, dtype), shape, dtype, data)
+            shape = (nbytes // itemsize,)
+        nbytes = max(nbytes, _size(shape, dtype))
+        # The storage covers every byte asked for; the tensor is its leading ``shape`` elements.
+        flat = torch.zeros(-(-nbytes // itemsize), dtype=DTYPES[dtype], device=self._device(device))
+        data = flat[:math.prod(shape)].view(shape)
+        return TorchBuffer(device, data.data_ptr(), nbytes, shape, dtype, data)
 
     def free(self, buf: Buffer) -> None:
         if not isinstance(buf, TorchBuffer):
@@ -128,12 +143,14 @@ class TorchEagerPlatform:
         return buf.data
 
     def reserve(self, nbytes: int, device: int) -> TorchVirtualRange:
+        check_extent(nbytes)
         storage = torch.zeros(nbytes, dtype=torch.uint8, device=self._device(device))
         return TorchVirtualRange(device, storage.data_ptr(), nbytes, storage)
 
     def map(self, vr: VirtualRange, offset: int, nbytes: int) -> None:
         if not isinstance(vr, TorchVirtualRange):
             raise TypeError(f"not a torch_eager virtual range: {vr!r}")
+        check_extent(nbytes)
         if offset != vr.mapped:
             raise ValueError(f"map must extend the mapped prefix at {vr.mapped}, got {offset}")
         if offset + nbytes > vr.reserved:

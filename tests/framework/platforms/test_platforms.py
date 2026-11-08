@@ -36,6 +36,37 @@ def test_a_buffer_has_the_shape_dtype_and_size_asked_for(platform: Platform) -> 
     assert raw.addr != buf.addr
 
 
+def test_a_buffer_covers_every_byte_asked_for(platform: Platform) -> None:
+    """``nbytes`` is a floor: more than ``shape`` needs (padding), or not a whole number of
+    elements, is still all there (PR #24 review)."""
+    padded = platform.alloc(4096, 0, shape=(1,), dtype="f32")
+    assert (padded.nbytes, padded.shape) == (4096, (1,))
+    ragged = platform.alloc(5, 0, dtype="f32")
+    assert (ragged.nbytes, ragged.shape) == (5, (1,))
+
+
+def test_negative_sizes_offsets_and_shapes_are_refused(platform: Platform) -> None:
+    """A negative (inferred) dimension once sized a view from the reservation behind the
+    mapped prefix: mapped 64 bytes, a tensor of 4092 (PR #24 review)."""
+    vr = platform.reserve(4096, 0)
+    platform.map(vr, 0, 64)
+    for bad in [lambda: platform.alloc(-1, 0), lambda: platform.alloc(0, 0, shape=(2, -1), dtype="f32"),
+                lambda: platform.reserve(-1, 0), lambda: platform.map(vr, 64, -32),
+                lambda: vr.view(0, (-1,), "f32"), lambda: vr.view(-4, (1,), "f32"),
+                lambda: vr.view(2, (4,), "f32")]:
+        with pytest.raises(ValueError, match="negative|not aligned"):
+            bad()
+    assert vr.mapped == 64
+
+
+def test_every_call_naming_a_device_checks_it(platform: Platform) -> None:
+    n = len(platform.devices())
+    for bad in [lambda: platform.alloc(64, n), lambda: platform.reserve(64, -1), lambda: platform.stream(n),
+                lambda: platform.synchronize(-1)]:
+        with pytest.raises(ValueError, match="no device"):
+            bad()
+
+
 def test_freeing_twice_is_an_error(platform: Platform) -> None:
     buf = platform.alloc(1024, 0)
     platform.free(buf)
@@ -81,6 +112,9 @@ def test_a_torch_eager_buffer_is_a_zeroed_tensor_at_its_address() -> None:
         t = p.tensor(buf)
         assert (t.shape, t.dtype, t.device.type) == ((3, 5), dtype, "cpu")
         assert t.data_ptr() == buf.addr and t.nbytes == buf.nbytes and not t.any()
+    for nbytes, shape in [(4096, (1,)), (5, None)]:
+        b = p.alloc(nbytes, 0, shape=shape, dtype="f32")
+        assert p.tensor(b).shape == (1,) and p.tensor(b).untyped_storage().nbytes() >= nbytes
     buf = p.alloc(0, 0, shape=(4,), dtype="f32")
     p.tensor(buf).copy_(torch.arange(4.0))
     assert p.tensor(buf).tolist() == [0.0, 1.0, 2.0, 3.0]  # the same tensor every time
