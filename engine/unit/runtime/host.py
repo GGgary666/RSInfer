@@ -93,6 +93,10 @@ def make_platform(spec: ProcSpec) -> Platform:
         from platforms.fake import FakePlatform
 
         return FakePlatform(devices=spec.platform_options.get("devices", max(1, len(spec.gpus))))
+    if spec.platform == "torch_eager":
+        from platforms.torch_eager import TorchEagerPlatform
+
+        return TorchEagerPlatform(cuda=bool(spec.platform_options.get("cuda", 0)))
     raise ValueError(f"unknown platform {spec.platform!r}")
 
 

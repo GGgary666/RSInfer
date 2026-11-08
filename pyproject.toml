@@ -10,6 +10,10 @@ dependencies = [
 
 [project.optional-dependencies]
 frontend = ["transformers>=5,<6", "jinja2>=3.1", "fastapi>=0.115", "uvicorn>=0.30"]
+# The torch platforms (platforms.torch_eager) and the model units need one of the two;
+# they exclude each other. CI and machines without a GPU use `cpu`; SM100 hosts use `gpu`.
+cpu = ["torch==2.11.0", "safetensors==0.8.0"]
+gpu = ["torch==2.11.0 ; sys_platform == 'linux'", "safetensors==0.8.0"]
 
 [dependency-groups]
 dev = [
@@ -21,6 +25,8 @@ dev = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "httpx>=0.27",
+    # The HF reference the model units are tested against (stage2-contract.md §1.3).
+    "transformers==5.22.1",
 ]
 
 [tool.uv]
@@ -28,11 +34,29 @@ dev = [
 # snapshot directory (doc/specs/nodeagent.md), and an editable install would
 # put the agent's workspace on sys.path.
 package = false
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["engine", "."]
-addopts = "-ra --ignore=tests/framework/formal"
+addopts = "-ra --ignore=tests/framework/formal --ignore=tests/gpu"
 timeout = 120
 markers = [
     "covers(edges=(), ladder=(), kinds=()): what a test exercises, for the coverage check (tests/scenarios/coverage.py)",
