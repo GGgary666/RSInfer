@@ -118,6 +118,11 @@ class ControlLink:
         """The identity this process serves: what an internal change is ``computed_under``."""
         return self._host.identity
 
+    @property
+    def address(self) -> str:
+        """The supervisor's address, for a unit that looks peers up from a thread of its own."""
+        return self._host.spec.control
+
     def submit(self, cs: ChangeSet) -> Result[int]:
         h = self._host
         r = h.client.call(h.spec.control, SubmitChange(cs), timeout=h.ipc.rpc_timeout_s)

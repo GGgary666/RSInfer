@@ -125,6 +125,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | 模块 | 实际交接 |
 |---|---|
 | `requests`、`sampling`、`columns` | 前端、调度器和 worker 使用的消息与采样数据 |
+| `serving` | 前端的 token 返回地址（`ReturnRoute`），随每条请求记录一起发给调度器 |
 | `records` | 调度器发给 worker 的步计划和结果 |
 | `state`、`storage`、`tensor` | 模型向存储/账本提供的当前状态声明，以及 buffer 交接 |
 | `kernels`、`model` | kernel 注册和选择，以及模型向 plan/权重存储提供的数据 |

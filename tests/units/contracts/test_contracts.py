@@ -86,6 +86,7 @@ REACHES: dict[str, set[str]] = {
     "tensor": set(),
     "sampling": set(),
     "requests": {"columns", "sampling"},  # frontend <-> scheduler
+    "serving": set(),  # where the scheduler sends a frontend its tokens
     "records": {"columns", "sampling"},  # scheduler <-> worker
     "state": set(),
     "storage": {"state", "tensor"},  # storage unit <-> its users in the worker

@@ -1,0 +1,11 @@
+[unit]
+id = "frontend.tokenizer"
+kind = "logic"
+process = ["frontend"]
+entry = "frontend.tokenizer.unit:Unit"
+
+[provides]
+services = ["frontend.tokenizer@1"]
+
+[config]
+"frontend.tokenizer_path" = { type = "str", default = "", binding = "startup", doc = "Local HF tokenizer directory; install the frontend extra." }
