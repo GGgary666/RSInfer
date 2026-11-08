@@ -45,6 +45,14 @@ def test_a_buffer_covers_every_byte_asked_for(platform: Platform) -> None:
     assert (ragged.nbytes, ragged.shape) == (5, (1,))
 
 
+def test_a_buffer_without_elements_still_has_an_address(platform: Platform) -> None:
+    """Bytes asked for with no whole element in them, or an empty shape with room reserved,
+    are still memory at an address; even an empty buffer has one (PR #24 review)."""
+    for nbytes, shape in [(1, None), (4096, (0,)), (0, (0,))]:
+        buf = platform.alloc(nbytes, 0, shape=shape, dtype="f32")
+        assert buf.shape == (0,) and buf.nbytes == nbytes and buf.addr != 0, (nbytes, shape)
+
+
 def test_negative_sizes_offsets_and_shapes_are_refused(platform: Platform) -> None:
     """A negative (inferred) dimension once sized a view from the reservation behind the
     mapped prefix: mapped 64 bytes, a tensor of 4092 (PR #24 review)."""
@@ -112,9 +120,11 @@ def test_a_torch_eager_buffer_is_a_zeroed_tensor_at_its_address() -> None:
         t = p.tensor(buf)
         assert (t.shape, t.dtype, t.device.type) == ((3, 5), dtype, "cpu")
         assert t.data_ptr() == buf.addr and t.nbytes == buf.nbytes and not t.any()
-    for nbytes, shape in [(4096, (1,)), (5, None)]:
+    for nbytes, shape, numel in [(4096, (1,), 1), (5, None, 1), (1, None, 0), (4096, (0,), 0), (0, (0,), 0)]:
         b = p.alloc(nbytes, 0, shape=shape, dtype="f32")
-        assert p.tensor(b).shape == (1,) and p.tensor(b).untyped_storage().nbytes() >= nbytes
+        storage = p.tensor(b).untyped_storage()
+        assert p.tensor(b).numel() == numel and storage.nbytes() >= nbytes
+        assert b.addr == storage.data_ptr() != 0, (nbytes, shape)  # the storage's, even with no elements
     buf = p.alloc(0, 0, shape=(4,), dtype="f32")
     p.tensor(buf).copy_(torch.arange(4.0))
     assert p.tensor(buf).tolist() == [0.0, 1.0, 2.0, 3.0]  # the same tensor every time

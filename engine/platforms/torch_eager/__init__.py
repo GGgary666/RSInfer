@@ -123,10 +123,12 @@ class TorchEagerPlatform:
         if shape is None:
             shape = (nbytes // itemsize,)
         nbytes = max(nbytes, _size(shape, dtype))
-        # The storage covers every byte asked for; the tensor is its leading ``shape`` elements.
-        flat = torch.zeros(-(-nbytes // itemsize), dtype=DTYPES[dtype], device=self._device(device))
+        # The storage covers every byte asked for, and at least one element so that every buffer
+        # has a real address, as on the fake platform; the tensor is its leading ``shape`` elements.
+        # The address is the storage's: a tensor without elements reports ``data_ptr() == 0``.
+        flat = torch.zeros(max(1, -(-nbytes // itemsize)), dtype=DTYPES[dtype], device=self._device(device))
         data = flat[:math.prod(shape)].view(shape)
-        return TorchBuffer(device, data.data_ptr(), nbytes, shape, dtype, data)
+        return TorchBuffer(device, flat.data_ptr(), nbytes, shape, dtype, data)
 
     def free(self, buf: Buffer) -> None:
         if not isinstance(buf, TorchBuffer):

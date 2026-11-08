@@ -64,6 +64,7 @@ class Platform(Protocol):
 
 所有平台一致的约定（2026-11-08，PR #24 评审）：
 - `alloc` 至少给 `max(nbytes, shape 所需字节)`；不给 `shape` 时，取 `nbytes` 里放得下的整数个元素，多出来的字节也在。
+- buffer 的地址是实际分配的那段内存的起始地址，没有元素的 buffer 也有非零地址（`torch_eager` 至少分配一个元素；PyTorch 对没有元素的张量报 `data_ptr() == 0`，所以不用它）。
 - 大小、偏移、维度都不能是负数（不支持 PyTorch 那种 `-1` 推断维度）；view 的偏移要按元素对齐。否则报 `ValueError`（`platforms.base.check_extent`、`check_view`）。
 - 每个带设备号的调用都检查设备号。
 
