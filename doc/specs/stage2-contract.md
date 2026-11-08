@@ -29,11 +29,11 @@
 | | 负责 | 说明 |
 |---|---|---|
 | @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
-| @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_cpu`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
+| @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_eager`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
 | 本文和 `engine/core/contracts/` | 两边共有 | 团队 PR 由双方 review；同一 RSI agent 可一起修改接口与全部使用者，不增加运行时审批 |
 
 分工的边界划在**可用 CPU 参照实现验证的接口**上：
-- 平台有 `torch_cpu` 和 `fake`；
+- 平台有 `torch_eager` 和 `fake`；
 - kernel 有 PyTorch 参照实现；
 - graph 有 eager 路径。
 
@@ -43,7 +43,7 @@
 
 | 里程碑 | 内容 | 主要靠谁 |
 |---|---|---|
-| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_cpu` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
+| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_eager` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
 | M2b | SM100 上的 TP1，换成真 kernel，仍然 eager，全模型和 HF 参照在容差内对齐 | 两边集成 |
 | M2c | decode graph：graph 和 eager 逐位一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
 | M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
@@ -104,7 +104,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 - 控制面单元要加的规则：
   - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就重录：能分片的在准备阶段，不能的在暂停期内，§9.4），以及 grow；dry-run 报出重录造成的停顿；
   - `core.manifest`：单元不许自己建 stream（§10.4）。
-- 新平台 `platforms.torch_cpu` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
+- 新平台 `platforms.torch_eager` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
 
 ## 3. 最小共享交接面（2026-11-08 更新）
 
@@ -189,7 +189,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - worker 碰到 `from_previous = 1` 却没有可接的 token，也回 `Resync`，不跑。
   - 采样不在 worker 里留随机状态：客户端没给 seed 的话，调度器在接纳请求时补一个，worker 按（seed, 位置）取随机数。所以重建前后采到的 token 一样，和 batch 怎么拼也无关。
   - 开投机时，下一步要验证的草稿如果留在显存里，也一起丢掉；重建后每行的第一步不带草稿。
-  - 契约测试（M2a，`torch_cpu`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
+  - 契约测试（M2a，`torch_eager`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
 
 ### 4.4 一步重叠
 
@@ -311,15 +311,31 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - 包括：页大小、NHD 还是 HND、GDN 状态在槽内的排布、VMM 的映射粒度（2 MiB）和每次扩多少。
 - 都写成声明里的数据，不写死在代码里。
 - 存储单元由 @wutianyuan1 这边实现，布局由 @gaow0007 定。
+- **2026-11-08 已定：严格照 sglang。**
+  - KV：`MHATokenToKVPool` 的 NHD，每层一份 K、一份 V，`[容量 + page_size, kv 头数, head_dim]`，按 token 槽寻址，槽 0 所在的页做 padding；
+  - GDN：`MambaPool`，conv `[GDN 层, 槽 + 1, conv_dim, kernel - 1]`，temporal `[GDN 层, 槽 + 1, v 头, v_dim, k_dim]` fp32；
+  - 持久 batch 的表：`req_to_token` `[行 + 1, 最大上下文]` int32，以及行到 GDN 槽的映射。
+  - 注意 temporal 是 `[v_dim, k_dim]`，和 HF 的 `[k_dim, v_dim]` 互为转置；参照 kernel 按 sglang 的排法写，和 HF 比时转置（`tests/units/kernels/test_reference.py`）。
 
 ## 6. kernel 目录
 
 代码：`core/contracts/kernels.py`。schema 和 flashinfer-bench 的 Definition / Solution 对齐。
 
-- **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_cpu` 上跑，是 CI 的基准，也是检验 solution 的标准。
+- **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_eager` 上跑，是 CI 的基准，也是检验 solution 的标准。
 - **solution** 写怎么算：用哪个库的哪个版本、支持哪些 shape、能不能录进 graph、需要哪些平台能力、要不要进程级初始化、能不能跨机。
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
+- **实现（2026-11-08）**：
+  - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
+  - 选择：符合 shape 和平台能力的非参照 solution 里按 id 取第一个；没有就用参照实现，`Selected.fallback` 为真。`Definition.reference` 是参照 solution 的 id。
+  - definition 的名字和 solution 的 id 在目录里唯一，重复登记会报错，所以查找结果和登记顺序无关。重载时旧实例的登记先撤掉，新实例再登记，不会撞名。参照 solution 的 id 带版本（`reference.gemm.linear@1`），同一 definition 的新旧版本可以同时登记（2026-11-09）。
+  - `kernels.reference`（`engine/kernels/reference/`）登记 Qwen3.8 要的全部 definition 和 PyTorch 参照：`norm.gemma_rms`、`norm.rms_gated`、`pos.rope_neox`、`act.silu_and_mul`、`gemm.linear`、`embed.lookup`、`kv.store`、`attn.paged`、`gdn.conv1d`、`gdn.gating`、`gdn.delta_rule`、`sample.seeded`（都是 `@1`）。
+  - 参照按 HF `qwen3_5` 的算法和 dtype 转换写；conv 和 delta rule 可以接着上一块的状态继续算（HF 的 prefill 卷积不接受初始状态，这部分是补的）。采样按（seed, 位置）取随机数。
+  - **和 batch 怎么拼是否无关**（`Definition.batch_invariant`，默认否，2026-11-09 更正）：
+    - 声明为是的只有按构造成立的：attention 和采样逐行算，conv 和 delta rule 每次只接一行、逐 token 算，lookup 和 store 只搬数据。
+    - norm、RoPE、激活、linear、gating 是一个 torch 算子作用在整个 batch 上，PyTorch 会随行数换计算路径和累加顺序，不声明。实测 CPU fp32 的 linear，同一行单独算和放进 batch 里算，最后几位不同；两个 logit 很接近时，greedy 会选出不同的 token。
+    - 未决：§1 验收里的“批量对单条”和 §4.4 第 8 条的“开重叠对不开”要求完全一致，只靠这套参照做不到。M2d 之前要定：这些对比用逐行算的 solution，还是按容差比。
+  - 测试：`tests/units/kernels/`，对照 HF 的实现、分块等于不分块；声明和 batch 怎么拼无关的参照，单独算和放进 batch 里算逐位相同。
 
 ## 7. 层、模型、权重
 
@@ -405,11 +421,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 | 平台 | 用途 | 有没有计算 | graph |
 |---|---|---|---|
 | `fake`（已有） | 测引擎的机制：变更、重载、故障 | 没有，只有按名字调用的假 kernel | 记录依赖，replay 时检查 |
-| `torch_cpu`（新，@wutianyuan1） | 在 CPU 上跑真模型语义：M2a、CI 里的单元测试和五组对比 | torch CPU 张量、参照 kernel | 记下 capture 时的调用，replay 时检查依赖、重新执行 |
+| `torch_eager`（PR #24 已合入 master，2026-11-08） | 在 CPU 或进程自己的 CUDA 卡上跑真模型语义：M2a、CI 里的单元测试和五组对比、SM100 上的 eager | torch 张量、参照 kernel | 不录 graph（`graph()` 报错），见 platform.md §2.3 |
 | `cuda_sm100`（新，@gaow0007） | SM100 | torch.cuda、CUDA VMM | 真 CUDA graph |
 
-- `torch_cpu` 和 `cuda_sm100` 跑同一套平台契约测试。
-- `torch_cpu` 上，“graph 对 eager”自然完全一致，这组对比只在 GPU 层有意义。
+- `torch_eager` 和 `cuda_sm100` 跑同一套平台契约测试。
+- `torch_eager` 上，“graph 对 eager”自然完全一致，这组对比只在 GPU 层有意义。
 
 ### 10.2 buffer
 
@@ -422,7 +438,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - `view`：只覆盖已映射的部分，什么操作都能用；
   - `span`：覆盖整个预留区间，只给按页号访问的 kernel 用。
 - 在 GPU 上，eager 操作只要碰到没映射的部分（例如对 span 做 `zero_()`、`sum()`），就会触发页错误，CUDA context 直接废掉，进程就丢了。
-- 所以 `fake` 和 `torch_cpu` 要模拟这一点：kernel 访问超出已映射部分就报错，CI 才能抓到。
+- 所以 `fake` 和 `torch_eager` 要模拟这一点：kernel 访问超出已映射部分就报错，CI 才能抓到。
 - 现在假平台不允许建超出已映射部分的 view（`engine/platforms/fake/__init__.py:82`），要按上面改。
 - grow 不改地址，也不改绑定代数；grow 之前录的 graph 能读到新映射的页，不用重录，不用排空（P4、P6）。
 - 只有 span 能看到新页：graph 里写死了 view 的 shape。
@@ -463,8 +479,8 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 | 层 | 位置 | 平台 | 谁跑 |
 |---|---|---|---|
-| 单元的 CPU 测试 | `tests/units/<单元路径>/` | `torch_cpu`、`fake` | CI |
-| 引擎级 | `tests/scenarios/` | `fake`，M2a 以后加 `torch_cpu` | CI |
+| 单元的 CPU 测试 | `tests/units/<单元路径>/` | `torch_eager`、`fake` | CI |
+| 引擎级 | `tests/scenarios/` | `fake`，M2a 以后加 `torch_eager` | CI |
 | GPU | `tests/gpu/` | `cuda_sm100` | 在 SM100 上手动跑，像 formal 一样由 `addopts` 排除；@gaow0007 跑自己那几块，Devin 跑集成 |
 
 - 平台契约测试和 kernel 契约测试（solution 对参照实现）对每个平台、每个 solution 各跑一遍，用参数化，不用 skip。
@@ -541,7 +557,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 ## 15. 待定
 
 1. §9.4 里还没测过的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿；不能分片时选哪种做法。
-2. `torch_cpu` 平台上的 graph：要不要模拟“录制时写死 Python 标量”。不模拟的话，这类错误只有 GPU 层才抓得到。
+2. ~~`torch_eager` 平台上的 graph~~：已定（2026-11-08），`torch_eager` 不录 graph；“录制时写死 Python 标量”这类错误由 `fake` 和 GPU 层抓。
 3. 前端和调度之间的流在 M2a 用每步记录流。前端以后要不要拆成多个进程，到时再定。
 4. 采样放在 graph 里还是 graph 外，由 @gaow0007 在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。
 5. 投机的记录：草稿放在哪、验证步的 `num_tokens` 怎么数。M2d 定，是否新增分段或版本按 §3 判断（§4.2）。
