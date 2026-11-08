@@ -1,0 +1,11 @@
+[unit]
+id = "frontend.detok"
+kind = "logic"
+process = ["frontend"]
+entry = "frontend.detok.unit:Unit"
+
+[provides]
+services = ["frontend.detok@1"]
+
+[requires]
+services = ["frontend.tokenizer@1"]
