@@ -276,9 +276,39 @@ def test_two_tcp_producers_writing_at_once_are_reported(zctx: zmq.Context[zmq.So
             later.write(b"x" * 100, timeout=5)
         with pytest.raises(PeerLost, match="two producers"):
             take(reader, 1)
+        for _ in range(20):  # broken for good: it holds nothing and takes no more frames
+            with pytest.raises(PeerLost, match="two producers"):
+                reader.read(timeout=0.05)
+        assert getattr(reader, "_held") == 0
     finally:
         current.abort()
         later.abort()
+        reader.close()
+
+
+def test_a_slow_consumer_does_not_make_a_closed_producer_look_quiet(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """Codex's case on #23: between reads the consumer pauses longer than ``peer_timeout_s``.
+    Time away from ``read`` is not the producer's silence: its tail is queued, unread."""
+    hosts = BACKENDS["tcp"]
+    tun = msgspec.structs.replace(TUN, stream_hwm=4, peer_timeout_s=0.05)
+    reader, address = reader_for(zctx, hosts, tun=tun)
+    try:
+        first = writer_for(zctx, hosts, address, tun)
+        first.write(b"a0", timeout=5)
+        assert take(reader, 1) == [b"a0"]
+        for i in range(1, 24):
+            first.write(f"a{i}".encode(), timeout=5)
+        first.close()
+        second = writer_for(zctx, hosts, address, tun)
+        for i in range(12):
+            second.write(f"b{i}".encode(), timeout=5)
+        second.close()
+        got: list[tuple[bytes, int]] = []
+        for _ in range(35):
+            time.sleep(0.08)  # a consumer busy with something else
+            got.append((take(reader, 1)[0], reader.writer_generation))
+        assert got == [(f"a{i}".encode(), 1) for i in range(1, 24)] + [(f"b{i}".encode(), 2) for i in range(12)]
+    finally:
         reader.close()
 
 

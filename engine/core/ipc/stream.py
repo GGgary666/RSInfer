@@ -447,11 +447,17 @@ class TcpReader:
     """The consumer end over TCP. ZMQ fair-queues the connections of several producers, so their
     frames may arrive interleaved. A replaceable reader keeps one current producer, in order:
     frames of earlier producers are dropped; frames of a later one wait until the current one
-    closed (its close frame was read) or went quiet for ``peer_timeout_s``. Then the later one
-    becomes current. So a producer's own records are never mixed with another's, and the tail
-    of one that closed in order is not lost to its successor. Waiting frames are bounded by
-    ``ipc.stream_hold_bytes``: past that, two producers write at once, and ``read`` raises
-    ``PeerLost``."""
+    ended, and the later one becomes current. So a producer's own records are never mixed with
+    another's, and the tail of one that closed in order is not lost to its successor.
+
+    The current producer ended when its close frame was read, or when it was quiet for
+    ``peer_timeout_s`` while the reader was reading: nothing of it arrived although the queue
+    was drained again and again. Time the caller spent away from ``read`` (more than
+    ``peer_timeout_s`` between two looks) does not count: its frames may be waiting unread.
+
+    Waiting frames are bounded by ``ipc.stream_hold_bytes``. Past that, two producers write at
+    once: the reader is broken for good, holds nothing, and every ``read`` raises ``PeerLost``
+    until it is closed and opened again."""
 
     def __init__(self, zctx: zmq.Context[zmq.Socket[bytes]], bind_host: str, tun: IpcTunables, *,
                  replaceable: bool = False) -> None:
@@ -466,12 +472,15 @@ class TcpReader:
         self._expect = 0
         self._closed = False
         """The current producer sent its close frame."""
-        self._last = 0.0
-        """When the current producer's last frame arrived."""
+        self._quiet = 0.0
+        """How long the reader, while reading, has heard nothing from the current producer."""
+        self._looked = time.monotonic()
+        """When the reader last looked at the queue."""
         self._ready: deque[bytes] = deque()
         self._later: dict[_Producer, list[tuple[int, int, bytes]]] = {}
         self._held = 0
         """Bytes in ``_later``."""
+        self._broken: str | None = None
         self.writer_generation = 0
         """The producer of the record last returned: 1 for the first, one more per replacement."""
 
@@ -480,7 +489,7 @@ class TcpReader:
         if seq != self._expect:
             raise PeerLost(f"step stream lost records: expected #{self._expect}, got #{seq}")
         self._expect += 1
-        self._last = time.monotonic()
+        self._quiet = 0.0
         if kind == 1:
             if not self._replaceable:
                 raise StreamClosed("producer closed the stream")
@@ -489,11 +498,19 @@ class TcpReader:
             self._ready.append(payload)
 
     def _adopt(self, producer: _Producer) -> None:
-        self._current, self._expect, self._closed = producer, 0, False
-        self._last = time.monotonic()
+        self._current, self._expect, self._closed, self._quiet = producer, 0, False, 0.0
         self.writer_generation += 1
 
-    def _frame(self, raw: bytes) -> None:
+    def _look(self) -> None:
+        """The reader just looked and found nothing of the current producer (an empty queue, or a
+        later producer's frame): count the time since the last look as quiet, unless the caller
+        was away longer than ``peer_timeout_s``."""
+        now = time.monotonic()
+        gap, self._looked = now - self._looked, now
+        self._quiet = self._quiet + gap if gap <= self._tun.peer_timeout_s else 0.0
+
+    def _frame(self, raw: bytes) -> bool:
+        """Sort one frame; whether it was the current producer's."""
         start, nonce, seq, kind = _FRAME.unpack_from(raw)
         producer, payload = (start, nonce), raw[_FRAME.size:]
         current = self._current
@@ -502,30 +519,33 @@ class TcpReader:
             current = producer
         if producer == current:
             self._take(seq, kind, payload)
-        elif not self._replaceable:
+            return True
+        if not self._replaceable:
             raise PeerLost("a second producer writes to a single-producer step stream")
         elif producer > current:
+            if self._held + len(raw) > self._tun.stream_hold_bytes:
+                self._broken = (f"a later producer wrote more than {self._tun.stream_hold_bytes} bytes while "
+                                "the current one did not end: two producers write to this step stream at once")
+                self._later.clear()
+                self._held = 0
+                raise PeerLost(self._broken)
             self._later.setdefault(producer, []).append((seq, kind, payload))
             self._held += len(raw)
-            if self._held > self._tun.stream_hold_bytes:
-                raise PeerLost(f"a later producer wrote {self._held} bytes while the current one did not end: "
-                               "two producers write to this step stream at once")
         # else: an earlier producer's frame, queued before it was replaced
+        return False
 
-    def _replace_if_due(self) -> None:
-        """Make the earliest waiting producer current once the current one closed or went quiet.
-        How many frames wait proves nothing: the current one's tail may still be queued."""
-        while self._later and not self._ready:
-            if not (self._closed or time.monotonic() - self._last > self._tun.peer_timeout_s):
-                return
-            producer = min(self._later)
-            frames = self._later.pop(producer)
-            self._held -= sum(_FRAME.size + len(payload) for _, _, payload in frames)
-            self._adopt(producer)
-            for seq, kind, payload in frames:
-                self._take(seq, kind, payload)
+    def _replace(self) -> None:
+        """Make the earliest waiting producer current."""
+        producer = min(self._later)
+        frames = self._later.pop(producer)
+        self._held -= sum(_FRAME.size + len(payload) for _, _, payload in frames)
+        self._adopt(producer)
+        for seq, kind, payload in frames:
+            self._take(seq, kind, payload)
 
     def read(self, timeout: float | None = None) -> bytes | None:
+        if self._broken is not None:
+            raise PeerLost(self._broken)
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if self._ready:
@@ -533,12 +553,18 @@ class TcpReader:
             # Never wait past the deadline: read(0) only looks.
             wait_ms = 10 if deadline is None else min(10, max(0, math.ceil((deadline - time.monotonic()) * 1000)))
             if self._sock.poll(wait_ms, zmq.POLLIN):
-                self._frame(self._sock.recv())
-                self._replace_if_due()
+                if self._frame(self._sock.recv()):
+                    self._looked = time.monotonic()
+                else:
+                    self._look()
+                while self._replaceable and self._closed and self._later and not self._ready:
+                    self._replace()
                 continue
             self._link.update()
             if self._replaceable:
-                self._replace_if_due()
+                self._look()  # the queue is drained: only now may quiet end the current producer
+                while self._later and not self._ready and (self._closed or self._quiet > self._tun.peer_timeout_s):
+                    self._replace()
                 if self._ready:
                     continue
             elif self._link.lost:
