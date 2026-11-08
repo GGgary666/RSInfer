@@ -19,7 +19,7 @@ from core.supervisor.protocol import ProcSpec
 from tests.framework.change.harness import Capture
 from tests.framework.support import PROC, events, spec, write_tree
 from unit.runtime import ProcessPlan
-from unit.runtime.host import LOOP_SERVICE, ProcessHost
+from unit.runtime.host import EXIT_QUIESCE_FAILED, LOOP_SERVICE, ProcessHost
 
 LOOP = '''
 from tests.framework.support import events
@@ -53,6 +53,25 @@ class Loop:
         while self.in_flight:
             self.finished.append(self.in_flight.pop(0))
         return self.finished[-1] if self.finished else None
+
+
+class Follower(Loop):
+    """A worker under overlap scheduling: each plan from the scheduler starts that epoch and
+    finishes the one before; without a new plan, step() returns at once."""
+
+    def __init__(self, ctx, config):
+        super().__init__(ctx, config)
+        self.plans = []
+
+    def step(self):
+        if not self.plans:
+            return None
+        self.in_flight.append(self.plans.pop(0))
+        if len(self.in_flight) < 2:
+            return None
+        done = self.in_flight.pop(0)
+        self.finished.append(done)
+        return done
 '''
 
 
@@ -60,11 +79,12 @@ class LoopState(Protocol):
     in_flight: list[int]
     finished: list[int]
     fail_quiesce: bool
+    plans: list[int]
 
 
 class Proc:
-    def __init__(self, tmp: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.unit = spec(f"{pkg}.loop", f"{pkg}.loop:Loop", provides=[LOOP_SERVICE])
+    def __init__(self, tmp: Path, pkg: str, monkeypatch: pytest.MonkeyPatch, cls: str = "Loop") -> None:
+        self.unit = spec(f"{pkg}.loop", f"{pkg}.loop:{cls}", provides=[LOOP_SERVICE])
         code = write_tree(tmp / "v1" / "engine", {f"{pkg}/loop.py": LOOP})
         plan = ProcessPlan(PROC, Identity("v1"), [self.unit], code_root=str(code))
         self.host = ProcessHost(ProcSpec(PROC, Identity("v1"), plan, "unused", "127.0.0.1"))
@@ -84,11 +104,13 @@ class Proc:
 
     def turn(self) -> None:
         """One turn of ``ProcessHost.run``: a safe point, then a step unless paused."""
-        self.host.safe_point()
-        if not self.host.paused:
-            epoch = self.host.runtime.lookup(LOOP_SERVICE).step()  # type: ignore[union-attr]
-            if epoch is not None:
-                self.host.epoch = epoch
+        self.host.turn()
+
+    def ask(self, msg: msgspec.Struct) -> Capture:
+        """Deliver a request whose reply is deferred; the reply lands in ``.result`` later."""
+        result = self.host.handlers[type(msg)](self.host.registry.wrap(msg, self.host.me), msg)
+        assert isinstance(result, Capture)
+        return result
 
     def send(self, msg: msgspec.Struct) -> Result[msgspec.Struct]:
         result = self.host.handlers[type(msg)](self.host.registry.wrap(msg, self.host.me), msg)
@@ -109,6 +131,15 @@ class Proc:
 @pytest.fixture
 def proc(tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> Generator[Proc]:
     p = Proc(tmp_path, pkg, monkeypatch)
+    try:
+        yield p
+    finally:
+        p.close()
+
+
+@pytest.fixture
+def follower(tmp_path: Path, pkg: str, monkeypatch: pytest.MonkeyPatch) -> Generator[Proc]:
+    p = Proc(tmp_path, pkg, monkeypatch, cls="Follower")
     try:
         yield p
     finally:
@@ -141,8 +172,45 @@ def test_a_loop_that_cannot_finish_its_steps_fails_the_pause_and_keeps_serving(p
     assert proc.loop.finished == [1], "the old version keeps serving"
 
 
+def test_a_follower_whose_last_step_only_quiesce_finishes_pauses_at_the_agreed_epoch(follower: Proc) -> None:
+    follower.loop.plans += [1, 2, 3]
+    for _ in range(3):
+        follower.turn()
+    assert follower.host.epoch == 2 and follower.loop.in_flight == [3]
+    follower.prepare(1)
+    # The leader stopped after epoch 3 and sends no step 4: only quiesce() finishes epoch 3.
+    assert follower.send(Pause(1, 3)).unwrap() == Paused(1, 3)
+    assert follower.loop.in_flight == [] and follower.host.paused
+
+
+def test_a_pause_before_the_first_finished_step_waits_for_the_agreed_epoch(follower: Proc) -> None:
+    follower.loop.plans.append(1)
+    follower.turn()
+    assert follower.host.epoch is None and follower.loop.in_flight == [1]
+    follower.prepare(1)
+    reply = follower.ask(Pause(1, 3))
+    for _ in range(3):
+        follower.turn()
+    assert reply.result is None and not follower.host.paused, "epochs 2 and 3 have not run yet"
+    follower.loop.plans += [2, 3]
+    for _ in range(3):
+        follower.turn()
+    assert reply.result is not None and reply.result.unwrap() == Paused(1, 3)
+    assert follower.loop.finished == [1, 2, 3] and follower.host.paused
+
+
 def test_shutdown_finishes_the_steps_in_flight_before_unloading(proc: Proc) -> None:
     proc.turn()
     proc.turn()
     proc.close()
     assert events[-2:] == [("quiesce", [2]), ("unload", [])]
+
+
+def test_a_shutdown_that_cannot_finish_the_steps_unloads_nothing_and_fails(proc: Proc) -> None:
+    proc.turn()
+    proc.loop.fail_quiesce = True
+    proc.host.paused = True  # as a failed undo leaves it: no more steps, the one in flight unsettled
+    proc.closed = True
+    assert proc.host.shutdown() == EXIT_QUIESCE_FAILED
+    assert events[-1] == ("quiesce", [1]) and not [e for e in events if e[0] == "unload"]
+    assert proc.host.diagnostics[-1].code == "host.quiesce_failed"
