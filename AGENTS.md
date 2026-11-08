@@ -65,6 +65,13 @@
 
 `engine/core/state/alloc/prefix.py` 保存账本内部的联合前缀匹配算法；当前仅有该辅助库，账本单元由后续实现补充。
 
+worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
+
+| 路径 | 内容 |
+|---|---|
+| `engine/core/kernels/` | kernel 目录 `core.kernels`（`kernels.catalog@1`）：登记 definition 和 solution，按 shape 和平台能力选，没有合适的就用参照实现 |
+| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），算法和 dtype 照 HF `qwen3_5`，状态排布照 sglang |
+
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
 ### `tests/`
@@ -79,6 +86,7 @@
   - `formal/`：TLA+ 有限模型（`models/`）、runner（`run.py`）、对真实实现的轨迹回放和契约测试。细节见 `tests/framework/formal/README.md`。
 - `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。`units/contracts/`：接口库 `core.contracts`（编码往返、单元能 import 它、每个模块只 import 到本接缝的模块）。
 - `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
+- `tests/units/kernels/`：kernel 目录的选择和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`）。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
