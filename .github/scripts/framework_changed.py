@@ -34,14 +34,20 @@ def touches_framework(paths: Iterable[str], framework: FrameworkModules) -> bool
     return False
 
 
+def changed(base: str, root: Path) -> list[str]:
+    """The paths changed from the merge base of ``base`` to HEAD. A move is its old path and its new
+    one (``--no-renames``): moving a file out of the framework changes the framework too."""
+    out = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], cwd=root, check=True,
+                         capture_output=True, text=True).stdout
+    return out.split()
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2 or not argv[1]:
         print("true")
         return 0
     root = Path(__file__).resolve().parents[2]
-    changed = subprocess.run(["git", "diff", "--name-only", f"{argv[1]}...HEAD"], cwd=root, check=True,
-                             capture_output=True, text=True).stdout.split()
-    print("true" if touches_framework(changed, FrameworkModules.load(root / "engine")) else "false")
+    print("true" if touches_framework(changed(argv[1], root), FrameworkModules.load(root / "engine")) else "false")
     return 0
 
 
