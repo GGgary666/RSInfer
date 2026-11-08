@@ -20,6 +20,10 @@ from core.ipc import IpcTunables, RpcServer, StreamAddress, open_reader, open_wr
 BIND = "127.0.0.1"  # test data: the address of every fake host
 TUN = IpcTunables(heartbeat_interval_s=0.05, peer_timeout_s=0.5, stream_hwm=4,
                   stream_socket_buffer=1 << 16, shm_capacity=1 << 16)
+"""For the tests that kill a peer: it is declared lost soon."""
+PATIENT = msgspec.structs.replace(TUN, peer_timeout_s=5.0)
+"""For the tests whose peers all live: a runner busy under ``pytest -n auto`` can stall a
+process past 0.5 s, and a live peer must not be declared lost then."""
 
 
 class Ping(msgspec.Struct, frozen=True):
@@ -52,7 +56,7 @@ def stamp(i: int, size: int) -> bytes:
 
 def write_records(address: StreamAddress, host: str, sizes: list[int], close: bool, then_sleep: float) -> None:
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
-    w = open_writer(zctx, local=HostId(host), address=address, tun=TUN)
+    w = open_writer(zctx, local=HostId(host), address=address, tun=PATIENT)  # no test kills its reader
     for i, size in enumerate(sizes):
         w.write(stamp(i, size), timeout=30)
     if close:
