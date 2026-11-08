@@ -50,8 +50,9 @@ PROC_TUNABLES = {"host.idle_poll_s": 0.01}
 
 
 def serving_units(directory: str | os.PathLike[str], names: list[str]) -> set[str]:
-    """The repo's own units outside the control plane (kernels, models, ...). Scenario roles list no
-    units, so they would run in every scenario process, importing torch there at each start."""
+    """The repo's own units outside the control plane (request table, kernels, models, ...).
+    Scenario roles list no units, so they would run in every scenario process; the kernel units
+    import torch at each start."""
     out: set[str] = set()
     for name in names:
         path = Path(directory, name, MANIFEST_FILE)

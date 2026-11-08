@@ -1,0 +1,24 @@
+[unit]
+id = "frontend.http"
+kind = "logic"
+process = ["frontend"]
+entry = "frontend.http.unit:Unit"
+
+[provides]
+services = ["frontend.http@1"]
+
+[requires]
+services = ["frontend.tokenizer@1", "frontend.detok@1", "proc.control@1", "proc.streams@1"]
+
+[config]
+"frontend.model" = { type = "str", default = "Qwen3.8-27B", binding = "startup" }
+"frontend.http_bind" = { type = "str", default = "", binding = "startup", doc = "Bind address from deployment configuration." }
+"frontend.http_port" = { type = "int", default = 8000, binding = "startup" }
+"frontend.requests_address" = { type = "dict", default = {}, binding = "startup", doc = "Scheduler request StreamAddress: host, shm or tcp." }
+"frontend.scheduler" = { type = "dict", default = {}, binding = "startup", doc = "Scheduler ProcId, looked up through the supervisor (again when it is replaced) unless requests_address is set." }
+"frontend.max_tokens" = { type = "int", default = 4096, binding = "startup" }
+"frontend.max_requests" = { type = "int", default = 1024, binding = "startup" }
+"frontend.io_timeout_s" = { type = "float", default = 2.0, binding = "startup" }
+"frontend.response_timeout_s" = { type = "float", default = 120.0, binding = "startup", doc = "Maximum silence between scheduler responses; request cleanup still sends cancellation." }
+"frontend.start_timeout_s" = { type = "float", default = 15.0, binding = "startup" }
+"frontend.shutdown_timeout_s" = { type = "float", default = 10.0, binding = "startup" }
