@@ -73,6 +73,26 @@ def test_cold_start_on_two_hosts_loads_only_snapshot_code(tmp_path: Path) -> Non
     run(main())
 
 
+def test_a_role_on_torch_eager_gives_its_units_real_tensors(tmp_path: Path) -> None:
+    """The platform travels from the role in the topology to the process (``ProcSpec.platform``,
+    ``make_platform``): a unit there gets torch tensors from ``ctx.platform``. A worker placed on
+    GPU 0 still runs on the CPU unless the role asks for CUDA."""
+    async def main() -> None:
+        async with cluster(tmp_path, ["host-a"]) as c:
+            identity, files = c.ingest(build_tree(tmp_path))
+            topo = topology(tmp_path, ["host-a"], ["host-a"], [
+                replace(role("worker", ["toyc.tunable", "toyc.tensor"]), platform="torch_eager")])
+            (await c.sup.apply_topology(topo, identity, files, c.plan_for(identity))).unwrap()
+            worker = proc("host-a", "worker", 0)
+            [st] = c.sup.status()
+            assert st.proc == worker and st.state == "RUNNING"
+            assert {u.unit: u.state for u in st.units}["toyc.tensor"] == InstanceState.ACTIVE
+            assert "tensor torch_eager torch.Tensor (2, 3) cpu 9.0" in c.log_of(worker)
+            await c.sup.stop_all()
+
+    run(main())
+
+
 def test_child_env_replaces_only_where_code_comes_from(tmp_path: Path) -> None:
     w = proc("host-a", "worker", 0)
     spec = ProcSpec(w, Identity("i"), ProcessPlan(w, Identity("i"), []), "tcp://control", "addr",

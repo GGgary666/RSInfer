@@ -215,6 +215,9 @@ class FakePlatform:
         buf.freed = True
         self._used[buf.device] -= buf.nbytes
 
+    def tensor(self, buf: Buffer) -> Any:
+        raise TypeError("the fake platform has no tensors; run real kernels on torch_eager")
+
     def reserve(self, nbytes: int, device: int) -> FakeVirtualRange:
         return FakeVirtualRange(device, self._take(nbytes, device, 0), nbytes)
 
@@ -232,6 +235,10 @@ class FakePlatform:
 
     def stream(self, device: int) -> FakeStream:
         return FakeStream(device, next(self._streams))
+
+    def synchronize(self, device: int) -> None:
+        if not 0 <= device < len(self._devices):
+            raise ValueError(f"no device {device}")
 
     def graph(self) -> FakeGraphRecorder:
         return FakeGraphRecorder(self)

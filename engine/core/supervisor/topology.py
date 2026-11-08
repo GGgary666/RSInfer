@@ -11,6 +11,7 @@ from __future__ import annotations
 import msgspec
 
 from core.common.ids import HostId, ProcId, UnitId
+from platforms import PLATFORMS
 
 
 class HostSpec(msgspec.Struct, frozen=True):
@@ -54,6 +55,10 @@ class RoleSpec(msgspec.Struct, frozen=True):
     env: dict[str, str] = {}
     leads_epochs: bool = False
     """Its processes decide epochs (the scheduler host); they pause first in a change."""
+    platform: str = "fake"
+    """The platform its processes run on (``platforms.PLATFORMS``, doc/specs/platform.md)."""
+    platform_options: dict[str, int] = {}
+    """Handed to the platform: ``{"cuda": 1}`` puts ``torch_eager`` on the process's GPUs."""
 
 
 class Topology(msgspec.Struct, frozen=True):
@@ -86,6 +91,8 @@ class Topology(msgspec.Struct, frozen=True):
                     problems.append(f"role {r.name} placed on unknown host {h}")
             if r.per_rank and r.hosts:
                 problems.append(f"role {r.name} is per rank; it is placed by the mesh, not hosts")
+            if r.platform not in PLATFORMS:
+                problems.append(f"role {r.name} names an unknown platform {r.platform!r}; known: {list(PLATFORMS)}")
         names = [r.name for r in self.roles]
         if len(set(names)) != len(names):
             problems.append("duplicate role names")
@@ -100,6 +107,8 @@ class DesiredProc(msgspec.Struct, frozen=True):
     gpus: list[int]
     env: dict[str, str]
     rank: int | None = None
+    platform: str = "fake"
+    platform_options: dict[str, int] = {}
 
 
 def desired_procs(topo: Topology) -> dict[ProcId, DesiredProc]:
@@ -108,11 +117,13 @@ def desired_procs(topo: Topology) -> dict[ProcId, DesiredProc]:
         if role.per_rank:
             for p in sorted(topo.placement, key=lambda p: p.rank):
                 pid = ProcId(p.host, role.name, p.rank)
-                out[pid] = DesiredProc(pid, list(role.units), [p.device], dict(role.env), p.rank)
+                out[pid] = DesiredProc(pid, list(role.units), [p.device], dict(role.env), p.rank,
+                                       role.platform, dict(role.platform_options))
         else:
             for i, host in enumerate(role.hosts):
                 pid = ProcId(host, role.name, i)
-                out[pid] = DesiredProc(pid, list(role.units), [], dict(role.env))
+                out[pid] = DesiredProc(pid, list(role.units), [], dict(role.env), None,
+                                       role.platform, dict(role.platform_options))
     return out
 
 

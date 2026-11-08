@@ -211,6 +211,23 @@ class Tunable:
         ctx.on_config("toyc.chunk", lambda v: log(config, ctx, f"chunk {v}"))
         log(config, ctx, f"tunable loaded gen{ctx.instance.generation} flavor {config['toyc.flavor']}")
 ''',
+    "toyc/tensor.py": '''
+from toyc.logutil import log
+
+
+class Tensor:
+    """Holds one buffer of its process's platform and logs the tensor behind it."""
+
+    def __init__(self, ctx, config):
+        platform = ctx.platform
+        buf = platform.alloc(0, 0, shape=(2, 3), dtype="f32")
+        ctx.effect(lambda: lambda: platform.free(buf))
+        t = platform.tensor(buf)
+        t.fill_(1.5)
+        platform.synchronize(0)
+        log(config, ctx, f"tensor {platform.info().name} {type(t).__module__}.{type(t).__name__} "
+                         f"{tuple(t.shape)} {t.device.type} {float(t.sum())}")
+''',
     "toyc/versioned.py": '''
 from toyc.logutil import log
 
@@ -249,6 +266,7 @@ SPECS: dict[str, UnitSpec] = {
                               "toyc.late_reader": {"type": "bool", "default": False, "binding": "startup"}}),
     "toyc.stubborn": spec("toyc.stubborn", "toyc.units:Stubborn", provides=["proc.loop@1"], process=["worker"],
                           reads=["toyc.log_dir"]),
+    "toyc.tensor": spec("toyc.tensor", "toyc.tensor:Tensor", process=["worker"], reads=["toyc.log_dir"]),
 }
 
 FAST = {
