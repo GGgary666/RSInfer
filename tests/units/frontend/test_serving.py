@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Generator
@@ -11,7 +12,9 @@ from typing import Any
 import httpx
 import pytest
 
+import frontend.transport as transport
 from frontend.detok.unit import Detokenizer
+from frontend.http.api import OpenAICompletionRequest
 from tests.units.frontend.support import ByteTokenizer, FakeSupervisor, Frontend, ScriptScheduler
 
 
@@ -230,6 +233,88 @@ def test_requests_waiting_for_a_scheduler_each_keep_their_own_deadline() -> None
             results = list(pool.map(request, range(6)))
         assert [code for code, _ in results] == [503] * 6
         assert max(elapsed for _, elapsed in results) < 0.6, results
+    finally:
+        front.close()
+        supervisor.close()
+
+
+def wait_until(check: Any, within: float = 2.0) -> None:
+    deadline = time.monotonic() + within
+    while not check():
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+
+def test_a_request_given_up_before_it_went_out_never_reaches_the_scheduler() -> None:
+    """The submitting coroutine is cancelled while its request waits for a scheduler: the
+    request leaves the queue, and the scheduler found later never sees it (Codex on #26)."""
+    supervisor = FakeSupervisor()
+    front = Frontend(supervisor=supervisor, io_timeout_s=2.0)
+    manager = front.server.manager
+    scheduler: ScriptScheduler | None = None
+    try:
+        submit = asyncio.run_coroutine_threadsafe(
+            manager.submit(OpenAICompletionRequest(model="toy", prompt="given up"), chat=False),
+            getattr(manager.channel, "_loop"))
+        wait_until(lambda: bool(manager.states))
+        submit.cancel()
+        wait_until(lambda: not manager.states)
+        scheduler = ScriptScheduler()
+        supervisor.target = scheduler.address
+        with httpx.Client(base_url=front.url, timeout=10) as client:
+            response = client.post("/v1/completions", json={"model": "toy", "prompt": "x", "max_tokens": 64})
+        assert response.status_code == 200, response.text
+        assert scheduler.new.qsize() == 1  # only the request still wanted
+        assert scheduler.aborts.empty()
+    finally:
+        front.close()
+        if scheduler is not None:
+            scheduler.close()
+        supervisor.close()
+
+
+def test_a_request_given_up_after_it_went_out_is_aborted_at_the_scheduler() -> None:
+    """The request went out, but its coroutine is cancelled before it learns so (its event loop
+    is busy meanwhile): the scheduler has it, so it is told to drop it."""
+    supervisor = FakeSupervisor()
+    front = Frontend(supervisor=supervisor, io_timeout_s=2.0)
+    manager = front.server.manager
+    loop = getattr(manager.channel, "_loop")
+    scheduler = ScriptScheduler(hold=True)
+    try:
+        submit = asyncio.run_coroutine_threadsafe(
+            manager.submit(OpenAICompletionRequest(model="toy", prompt="given up late"), chat=False), loop)
+        wait_until(lambda: bool(manager.states))
+        loop.call_soon_threadsafe(time.sleep, 0.5)  # the event loop is busy: the answer waits
+        supervisor.target = scheduler.address
+        uid = scheduler.new.get(timeout=2).request  # it went out meanwhile
+        submit.cancel()
+        assert scheduler.aborts.get(timeout=3).request == uid
+        wait_until(lambda: not manager.states)
+    finally:
+        front.close()
+        scheduler.close()
+        supervisor.close()
+
+
+def test_a_waiting_request_is_encoded_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retries reuse the encoded record: a long prompt is not encoded again every turn."""
+    encodes = 0
+    encode = transport.encode_record
+
+    def counting(record: Any) -> bytes:
+        nonlocal encodes
+        encodes += 1
+        return encode(record)
+
+    monkeypatch.setattr(transport, "encode_record", counting)
+    supervisor = FakeSupervisor()
+    front = Frontend(supervisor=supervisor, io_timeout_s=0.3)
+    try:
+        with httpx.Client(base_url=front.url, timeout=10) as client:
+            response = client.post("/v1/completions", json={"model": "toy", "prompt": "x" * 10000})
+        assert response.status_code == 503
+        assert encodes == 1
     finally:
         front.close()
         supervisor.close()

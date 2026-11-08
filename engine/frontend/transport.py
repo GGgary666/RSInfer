@@ -26,14 +26,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import zmq
 
 from core.common.ids import Endpoint, HostId, ProcId
 from core.common.result import Failed
-from core.contracts.requests import REQUESTS, TOKENS, Requests, TokenEvents
+from core.contracts.requests import REQUESTS, TOKENS, AbortRequest, Requests, TokenEvents
 from core.contracts.serving import ReturnRoute
 from core.ipc.channels import ChannelReader, ChannelWriter
 from core.ipc.config import IpcTunables
@@ -78,6 +78,18 @@ class _Send:
     deadline: float
     """Set when the caller queued it: time spent waiting behind other sends counts."""
     done: Callable[[int | BaseException | None], None]
+    data: bytes | None = None
+    """The record, encoded at the first try and reused while it waits (its sequence stays)."""
+    sent: bool = False
+    cancelled: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    """Orders the I/O thread's check-and-write against the caller giving up."""
+
+    def cancel(self) -> bool:
+        """The caller gave up. Whether it had already gone out: then the scheduler has it."""
+        with self.lock:
+            self.cancelled = True
+            return self.sent
 
 
 class StepChannel:
@@ -147,17 +159,24 @@ class StepChannel:
                 pending.popleft()
                 item.done(None)
                 continue
-            try:
-                record = (RecordBuilder(REQUESTS, self.sequence).add(Requests.SECTION, item.requests)
-                          .add(ReturnRoute.SECTION, ReturnRoute(self.tokens.address)).build())
-                if not self.writer.write(encode_record(record), timeout=0):
-                    return  # no scheduler right now, or a connection still opening
-            except TimeoutError:
-                return  # the scheduler is there but its queue is full
-            except Exception as e:  # noqa: BLE001 - this request cannot be sent: its caller says why
-                pending.popleft()
-                item.done(e)
-                continue
+            with item.lock:
+                if item.cancelled:  # its caller gave up before it went out: it never goes
+                    pending.popleft()
+                    continue
+                try:
+                    if item.data is None:
+                        record = (RecordBuilder(REQUESTS, self.sequence).add(Requests.SECTION, item.requests)
+                                  .add(ReturnRoute.SECTION, ReturnRoute(self.tokens.address)).build())
+                        item.data = encode_record(record)
+                    if not self.writer.write(item.data, timeout=0):
+                        return  # no scheduler right now, or a connection still opening
+                except TimeoutError:
+                    return  # the scheduler is there but its queue is full
+                except Exception as e:  # noqa: BLE001 - this request cannot be sent: its caller says why
+                    pending.popleft()
+                    item.done(e)
+                    continue
+                item.sent = True
             pending.popleft()
             self.sequence += 1
             self._moved_to(self.writer.address)
@@ -260,8 +279,17 @@ class StepChannel:
         if self.closed:
             return None
         future: asyncio.Future[int | None] = asyncio.get_running_loop().create_future()
-        self._outbox.put(_Send(requests, time.monotonic() + self.tun.rpc_timeout_s, self._answer(future)))
-        return await future
+        item = _Send(requests, time.monotonic() + self.tun.rpc_timeout_s, self._answer(future))
+        self._outbox.put(item)
+        try:
+            return await future
+        except asyncio.CancelledError:
+            # Not sent yet: it never will be. Sent already: the scheduler has requests nobody
+            # waits for any more, so it is told to drop them.
+            if item.cancel() and requests.new:
+                drop = Requests(abort=[AbortRequest(r.request, "the client went away") for r in requests.new])
+                self._outbox.put(_Send(drop, time.monotonic() + self.tun.rpc_timeout_s, lambda _: None))
+            raise
 
     async def receive(self) -> tuple[int, TokenEvents]:
         if self._inbox is None or self.closed:
