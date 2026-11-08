@@ -25,8 +25,9 @@ CONTROL_ROLE = "control"
 HOST_SERVICES: Mapping[str, frozenset[str]] = MappingProxyType({
     CONTROL_ROLE: frozenset({"ctrl.change@1", "ctrl.supervisor@1", "ctrl.blobs@1", "ctrl.events@1", "ctrl.self@1"}),
 })
-"""Services the control host provides; every other process host provides ``proc.control@1``."""
-PROCESS_HOST_SERVICES = frozenset({"proc.control@1"})
+"""Services the control host provides; every other process host provides ``proc.control@1`` and
+``proc.streams@1``."""
+PROCESS_HOST_SERVICES = frozenset({"proc.control@1", "proc.streams@1"})
 
 MUTABLE_CALLS = frozenset({"list", "dict", "set", "bytearray", "defaultdict", "deque", "OrderedDict", "Counter"})
 NATIVE_SUFFIXES = (".so", ".pyd")

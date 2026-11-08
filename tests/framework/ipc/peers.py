@@ -6,6 +6,7 @@ import asyncio
 import struct
 import time
 from multiprocessing.queues import Queue
+from multiprocessing.synchronize import Event
 from typing import Any
 
 import msgspec
@@ -15,7 +16,7 @@ import zmq.asyncio
 from core.common.ids import Endpoint, HostId, ProcId
 from core.common.messages import Envelope, SchemaRegistry
 from core.common.result import Ok, Result
-from core.ipc import IpcTunables, RpcServer, StreamAddress, open_reader, open_writer
+from core.ipc import IpcTunables, PeerLost, RpcServer, StreamAddress, open_reader, open_writer
 
 BIND = "127.0.0.1"  # test data: the address of every fake host
 TUN = IpcTunables(heartbeat_interval_s=0.05, peer_timeout_s=0.5, stream_hwm=4,
@@ -63,6 +64,23 @@ def write_records(address: StreamAddress, host: str, sizes: list[int], close: bo
         w.close()
         zctx.term()  # blocks until queued records are handed to the kernel
     time.sleep(then_sleep)
+
+
+def write_then_wait(address: StreamAddress, host: str, events: Queue[str], go: Event) -> None:
+    """Writes one record, waits for ``go`` (the test stops and continues this process in
+    between, as a stall would), then tries one more and closes; reports each outcome."""
+    zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
+    w = open_writer(zctx, local=HostId(host), address=address, tun=TUN)
+    w.write(b"old:0", timeout=5)
+    events.put("wrote old:0")
+    go.wait(60)
+    try:
+        w.write(b"old:1", timeout=1)
+        events.put("wrote old:1")
+    except PeerLost:
+        events.put("fenced")
+    w.close()
+    events.put("closed")
 
 
 def read_forever(q: Queue[Any], host: str, peer: str, shm_name: str) -> None:

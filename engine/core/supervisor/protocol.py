@@ -165,6 +165,15 @@ class CheckedIn(msgspec.Struct, frozen=True):
     pass
 
 
+class PublishEndpoint(msgspec.Struct, frozen=True):
+    """A reader a running process opened after it checked in (doc/specs/ipc.md §6)."""
+
+    proc: ProcId
+    incarnation: int
+    channel: str
+    address: StreamAddress
+
+
 class Lookup(msgspec.Struct, frozen=True):
     proc: ProcId
     channel: str
@@ -235,6 +244,7 @@ MESSAGES: list[tuple[str, type[msgspec.Struct]]] = [
     ("agent.shm_allocated@1", ShmAllocated),
     ("proc.check_in@1", CheckIn),
     ("proc.checked_in@1", CheckedIn),
+    ("proc.publish_endpoint@1", PublishEndpoint),
     ("proc.lookup@1", Lookup),
     ("proc.found@1", Found),
     ("proc.status@1", Status),

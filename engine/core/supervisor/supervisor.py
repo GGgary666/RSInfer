@@ -21,6 +21,7 @@ from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 from core.ipc.rpc import RpcClient, RpcServer
 from core.ipc.stream import StreamAddress
 from core.supervisor.protocol import (
+    AllocShm,
     Blobs,
     CheckedIn,
     CheckIn,
@@ -31,6 +32,7 @@ from core.supervisor.protocol import (
     Lookup,
     Materialize,
     ProcSpec,
+    PublishEndpoint,
     Register,
     Registered,
     Spawn,
@@ -90,6 +92,8 @@ class _Proc:
     spec: ProcSpec
     state: ProcState = "DECLARED"
     checkin: CheckIn | None = None
+    published: dict[str, StreamAddress] = field(default_factory=dict[str, StreamAddress])
+    """Readers it opened after checking in (``PublishEndpoint``)."""
     units: list[UnitBrief] = field(default_factory=list[UnitBrief])
     """What it runs: from its check-in, then from each change it confirmed (``Resumed``)."""
     exit_code: int | None = None
@@ -157,6 +161,16 @@ class Supervisor:
                 return self._fetch(msg)
             case Lookup():
                 return Ok(Found(self.endpoint(msg.proc, msg.channel)))
+            case PublishEndpoint():
+                return self._publish(msg)
+            case AllocShm():
+                # A process host asks for a ring name for a reader of its own: the node agent of
+                # that host names it and removes the segment when the process is gone.
+                host = self.hosts.get(msg.proc.host)
+                if host is None or host.lost:
+                    return fail(COMPONENT, "alloc_shm", "the process's host is not registered",
+                                subject=str(msg.proc), code="supervisor.no_host")
+                return await self.client.call(host.agent, msg, timeout=self.tun.rpc_timeout_s)
             case _:
                 handler = self.handlers.get(type(msg))
                 if handler is not None:
@@ -262,7 +276,15 @@ class Supervisor:
         rec = self.procs.get(proc)
         if rec is None or rec.checkin is None or rec.state != "RUNNING":
             return None
-        return rec.checkin.endpoints.get(channel)
+        return rec.published.get(channel) or rec.checkin.endpoints.get(channel)
+
+    def _publish(self, msg: PublishEndpoint) -> Result[msgspec.Struct]:
+        rec = self.procs.get(msg.proc)
+        if rec is None or rec.checkin is None or rec.spec.incarnation != msg.incarnation:
+            return fail(COMPONENT, "publish", "process has not checked in as this incarnation",
+                        subject=str(msg.proc), code="supervisor.unexpected_publish")
+        rec.published[msg.channel] = msg.address
+        return Ok(CheckedIn())
 
     def status(self) -> list[ProcStatus]:
         return [
