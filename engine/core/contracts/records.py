@@ -115,9 +115,9 @@ class StateAssign(msgspec.Struct, frozen=True):
 
 class StateCopy(msgspec.Struct, frozen=True):
     """Item copies of one state kind: restore a snapshot into a row's slot on a prefix hit
-    (``before`` the step), or snapshot a slot at a block boundary (``after`` it). ``after``
-    sees only the state at the end of the row's chunk in this step: a snapshot boundary the
-    chunk crosses inside it cannot be copied (§5.4)."""
+    (``before`` the step, from ``admit``), or snapshot a slot at a block boundary (``after``
+    it, from ``snapshot``). ``after`` sees only the state at the end of the row's chunk in
+    this step: a snapshot boundary the chunk crosses inside it cannot be copied (§5.4)."""
 
     kind: str
     when: Literal["before", "after"]

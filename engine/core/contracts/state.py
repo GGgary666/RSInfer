@@ -117,13 +117,17 @@ class AccountingPlugin(Protocol):
 
     - admission: ``common_prefix`` over every kind's ``reusable``, then ``admit`` in every
       kind; if one kind returns ``None`` the request is not admitted, and the kinds that did
-      admit it get ``release(request, step)``;
-    - planning a step: ``take`` for more items, ``publish`` for the blocks the step completes;
-    - each result: ``retire(step)``; a step answered with ``Resync``: ``retire(step, ran=False)``.
+      admit it get ``cancel(request, step)``;
+    - planning a step: ``take`` for more items, ``snapshot`` for each row's chunk end; a row
+      left out of the plan after all: ``cancel``;
+    - each result: ``retire(step)``, then ``publish`` for the blocks it completed (the
+      scheduler knows their tokens only now: with overlap, a decode token is on the worker
+      until the result arrives); a step answered with ``Resync``: ``retire(step, ran=False)``.
 
-    Items are free, held (by one or more requests), or cached (published, held by none,
-    evictable). A kind evicts cached items, least recently used first, only to give items
-    out; never one a request holds or one a pending copy reads."""
+    Items are free, held (by one or more requests; a reserved snapshot by the request it
+    snapshots), or cached (published, held by none, evictable). A kind evicts cached items,
+    least recently used first, only to give items out; never one a request holds or one a
+    pending copy reads."""
 
     def declare(self, decls: Sequence[StateDecl]) -> None: ...
     def set_capacity(self, items: int) -> None: ...
@@ -158,31 +162,50 @@ class AccountingPlugin(Protocol):
         (nothing taken) if that does not suffice. The scheduler then preempts or waits."""
         ...
 
-    def publish(self, request: int, block_hashes: Sequence[int], upto: int, step: int) -> list[tuple[int, int]]:
-        """Step ``step`` computes the request's tokens up to ``upto``: register the blocks it
-        completes under their hashes, reusable once the result of ``step`` arrives (before,
-        another request could read items the step has not written, or never writes). Returns
-        the ``(src, dst)`` copies to make after the step (``StateCopy(when="after")``).
+    def snapshot(self, request: int, upto: int, step: int) -> list[tuple[int, int]]:
+        """While planning ``step``: the request's chunk in it ends at token ``upto``. Returns the
+        ``(src, dst)`` copies to make after the step (``StateCopy(when="after")``); needs no
+        hashes, so it works while the previous step's tokens are still on the worker.
 
-        Paged KV registers the request's own pages, no copy. GDN can snapshot only the state at
-        the end of the step: it snapshots when ``upto`` is a multiple of ``snapshot_every``,
-        taking a free or evictable slot as ``dst`` (none: no snapshot); boundaries crossed
-        inside the step's chunk get no snapshot (§5.4)."""
+        GDN can keep only the state at the end of the step: it snapshots when ``upto`` is a
+        multiple of ``snapshot_every``, reserving a free or evictable slot as ``dst``, held for
+        the request until ``publish`` (none to reserve: no snapshot). Boundaries crossed inside
+        the chunk get none (§5.4). Paged KV keeps every page anyway: no copy."""
+        ...
+
+    def publish(self, request: int, block_hashes: Sequence[int], upto: int) -> None:
+        """The request's tokens up to ``upto`` are computed: the result of every step that
+        computed them has arrived, so the scheduler knows their hashes. Register the blocks
+        completed up to there; other requests may hit them at once. Never before the result:
+        another request could read items the step has not written, or never writes.
+
+        Paged KV registers the request's own pages. GDN registers the snapshot it reserved at a
+        boundary up to ``upto``; it becomes cached, no longer held by the request."""
+        ...
+
+    def cancel(self, request: int, step: int) -> None:
+        """What the request got while planning ``step`` (``admit``, ``take``, ``snapshot``)
+        goes back at once: that part of the plan is not sent, so nothing of it will run. New
+        items are free again, reused ones and copy sources no longer held by it. For a
+        rejected joint admission: waiting for ``step`` with ``release`` could wait forever,
+        since a step nobody is admitted to may never be sent."""
         ...
 
     def release(self, request: int, last_step: int) -> None:
         """The request is done. Its items stop being held only once the result of ``last_step``
         (the last step that used them) has arrived: with overlap, that step may still be running
         when the scheduler learns the request finished (§4.4). Then published items no request
-        holds become cached, the others free. A ``last_step`` already retired frees at once."""
+        holds become cached, the others free (a snapshot never published among them). The
+        scheduler publishes what the last result completed before releasing. A ``last_step``
+        already retired frees at once."""
         ...
 
     def retire(self, step: int, ran: bool = True) -> None:
         """The result of ``step`` arrived. Free what was released up to it; drop the holds of
-        the copies it made. ``ran``: make what it published reusable. Not ``ran`` (answered with
-        ``Resync``): drop what it published, its copy destinations become free again. A request
-        whose ``admit`` copies were in such a step goes back to the queue: the scheduler
-        releases it and admits it again from its token history (§4.3)."""
+        the copies it made. Not ``ran`` (answered with ``Resync``): it wrote nothing, so the
+        snapshots it reserved are free again. A request whose ``admit`` copies were in such a
+        step goes back to the queue: the scheduler releases it and admits it again from its
+        token history (§4.3)."""
         ...
 
     def check(self) -> list[str]:
