@@ -87,6 +87,61 @@ def log(config, ctx, text):
     with open(os.path.join(d, f"{p.host}-{p.role}-{p.index}.log"), "a") as f:
         f.write(text + "\\n")
 ''',
+    "toyc/channels.py": '''
+import time
+import uuid
+
+from core.common.ids import HostId, ProcId
+from toyc.logutil import log
+
+
+class Sender:
+    """Writes numbered records to the sink's reader "in" through the host's data channels; a
+    record the channel could not take is sent again, so the numbers have no gaps on its side."""
+    EVERY_S = 0.02
+
+    def __init__(self, ctx, config):
+        self.ctx, self.config = ctx, config
+        sink = config["toyc.sink"]
+        self.out = ctx.use("proc.streams@1").writer(ProcId(HostId(sink["host"]), sink["role"], sink["index"]), "in")
+        self.token, self.n, self.gen, self.last = uuid.uuid4().hex[:6], 0, 0, 0.0
+        log(config, ctx, f"sender up {self.token}")
+        ctx.provide("proc.loop@1", self)
+
+    def step(self):
+        time.sleep(0.002)
+        if time.monotonic() - self.last < self.EVERY_S:
+            return None
+        self.last = time.monotonic()
+        if self.out.write(f"{self.token}:{self.n}".encode(), timeout=1.0):
+            self.n += 1
+            if self.out.generation != self.gen:
+                self.gen = self.out.generation
+                log(self.config, self.ctx, f"sender gen {self.gen}")
+        return None
+
+
+class Sink:
+    """Logs what reaches its reader "in". ``toyc.late_reader``: open the reader at the first step,
+    after the process checked in, so the host publishes it on its own."""
+
+    def __init__(self, ctx, config):
+        self.ctx, self.config = ctx, config
+        self.inp = None if config["toyc.late_reader"] else self._open()
+        log(config, ctx, f"sink up {uuid.uuid4().hex[:6]}")
+        ctx.provide("proc.loop@1", self)
+
+    def _open(self):
+        return self.ctx.use("proc.streams@1").reader("in", HostId(self.config["toyc.source_host"]))
+
+    def step(self):
+        if self.inp is None:
+            self.inp = self._open()
+        data = self.inp.read(timeout=0.005)
+        if data is not None:
+            log(self.config, self.ctx, f"got {data.decode()} gen {self.inp.generation}")
+        return None
+''',
     "toyc/tunable.py": '''
 import time
 
@@ -185,6 +240,13 @@ SPECS: dict[str, UnitSpec] = {
     "toyc.versioned": spec("toyc.versioned", "toyc.versioned:Versioned", process=ALL_ROLES,
                            reads=["toyc.log_dir"]),
     "toyc.loop": spec("toyc.loop", "toyc.units:Loop", provides=["proc.loop@1"], process=["sched", "worker"]),
+    "toyc.sender": spec("toyc.sender", "toyc.channels:Sender", provides=["proc.loop@1"],
+                        requires=["proc.streams@1"], process=["sched"], reads=["toyc.log_dir"],
+                        config={"toyc.sink": {"type": "any", "default": {}, "binding": "startup"}}),
+    "toyc.sink": spec("toyc.sink", "toyc.channels:Sink", provides=["proc.loop@1"], requires=["proc.streams@1"],
+                      process=["worker"], reads=["toyc.log_dir"],
+                      config={"toyc.source_host": {"type": "str", "default": "", "binding": "startup"},
+                              "toyc.late_reader": {"type": "bool", "default": False, "binding": "startup"}}),
     "toyc.stubborn": spec("toyc.stubborn", "toyc.units:Stubborn", provides=["proc.loop@1"], process=["worker"],
                           reads=["toyc.log_dir"]),
 }

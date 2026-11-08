@@ -6,6 +6,7 @@ from core.ipc.records import OpenRecord, RecordBuilder, decode_record, encode_re
 from core.ipc.rpc import Deferred, RpcClient, RpcServer, SyncRpcClient, SyncRpcServer
 from core.ipc.stream import (
     PeerLost,
+    RingBusy,
     StepReader,
     StepWriter,
     StreamAddress,
@@ -23,6 +24,7 @@ __all__ = [
     "PeerLost",
     "Publisher",
     "RecordBuilder",
+    "RingBusy",
     "RpcClient",
     "RpcServer",
     "StepReader",
