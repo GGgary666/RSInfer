@@ -4,7 +4,7 @@ accounting plugin in the scheduler host that share it (stage2-contract.md §5, v
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, Protocol
 
 import msgspec
@@ -102,7 +102,8 @@ class Migratable(Protocol):
 class AccountingPlugin(Protocol):
     """The accounting of one state kind in the scheduler host (``ledger.<kind>@1``). Ids
     only, no memory. ``core.state.alloc`` admits a request only if every kind it needs can
-    give it items (joint admission), and takes the shortest prefix every kind can reuse."""
+    give it items (joint admission), and resumes it from the longest prefix every kind can
+    resume from (``common_prefix``)."""
 
     def declare(self, decls: Sequence[StateDecl]) -> None: ...
     def set_capacity(self, items: int) -> None: ...
@@ -123,11 +124,34 @@ class AccountingPlugin(Protocol):
         """The result of ``step`` arrived: free what was released up to it."""
         ...
 
-    def reusable(self, block_hashes: Sequence[int]) -> int:
-        """How many leading blocks of a new request this kind can reuse, after its own
-        alignment rules (a GDN snapshot exists only at snapshot boundaries)."""
+    def reusable(self, block_hashes: Sequence[int], limit: int) -> int:
+        """The longest prefix of a new request, in tokens and at most ``limit``, that this kind
+        can resume from: the largest length it supports at or below ``limit``, not the minimum
+        of some longest hit. ``block_hashes[i]`` covers tokens ``[0, (i + 1) * B)``, ``B`` being
+        the hash block of ``core.state.alloc``; every kind's alignment is a multiple of ``B``.
+        Paged KV supports every page boundary up to its longest run of cached blocks; GDN state
+        only the snapshots it still holds, so a hit at 96 tokens with snapshots at 64 and 128
+        supports 64 when asked for 96."""
         ...
 
     def check(self) -> list[str]:
         """Invariants: free + used == capacity, no item held twice, nothing leaked."""
         ...
+
+
+def common_prefix(kinds: Sequence[Callable[[int], int]], limit: int) -> int:
+    """The longest prefix, in tokens and at most ``limit``, every kind can resume from
+    (stage2-contract.md §5.3). ``kinds[i](n)`` is kind ``i``'s ``reusable(block_hashes, n)``.
+
+    Ask every kind with the current length, take the lowest answer, ask again until no kind
+    lowers it. The longest common length is never above an answer, since each kind answers
+    the largest length it supports up to what it was asked; and every kind supports the
+    length where it stops. ``limit`` leaves the request at least one token to compute."""
+    length = limit
+    while True:
+        lowest = min((kind(length) for kind in kinds), default=length)
+        if lowest > length:
+            raise ValueError(f"a kind answered {lowest} tokens when asked for at most {length}")
+        if lowest == length:
+            return length
+        length = lowest

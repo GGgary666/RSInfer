@@ -64,7 +64,13 @@ class PlanService(Protocol):
         pause window: it first waits for the step still running on the device, since nothing
         else may run in the process while a graph is captured (GPU probe P10). Warm-up runs on
         ``Scratch`` items only. The new graphs never share a memory pool with graphs that may
-        still replay; they replace the old ones at the epoch boundary."""
+        still replay; they replace the old ones at the epoch boundary.
+
+        Sliced only when the change reloads neither this unit nor one it uses: a new kernel
+        unit plus the config selecting it (scenario 4), or a new bucket set. When it reloads
+        one of them (code edited in place, the contracts library), the participant defers the
+        rebuild to the new instance at Execute and runs it in one go, inside the pause
+        (``change.prepare_one_shot``; stage2-contract.md §9.4)."""
         ...
 
 
@@ -91,7 +97,11 @@ class PersistentBatch(Protocol):
 
     Device-side tables (per row: positions, item ids of each state kind, the last sampled
     token) are updated with copies enqueued on the step stream, so the step still running
-    on the device keeps reading the values it was launched with (one step of overlap)."""
+    on the device keeps reading the values it was launched with (one step of overlap).
+
+    A rebuild loses the last sampled tokens too: the scheduler gives each row's next input
+    token itself until the row has run again (``BatchPlan.from_previous``). It has them: the
+    rebuild happens while paused, after ``quiesce()`` collected every result."""
 
     @property
     def binding(self) -> Binding: ...

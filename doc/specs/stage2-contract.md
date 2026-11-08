@@ -1,10 +1,10 @@
 # 阶段 2 的单元契约：Qwen3.8-27B
 
 - 日期：2026-11-07
-- 状态：**草案**。GPU 相关的几节（§5.5、§8、§9、§10）等同事审过才算定稿；标“（待定）”的地方还没定。
+- 状态：**草案**。GPU 相关的几节（§5.5、§8、§9、§10）等 @gaow0007 审过才算定稿；标“（待定）”的地方还没定。
 - 对应：[roadmap](../roadmap.md) 阶段 2；[v0-plan](../v0-plan.md) 5.10–5.13；[modules.html](../modules.html) 的单元清单；GPU 探针报告（PR #17，`doc/evaluations/gpu-probes.md`，含合并前补测的 P9–P11）；[state-changes.md](state-changes.md)；[change.md](change.md) 4.2、4.6、4.7。
 - 接口的代码形式在 `engine/core/contracts/`：本文写规则和理由，签名以那里为准。
-- 本文定下的事（2026-11-07 和发起人讨论确定）：
+- 本文定下的事（2026-11-07 和 @wutianyuan1 讨论确定）：
   - 分工（§1）；
   - 契约按“最多提前一步”的重叠调度来设计（§4.4）；
   - 阶段 2 先只做 TP1；
@@ -28,8 +28,8 @@
 
 | | 负责 | 说明 |
 |---|---|---|
-| 同事（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由他决定 |
-| 发起人和他的 agent | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_cpu`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
+| @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
+| @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_cpu`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
 | 本文和 `engine/core/contracts/` | 两边共有 | 改一个接口，接口两边各有一个人审过才合 |
 
 分工的边界划在**有 CPU 替身的接口**上：
@@ -37,27 +37,44 @@
 - kernel 有 PyTorch 参照实现；
 - graph 有 eager 路径。
 
-所以发起人这边不用等 GPU 部分，就能把整条链路跑通；同事那边按契约和契约测试实现，不需要了解引擎全局。他的任务，契约测试由发起人这边先写好。
+所以 @wutianyuan1 这边不用等 GPU 部分，就能把整条链路跑通；@gaow0007 按契约和契约测试实现，不需要了解引擎全局。这几块的契约测试由 @wutianyuan1 这边先写好。
 
 ### 1.3 里程碑
 
 | 里程碑 | 内容 | 主要靠谁 |
 |---|---|---|
-| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_cpu` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | 发起人 |
+| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_cpu` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
 | M2b | SM100 上的 TP1，换成真 kernel，仍然 eager，全模型和 HF 参照在容差内对齐 | 两边集成 |
-| M2c | decode graph：graph 和 eager 逐位一致；按分桶在准备阶段切片重录 | 同事为主 |
-| M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | 发起人为主 |
+| M2c | decode graph：graph 和 eager 逐位一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
+| M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
 - 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致；
 - 能服务流式请求。
 
+### 1.4 分支和合并（2026-11-08，提议，待两人确认）
+
+- 每人一条个人分支，`dev/wutianyuan1` 和 `dev/gaow0007`，都从 master 拉出。自己的 PR 合进自己的分支，自己审。CI 对所有分支的 push 和 PR 都跑；合进个人分支的 PR 不发PR 通知（`notify.yml` 只管 master）。
+- 两边共用的东西不走个人分支，直接 PR 到 master，两边各有一个人审过才合：
+  - `engine/core/contracts/` 和本文；
+  - 框架本体（`engine/framework.toml` 列出的模块，如 PR #18）；
+  - `pyproject.toml`、`uv.lock`（torch 的两个 extra，§11.2）、`.github/`。
+
+  这些东西如果在两条分支上各改各的，汇合时冲突最难解，而且另一边的代码是照着旧版本写的。`AGENTS.md` 的目录地图两边都会改，冲突好解，留在个人分支上。
+- master 上一有这类改动，两条个人分支都尽快把 master 合进来。用 merge，不用 rebase：个人分支已经推上去，别人在上面开 PR，rebase 会改写它的历史。
+- **汇合点**：每个里程碑结束时；以及一边要用另一边的东西时。步骤：
+  1. 先合的分支开 PR 到 master，CI 通过、对方看过，用 merge commit 合进去。不用 squash：squash 以后个人分支的历史和 master 对不上，下次汇合还会冲突。
+  2. 后合的分支先把新的 master 合进来，在自己分支上解决冲突、跑通 CI，再开 PR 到 master。
+  3. 两条都合完，各自从 master 接着做（个人分支 fast-forward 到 master）。
+- **先后顺序**：谁的改动是对方的前提，谁先合。通常是 @wutianyuan1 先合：GPU 这边的单元插在整条链路里，它们的 GPU 测试要用到链路；链路反过来只要 CPU 替身就能跑。
+- **第一个依赖**：M2a 的 worker 通过 `plan@1` 跑 eager，而 `core.plan` 归 @gaow0007。所以 `core.plan` 的 eager 路径（只有分桶 0，不录 graph）要先做，在 M2a 之前单独汇合一次。在那之前，@wutianyuan1 这边在测试里用一个只走 eager 的替身。
+
 ## 2. 进程和单元
 
-Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 下（例如 `core.sched` 放在 `engine/core/sched/`），每个目录一份 `unit.toml`。“同事”一栏打勾的归同事，其余归发起人。
+Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 下（例如 `core.sched` 放在 `engine/core/sched/`），每个目录一份 `unit.toml`。“@gaow0007”一栏打勾的归 @gaow0007，其余归 @wutianyuan1。
 
-| 进程（角色） | 单元 | 种类 | 提供 | 需要 | 同事 |
+| 进程（角色） | 单元 | 种类 | 提供 | 需要 | @gaow0007 |
 |---|---|---|---|---|---|
 | 前端 `frontend` | `frontend.http` | 逻辑 | — | `frontend.tokenizer@1`、`frontend.detok@1` | |
 | | `frontend.tokenizer` | 逻辑 | `frontend.tokenizer@1` | | |
@@ -84,7 +101,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | 控制面 | 已有的四个单元 | | | | |
 
 - 控制面单元要加的规则：
-  - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就在准备阶段重录），以及 grow；
+  - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就重录：能分片的在准备阶段，不能的在暂停期内，§9.4），以及 grow；dry-run 报出重录造成的停顿；
   - `core.manifest`：单元不许自己建 stream（§10.4）。
 - 新平台 `platforms.torch_cpu` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
 
@@ -95,7 +112,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
   - 放在单元目录之外，接口两边的单元都 import 它。接口一改，所有 import 它的单元在同一个 epoch 一起重载，这正是“改接口时两边一起重载”（modules.html ⑥）要的效果。
 - 不 import torch，因为 CI 不一定装 torch。张量的类型写作 `Tensor`（就是 `Any`）。
 - 服务名带版本（`plan@1`）。签名不兼容的改动要升版本，旧版本和新版本可以在同一个 epoch 换掉。
-- 测试：`tests/units/contracts/`。现在测了列编码和记录的往返，以及单元 import 契约时能通过 `core.manifest` 的检查。
+- 测试：`tests/units/contracts/`。现在测了列编码和记录的往返、联合前缀匹配（§5.3），以及单元 import 契约时能通过 `core.manifest` 的检查。
 
 ## 4. 每步记录（两边最重要的接缝）
 
@@ -137,6 +154,14 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - 调度每步只发增量（`RowDelta`、`StateOps`），不重建整个 batch。
 - 它是缓存：重载以后是空的，于是发 `Resync`，调度就发一份 `full` 增量，所以重载它不需要排空（`drain_on_reload = false`）。
 - **显存里的表只在 step stream 上按顺序更新**（入队拷贝），不从 host 直接同步写。这样上一步如果还在 GPU 上跑，它读到的仍然是 launch 时的值。
+- **重建以后**（2026-11-08，PR #19 评审）：
+  - 重建丢掉的不只是行和条目 id，还有每行上一次采到的 token。重建发生在暂停期内，调度器 `quiesce()` 时已经收完了所有结果，所以这些 token 它都有。
+  - 一行被重新加入以后（`full` 增量会重新加入所有行），它下一次跑的输入 token 由调度器给出，跑过一次以后才能再用 `from_previous = 1`。恢复以后隔了几步才再排进 batch 的行也是这样。`full` 增量里的 `StateOps` 给每行分配它持有的全部条目，不只是新的。
+  - 收到 `full` 之前，worker 不跑任何计划，每份都回 `Resync`、不带 `Sampled`。调度器把这些步当作没跑过：token 没算，拷贝没做，请求的长度退回到最后一个回了 `Sampled` 的步。这些步分出去的条目仍归原来的请求，`full` 里会再分一次。开了重叠时，`full` 之前已经发出的那份计划也会回 `Resync`，这是预期的。
+  - worker 碰到 `from_previous = 1` 却没有可接的 token，也回 `Resync`，不跑。
+  - 采样不在 worker 里留随机状态：客户端没给 seed 的话，调度器在接纳请求时补一个，worker 按（seed, 位置）取随机数。所以重建前后采到的 token 一样，和 batch 怎么拼也无关。
+  - 开投机时，下一步要验证的草稿如果留在显存里，也一起丢掉；重建后每行的第一步不带草稿。
+  - 契约测试（M2a，`torch_cpu`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
 
 ### 4.4 一步重叠
 
@@ -191,10 +216,20 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 ### 5.3 记账插件（调度宿主里，`ledger.<kind>@1`）
 
 - 只管 id，不碰显存。
-- `need`、`take`、`release` / `retire`（延迟释放，§4.4 第 5 条）、`reusable`（前缀能复用多少块，按各自的对齐规则）、`check`（不变量）。
+- `need`、`take`、`release` / `retire`（延迟释放，§4.4 第 5 条）、`reusable`（给定长度以内最长能从哪里恢复，按各自的对齐规则）、`check`（不变量）。
 - `core.state.alloc` 做两件事：
   - 联合准入：一个请求要的每种状态都分得到，才接纳它；
-  - 联合前缀匹配：取各种状态都能复用的最短长度。
+  - 联合前缀匹配：找每种状态都能从那里恢复的最长前缀（`common_prefix`）。
+- **联合前缀不是各自最长命中的最小值**（2026-11-08，PR #19 评审）。例：KV 每页 16 token，最长命中 96 token；GDN 每 64 token 一个快照，现存 64 和 128。最小值是 96，可是 GDN 在 96 没有状态，只能从 64 恢复。
+- 算法：
+  - `reusable(block_hashes, limit)` 返回这种状态在 `limit` 以内能恢复的最长长度。KV：最长连续命中以内的任一页边界；GDN：现存快照里不超过 `limit` 的最大一个。
+  - 从 `limit` 开始，取各种状态答案的最小值，再拿这个值去问，直到没有一种状态再压低它。
+  - 停下的长度每种状态都支持；而且每种状态的答案都不会低于真正的共同最长长度，所以停下的就是它。
+- 单位是 token：
+  - `block_hashes[i]` 覆盖前 (i+1)·B 个 token。B 是 `core.state.alloc` 的哈希块大小，默认等于 KV 页大小。
+  - 每种状态的对齐（页大小、快照间隔）都必须是 B 的倍数，`declare` 时检查。
+  - `limit` 是 prompt 长度减一，再向下对齐到 B：至少留一个 token 要算，才有 logits。
+- 契约测试在 `tests/units/contracts/`，覆盖不同的快照间隔、不同的最长命中、快照被淘汰的情况。
 
 ### 5.4 Qwen3.8 的状态
 
@@ -203,11 +238,11 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - 前缀复用：GDN 状态只在块边界有快照。快照占同一个池里的槽位，打快照、恢复快照都是条目拷贝（`StateCopy`）。所以 `gdn.slots` 的 `reusable` 只能对齐到快照边界。
 - MTP：config 里有 1 层 MTP，它的 KV 是 `kv.paged` 的另一层声明。
 
-### 5.5 显存里怎么排（同事定）
+### 5.5 显存里怎么排（@gaow0007 定）
 
 - 包括：页大小、NHD 还是 HND、GDN 状态在槽内的排布、VMM 的映射粒度（2 MiB）和每次扩多少。
 - 都写成声明里的数据，不写死在代码里。
-- 存储单元由发起人这边实现，布局由同事定。
+- 存储单元由 @wutianyuan1 这边实现，布局由 @gaow0007 定。
 
 ## 6. kernel 目录
 
@@ -226,7 +261,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - 模型单元在启动时给出 `Assembly`：用哪些层、每层存什么状态、有哪些权重。各项尺寸从 checkpoint 的 config 读，不写死。
 - Qwen3.8：64 层，48 层 GDN、16 层 full attention，排列是 3 层 GDN 加 1 层 full attention 重复。M2a 用同样的结构、小尺寸、随机权重。
 
-## 8. attention 和 GDN 的 backend（同事审）
+## 8. attention 和 GDN 的 backend（@gaow0007 审）
 
 代码：`core/contracts/plan.py` 的 `Backend`。
 
@@ -237,7 +272,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - flashinfer 在 cuda-graph 模式下重新 `plan` 以后可以直接 replay，同一 batch 大小内不同序列长度都正确（探针 P5、P6），所以 flashinfer 的 plan 结果不是按值依赖。
 - 有了持久 batch 以后，page 表可以在显存里增量维护，`prepare` 只更新变了的行。
 
-## 9. plan 单元和 CUDA graph（同事审）
+## 9. plan 单元和 CUDA graph（@gaow0007 审）
 
 代码：`core/contracts/plan.py` 的 `PlanService`、`Plan`、`GraphDep`。
 
@@ -273,6 +308,19 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
   - `rebuild` 返回一个迭代器，每个安全点前进一步（[change.md](change.md) 4.6）；
   - 每一步先等在途的那一步在 GPU 上做完（开了重叠的话，这个窗口里重叠暂时中断），再 warm-up、再录；
   - 旧 graph 在窗口之间照常服务，到 epoch 边界再换成新的。
+- **哪些变更能分片重录**（2026-11-08，PR #19 评审）：
+  - 分片的前提是：这次变更不重载 `core.plan`，也不重载它用到的单元。参与者会把被重载单元的准备动作推迟到执行阶段，在新实例上一次做完（`Participant._prepare_or_defer`，报 `change.prepare_one_shot`）。
+  - 能分片：
+    - 新 kernel 做成一个新单元，再加一个选它的配置项（场景 ④，`tests/scenarios/test_scenarios.py::test_4_a_new_kernel_rebuilds_only_the_graph_that_uses_it`）；
+    - 只改分桶的配置；
+    - 在目录里已有的 solution 之间换。
+
+    新的值由重录动作的参数带进来。
+  - 不能分片：原地改了 `core.plan`、backend、模型、层、`core.kernels` 或 `worker.batch` 的代码，或者改了 `core.contracts`（所有 import 它的单元一起重载）。这时重录在暂停期内一次做完，P9 的尺寸下 36 个分桶要 6.9 s 以上。
+  - 不能分片时，v0 有两种做法，都不用改框架，M2c 由 @gaow0007 选定：
+    1. 暂停期内只录最常用的几个分桶（按分桶的命中次数挑），其余分桶恢复后先走 eager。worker 循环在步与步之间调 `core.plan`，一个窗口补录一个分桶，每个窗口的代价和准备阶段分片一样，约 0.2 s。补录完之前，这些分桶的步慢一些，但结果不变，因为 graph 和 eager 逐位一致。补录不是变更：graph 是 eager 的缓存。
+    2. 整段停下来全录完，dry-run 把停顿报出来。
+  - 同一个单元的新旧实例并存（旧实例继续服务，新实例在旁边准备）要改框架，v0 不做。RSI agent 想让改代码也能分片准备，就照场景 ④ 出一个新单元，旧单元以后再删。
 - **代价**（P9，Qwen3.8-27B 的尺寸，sglang 默认的 36 个 batch 大小）：
   - 平时一步 30.6 ms。每个窗口约 0.2 s：等在途的那一步约 30 ms，两次 warm-up 约 110 ms，录制约 47 ms。
   - 36 个窗口合计约 6.6 s；一次全部录完也要 6.9 s 以上。
@@ -282,15 +330,15 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 - **显存峰值**：准备期间是新旧两套显存池之和；改了通信器的话，还要加上新旧两套通信器，每个 rank 每个通信器约 0.4–1 GiB。放不下就推迟到排空以后（[change.md](change.md) 4.7）。
 - 另一种做法是在别的进程里录，但那样要跨进程共享状态的地址，v0 不做。
 
-## 10. 平台 v2（同事审）
+## 10. 平台 v2（@gaow0007 审）
 
 ### 10.1 三个平台
 
 | 平台 | 用途 | 有没有计算 | graph |
 |---|---|---|---|
 | `fake`（已有） | 测引擎的机制：变更、重载、故障 | 没有，只有按名字调用的假 kernel | 记录依赖，replay 时检查 |
-| `torch_cpu`（新，发起人） | 在 CPU 上跑真模型语义：M2a、CI 里的单元测试和四组对比 | torch CPU 张量、参照 kernel | 记下 capture 时的调用，replay 时检查依赖、重新执行 |
-| `cuda_sm100`（新，同事） | SM100 | torch.cuda、CUDA VMM | 真 CUDA graph |
+| `torch_cpu`（新，@wutianyuan1） | 在 CPU 上跑真模型语义：M2a、CI 里的单元测试和五组对比 | torch CPU 张量、参照 kernel | 记下 capture 时的调用，replay 时检查依赖、重新执行 |
+| `cuda_sm100`（新，@gaow0007） | SM100 | torch.cuda、CUDA VMM | 真 CUDA graph |
 
 - `torch_cpu` 和 `cuda_sm100` 跑同一套平台契约测试。
 - `torch_cpu` 上，“graph 对 eager”自然完全一致，这组对比只在 GPU 层有意义。
@@ -349,7 +397,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 |---|---|---|---|
 | 单元的 CPU 测试 | `tests/units/<单元路径>/` | `torch_cpu`、`fake` | CI |
 | 引擎级 | `tests/scenarios/` | `fake`，M2a 以后加 `torch_cpu` | CI |
-| GPU | `tests/gpu/` | `cuda_sm100` | 在 SM100 上手动跑，像 formal 一样由 `addopts` 排除；同事跑他那几块，Devin 跑集成 |
+| GPU | `tests/gpu/` | `cuda_sm100` | 在 SM100 上手动跑，像 formal 一样由 `addopts` 排除；@gaow0007 跑自己那几块，Devin 跑集成 |
 
 - 平台契约测试和 kernel 契约测试（solution 对参照实现）对每个平台、每个 solution 各跑一遍，用参数化，不用 skip。
 - 五组对比：CPU 层用参照 kernel 跑，GPU 层用小尺寸配置加真 kernel 跑（只用和 batch 怎么拼无关的 solution）。
@@ -424,7 +472,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 ## 15. 待定
 
-1. §9.4 里还没测过的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；以及 dry-run 怎么报重录造成的停顿。
+1. §9.4 里还没测过的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿；不能分片时选哪种做法。
 2. `torch_cpu` 平台上的 graph：要不要模拟“录制时写死 Python 标量”。不模拟的话，这类错误只有 GPU 层才抓得到。
 3. 前端和调度之间的流在 M2a 用每步记录流。前端以后要不要拆成多个进程，到时再定。
-4. 采样放在 graph 里还是 graph 外，由同事在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。
+4. 采样放在 graph 里还是 graph 外，由 @gaow0007 在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。

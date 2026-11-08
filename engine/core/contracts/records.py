@@ -31,7 +31,9 @@ class SamplingParams(msgspec.Struct, frozen=True):
     top_p: float = 1.0
     top_k: int = -1
     seed: int | None = None
-    """Fixed per request: the reference mode samples the same tokens however requests are batched."""
+    """Set by the scheduler at admission when the client gave none. The worker draws from
+    (seed, position) and keeps no random state: the same tokens however requests are batched,
+    and a rebuilt persistent batch samples what the old one would have (§4.3)."""
 
 
 # ------------------------------------------------------------------ scheduler -> worker
@@ -46,7 +48,9 @@ class AddedRow(msgspec.Struct, frozen=True):
 
 class RowDelta(msgspec.Struct, frozen=True):
     """How the persistent batch changes before this step. Deltas arrive in order on a
-    lossless stream; ``full`` drops every row first (the answer to ``Resync``)."""
+    lossless stream; ``full`` drops every row first (the answer to ``Resync``). A full delta
+    re-adds every row the scheduler keeps, and the plan's ``StateOps`` assigns each of them
+    every item it holds, not only new ones."""
 
     SECTION: ClassVar[str] = "sched.rows@1"
     added: list[AddedRow] = []
@@ -68,7 +72,10 @@ class BatchPlan(msgspec.Struct, frozen=True):
     """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order."""
     from_previous: Column
     """``u8`` per row: 1 = the row's single input token is the token the worker sampled for it
-    the last time the row ran, resolved on the device without a host round trip."""
+    the last time the row ran, resolved on the device without a host round trip. Only for a
+    row that has run since it was last added (a full delta adds every row again) and whose
+    last run ended its prompt or decoded; otherwise its token is given in ``tokens``. A worker
+    with no token to resolve answers ``Resync`` and runs nothing."""
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
     """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
@@ -136,7 +143,15 @@ class Capacity(msgspec.Struct, frozen=True):
 
 
 class Resync(msgspec.Struct, frozen=True):
-    """The worker lost its persistent batch (``worker.batch`` was rebuilt): send ``full``."""
+    """The worker lost its persistent batch (``worker.batch`` was rebuilt), or got a plan it
+    cannot apply to it: send ``full``.
+
+    Until a full delta arrives the worker runs no plan: it answers each with ``Resync`` and no
+    ``Sampled``. The scheduler counts every step answered so as not run (with overlap, the next
+    one may already be on its way): its tokens were not computed and its copies not made, the
+    requests' lengths go back to the last step that returned ``Sampled``. Items assigned in
+    those steps stay with their requests; the full delta assigns them again. Further
+    ``Resync`` answers, to plans sent before the full delta, are expected."""
 
     SECTION: ClassVar[str] = "worker.resync@1"
     reason: str = ""
