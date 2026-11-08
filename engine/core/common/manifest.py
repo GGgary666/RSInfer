@@ -19,22 +19,25 @@ from core.common.result import Diagnostic, Failed, Ok, Result, diag, fail
 UnitKind = Literal["logic", "state"]
 Binding = Literal["live", "plan", "startup"]
 ConfigType = Literal["int", "float", "str", "bool", "list", "dict", "any"]
-StateAction = str
-"""Named by the state unit that offers and runs it (``ctx.on_action``); the framework keeps no list
-of them (modules.html P4). Common ones: ``refit`` (new contents, same layout), ``grow`` (more
-capacity, same addresses), ``relocate`` (move contents within the same version: EPLB moves experts
-between ranks), ``invalidate`` (drop the contents). Carrying contents to a new version of the
-unit's code is ``[state] migrate`` (doc/specs/state-changes.md)."""
+ActionName = str
+"""Named by the unit that offers and runs it (``ctx.on_action``); the framework keeps no list of
+them (modules.html P4). State units offer actions on their contents: ``refit`` (new contents, same
+layout), ``grow`` (more capacity, same addresses), ``relocate`` (move contents within the same
+version: EPLB moves experts between ranks), ``invalidate`` (drop the contents). Carrying contents
+to a new version of the unit's code is ``[state] migrate`` (doc/specs/state-changes.md). Logic
+units offer others, e.g. ``drain`` from the scheduler logic that holds the requests
+(state-changes.md §5)."""
 
-_SERVICE_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*@[0-9]+$")
-_UNIT_ID_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z0-9_]+)*$")
-_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_ENTRY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$")
+# Matched with ``fullmatch``: ``$`` also matches before a trailing newline.
+_SERVICE_RE = re.compile(r"[a-z][a-z0-9_]*(\.[a-z0-9_]+)*@[0-9]+")
+_UNIT_ID_RE = re.compile(r"[a-z][a-z0-9_]*(\.[a-z0-9_]+)*")
+_ACTION_RE = re.compile(r"[a-z][a-z0-9_]*")
+_ENTRY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*")
 
 
 def is_service_name(name: str) -> bool:
     """Service names carry an interface version: ``"sched.chunk_policy@1"``."""
-    return _SERVICE_RE.match(name) is not None
+    return _SERVICE_RE.fullmatch(name) is not None
 
 
 class UnitSection(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -82,8 +85,10 @@ class Reads(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class Capabilities(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     accept_config: bool = False
     """Can take new config values in place (``ctx.on_config``)."""
-    actions: list[StateAction] = []
-    """State units only: the actions the unit offers, by its own names (``StateAction``)."""
+    actions: list[ActionName] = []
+    """The actions the unit offers, by its own names. Only a state unit's actions may be asked
+    for by a ``StateRequest`` (checked by ``core.deps``); ``core.deps`` plans the others itself,
+    e.g. ``drain`` (state-changes.md §5.1)."""
     graph_capturable: bool = False
     """Kernel solutions only: may be recorded into a graph."""
     captures_graph: bool = False
@@ -119,9 +124,9 @@ class UnitManifest(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 def check_manifest(m: UnitManifest) -> list[str]:
     """Structural checks that do not need other manifests. Returns problems."""
     problems: list[str] = []
-    if not _UNIT_ID_RE.match(m.unit.id):
+    if not _UNIT_ID_RE.fullmatch(m.unit.id):
         problems.append(f"bad unit id {m.unit.id!r}")
-    if not _ENTRY_RE.match(m.unit.entry):
+    if not _ENTRY_RE.fullmatch(m.unit.entry):
         problems.append(f"bad entry {m.unit.entry!r}; expected 'module:Class'")
     if not m.unit.process:
         problems.append("unit.process is empty")
@@ -136,13 +141,10 @@ def check_manifest(m: UnitManifest) -> list[str]:
         problems.append(f"unit requires its own services: {sorted(self_dep)}")
     for key in set(m.config) & set(m.reads.config):
         problems.append(f"config key {key!r} both owned and read-only")
-    if m.unit.kind == "logic":
-        if m.state is not None:
-            problems.append("[state] is only allowed on state units")
-        if m.capabilities.actions:
-            problems.append("capabilities.actions is only allowed on state units")
+    if m.unit.kind == "logic" and m.state is not None:
+        problems.append("[state] is only allowed on state units")
     for name in m.capabilities.actions:
-        if not _ACTION_RE.match(name):
+        if not _ACTION_RE.fullmatch(name):
             problems.append(f"bad action name {name!r}; expected lowercase letters, digits and '_'")
     for key, decl in m.config.items():
         if not check_value_type(decl.type, decl.default):

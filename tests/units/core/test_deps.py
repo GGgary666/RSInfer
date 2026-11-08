@@ -6,6 +6,7 @@ what was recorded from it) and 4 (startup key: reload only its readers).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -271,20 +272,40 @@ def test_state_requests_become_the_state_units_own_actions(tmp_path: Path) -> No
     assert isinstance(bad, Failed) and bad.diagnostics[0].code == "deps.bad_state_request"
 
 
-def test_a_state_unit_names_its_own_actions(tmp_path: Path) -> None:
+def test_a_unit_names_its_own_actions(tmp_path: Path) -> None:
     """The framework keeps no list of action names (modules.html P4): a unit may offer one no other
-    unit has, without a change to the framework core. Only the form of the name is checked."""
+    unit has, without a change to the framework core. Only the form of the name is checked.
+
+    A logic unit may declare actions too: the scheduler logic holds the requests and declares
+    ``drain`` (state-changes.md §5.1). A ``StateRequest`` still reaches only state units."""
     s = {**BASE, "pkg/s/unit.toml": manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state",
                                                   capabilities='actions = ["compact", "grow"]'),
-         "pkg/s/unit.py": "class Unit:\n    pass\n"}
-    units = ("pkg.a", "pkg.b", "pkg.s")
+         "pkg/s/unit.py": "class Unit:\n    pass\n",
+         "pkg/q/unit.toml": manifest_toml("pkg.q", "pkg.q.unit:Unit", capabilities='actions = ["drain"]'),
+         "pkg/q/unit.py": "class Unit:\n    pass\n"}
+    units = ("pkg.a", "pkg.b", "pkg.s", "pkg.q")
     pa = only(Case(tmp_path / "1", base=s, new=s, units=units,
                    state=[StateRequest(UnitId("pkg.s"), "compact", {"below": 0.5})]).plan())
     assert pa.actions == [UnitAction(UnitId("pkg.s"), "compact", {"below": 0.5})] and pa.reload is None
-    for name in ["Compact", "", "compact now", "kv.compact"]:
-        bad = manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state", capabilities=f"actions = [{name!r}]")
+    logic = Case(tmp_path / "2", base=s, new=s, units=units, state=[StateRequest(UnitId("pkg.q"), "drain")]).plan()
+    assert isinstance(logic, Failed) and logic.diagnostics[0].code == "deps.bad_state_request"
+    assert "not a state unit" in logic.diagnostics[0].reason
+    for name in ["Compact", "", "compact now", "kv.compact", "compact\n"]:
+        bad = manifest_toml("pkg.s", "pkg.s.unit:Unit", kind="state", capabilities=f"actions = [{json.dumps(name)}]")
         r = parse_manifest(bad)
-        assert isinstance(r, Failed) and "bad action name" in r.diagnostics[0].reason, name
+        assert isinstance(r, Failed) and r.diagnostics[0].reason.startswith(f"bad action name {name!r}"), name
+
+
+def test_names_in_a_manifest_are_checked_in_full(tmp_path: Path) -> None:
+    """``$`` also matches before a trailing newline: a name that ends in one is refused, not trimmed."""
+    # "\\n" in TOML text is the escape for a newline in the value.
+    cases = {"unit id": manifest_toml("pkg.s\\n", "pkg.s.unit:Unit"),
+             "entry": manifest_toml("pkg.s", "pkg.s.unit:Unit\\n"),
+             "service": manifest_toml("pkg.s", "pkg.s.unit:Unit", provides=["pkg.s@1\\n"])}
+    for what, text in cases.items():
+        r = parse_manifest(text)
+        assert isinstance(r, Failed) and r.has_code("manifest.invalid") and "\\n" in r.diagnostics[0].reason, what
+    assert not isinstance(parse_manifest(manifest_toml("pkg.s", "pkg.s.unit:Unit", provides=["pkg.s@1"])), Failed)
 
 
 def test_the_same_inputs_give_the_same_plan(tmp_path: Path) -> None:
