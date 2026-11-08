@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
+import signal
 import socket
 import time
 import uuid
 from collections.abc import Iterator
+from multiprocessing.shared_memory import SharedMemory
 
 import msgspec
 import pytest
 import zmq
 
 from core.common.ids import HostId, ProcId
-from core.ipc import StreamAddress
+from core.ipc import IpcTunables, StreamAddress
 from core.ipc.channels import ChannelReader, Channels, ChannelWriter
-from tests.framework.ipc.peers import BIND, PATIENT
+from tests.framework.ipc.peers import BIND, PATIENT, read_forever
 
 TUN = msgspec.structs.replace(PATIENT, lookup_retry_s=0.05)
+QUICK = msgspec.structs.replace(TUN, peer_timeout_s=0.5)
+"""For the tests whose reader is dead: it is known dead soon."""
+SPAWN = mp.get_context("spawn")
 BACKENDS = {"shm": ("host-a", "host-a"), "tcp": ("host-a", "host-b")}
 READER = ProcId(HostId("host-a"), "dst", 0)
 
@@ -47,7 +54,8 @@ class Directory:
         for channels in self.opened:
             channels.close()
 
-    def channels(self, zctx: zmq.Context[zmq.Socket[bytes]], host: str, proc: ProcId = READER) -> Channels:
+    def channels(self, zctx: zmq.Context[zmq.Socket[bytes]], host: str, proc: ProcId = READER,
+                 tun: IpcTunables = TUN) -> Channels:
         def allocate(name: str) -> str:
             ring = f"agx-test-{name}-{uuid.uuid4().hex[:8]}"
             self.allocated.append(ring)
@@ -61,7 +69,7 @@ class Directory:
             self.lookups += 1
             return self.endpoints.get((p, name))
 
-        channels = Channels(zctx, local=HostId(host), bind=BIND, tun=TUN, allocate=allocate, lookup=lookup,
+        channels = Channels(zctx, local=HostId(host), bind=BIND, tun=tun, allocate=allocate, lookup=lookup,
                             publish=publish)
         self.opened.append(channels)
         return channels
@@ -134,13 +142,43 @@ def test_a_writer_follows_its_reader_to_a_new_process(zctx: zmq.Context[zmq.Sock
     assert writer.generation == 2
 
 
-def test_a_writer_to_an_address_nobody_listens_on_says_so(zctx: zmq.Context[zmq.Socket[bytes]],
-                                                         directory: Directory) -> None:
-    """Not ``TimeoutError``: that means a reader that does not keep up."""
+def test_a_tcp_writer_never_waits_for_a_connection(zctx: zmq.Context[zmq.Socket[bytes]],
+                                                   directory: Directory) -> None:
+    """Nobody listens at the address: ``write`` says so at once, even without a timeout (not
+    ``TimeoutError``, which means a reader that does not keep up), and counts no connection."""
     with socket.socket() as s:
         s.bind((BIND, 0))
         port = s.getsockname()[1]
-    channels = directory.channels(zctx, "host-a")
-    writer = channels.writer_to(StreamAddress(HostId("host-b"), tcp=f"tcp://{BIND}:{port}"))
-    assert writer.write(b"x", timeout=0.1) is False
-    channels.discard(StreamAddress(HostId("host-b"), tcp=f"tcp://{BIND}:{port}"))
+    writer = directory.channels(zctx, "host-a", tun=QUICK).writer_to(
+        StreamAddress(HostId("host-b"), tcp=f"tcp://{BIND}:{port}"))
+    deadline = time.monotonic() + QUICK.peer_timeout_s + 0.5
+    while time.monotonic() < deadline:
+        t0 = time.monotonic()
+        assert writer.write(b"x") is False
+        assert time.monotonic() - t0 < 0.2
+        time.sleep(0.02)
+    assert writer.generation == 0
+
+
+def test_a_writer_does_not_reconnect_to_a_dead_reader_again_and_again(zctx: zmq.Context[zmq.Socket[bytes]],
+                                                                      directory: Directory) -> None:
+    """A killed reader leaves its ring behind until the node agent removes it. The writer sees
+    the reader is gone before attaching, and counts no connection however often it is asked."""
+    q = SPAWN.Queue()
+    ring = f"agx-test-{uuid.uuid4().hex[:12]}"
+    child = SPAWN.Process(target=read_forever, args=(q, "host-a", "host-a", ring))
+    child.start()
+    try:
+        address = q.get(timeout=20)
+        assert child.pid is not None
+        os.kill(child.pid, signal.SIGKILL)
+        child.join(10)
+        time.sleep(QUICK.peer_timeout_s + 0.2)  # its heartbeat is stale now
+        writer = directory.channels(zctx, "host-a", tun=QUICK).writer_to(address)
+        for _ in range(30):
+            assert writer.write(b"x", timeout=1) is False
+            time.sleep(0.02)
+        assert writer.generation == 0 and writer.address is None
+    finally:
+        child.join(10)
+        SharedMemory(name=ring).unlink()  # what the node agent does for a killed process

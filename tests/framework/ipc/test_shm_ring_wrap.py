@@ -99,7 +99,7 @@ def ring() -> Generator[RingPair]:
         pair.close()
 
 
-@pytest.mark.parametrize(("warmup", "large"), [(20, 40), (4, 60)])
+@pytest.mark.parametrize(("warmup", "large"), [(20, 40), (4, 56)])  # 8-byte record header
 def test_large_record_progresses_after_drained_ring_wrap(ring: RingPair, warmup: int, large: int) -> None:
     first, second = b"a" * warmup, b"b" * large
     ring.write(first)
@@ -110,13 +110,13 @@ def test_large_record_progresses_after_drained_ring_wrap(ring: RingPair, warmup:
     assert ring.reply() == {"written": True}
 
 
-@pytest.mark.parametrize(("warmup", "large"), [(20, 40), (4, 60)])
+@pytest.mark.parametrize(("warmup", "large"), [(20, 40), (4, 56)])  # 8-byte record header
 def test_timed_out_wrap_preserves_unread_record_and_can_retry(ring: RingPair, warmup: int, large: int) -> None:
     first, unread, next_record = b"a" * warmup, b"unread" * 3 + b"!!", b"z" * large
     ring.write(first)
     assert ring.reader.read(timeout=1) == first
     ring.write(unread)
-    # Stop consuming. The unread 24-byte frame plus the new frame exceeds 64.
+    # Stop consuming. The unread 32-byte frame plus the new frame exceeds 64.
     ring.start_write(next_record, timeout=0.05)
     outcome = ring.reply()
     received = ring.reader.read(timeout=1)
@@ -148,7 +148,7 @@ def test_closing_after_timed_out_wrap_drains_unread_data_before_eof(ring: RingPa
 def test_variable_records_are_ordered_and_lossless_across_repeated_wraps(capacity: int) -> None:
     pair = RingPair(capacity)
     # 65/67 also exercise wrap padding too short to contain a 4-byte marker.
-    sizes = [0, 20, 40, 60, 1, 12, 4, 52] * 3
+    sizes = [0, 20, 40, 56, 1, 12, 4, 52] * 3  # 56 + the 8-byte header fills a 64-byte ring
     records = [bytes([i + 1]) * size for i, size in enumerate(sizes)]
     try:
         for offset in range(0, len(records), 3):

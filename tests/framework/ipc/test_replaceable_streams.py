@@ -14,7 +14,7 @@ import zmq
 from core.common.ids import HostId
 from core.ipc import IpcTunables, PeerLost, RingBusy, StreamAddress, open_reader, open_writer
 from core.ipc.stream import ShmReader, ShmWriter, TcpReader, TcpWriter
-from tests.framework.ipc.peers import BIND, PATIENT, TUN, write_records
+from tests.framework.ipc.peers import BIND, PATIENT, TUN, write_records, write_then_wait
 
 SPAWN = mp.get_context("spawn")
 BACKENDS = {"shm": ("host-a", "host-a"), "tcp": ("host-a", "host-b")}
@@ -130,12 +130,19 @@ def test_late_records_of_a_replaced_tcp_producer_are_dropped(zctx: zmq.Context[z
 def test_a_single_producer_stream_still_refuses_a_second_producer(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
     hosts = BACKENDS["tcp"]
     reader, address = reader_for(zctx, hosts, replaceable=False)
+    first = writer_for(zctx, hosts, address)
+    second: ShmWriter | TcpWriter | None = None
     try:
-        writer_for(zctx, hosts, address).write(b"a0", timeout=5)
-        writer_for(zctx, hosts, address).write(b"b0", timeout=5)
+        first.write(b"a0", timeout=5)
+        assert take(reader, 1) == [b"a0"]
+        second = writer_for(zctx, hosts, address)
+        second.write(b"b0", timeout=5)
         with pytest.raises(PeerLost, match="second producer"):
-            take(reader, 2)
+            reader.read(timeout=10)
     finally:
+        first.abort()
+        if second is not None:
+            second.abort()
         reader.close()
 
 
@@ -149,3 +156,103 @@ def test_a_shm_producer_notices_a_closed_reader_before_writing(zctx: zmq.Context
     with pytest.raises(PeerLost):
         writer.write(b"a1", timeout=5)
     writer.close()
+
+
+def test_records_a_producer_left_behind_keep_its_generation(zctx: zmq.Context[zmq.Socket[bytes]],
+                                                            hosts: tuple[str, str]) -> None:
+    """The first producer closes with records unread and the next one writes before the reader
+    gets to them: each record comes with the generation of the producer that wrote it, and over
+    TCP the closed producer's tail is not lost to the next one (its records wait)."""
+    reader, address = reader_for(zctx, hosts)
+    try:
+        first = writer_for(zctx, hosts, address)
+        first.write(b"old:0", timeout=5)
+        first.write(b"old:1", timeout=5)
+        first.close()
+        second = writer_for(zctx, hosts, address)
+        second.write(b"new:0", timeout=5)
+        got: list[tuple[bytes, int]] = []
+        for _ in range(3):
+            got.append((take(reader, 1)[0], reader.writer_generation))
+        assert got == [(b"old:0", 1), (b"old:1", 1), (b"new:0", 2)]
+        second.close()
+    finally:
+        reader.close()
+
+
+def test_a_stalled_shm_producer_is_fenced_once_another_took_over(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """A producer that stalls past ``peer_timeout_s`` is taken over. When it goes on, its writes
+    fail and never reach the reader, and its close does not mark its successor closed."""
+    hosts = BACKENDS["shm"]
+    reader, address = reader_for(zctx, hosts, tun=TUN)
+    events, go = SPAWN.Queue(), SPAWN.Event()
+    child = SPAWN.Process(target=write_then_wait, args=(address, hosts[1], events, go))
+    child.start()
+    assert child.pid is not None
+    try:
+        assert events.get(timeout=20) == "wrote old:0"
+        assert take(reader, 1) == [b"old:0"]
+        os.kill(child.pid, signal.SIGSTOP)  # its heartbeat stops too
+        time.sleep(TUN.peer_timeout_s + 0.3)
+        successor = writer_for(zctx, hosts, address, TUN)
+        successor.write(b"new:0", timeout=5)
+        os.kill(child.pid, signal.SIGCONT)
+        go.set()
+        assert events.get(timeout=20) == "fenced"
+        assert events.get(timeout=20) == "closed"
+        assert take(reader, 1) == [b"new:0"] and reader.writer_generation == 2
+        assert reader.read(timeout=0.3) is None  # old:1 was never written
+        with pytest.raises(RingBusy):  # the successor still owns the ring
+            writer_for(zctx, hosts, address, TUN)
+        successor.write(b"new:1", timeout=5)
+        assert take(reader, 1) == [b"new:1"]
+        successor.close()
+    finally:
+        os.kill(child.pid, signal.SIGCONT)
+        child.join(10)
+        reader.close()
+
+
+def test_any_number_of_replaced_tcp_producers_stay_replaced(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """Producers are ordered by when they started, not remembered in a bounded list: after 17
+    replacements a late frame of the first one is still dropped."""
+    hosts = BACKENDS["tcp"]
+    reader, address = reader_for(zctx, hosts, tun=TUN)
+    writers: list[ShmWriter | TcpWriter] = []
+    try:
+        for i in range(18):
+            writers.append(writer_for(zctx, hosts, address, TUN))
+            writers[-1].write(f"p{i}".encode(), timeout=5)
+            if i >= 2:
+                writers[-2].close()  # the first one stays open: it is replaced once it is quiet
+            assert take(reader, 1) == [f"p{i}".encode()]
+        writers[0].write(b"late", timeout=5)
+        writers[-1].write(b"last", timeout=5)
+        assert take(reader, 1) == [b"last"]
+        assert reader.read(timeout=0.3) is None
+        assert reader.writer_generation == 18
+    finally:
+        for w in writers:
+            w.abort()
+        reader.close()
+
+
+def test_an_earlier_tcp_producer_never_replaces_a_later_one(zctx: zmq.Context[zmq.Socket[bytes]]) -> None:
+    """ZMQ fair-queues the two connections: the earlier producer's first frame can arrive after
+    the later one's. It is dropped; it does not take the stream back."""
+    hosts = BACKENDS["tcp"]
+    reader, address = reader_for(zctx, hosts)
+    earlier = writer_for(zctx, hosts, address)
+    later = writer_for(zctx, hosts, address)
+    try:
+        later.write(b"b0", timeout=5)
+        assert take(reader, 1) == [b"b0"]
+        earlier.write(b"a0", timeout=5)
+        later.write(b"b1", timeout=5)
+        assert take(reader, 1) == [b"b1"]
+        assert reader.read(timeout=0.3) is None
+        assert reader.writer_generation == 1
+    finally:
+        earlier.abort()
+        later.abort()
+        reader.close()

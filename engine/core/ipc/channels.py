@@ -7,7 +7,7 @@ loop unit finds its readers where they were, at the same address.
 Peers come and go. A reader takes the next producer when one closes or dies; a writer to a
 named reader looks it up again, through the supervisor, when that reader's process is
 replaced. Both count how often that happened (``generation``): what was in flight to an
-old peer is lost, and only the unit knows what to do about it.
+old peer may be lost, and only the unit knows what to do about it.
 
 All calls run on the host's loop thread. Lookups go to the supervisor only while a writer
 has no reader to write to, at most every ``ipc.lookup_retry_s``; never per record.
@@ -53,7 +53,8 @@ class ChannelReader:
 
     @property
     def generation(self) -> int:
-        """Producers this reader has had; a change means records of an earlier one may be lost."""
+        """Which producer wrote the record last returned: 1 for the first, one more per
+        replacement. A change means records of an earlier producer may be lost."""
         return self._reader.writer_generation
 
     def close(self) -> None:
@@ -67,28 +68,34 @@ class ChannelWriter:
                  resolve: Callable[[], StreamAddress | None]) -> None:
         self._zctx, self._local, self._tun, self._resolve = zctx, local, tun, resolve
         self._writer: ShmWriter | TcpWriter | None = None
+        self._connected = False
         self._since = 0.0
         self._next_try = 0.0
+        self._dead: StreamAddress | None = None
+        self._dead_until = 0.0
         self.address: StreamAddress | None = None
         self.generation = 0
-        """Connections made; a change means records sent on an earlier one may be lost."""
+        """Connections established; a change means records sent on an earlier one may be lost."""
 
     def write(self, data: bytes, timeout: float | None = None) -> bool:
         """Send one record. ``False``: there is no reader to send to right now (not published
-        yet, gone, or its replacement has not published), and nothing was sent; try again
-        later. Raises ``TimeoutError`` if the reader is there but does not keep up."""
+        yet, gone, its replacement not published yet, or a TCP connection still opening), and
+        nothing was sent; try again later. Never waits for a connection. Raises
+        ``TimeoutError`` if a connected reader does not keep up within ``timeout``."""
         if self._writer is None and not self._connect():
             return False
-        assert self._writer is not None
-        try:
-            self._writer.write(data, timeout)
-        except TimeoutError:
-            if isinstance(self._writer, TcpWriter) and not self._writer.connected:
-                # Not connected (yet): nobody listens there, or the reader is still starting.
+        writer = self._writer
+        assert writer is not None
+        if not self._connected:
+            assert isinstance(writer, TcpWriter)
+            if not writer.connected:
                 if time.monotonic() - self._since > self._tun.peer_timeout_s:
-                    self.abandon()
+                    self.abandon()  # nobody accepts the connection there
                 return False
-            raise
+            self._connected = True
+            self.generation += 1
+        try:
+            writer.write(data, timeout)
         except (PeerLost, StreamClosed):
             self.abandon()
             return False
@@ -100,21 +107,32 @@ class ChannelWriter:
             return False
         self._next_try = now + self._tun.lookup_retry_s
         address = self._resolve()
-        if address is None:
-            return False
+        if address is None or (address == self._dead and now < self._dead_until):
+            return False  # a dead reader's address is tried again only every peer_timeout_s
         try:
-            self._writer = open_writer(self._zctx, local=self._local, address=address, tun=self._tun)
-        except (RingBusy, FileNotFoundError):
-            return False  # the previous producer is still there, or the ring is already gone
-        self.address, self._since = address, now
-        self.generation += 1
+            writer = open_writer(self._zctx, local=self._local, address=address, tun=self._tun)
+        except RingBusy:
+            return False  # the previous producer has not closed or timed out yet
+        except (PeerLost, FileNotFoundError):
+            self._bury(address)  # the ring's reader is gone, or the ring itself
+            return False
+        self._writer, self.address, self._since = writer, address, now
+        self._connected = isinstance(writer, ShmWriter)  # a TCP connection is made in the background
+        if self._connected:
+            self.generation += 1
         return True
 
+    def _bury(self, address: StreamAddress | None) -> None:
+        self._dead, self._dead_until = address, time.monotonic() + self._tun.peer_timeout_s
+
     def abandon(self) -> None:
-        """Drop the connection without delivering what is queued; the next write connects again."""
+        """The reader is gone: drop the connection without delivering what is queued. The next
+        write looks the reader up again, and connects to this address no sooner than
+        ``peer_timeout_s`` from now."""
         if self._writer is not None:
             self._writer.abort()
             self._writer = None
+            self._bury(self.address)
 
     def close(self) -> None:
         """Orderly end: the reader gets what is queued, then waits for the next producer."""

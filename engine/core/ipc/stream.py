@@ -10,8 +10,9 @@ A peer that stops proving it is alive for ``ipc.peer_timeout_s`` is reported
 as ``PeerLost``; the caller reports that to the control plane.
 
 A reader opened ``replaceable`` outlives its producers: when one closes or dies, the
-next one to connect takes over, and ``writer_generation`` counts them. The process host
-keeps such readers for its units (``core.ipc.channels``, doc/specs/ipc.md §6).
+next one takes over, one at a time, and ``writer_generation`` says which producer wrote the
+record just returned. The process host keeps such readers for its units
+(``core.ipc.channels``, doc/specs/ipc.md §6).
 """
 
 from __future__ import annotations
@@ -175,29 +176,56 @@ class _Ring:
                 pass
 
 
+_RECORD = struct.Struct("<II")  # payload length (or _MARK: skip to the ring's end), producer generation
+
+
 class ShmWriter:
+    """The producer of a ring. Opening it makes this producer the ring's owner: its generation
+    goes into the header (``_O_WGEN``) and into every record it writes. A producer that was
+    taken over (it stalled past ``peer_timeout_s``, then went on) is fenced: before writing,
+    before publishing, before beating and before closing it checks that it still owns the
+    ring, and does nothing if not. A record it slips in after all is older than records the
+    reader already returned, and the reader drops it."""
+
     def __init__(self, name: str, tun: IpcTunables) -> None:
         self._ring = r = _Ring.attach(name)
         self._tun = tun
+        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, tun.peer_timeout_s):
+            r.close()
+            raise PeerLost(f"{name}: the step-stream reader is gone")
         if r.f64(_O_WBEAT) != 0.0 and not r.u64(_O_WCLOSED) and not r.peer_lost(_O_WBEAT, tun.peer_timeout_s):
             r.close()
             raise RingBusy(f"{name} has a live producer")
-        # The previous producer closed or died: published records stay for the reader, and an
-        # unpublished half record is invisible (the length and head are written last).
+        # The previous producer closed or died: what it published stays for the reader, and a
+        # half-written record is invisible (its length and the head are written last).
+        self._gen = r.u64(_O_WGEN) + 1
+        r.set_u64(_O_WGEN, self._gen)
         r.set_u64(_O_WCLOSED, 0)
-        r.set_u64(_O_WGEN, r.u64(_O_WGEN) + 1)
-        self._ring.beat(_O_WBEAT)
-        self._hb = _Heartbeat(tun.heartbeat_interval_s, lambda: self._ring.beat(_O_WBEAT))
+        r.beat(_O_WBEAT)
+        self._hb = _Heartbeat(tun.heartbeat_interval_s, self._beat)
         self._hb.start()
+
+    def _owns(self) -> bool:
+        return self._ring.u64(_O_WGEN) == self._gen
+
+    def _beat(self) -> None:
+        if self._owns():
+            self._ring.beat(_O_WBEAT)
+
+    def _check(self) -> None:
+        r = self._ring
+        if not self._owns():
+            raise PeerLost("another producer took this step-stream ring over")
+        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
+            raise PeerLost("step-stream reader is gone")
 
     def write(self, data: bytes, timeout: float | None = None) -> None:
         r = self._ring
         cap = r.capacity
-        size = _pad(4 + len(data))
+        size = _pad(_RECORD.size + len(data))
         if size > cap:
             raise ValueError(f"record of {len(data)} bytes exceeds ring capacity {cap}")
-        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
-            raise PeerLost("step-stream reader is gone")  # before writing into a ring nobody reads
+        self._check()  # not into a ring nobody reads, or one another producer owns now
         deadline = None if timeout is None else time.monotonic() + timeout
         backoff = _Backoff()
         while True:
@@ -209,28 +237,32 @@ class ShmWriter:
             if skip and cap - (head - tail) >= skip:
                 # Publish padding separately: padding + record may exceed capacity.
                 # Only the reader advances tail, after consuming any queued records.
+                self._check()
                 if skip >= 4:
                     struct.pack_into("<I", r.buf, _HEADER + pos, _MARK)
                 r.set_u64(_O_HEAD, head + skip)
                 continue
-            if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
-                raise PeerLost("step-stream reader is gone")
+            self._check()
             if deadline is not None and time.monotonic() > deadline:
                 raise TimeoutError("step-stream reader is not keeping up")
             backoff.wait()
+        self._check()
         if skip:
             if skip >= 4:
                 struct.pack_into("<I", r.buf, _HEADER + pos, _MARK)
             head += skip
             pos = 0
-        r.buf[_HEADER + pos + 4:_HEADER + pos + 4 + len(data)] = data
-        struct.pack_into("<I", r.buf, _HEADER + pos, len(data))
+        r.buf[_HEADER + pos + _RECORD.size:_HEADER + pos + _RECORD.size + len(data)] = data
+        _RECORD.pack_into(r.buf, _HEADER + pos, len(data), self._gen)
+        if not self._owns():  # taken over meanwhile: this record is never published
+            raise PeerLost("another producer took this step-stream ring over")
         r.set_u64(_O_HEAD, head + size)
         r.beat(_O_WBEAT)
 
     def close(self) -> None:
         self._hb.stop()
-        self._ring.set_u64(_O_WCLOSED, 1)
+        if self._owns():  # a fenced producer must not mark its successor closed
+            self._ring.set_u64(_O_WCLOSED, 1)
         self._ring.close()
 
     def abort(self) -> None:
@@ -243,6 +275,7 @@ class ShmReader:
         self._tun = tun
         self._replaceable = replaceable
         self.name = name
+        self._gen = 0
         self._ring.beat(_O_RBEAT)
         self._hb = _Heartbeat(tun.heartbeat_interval_s, lambda: self._ring.beat(_O_RBEAT))
         self._hb.start()
@@ -260,8 +293,13 @@ class ShmReader:
                 if n == _MARK:
                     r.set_u64(_O_TAIL, tail + (cap - pos))
                     continue
-                data = bytes(r.buf[_HEADER + pos + 4:_HEADER + pos + 4 + n])
-                r.set_u64(_O_TAIL, tail + _pad(4 + n))
+                gen = _RECORD.unpack_from(r.buf, _HEADER + pos)[1]
+                start = _HEADER + pos + _RECORD.size
+                data = bytes(r.buf[start:start + n])
+                r.set_u64(_O_TAIL, tail + _pad(_RECORD.size + n))
+                if gen < self._gen:
+                    continue  # a fenced producer's record, after records of its successor
+                self._gen = gen
                 return data
             if not self._replaceable:
                 if r.u64(_O_WCLOSED):
@@ -274,8 +312,9 @@ class ShmReader:
 
     @property
     def writer_generation(self) -> int:
-        """Producers this ring has had; a new one takes over after the last closed or died."""
-        return self._ring.u64(_O_WGEN)
+        """The producer of the record last returned: 1 for the ring's first, one more for each
+        producer that took over. Records a producer left in the ring keep its generation."""
+        return self._gen
 
     def close(self) -> None:
         self._hb.stop()
@@ -285,7 +324,7 @@ class ShmReader:
 
 # --------------------------------------------------------------------- tcp
 
-_FRAME = struct.Struct("<QQB")  # producer id, sequence number, kind (0 data, 1 close)
+_FRAME = struct.Struct("<QQQB")  # producer start (ns), producer nonce, sequence number, kind (0 data, 1 close)
 
 
 def _tune(sock: zmq.Socket[bytes], tun: IpcTunables) -> None:
@@ -333,7 +372,8 @@ class TcpWriter:
         self._sock.setsockopt(zmq.IMMEDIATE, 1)
         self._link = _Link(self._sock)
         self._sock.connect(address)
-        self._id = secrets.randbits(64)
+        # Orders the producers of one reader: the one that started later replaces the earlier.
+        self._key = (time.time_ns(), secrets.randbits(64))
         self._seq = 0
         self._tun = tun
 
@@ -344,7 +384,7 @@ class TcpWriter:
         return self._link.seen and not self._link.lost
 
     def _send(self, kind: int, data: bytes, timeout: float | None) -> None:
-        frame = _FRAME.pack(self._id, self._seq, kind) + data
+        frame = _FRAME.pack(*self._key, self._seq, kind) + data
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             self._link.update()
@@ -380,7 +420,18 @@ class TcpWriter:
         self._sock.close(0)
 
 
+type _Producer = tuple[int, int]
+"""(start time in ns, nonce): a later start is a later producer."""
+
+
 class TcpReader:
+    """The consumer end over TCP. ZMQ fair-queues the connections of several producers, so their
+    frames may arrive interleaved. A replaceable reader keeps one current producer, in order:
+    frames of earlier producers are dropped; frames of a later one wait until the current one
+    closed, went quiet for ``peer_timeout_s``, or the later one has ``stream_hwm`` frames
+    waiting. Then the later one becomes current. So a producer's own records are never mixed
+    with another's, and the tail of one that closed in order is not lost to its successor."""
+
     def __init__(self, zctx: zmq.Context[zmq.Socket[bytes]], bind_host: str, tun: IpcTunables, *,
                  replaceable: bool = False) -> None:
         self._sock = zctx.socket(zmq.PULL)
@@ -388,51 +439,83 @@ class TcpReader:
         self._link = _Link(self._sock)
         self._sock.bind(f"tcp://{bind_host}:*")
         self.address = self._sock.getsockopt_string(zmq.LAST_ENDPOINT)
+        self._tun = tun
         self._replaceable = replaceable
-        self._writer: int | None = None
+        self._current: _Producer | None = None
         self._expect = 0
-        self._retired: deque[int] = deque(maxlen=16)
+        self._closed = False
+        """The current producer sent its close frame."""
+        self._last = 0.0
+        """When the current producer's last frame arrived."""
+        self._ready: deque[bytes] = deque()
+        self._later: dict[_Producer, list[tuple[int, int, bytes]]] = {}
         self.writer_generation = 0
-        """Producers this reader has taken records from."""
+        """The producer of the record last returned: 1 for the first, one more per replacement."""
 
-    def _accept(self, writer: int, seq: int) -> bool:
-        """Whether a frame of ``writer`` is read; switches to a new producer at its first frame."""
-        if writer == self._writer:
-            return True
-        if writer in self._retired:
-            return False  # queued before its producer was replaced or closed
-        if self._writer is not None and not self._replaceable:
-            raise PeerLost("a second producer writes to a single-producer step stream")
-        if seq != 0:
-            raise PeerLost(f"step stream lost records: a new producer starts at #{seq}")
-        if self._writer is not None:
-            self._retired.append(self._writer)
-        self._writer, self._expect = writer, 0
+    def _take(self, seq: int, kind: int, payload: bytes) -> None:
+        """A frame of the current producer."""
+        if seq != self._expect:
+            raise PeerLost(f"step stream lost records: expected #{self._expect}, got #{seq}")
+        self._expect += 1
+        self._last = time.monotonic()
+        if kind == 1:
+            if not self._replaceable:
+                raise StreamClosed("producer closed the stream")
+            self._closed = True
+        else:
+            self._ready.append(payload)
+
+    def _adopt(self, producer: _Producer) -> None:
+        self._current, self._expect, self._closed = producer, 0, False
+        self._last = time.monotonic()
         self.writer_generation += 1
-        return True
+
+    def _frame(self, raw: bytes) -> None:
+        start, nonce, seq, kind = _FRAME.unpack_from(raw)
+        producer, payload = (start, nonce), raw[_FRAME.size:]
+        current = self._current
+        if current is None:
+            self._adopt(producer)
+            current = producer
+        if producer == current:
+            self._take(seq, kind, payload)
+        elif not self._replaceable:
+            raise PeerLost("a second producer writes to a single-producer step stream")
+        elif producer > current:
+            self._later.setdefault(producer, []).append((seq, kind, payload))
+        # else: an earlier producer's frame, queued before it was replaced
+
+    def _replace_if_due(self, force: bool = False) -> None:
+        """Make the earliest waiting producer current once the current one is done with."""
+        while self._later and not self._ready:
+            waiting = sum(len(frames) for frames in self._later.values())
+            quiet = time.monotonic() - self._last > self._tun.peer_timeout_s
+            if not (self._closed or quiet or force or waiting >= self._tun.stream_hwm):
+                return
+            producer = min(self._later)
+            frames = self._later.pop(producer)
+            self._adopt(producer)
+            for seq, kind, payload in frames:
+                self._take(seq, kind, payload)
+            force = False
 
     def read(self, timeout: float | None = None) -> bytes | None:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            if self._ready:
+                return self._ready.popleft()
             # Never wait past the deadline: read(0) only looks.
             wait_ms = 10 if deadline is None else min(10, max(0, math.ceil((deadline - time.monotonic()) * 1000)))
             if self._sock.poll(wait_ms, zmq.POLLIN):
-                raw = self._sock.recv()
-                writer, seq, kind = _FRAME.unpack_from(raw)
-                if not self._accept(writer, seq):
-                    continue
-                if seq != self._expect:
-                    raise PeerLost(f"step stream lost records: expected #{self._expect}, got #{seq}")
-                self._expect += 1
-                if kind == 1:
-                    if not self._replaceable:
-                        raise StreamClosed("producer closed the stream")
-                    self._retired.append(writer)
-                    self._writer = None
-                    continue
-                return raw[_FRAME.size:]
+                self._frame(self._sock.recv())
+                self._replace_if_due()
+                continue
             self._link.update()
-            if self._link.lost and not self._replaceable:
+            if self._replaceable:
+                self._replace_if_due()
+                if self._ready:
+                    continue
+            elif self._link.lost:
                 # Data and monitor events come through separate queues: the last records may
                 # be ready after the empty poll, before the disconnect was seen.
                 if self._sock.poll(0, zmq.POLLIN):
