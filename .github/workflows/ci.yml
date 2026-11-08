@@ -1,13 +1,25 @@
 name: ci
 on:
+  # Pull requests run once per push; pushes run only where pull requests land.
   push:
+    branches: [master, madoka/dev]
   pull_request:
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the base of a pull request, to see what it changed
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --python 3.12 --extra cpu
       - run: uv run pyright
-      - run: uv run pytest -n auto
+      - id: scope
+        name: does the change touch the framework?
+        run: echo "framework=$(PYTHONPATH=engine uv run python .github/scripts/framework_changed.py ${{ github.event.pull_request.base.sha }})" >> "$GITHUB_OUTPUT"
+      - name: pytest
+        if: steps.scope.outputs.framework == 'true'
+        run: uv run pytest -n auto
+      - name: pytest without tests/framework (the framework did not change)
+        if: steps.scope.outputs.framework != 'true'
+        run: uv run pytest -n auto --ignore=tests/framework

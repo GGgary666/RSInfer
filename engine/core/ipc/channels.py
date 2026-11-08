@@ -9,8 +9,7 @@ named reader looks it up again, through the supervisor, when that reader's proce
 replaced. Both count how often that happened (``generation``): what was in flight to an
 old peer may be lost, and only the unit knows what to do about it.
 
-All calls run on the host's loop thread; a unit may hand a reader to one thread of its own,
-which is then its only user (the frontend's I/O thread). Lookups go to the supervisor only while a writer
+All calls run on the host's loop thread. Lookups go to the supervisor only while a writer
 has no reader to write to, at most every ``ipc.lookup_retry_s``; never per record.
 """
 
