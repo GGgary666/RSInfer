@@ -47,7 +47,7 @@
 
 ### 5.1 谁来排空、收到什么
 
-- 持有在途请求的单元在清单里声明自己能排空：`capabilities.actions` 加上 `drain`（实现时给 `StateAction` 加这个值）。这种单元一般在调度宿主上（拓扑里 `leads_epochs` 的角色），不在要重启的 worker 上：worker 只知道自己的 KV，只有调度器知道哪些请求会受影响。
+- 持有在途请求的单元在清单里声明自己能排空：`capabilities.actions` 加上 `drain`（动作名由单元自己起；调度逻辑是逻辑单元，逻辑单元也能声明动作；框架不用改）。这种单元一般在调度宿主上（拓扑里 `leads_epochs` 的角色），不在要重启的 worker 上：worker 只知道自己的 KV，只有调度器知道哪些请求会受影响。
 - `core.deps` 给**受影响的调度域**的领头进程里、声明了 `drain` 的单元生成排空动作（`ProcActions.drain`）。“受影响”指这个域里有进程要重启或停掉，或者有 `drain_on_reload = true` 的状态单元要重建、而且不能迁移。别的调度域不排空（DP）。
 - 参数只给**事实**，不给指令：
   ```python
