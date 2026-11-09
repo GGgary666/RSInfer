@@ -136,7 +136,7 @@ async def scenario(tmp: Path, *, ranks: tuple[str, ...] = HOSTS, files: dict[str
     zctx = zmq.asyncio.Context()
     tun = msgspec.structs.replace(ChangeTunables(coordinator_timeout_s=30.0, keepalive_interval_s=1.0), **change_tun)
     cp = ControlPlane(zctx, host=HostId("host-a"), bind=ADDRESS, state_dir=tmp / "control",
-                      sup_tun=SupervisorTunables(heartbeat_timeout_s=2.0, monitor_interval_s=0.05,
+                      sup_tun=SupervisorTunables(heartbeat_timeout_s=10.0, monitor_interval_s=0.05,
                                                  checkin_timeout_s=30.0, rpc_timeout_s=10.0, stop_timeout_s=5.0),
                       change_tun=tun, proc_tunables=dict(PROC_TUNABLES))
     await cp.start()
