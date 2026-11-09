@@ -167,11 +167,14 @@ def test_a_failed_worker_stops_the_steps_and_new_requests_get_an_error() -> None
         b.run_until(lambda: b.engine.loop.fault is not None)
         fault = b.engine.loop.fault
         assert fault is not None and (fault.step, fault.rank) == (at, 1) and "scripted failure" in fault.reason
-        sent = [len(w.fixture.received) for w in b.workers]
+        # A step planned before the failure answer may still be on its way to a rank, so count what
+        # the scheduler sent, not what the workers have read yet.
+        last = b.engine.table.last_submitted
         b.client.send([request(2, [7, 7], 3)])
         b.run_until(b.finished(2))
         assert b.client.outputs[2].error is not None and "stopped serving" in b.client.outputs[2].error
-        assert [len(w.fixture.received) for w in b.workers] == sent  # no step went out since
+        assert b.engine.table.last_submitted == last  # no step went out since
+        assert all(e <= last for w in b.workers for e in w.fixture.received)
         assert b.client.outputs[1].finished is None  # held, for whoever changes the engine next
         t0 = time.monotonic()
         b.engine.loop.quiesce()  # does not wait for the failed steps: a change can still pause
