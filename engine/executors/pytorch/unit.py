@@ -32,6 +32,15 @@ from core.contracts.records import BatchPlan, Capacity, Resync, RowDelta, Sample
 from platforms.base import StaleGraph
 
 
+def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host ``values`` on ``device`` without waiting for the work queued there: from pinned memory,
+    ``non_blocking``, as SGLang's ``ForwardBatch`` copies its inputs. A blocking copy would wait
+    for the step still running, and so would the next step's preparation."""
+    if device.type != "cuda":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
+
+
 class Mark:
     """A point in the device work of the steps: a timing CUDA event recorded on the stream, so it
     is passed when the device gets there; on the CPU, where that work runs inside ``submit``, the
@@ -152,7 +161,7 @@ class PyTorchExecutor:
                 store.clear(fresh)
         self._copies(state, "before")
 
-        given = torch.tensor(list(plan.tokens.values()), dtype=torch.int64, device=device)
+        given = on_device(torch.tensor(list(plan.tokens.values()), dtype=torch.int64), device)
         parts: list[torch.Tensor] = []
         offset = 0
         for r, n, prev in zip(rows, num_tokens, plan.from_previous.values(), strict=True):
@@ -162,8 +171,9 @@ class PyTorchExecutor:
                 parts.append(given[offset:offset + n])
                 offset += n
         input_ids = torch.cat(parts)
-        pos = torch.cat([torch.arange(p, p + n, device=device) for p, n in zip(positions, num_tokens, strict=True)])
-        last_index = torch.cumsum(torch.tensor(num_tokens, device=device), dim=0) - 1
+        pos = on_device(torch.cat([torch.arange(p, p + n) for p, n in zip(positions, num_tokens, strict=True)]),
+                        device)
+        last_index = on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device)
 
         try:
             logits = chosen.run(self.batch, plan, input_ids, pos, last_index)

@@ -21,6 +21,15 @@ from core.contracts.state import StateDecl
 KIND = "gdn.slots"
 
 
+def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host ``values`` on ``device`` without waiting for the work queued there: from pinned memory,
+    ``non_blocking``, as SGLang's ``ForwardBatch`` copies its inputs. A blocking copy would wait
+    for the step still running, and so would the next step's preparation."""
+    if device.type != "cuda":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
+
+
 @dataclass(frozen=True)
 class LayerState:
     """``Binding`` of one layer: ``conv`` ``[size + 1, conv_dim, K - 1]`` and ``temporal``."""
@@ -91,7 +100,7 @@ class MambaPool:
     def indices(self, items: Sequence[int]) -> torch.Tensor:
         """The slots of ``items``, on the device of the states (``index_fill_`` wants them there)."""
         conv, _ = self._tensors()
-        return torch.tensor(list(items), dtype=torch.int64, device=conv.device) + 1
+        return on_device(torch.tensor(list(items), dtype=torch.int64) + 1, conv.device)
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``copy_from``: clone conv and temporal state from ``src`` slots into ``dst`` slots."""

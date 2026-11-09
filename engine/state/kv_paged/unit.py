@@ -21,6 +21,15 @@ from core.contracts.state import StateDecl
 KIND = "kv.paged"
 
 
+def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host ``values`` on ``device`` without waiting for the work queued there: from pinned memory,
+    ``non_blocking``, as SGLang's ``ForwardBatch`` copies its inputs. A blocking copy would wait
+    for the step still running, and so would the next step's preparation."""
+    if device.type != "cuda":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
+
+
 @dataclass(frozen=True)
 class LayerBuffers:
     """``Binding`` of one layer: ``k`` and ``v``."""
@@ -90,9 +99,9 @@ class KVPool:
 
     def slots(self, items: Sequence[int]) -> torch.Tensor:
         """The token slots of ``items``, in order, on the device of the buffers."""
-        device = next(iter(self.k_buffer.values())).device if self.k_buffer else None
-        return ((torch.tensor(list(items), dtype=torch.int64, device=device)[:, None] + 1) * self.page_size
-                + torch.arange(self.page_size, device=device)).flatten()
+        device = next(iter(self.k_buffer.values())).device if self.k_buffer else torch.device("cpu")
+        return on_device(((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
+                          + torch.arange(self.page_size)).flatten(), device)
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``move_kv_cache`` by page: every layer's ``buffer[dst slots] = buffer[src slots]``."""
