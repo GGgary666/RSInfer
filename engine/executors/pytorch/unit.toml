@@ -1,8 +1,8 @@
 [unit]
-id = "executors.eager"
+id = "executors.pytorch"
 kind = "logic"
 process = ["worker"]
-entry = "executors.eager.unit:Unit"
+entry = "executors.pytorch.unit:Unit"
 
 [provides]
 services = ["executor@1"]

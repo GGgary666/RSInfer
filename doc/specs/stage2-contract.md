@@ -28,7 +28,7 @@
 
 | | 负责 | 说明 |
 |---|---|---|
-| @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
+| @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
 | @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_eager`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
 | 本文和 `engine/core/contracts/` | 两边共有 | 团队 PR 由双方 review；同一 RSI agent 可一起修改接口与全部使用者，不增加运行时审批 |
 
@@ -93,8 +93,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | worker（每 rank 一个） | `core.worker` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `worker.batch@1`、`plan@1`、`model@1` | |
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
 | | `core.plan` | 逻辑，录 graph | `plan@1` | `model@1`、各 backend、各状态单元 | ✓ |
-| | `executors.cuda` | 逻辑 | `executor@1` | | ✓ |
-| | `executors.eager` | 逻辑 | `executor@1`（和 `executors.cuda` 二选一） | `worker.batch@1`、`model@1`、各 backend、各状态单元 | |
+| | `executors.pytorch` | 逻辑 | `executor@1`（worker 唯一的 executor，2026-11-09） | `worker.batch@1`、`model@1`、各 backend、各状态单元 | |
 | | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1` | |
 | | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1` | |
 | | `core.kernels` | 逻辑 | `kernels.catalog@1` | | |
@@ -497,12 +496,12 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   | `layers.attn`、`layers.gdn` | `layers.attn@1`、`layers.gdn@1`（`Backend`） | `RadixAttention` + `TorchNativeAttnBackend`；`RadixLinearAttention` + `GDNAttnBackend` 的普通路径。`prepare` 就是 `init_forward_metadata`；MIXED 步走 extend |
   | `state.kv_paged`、`state.gdn_slots` | `state.kv.paged@1`、`state.gdn.slots@1` | `MHATokenToKVPool`（每层 `[size + page_size, kv 头, head_dim]`，槽 0 所在页是 padding）；`MambaPool`（conv `[层, 槽 + 1, conv_dim, K-1]`、temporal `[层, 槽 + 1, HV, V, K]` fp32，槽 0 是 padding），`copy` 即 `copy_from`，`clear` 即 `clear_slots`；条目 `i` 是页或槽 `i + 1`（§5.2） |
   | `worker.batch` | `worker.batch@1` | `HybridReqToTokenPool`：`req_to_token`、行到 GDN 槽的映射；记录里的行 `r` 是表里的 `r + 1`，条目 `i` 是页或槽 `i + 1` |
-  | `executors.eager` | `executor@1` | `ModelRunner`：从 position 0 开始的行先清 GDN 槽（`mamba_clear_indices`）、恢复快照、组装 `input_ids` / `positions`、各 backend 准备、前向、在每行最后一个 token 的位置采样 |
+  | `executors.pytorch`（原名 `executors.eager`） | `executor@1` | `ModelRunner`：从 position 0 开始的行先清 GDN 槽（`mamba_clear_indices`）、恢复快照、组装 `input_ids` / `positions`、各 backend 准备、前向、在每行最后一个 token 的位置采样 |
 
-  - 接缝：worker 循环只调 `executor@1`（`core/contracts/execution.py`），持久 batch、backend、模型、采样器都在它后面。`executors.eager` 和 `executors.cuda` 是同一个服务的两种实现，一个 worker 角色只加载其中一个（和 `policy.compose@1` 可以有几种实现一样），不算撞名（2026-11-09，#30 评审）。
+  - 接缝：worker 循环只调 `executor@1`（`core/contracts/execution.py`），持久 batch、backend、模型、采样器都在它后面。~~`executors.eager` 和 `executors.cuda` 是同一个服务的两种实现，一个 worker 角色只加载其中一个~~（2026-11-09，#30 评审）。2026-11-09 改：两者二选一就做不到“同一个 worker 里有的 bucket 走 graph、有的走 eager”（§9.1、§9.4.3），所以只留一个 executor，叫 `executors.pytorch`，在 `torch_eager` 和 `cuda_sm100` 上都用它；graph 由 `core.plan` 提供，照 SGLang 的 `ModelRunner` 和它的 runner。不再有 `executors.cuda`。
   - 契约随之补了：`WeightStore.register` / `load`、`Model`、`PersistentBatch.check` / `sampling` / `record`、`StateStore.clear`。
   - 每一行都采样（SGLang 也是）。prefill 中间块采到的 token 由调度器在调 `RequestTable.sample()` 之前丢掉。
-  - 测试（`tests/units/executors/test_eager.py`，CPU fp32）：贪心生成和 HF 逐 token 相同，logits 在 1e-4 内；批量对单条、分块 prefill 对不分块、batch 重建（先回 `Resync`，收到全量增量后接着生成）对不重建、快照恢复对从头算，token 相同，logits 在容差内；条目从 0 开始分（和账本一样），每步之间改写 scratch 条目，token 不变。
+  - 测试（`tests/units/executors/test_pytorch.py`，CPU fp32）：贪心生成和 HF 逐 token 相同，logits 在 1e-4 内；批量对单条、分块 prefill 对不分块、batch 重建（先回 `Resync`，收到全量增量后接着生成）对不重建、快照恢复对从头算，token 相同，logits 在容差内；条目从 0 开始分（和账本一样），每步之间改写 scratch 条目，token 不变。
 
 ## 8. attention 和 GDN 的 backend（@gaow0007 审）
 

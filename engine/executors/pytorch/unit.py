@@ -1,8 +1,9 @@
 # Copyright 2023-2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""``executors.eager``: one step, eagerly (``executor@1``, no graphs). Adapted from SGLang's
-``ModelRunner`` (srt/model_executor/model_runner.py, e838360; LICENSE.sglang): the state slots of
-rows starting from position 0 are cleared and snapshots restored before the step
+"""``executors.pytorch``: the worker's one executor (``executor@1``), on every torch platform.
+Adapted from SGLang's ``ModelRunner`` (srt/model_executor/model_runner.py, e838360;
+LICENSE.sglang): the state slots of rows starting from position 0 are cleared and snapshots
+restored before the step
 (``mamba_clear_indices``, copy-on-write sources),
 the ``ForwardBatch`` inputs are built (``input_ids``, ``positions``), every backend initializes
 its metadata, the model runs with its logits processor, and the sampler draws at the position of
@@ -63,7 +64,7 @@ def check_plan(plan: BatchPlan) -> None:
         raise ValueError("tokens holds the input of every row without from_previous")
 
 
-class EagerExecutor:
+class PyTorchExecutor:
     """``executor@1``."""
 
     def __init__(self, platform: Any, batch: Any, model: Any, sampler: Any, backends: dict[str, Any],
@@ -141,5 +142,5 @@ class Unit:
         layers: Sequence[str] = model.assembly.layers
         backends = {name: ctx.use(name) for name in dict.fromkeys(layers)}
         stores = {kind: ctx.use(name) for kind, name in self.STORES}
-        ctx.provide("executor@1", EagerExecutor(ctx.platform, ctx.use("worker.batch@1"), model,
+        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, ctx.use("worker.batch@1"), model,
                                                 ctx.use("layers.sampler@1"), backends, stores))
