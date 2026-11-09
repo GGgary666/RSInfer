@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import PersistentBatch, PlanKey
+from core.contracts.plan import GDNBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 
 KIND = "gdn.slots"
@@ -111,3 +111,7 @@ class GDNAttnBackend:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         ctx.provide("layers.gdn@1", GDNAttnBackend(ctx.use("kernels.catalog@1"), ctx.use("state.gdn.slots@1")))
+
+
+if TYPE_CHECKING:
+    _: type[GDNBackend] = GDNAttnBackend

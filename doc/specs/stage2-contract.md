@@ -585,11 +585,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 | 待落实项 | 当前边界与建议 |
 |---|---|
-| Mixed batch | `BatchPlan.phase` 有 `mixed`，但 `PlanKey.phase` 只有 prefill/decode。建议首版明确走 eager，由 backend 按行组织执行；拆分方式及接口映射仍需落实，不能伪装成 decode graph。未支持的组合在状态更新前拒绝 |
+| Mixed batch | `BatchPlan.phase` 有 `mixed`，但 `PlanKey.phase` 只有 prefill/decode。建议首版明确走 eager，由 backend 按行组织执行；拆分方式及接口映射仍需落实，不能伪装成 decode graph。未支持的组合在状态更新前拒绝。2026-11-09 定：照 SGLang 的 `EagerRunner`，mixed 步当作 extend，走 bucket 0（eager），`PlanKey.phase` 记为 prefill（`core/contracts/plan.py` 的 `Backend`） |
 | GDN speculative 部分接受 | M2d 根据所选 SGLang 路径确定中间状态保存或恢复重算方案、历史容量、tree/chain 能力及验收范围；实现前拒绝对应 verify 组合 |
-| Backend 输入与绑定 | `forward(layer, *args)` 尚未表达 full attention/GDN 的参数语义。分别明确 tensor 顺序、shape/dtype、是否已经 normalization/scale/gate 变换，以及权重/状态绑定来源；在模型层与 backend 分别实现前落实 |
+| Backend 输入与绑定 | `forward(layer, *args)` 尚未表达 full attention/GDN 的参数语义。分别明确 tensor 顺序、shape/dtype、是否已经 normalization/scale/gate 变换，以及权重/状态绑定来源；在模型层与 backend 分别实现前落实。2026-11-09 已落实：`AttentionBackend.forward`、`GDNBackend.forward` |
 
-当前 `core/contracts/plan.py` 的 docstring 仍将 prepare 描述为 host 工作、forward 描述为只在 graph 内运行；stride/layout 的绑定失效条件和阶段表示也需在对应实现时与本节同步，本次仅补设计文档。
+~~当前 `core/contracts/plan.py` 的 docstring 仍将 prepare 描述为 host 工作、forward 描述为只在 graph 内运行~~：2026-11-09 已按 §8.4 改写，并补了 `Binding.generation` 的 stride 和提供者实例规则（§9.3）。
 
 **验收要求：** 按 §5.5.8 的支持矩阵覆盖连续执行与 chunk/prefix 恢复后的输出及状态、verify 接受零个/部分/全部 token、eager/graph 等价性，以及配置切换前后的执行版本一致性。增加 A/B/C 对抗用例：只恢复 recurrent 而遗漏 conv、重复 normalization、提前覆盖下一步元数据、混用 A 的 prepare 与 B 的 graph、候选 capture 改写活跃状态、依赖失效后仍 replay。错误实现应被测试拒绝；stream 时序、capture 隔离和切换中的在途工作必须有真实 GPU 测试，不能仅靠 fake 平台通过就宣称正确。
 

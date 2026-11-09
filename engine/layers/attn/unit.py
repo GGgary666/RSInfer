@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import PersistentBatch, PlanKey
+from core.contracts.plan import AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 
 
@@ -95,3 +95,7 @@ class TorchNativeAttnBackend:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         ctx.provide("layers.attn@1", TorchNativeAttnBackend(ctx.use("kernels.catalog@1"), ctx.use("state.kv.paged@1")))
+
+
+if TYPE_CHECKING:
+    _: type[AttentionBackend] = TorchNativeAttnBackend

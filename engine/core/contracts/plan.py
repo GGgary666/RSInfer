@@ -40,18 +40,55 @@ class PlanService(Protocol):
 
 
 class Backend(Protocol):
-    """An attention or GDN backend (``attn.backend.<name>@1``), split the way sglang splits it.
+    """An attention or GDN backend (``layers.attn@1``, ``layers.gdn@1``), split the way SGLang
+    splits it (stage2-contract.md §8). The backend prepares the step's metadata, runs the layer's
+    computation and updates its state kind; the worker orders the steps and the plan owns graphs.
 
-    ``prepare`` runs outside the graph each step: host-side work that writes the step's
-    metadata (page tables, sequence lengths, slot indices) into the backend's own fixed
-    buffers. ``forward`` runs inside the graph: fixed-shape device work only. The fixed
-    buffers are the graph's by-address dependencies; the batch size is a by-value one."""
+    ``prepare`` runs outside any graph, once per step and for that step's plan (``key``): SGLang's
+    ``init_forward_metadata`` for an eager plan, ``init_forward_metadata_replay_cuda_graph`` for a
+    graph bucket. It is not limited to the host: it may call a library's planning, enqueue copies
+    or update device tables, writing into the backend's own fixed buffers in the order of the
+    step stream (§8.4). It never appends the step's K/V, advances a GDN state or restores one; the
+    worker's state copies do the restoring. ``forward`` runs the layer eagerly or under capture,
+    with the metadata of the last ``prepare``. A mixed step runs as an extend, eagerly (§8.7).
+
+    The fixed buffers are the graph's by-address dependencies (``binding``); the bucket and the
+    selected solutions are by-value ones (§8.5, §9.3)."""
 
     @property
     def binding(self) -> Binding: ...
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None: ...
-    def forward(self, layer: int, *args: Tensor) -> Tensor: ...
+
+
+class AttentionBackend(Backend, Protocol):
+    """``layers.attn@1``: full attention (SGLang's ``RadixAttention`` and its backend)."""
+
+    def forward(self, layer: int, q: Tensor, k: Tensor, v: Tensor, num_heads: int, num_kv_heads: int,
+                head_dim: int, scaling: float) -> Tensor:
+        """``q`` ``[tokens, num_heads * head_dim]``, ``k`` and ``v`` ``[tokens, num_kv_heads * head_dim]``,
+        the step's tokens in row order. The model has already applied the Q/K RMSNorm and RoPE; the
+        backend writes this step's K/V at the slots the scheduler gave the rows (it allocates none)
+        and attends. Returns ``[tokens, num_heads * head_dim]``; an output gate, if the model has
+        one, is the model's."""
+        ...
+
+
+class GDNBackend(Backend, Protocol):
+    """``layers.gdn@1``: gated delta net (SGLang's ``RadixLinearAttention`` and ``GDNAttnBackend``)."""
+
+    def forward(self, layer: int, mixed_qkv: Tensor, a: Tensor, b: Tensor, conv_weights: Tensor,
+                bias: Tensor | None, activation: str, A_log: Tensor, dt_bias: Tensor, num_k_heads: int,
+                num_v_heads: int, head_k_dim: int, head_v_dim: int) -> Tensor:
+        """``mixed_qkv`` ``[tokens, conv_dim]`` is the input projection before the convolution, ``a``
+        and ``b`` ``[tokens, num_v_heads]`` the gate inputs. The backend runs everything of the GDN
+        in between, once each: the causal conv and its activation, the per-head L2 norm of q and k
+        (it may be fused into the kernel), the gating of ``a`` and ``b`` into the decay and the
+        update rate, the gated delta rule, and both state updates, conv and recurrent. The weights
+        come from the weight store; the backend only reads them. Returns the core output
+        ``[1, tokens, num_v_heads, head_v_dim]``; the gated RMSNorm with ``z`` and the output
+        projection are the model's."""
+        ...
 
 
 class PersistentBatch(Protocol):
