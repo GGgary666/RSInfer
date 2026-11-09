@@ -85,6 +85,7 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 | `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
 | `engine/executors/eager/` | `executors.eager`（`executor@1`）：一步 eager 执行，SGLang `ModelRunner` 的流程 |
+| `engine/core/worker/` | worker 循环 `core.worker`（`proc.loop@1`）：读计划、交给 `executor@1`、按计划顺序回 `Sampled` / `Resync` / `StepFailure`，启动时和结果换了读端时报 `Capacity` |
 
 从 SGLang（`e838360`）搬运的代码在文件头注明出处，各目录带一份 `LICENSE.sglang`。改这些单元时先看 SGLang 的对应实现，能搬运的就搬运后适配，不自己另写。
 
@@ -104,6 +105,7 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 - `tests/units/scheduler/`：调度器、账本和前缀匹配算法的测试。`support.py` 把调度宿主的单元放进进程内的单元运行时，配上线程上的夹具 worker 和充当前端的客户端；`test_processes.py` 用真实控制面起调度宿主和两个夹具 worker 进程。`units/schedfix/` 是测试夹具单元（夹具 worker），真实进程测试把它拷进工作区。
 - `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
 - `tests/units/kernels/`：kernel 目录的选择和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`）。
+- `tests/units/worker/`：worker 循环。先对着假 executor 测循环本身，再把 worker 的全部单元加上循环放到线程上（`support.py` 的 `RealWorker`），接在 `tests/units/scheduler/support.py` 的真调度器下面，贪心生成和 HF 逐 token 相同。
 - `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
