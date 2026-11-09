@@ -67,10 +67,13 @@ class Taken:
 
 class WorkerLoop:
     def __init__(self, executor: Executor, plans: Reader, results: Writer, *, rank: int,
-                 idle_wait_s: float = 0.01, quiesce_timeout_s: float = 30.0,
+                 idle_wait_s: float = 0.01, quiesce_timeout_s: float = 30.0, announce_every_s: float = 1.0,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.executor, self.plans, self.results, self.rank = executor, plans, results, rank
         self.idle_wait_s, self.quiesce_timeout_s, self.clock = idle_wait_s, quiesce_timeout_s, clock
+        self.announce_every_s = announce_every_s
+        self.last_write = clock()
+        """When a record last went out."""
         self.taken: deque[Taken] = deque()
         self.outbox: deque[tuple[int, bytes]] = deque()
         self.epoch: int | None = None
@@ -173,9 +176,17 @@ class WorkerLoop:
     # ------------------------------------------------------------------ results
 
     def _announce(self) -> None:
-        if self.announcing or self.announced_on == self.results.generation:
+        """``Capacity`` at start and on every new results connection. A connection is found new
+        only when a write is tried (``ChannelWriter``), so an idle worker also sends it every
+        ``announce_every_s``: a scheduler host restarted while nothing ran waits for it, and
+        sends no plan until it has it."""
+        if self.announcing:
             return
-        if self.announced_on is not None:
+        moved = self.announced_on != self.results.generation
+        idle = not self.taken and not self.outbox and self.clock() - self.last_write >= self.announce_every_s
+        if not moved and not idle:
+            return
+        if moved and self.announced_on is not None:
             self._note("results go to a new reader (a new scheduler?): Capacity again")
         self.outbox.appendleft((0, self._record(0, (Capacity.SECTION, self.executor.capacity()))))
         self.announcing = True
@@ -189,6 +200,7 @@ class WorkerLoop:
             except TimeoutError:
                 break
             self.outbox.popleft()
+            self.last_write = self.clock()
             if epoch > 0:
                 self.epoch = max(self.epoch or 0, epoch)
             else:
@@ -213,5 +225,6 @@ class Unit:
         self.loop = WorkerLoop(cast(Executor, ctx.use("executor@1")), streams.reader("plans", scheduler.host),
                                streams.writer(scheduler, f"results.{rank}"), rank=rank,
                                idle_wait_s=config["worker.idle_wait_s"],
-                               quiesce_timeout_s=config["worker.quiesce_timeout_s"])
+                               quiesce_timeout_s=config["worker.quiesce_timeout_s"],
+                               announce_every_s=config["worker.announce_every_s"])
         ctx.provide("proc.loop@1", self.loop)

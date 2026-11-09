@@ -146,6 +146,51 @@ def test_a_new_reader_of_the_answers_gets_capacity_again() -> None:
     assert [a for a in pipe.answers() if a[1] == Capacity.SECTION] == [(0, Capacity.SECTION)] * 2
 
 
+def test_an_idle_worker_finds_a_scheduler_restarted_while_nothing_ran() -> None:
+    """Over a real ``ChannelWriter``: the connection is found replaced only when a write is tried,
+    and an idle worker has nothing to write. The new scheduler waits for ``Capacity`` before it
+    sends a plan, so without the idle re-announce both would wait for ever (Codex, #37)."""
+    import time
+    import uuid
+
+    import msgspec
+    import zmq
+
+    from core.common.ids import HostId
+    from core.ipc import IpcTunables, open_reader
+    from core.ipc.channels import ChannelWriter
+
+    host, zctx = HostId("host-a"), zmq.Context()
+    tun = msgspec.structs.replace(IpcTunables(), lookup_retry_s=0.02, peer_timeout_s=0.5)
+
+    def reader() -> tuple[Any, Any]:
+        return open_reader(zctx, local=host, peer=host, bind_host="127.0.0.1", shm_name=f"agx-w-{uuid.uuid4().hex[:8]}",
+                           tun=tun)
+
+    def capacity_within(r: Any, seconds: float) -> bool:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            w.step()
+            raw = r.read(timeout=0.01)
+            if raw is not None and Capacity.SECTION in decode_record(raw).sections:
+                return True
+        return False
+
+    first, address = reader()
+    current = {"address": address}
+    results = ChannelWriter(zctx, host, tun, lambda: current["address"])
+    w = WorkerLoop(FakeExecutor(), Pipe(), results, rank=0, idle_wait_s=0.005, announce_every_s=0.2)
+    try:
+        assert capacity_within(first, 5)
+        first.close()  # the scheduler host is restarted while nothing runs
+        second, current["address"] = reader()
+        assert capacity_within(second, 10)
+        second.close()
+    finally:
+        results.close()
+        zctx.term()
+
+
 def test_quiesce_finishes_every_step_and_says_when_answers_cannot_go_out() -> None:
     slow = Pending(1, done=False)
     ex = FakeExecutor({1: slow})
