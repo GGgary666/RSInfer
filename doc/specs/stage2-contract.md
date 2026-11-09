@@ -83,21 +83,21 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 
 | 进程（角色） | 单元 | 种类 | 提供 | 需要 | @gaow0007 |
 |---|---|---|---|---|---|
-| 前端 `frontend` | `frontend.http` | 逻辑 | — | `frontend.tokenizer@1`、`frontend.detok@1` | |
+| 前端 `frontend` | `frontend.http` | 逻辑 | `frontend.http@1` | `frontend.tokenizer@1`、`frontend.detok@1`、`proc.control@1`、`proc.streams@1` | |
 | | `frontend.tokenizer` | 逻辑 | `frontend.tokenizer@1` | | |
-| | `frontend.detok` | 逻辑 | `frontend.detok@1` | | |
-| 调度宿主 `sched`（`leads_epochs`） | `core.sched` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `sched.reqs@1`、`ledger@1`、各决策点 | |
+| | `frontend.detok` | 逻辑 | `frontend.detok@1` | `frontend.tokenizer@1` | |
+| 调度宿主 `sched`（`leads_epochs`） | `core.sched` | 逻辑 | `proc.loop@1`（带 `quiesce`）、`sched.status@1` | `sched.reqs@1`、`ledger@1`、各决策点、`proc.streams@1`、`proc.control@1` | |
 | | `policies.*` | 逻辑 | `policy.<决策点>@1` | | |
 | | `sched.reqs` | 状态 | `sched.reqs@1` | | |
 | | `core.state.alloc` | 状态 | `ledger@1` | 各类池先作为内部实现，按实际独立替换需求再拆分 | |
 | worker（每 rank 一个） | `core.worker` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `worker.batch@1`、`plan@1`、`model@1` | |
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
-| | `core.plan` | 逻辑，录 graph | `plan@1`（eager plan 和 graph plan；2026-11-09 先只有 eager） | `model@1`、各 backend、各状态单元 | ✓ |
+| | `core.plan` | 逻辑，录 graph | `plan@1`（eager plan 和 graph plan；2026-11-09 先只有 eager） | `model@1`、各 backend（现在是 `layers.attn@1`、`layers.gdn@1`；状态单元由 backend 使用） | ✓ |
 | | `executors.pytorch` | 逻辑 | `executor@1`（worker 唯一的 executor，2026-11-09） | `worker.batch@1`、`plan@1`、`layers.sampler@1`、各状态单元 | |
-| | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1` | |
-| | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1` | |
+| | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1`、`state.kv.paged@1`、`state.gdn.slots@1`（启动时向两个存储 `declare`） | |
+| | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1`；attn 外壳还要 `state.kv.paged@1`，gdn 外壳还要 `state.gdn.slots@1` | |
 | | `core.kernels` | 逻辑 | `kernels.catalog@1` | | |
-| | `kernels.reference` | 逻辑 | 往目录里登记参照实现 | | |
+| | `kernels.reference` | 逻辑 | 往目录里登记参照实现 | `kernels.catalog@1` | |
 | | `kernels.flashinfer`、`kernels.fla` | 逻辑 | 往目录里登记 solution | | ✓ |
 | | `attn.backend.flashinfer`、`gdn.backend.fla` | 逻辑 | `attn.backend.*@1`、`gdn.backend.*@1` | 状态单元、`worker.batch@1` | ✓ |
 | | `core.state.holder` | 状态 | `state.holder@1`（显存预算、状态池容量） | | |
@@ -106,6 +106,8 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | | `core.dist`、`dist.groups` | 逻辑、状态 | M2d 才要 | | |
 | 控制面 | 已有的四个单元 | | | | |
 
+- 2026-11-09 补：已经实现的单元，“提供”“需要”两列按它们 `unit.toml` 的 `[provides]`、`[requires]` 改过；还没实现的几行（`core.worker`、`core.state.holder` 等）没动。
+- 2026-11-09 注：表里 `attn.backend.flashinfer`、`gdn.backend.fla` 这一行和已经实现的做法不一样。现在 attention 和 GDN 的 backend 外壳是 `layers.attn`、`layers.gdn`（`Backend`，§7），由它们按 §5.5.3 的 `attn.backend`、`gdn.backend` 等键，在 kernel 目录里选这个名字下的那组 solution（§6），没有单独的 `attn.backend.*@1`、`gdn.backend.*@1` 服务。flashinfer、fla 是照这种方式接（每步元数据的准备，即 SGLang 各 backend 的 `init_forward_metadata`，怎样随 backend 换），还是做成单独的 backend 单元，接入时再定。
 - 控制面单元要加的规则：
   - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就重录：能分片的在准备阶段，不能的在暂停期内，§9.4），以及容量变更的影响；dry-run 报出重录造成的停顿；
   - `core.manifest`：单元不许自己建 stream（§10.4）。
@@ -135,6 +137,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | `state`、`storage`、`tensor` | 模型向存储/账本提供的当前状态声明，以及 buffer 交接 |
 | `kernels`、`model` | kernel 注册和选择，以及模型向 plan/权重存储提供的数据 |
 | `plan` | worker 获取 plan，以及 backend 与持久 batch 的必要调用 |
+| `execution` | worker 循环调用 executor 的接缝（`executor@1`：`submit`、`PendingStep`、`capacity`、`synchronize`，§7；2026-11-09 补进本表） |
 | `ledger`、`policy` | 调度器调用账本的最小调用集；调度器的两个决策点（准入和排序、这一步怎么组成）的快照和决定（2026-11-08，第 3 步） |
 
 本轮收缩：删除共享 `ledger.py`（账本插件尚是本组内部实现），`common_prefix` 移到 `core.state.alloc.prefix`；删除 graph 的内部 `GraphDep`、强制公开的重录流程、重复的可选状态动作 Protocol，以及未实际交接的状态/模型预留字段。请求表与账本的内部字段不建立共享镜像。状态声明先保留 request/slot，跨层借用、host 放置和分区等在实际实现需要交接时再加入。
@@ -168,6 +171,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 | | | `worker.stats@1`（`StepStats`） | 这一步的 CPU 时间、GPU 时间，以及开始前 GPU 空了多久 |
 | | | `state.capacity@1`（`Capacity`） | 各状态种类可用的条目数，启动时和已支持的容量变更生效后发 |
 | | | `worker.resync@1`（`Resync`） | 持久 batch 被重建了，要一份全量 |
+| | | `worker.failure@1`（`StepFailure`） | 这一步开始执行以后失败了，worker 说不清设备上做了什么：调度器不再给这个 rank 所在的域发步，新请求回错误并报告，不冻结（`engine/core/sched/README.md`；2026-11-09 补进本表） |
 | 前端 → 调度 | `frontend.requests@1` | `frontend.batch@1`（`Requests`） | 新请求（已分词）、中止 |
 | 调度 → 前端 | `sched.tokens@1` | `sched.events@1`（`TokenEvents`） | 这一步各请求的新 token、结束原因，以及这一步跑在哪个身份下 |
 
