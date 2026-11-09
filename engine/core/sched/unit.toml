@@ -1,0 +1,29 @@
+[unit]
+id = "core.sched"
+kind = "logic"
+process = ["sched"]
+entry = "core.sched.unit:Unit"
+
+[provides]
+services = ["proc.loop@1", "sched.status@1"]
+
+[requires]
+services = ["sched.reqs@1", "ledger@1", "policy.order@1", "policy.compose@1", "proc.streams@1", "proc.control@1"]
+
+[capabilities]
+accept_config = true
+
+[reads]
+# What one row of the workers' persistent batch holds (worker.batch; stage2-contract.md §4.3).
+config = ["batch.max_rows", "batch.max_context_len"]
+
+[config]
+"sched.workers" = { type = "list", default = [], binding = "startup", doc = "The workers' ProcIds, rank 0 first; one per rank." }
+"sched.frontend_host" = { type = "str", default = "", binding = "startup", doc = "Host of the frontend that writes to the reader requests." }
+"sched.max_batch" = { type = "int", default = 32, binding = "startup", doc = "Rows plans use at most; never more than the workers' batch.max_rows." }
+"sched.token_budget" = { type = "int", default = 2048, binding = "startup", doc = "Prompt tokens per step (sglang's chunked_prefill_size, smallest default)." }
+"sched.overlap" = { type = "bool", default = false, binding = "live", doc = "Plan step N + 1 before step N's result (stage2-contract.md 4.4)." }
+"sched.step_timeout_s" = { type = "float", default = 3600.0, binding = "startup", doc = "A step without every rank's answer for this long counts as a worker failure. Long: a first GPU step may compile for minutes." }
+"sched.quiesce_timeout_s" = { type = "float", default = 30.0, binding = "startup", doc = "How long a pause waits for the steps in flight; then the pause fails and the engine goes on serving." }
+"sched.frontend_timeout_s" = { type = "float", default = 5.0, binding = "startup", doc = "A frontend that takes no tokens for this long has its requests cancelled." }
+"sched.idle_wait_s" = { type = "float", default = 0.01, binding = "startup", doc = "Longest wait for a record when there is nothing to do." }

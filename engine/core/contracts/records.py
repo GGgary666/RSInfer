@@ -110,7 +110,11 @@ class StateOps(msgspec.Struct, frozen=True):
 
 class Sampled(msgspec.Struct, frozen=True):
     """Tokens sampled in step ``epoch`` (the record's epoch). ``counts`` is 1 per row without
-    speculation, the accepted length plus one with it."""
+    speculation, the accepted length plus one with it.
+
+    Every row of the plan samples, also a row whose chunk does not end its prompt; the scheduler
+    drops that token, as sglang and mini-sglang drop a chunked request's (2026-11-08). The
+    worker keeps every row's last token for ``from_previous`` regardless."""
 
     SECTION: ClassVar[str] = "worker.sampled@1"
     rows: Column
@@ -152,3 +156,14 @@ class Resync(msgspec.Struct, frozen=True):
 
     SECTION: ClassVar[str] = "worker.resync@1"
     reason: str = ""
+
+
+class StepFailure(msgspec.Struct, frozen=True):
+    """The worker failed while running step ``epoch`` (the record's epoch), after it began, so it
+    cannot say what the device did. Unlike ``Resync`` (a plan refused before anything ran), the
+    step is not taken as not run: the scheduler stops sending this rank's domain steps, answers
+    new requests with an error and reports it. Nothing is frozen; what happens to the requests
+    it holds is for whoever changes the engine next to choose."""
+
+    SECTION: ClassVar[str] = "worker.failure@1"
+    reason: str

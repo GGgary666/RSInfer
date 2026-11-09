@@ -88,6 +88,8 @@ REACHES: dict[str, set[str]] = {
     "requests": {"columns", "sampling"},  # frontend <-> scheduler
     "serving": set(),  # where the scheduler sends a frontend its tokens
     "records": {"columns", "sampling"},  # scheduler <-> worker
+    "ledger": set(),  # scheduler -> its ledger
+    "policy": set(),  # scheduler -> its policy units
     "state": set(),
     "storage": {"state", "tensor"},  # storage unit <-> its users in the worker
     "kernels": set(),
