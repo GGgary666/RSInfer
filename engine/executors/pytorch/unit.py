@@ -29,12 +29,43 @@ from core.contracts.records import BatchPlan, Capacity, Resync, RowDelta, Sample
 from platforms.base import StaleGraph
 
 
+class Mark:
+    """A point in the device work of the steps: a timing CUDA event recorded on the stream, so it
+    is passed when the device gets there; on the CPU, where that work runs inside ``submit``, the
+    host clock when it is made."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+        self.at = 0.0
+        if self.event is not None:
+            self.event.record(torch.cuda.current_stream(device))
+        else:
+            self.at = time.perf_counter()
+
+    def wait(self) -> None:
+        if self.event is not None:
+            self.event.synchronize()
+
+    def us_until(self, later: Mark) -> float:
+        """Device time from this mark to ``later``; both passed."""
+        if self.event is not None and later.event is not None:
+            return self.event.elapsed_time(later.event) * 1e3
+        return (later.at - self.at) * 1e6
+
+
 @dataclass(frozen=True)
 class Step:
     """``PendingStep``; on the CPU and with eager CUDA, finished when ``submit`` returns."""
 
     sampled: Sampled
-    step_stats: StepStats
+    epoch: int
+    host_us: float
+    begin: Mark
+    """Before the step's first device work (the persistent batch's tables)."""
+    end: Mark
+    """After its last (the copies after the forward)."""
+    previous: Mark | None
+    """The previous step's ``end``: the device sat idle from there to ``begin``."""
     logits: torch.Tensor
     """Each row's last-token logits; for evaluation and tests."""
 
@@ -45,7 +76,11 @@ class Step:
         return self.sampled
 
     def stats(self) -> StepStats:
-        return self.step_stats
+        """``device_us`` spans the step's device work, gaps between its kernels included;
+        ``idle_before_us`` is the gap since the previous step's work (0 for the first)."""
+        self.end.wait()
+        idle = self.previous.us_until(self.begin) if self.previous is not None else 0.0
+        return StepStats(self.epoch, self.host_us, self.begin.us_until(self.end), max(idle, 0.0))
 
 
 def check_plan(plan: BatchPlan) -> None:
@@ -70,6 +105,8 @@ class PyTorchExecutor:
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any]) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
+        self.last_end: Mark | None = None
+        """The end of the device work of the step submitted last."""
 
     def capacity(self) -> Capacity:
         return Capacity({kind: store.capacity() for kind, store in self.stores.items()})
@@ -84,6 +121,9 @@ class PyTorchExecutor:
         if reason:
             return Resync(reason)
         chosen, eager = self._plans(plan)
+        last_token = self.batch.binding.buffers()["last_token"]
+        device = last_token.device
+        begin = Mark(device)
         self.batch.apply(delta, state)
         rows = [int(r) for r in plan.rows.values()]
         num_tokens = [int(n) for n in plan.num_tokens.values()]
@@ -99,8 +139,6 @@ class PyTorchExecutor:
                 store.clear(fresh)
         self._copies(state, "before")
 
-        last_token = self.batch.binding.buffers()["last_token"]
-        device = last_token.device
         given = torch.tensor(list(plan.tokens.values()), dtype=torch.int64, device=device)
         parts: list[torch.Tensor] = []
         offset = 0
@@ -124,11 +162,13 @@ class PyTorchExecutor:
                                              [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
         self.batch.record(rows, next_token_ids)
         self._copies(state, "after")
+        end, previous = Mark(device), self.last_end
+        self.last_end = end
 
         sampled = Sampled(Column.of("i32", rows), Column.of("i32", [1] * len(rows)),
                           Column.of("i64", next_token_ids.tolist()))
         host_us = (time.perf_counter() - start) * 1e6
-        return Step(sampled, StepStats(epoch, host_us, 0.0, 0.0), logits)
+        return Step(sampled, epoch, host_us, begin, end, previous, logits)
 
     def _plans(self, plan: BatchPlan) -> tuple[Plan, Plan]:
         """The step's plan and the eager one. A decode step takes the smallest ready graph bucket

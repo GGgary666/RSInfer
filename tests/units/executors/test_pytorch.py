@@ -5,6 +5,7 @@ snapshot (stage2-contract.md §1.3; the comparisons are not bitwise, §6)."""
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -135,3 +136,17 @@ def test_writing_the_scratch_items_between_steps_changes_no_request(worker: Work
 
 def test_capacity_counts_the_usable_items_of_each_kind(worker: Worker) -> None:
     assert worker.service("executor@1").capacity().items == {"kv.paged": 32, "gdn.slots": 6}
+
+
+def test_step_stats_time_the_device_work_and_the_gap_before_it(worker: Worker) -> None:
+    """``StepStats`` (stage2-contract.md §4.4 item 9). On the CPU the device work runs inside
+    ``submit``, so it lies within ``host_us``; the first step has no previous one to be idle after,
+    and the second was idle for at least the time the test slept between them."""
+    d = Driver(worker)
+    d.add(0, PROMPTS[0])
+    first = d.step({0: len(PROMPTS[0])}).stats()
+    time.sleep(0.01)
+    second = d.step({0: 1}).stats()
+    assert (first.step, second.step) == (1, 2)
+    assert first.idle_before_us == 0.0 and second.idle_before_us >= 10_000
+    assert 0 < first.device_us <= first.host_us and 0 < second.device_us <= second.host_us
