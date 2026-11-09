@@ -193,6 +193,8 @@ class Op:
         self.left = args.get("ticks", 0)
         self.never = args.get("never", False)
         log(self.config, self.ctx, "drain start")
+        if args.get("refuse"):
+            raise RuntimeError("the toy holds requests")
 
     def drained(self):
         self.left -= 1

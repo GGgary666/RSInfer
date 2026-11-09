@@ -67,20 +67,25 @@ def test_2_serve_starts_the_engine_and_the_client_drives_it(tmp_path: Path) -> N
 
         policy = workspace / "engine/scn/policy_fcfs/unit.py"
         policy.write_text(policy.read_text().replace("VERSION = 1", "VERSION = 2"))
-        dry = client(control, "apply", "--source", str(workspace), "--dry-run")["result"]
-        assert dry["status"] == "planned" and dry["new_identity"] != status["identity"]
-        applied = client(control, "apply", "--source", str(workspace), "--intent", "a faster policy")["result"]
-        assert applied["status"] == "committed" and applied["new_identity"] == dry["new_identity"]
-        assert client(control, "status")["identity"] == applied["new_identity"]
+        # apply prints a summary: what moved where, not every process's plan after the change
+        dry = client(control, "apply", "--source", str(workspace), "--dry-run")
+        assert dry["status"] == "planned" and dry["identity"]["new"] != status["identity"]
+        assert "plan" not in dry and any("scn.policy_fcfs" in p.get("reload", []) for p in dry["processes"].values())
+        full = client(control, "apply", "--source", str(workspace), "--dry-run", "--json")["result"]
+        assert full["new_identity"] == dry["identity"]["new"] and full["plan"]["procs"][0]["plan_after"]
+        applied = client(control, "apply", "--source", str(workspace), "--intent", "a faster policy")
+        assert applied["status"] == "committed" and applied["identity"]["new"] == dry["identity"]["new"]
+        assert client(control, "status")["identity"] == applied["identity"]["new"]
         logs = client(control, "logs")
-        assert [c["source"] for c in logs["changes"]] == ["startup", "apply", "apply"]
+        assert [c["source"] for c in logs["changes"]] == ["startup", "apply", "apply", "apply"]
 
         # the control plane answers, but the change failed: scripts must see it in the exit code
         queue = workspace / "engine/core/change/queue.py"
         queue.write_text(queue.read_text().replace('"""Change queue', '"""The change queue'))
-        failed = client(control, "apply", "--source", str(workspace), exit_code=1)["result"]
-        assert failed["status"] == "failed" and failed["plan"]["restart_engine"]
-        assert client(control, "status")["identity"] == applied["new_identity"]
+        failed = client(control, "apply", "--source", str(workspace), exit_code=1)
+        assert failed["status"] == "failed" and failed["restart_engine"]
+        assert any("framework modules changed" in d["reason"] for d in failed["diagnostics"])
+        assert client(control, "status")["identity"] == applied["identity"]["new"]
     finally:
         serve.send_signal(signal.SIGTERM)
         try:
