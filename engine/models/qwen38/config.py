@@ -32,6 +32,8 @@ class Qwen3_5TextConfig(msgspec.Struct, frozen=True):
     attn_output_gate: bool
     tie_word_embeddings: bool
     hidden_act: str
+    mamba_ssm_dtype: str = ""
+    """The SSM state dtype the checkpoint asks for, in SGLang's names; empty: none (``mamba2_state_dtype``)."""
 
     @staticmethod
     def from_hf(raw: dict[str, Any]) -> Qwen3_5TextConfig:
@@ -55,6 +57,7 @@ class Qwen3_5TextConfig(msgspec.Struct, frozen=True):
             attn_output_gate=d.get("attn_output_gate", True),
             tie_word_embeddings=d.get("tie_word_embeddings", False),
             hidden_act=d.get("hidden_act", "silu"),
+            mamba_ssm_dtype=d.get("mamba_ssm_dtype") or "",
         )
 
     @property

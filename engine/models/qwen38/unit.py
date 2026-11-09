@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -73,26 +74,44 @@ def params(cfg: Qwen3_5TextConfig, dtype: str) -> list[WeightDecl]:
     return out
 
 
-def states(cfg: Qwen3_5TextConfig, dtype: str, page_size: int) -> list[StateDecl]:
+STATE_DTYPES = MappingProxyType({"bf16": "bf16", "bfloat16": "bf16", "f16": "f16", "float16": "f16", "f32": "f32",
+                                  "float32": "f32"})
+"""The state dtypes stage 2 keeps, in the platform's names and SGLang's."""
+
+
+def state_dtype(key: str, value: str, auto: str) -> str:
+    """A state dtype key (stage2-contract.md §5.5.3): ``auto`` is ``auto``'s value; anything but bf16,
+    f16 and f32 (FP8 and FP4 KV among them) is refused at start."""
+    if value == "auto":
+        return auto
+    if value not in STATE_DTYPES:
+        raise ValueError(f"{key} = {value!r}: stage 2 keeps states in bf16, f16 or f32 (or auto)")
+    return STATE_DTYPES[value]
+
+
+def states(cfg: Qwen3_5TextConfig, dtype: str, page_size: int, *, kv_dtype: str | None = None,
+           conv_dtype: str | None = None, ssm_dtype: str = "f32") -> list[StateDecl]:
     """KV per full-attention layer (``MHATokenToKVPool``), conv and temporal state per GDN layer
-    (``Mamba2StateShape``: conv ``(conv_dim, K - 1)``, temporal ``(HV, V, K)``, fp32)."""
+    (``Mamba2StateShape``: conv ``(conv_dim, K - 1)``, temporal ``(HV, V, K)``). KV and conv are in
+    ``dtype`` unless given, temporal in ``ssm_dtype`` (``Mamba2StateDType``)."""
     d = Dims.of(cfg)
     out: list[StateDecl] = []
     for i, kind in enumerate(cfg.layers_block_type):
         if kind == "attention":
-            kv = ((page_size, cfg.num_key_value_heads, cfg.head_dim), dtype)
+            kv = ((page_size, cfg.num_key_value_heads, cfg.head_dim), kv_dtype or dtype)
             out.append(StateDecl("kv.paged", i, {"k": kv, "v": kv}, "request", tokens_per_item=page_size))
         else:
             temporal = (cfg.linear_num_value_heads, cfg.linear_value_head_dim, cfg.linear_key_head_dim)
-            out.append(StateDecl("gdn.slots", i, {"conv": ((d.conv_dim, cfg.linear_conv_kernel_dim - 1), dtype),
-                                                  "temporal": (temporal, "f32")}, "slot"))
+            out.append(StateDecl("gdn.slots", i, {"conv": ((d.conv_dim, cfg.linear_conv_kernel_dim - 1), conv_dtype or dtype),
+                                                  "temporal": (temporal, ssm_dtype)}, "slot"))
     return out
 
 
 class Qwen3_5ForCausalLM:
     """``model@1``."""
 
-    def __init__(self, cfg: Qwen3_5TextConfig, dtype: str, page_size: int, services: Mapping[str, Any]) -> None:
+    def __init__(self, cfg: Qwen3_5TextConfig, dtype: str, page_size: int, services: Mapping[str, Any],
+                 state_dtypes: Mapping[str, str] | None = None) -> None:
         self.cfg, self.dims = cfg, Dims.of(cfg)
         s = services
         self.weights, self.kv, self.gdn_states = s["state.weights@1"], s["state.kv.paged@1"], s["state.gdn.slots@1"]
@@ -100,7 +119,8 @@ class Qwen3_5ForCausalLM:
         self.rope, self.act, self.attn, self.gdn = (s["layers.rope@1"], s["layers.activation@1"], s["layers.attn@1"],
                                                     s["layers.gdn@1"])
         self._assembly = Assembly(["layers.attn@1" if k == "attention" else "layers.gdn@1"
-                                   for k in cfg.layers_block_type], states(cfg, dtype, page_size), params(cfg, dtype))
+                                   for k in cfg.layers_block_type], states(cfg, dtype, page_size, **(state_dtypes or {})),
+                                  params(cfg, dtype))
         self._views: list[Any] = []
         self._cached: tuple[int, list[Mapping[str, torch.Tensor]]] = (-1, [])
 
@@ -306,7 +326,13 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         cfg = Qwen3_5TextConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))
         services = {name: ctx.use(name) for name in self.SERVICES}
-        self.model = Qwen3_5ForCausalLM(cfg, config["model.dtype"], config["state.kv.page_size"], services)
+        dtype = config["model.dtype"]
+        state_dtypes = {
+            "kv_dtype": state_dtype("state.kv.dtype", config["state.kv.dtype"], dtype),
+            "conv_dtype": state_dtype("state.gdn.conv_dtype", config["state.gdn.conv_dtype"], "bf16"),
+            "ssm_dtype": state_dtype("state.gdn.ssm_dtype", config["state.gdn.ssm_dtype"],
+                                     STATE_DTYPES.get(cfg.mamba_ssm_dtype, "f32"))}
+        self.model = Qwen3_5ForCausalLM(cfg, dtype, config["state.kv.page_size"], services, state_dtypes)
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")
         self.model.start()
         ctx.provide("model@1", self.model)

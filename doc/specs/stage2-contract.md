@@ -360,6 +360,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - **`auto`**：按 kernel 目录的规则选（§6），选不到就用参照实现，并在日志里标出 fallback。
 - dtype 的约束照 SGLang 在启动时检查（如 `handle_linear_attn_backend`：SM100 上 flashinfer 的 GDN decode / verify 要求 `mamba_ssm_dtype` 为 bf16），不兼容就报错，不悄悄降精度。这类检查随对应的 kernel 一起接入。
 - 解析在 worker 启动时做一次，结果打一条 INFO 日志：平台；每种状态的 dtype 和页大小；prefill、decode 两个阶段各自的 backend 和每个 definition 选中的 solution，是否 fallback；verify 标为 disabled。运行中不再换。
+- **实现（2026-11-09）**：dtype 键由 `state.kv_paged`、`state.gdn_slots` 声明，模型单元读它们生成 `StateDecl`；backend 键由 `layers.attn`、`layers.gdn` 声明。`core.plan` 启动时让每个 backend `resolve`（`Backend.resolve`，共享代码在库 `engine/layers/solutions.py`），把结果打成一行 `core.plan: {json}`，也放在 `plan@1` 的 `resolved` 上；之后 backend 只调用固定下来的 solution。kernel 目录按名字选 backend 的规则见 §6。测试：`tests/units/executors/test_config.py`。
 - fp32 的对齐测试把三种状态的 dtype 都显式配成 f32；默认配置下 conv state 是 bf16，和 SGLang 一样。
 
 #### 5.5.4 前缀复用、投机与 buffer 交接
@@ -465,6 +466,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_eager` 上跑，是 CI 的基准，也是检验 solution 的标准。
 - **solution** 写怎么算：用哪个库的哪个版本、支持哪些 shape、能不能录进 graph、需要哪些平台能力、要不要进程级初始化、能不能跨机。
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
+- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）仍在每次调用时按 `auto` 选。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
 - **实现（2026-11-08）**：
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。

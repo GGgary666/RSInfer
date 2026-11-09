@@ -11,6 +11,7 @@ import msgspec
 
 from core.contracts.records import BatchPlan, RowDelta, StateOps
 from core.contracts.sampling import SamplingParams
+from core.contracts.state import StateDecl
 from core.contracts.tensor import Binding, Tensor
 
 type Phase = Literal["prefill", "decode"]
@@ -75,6 +76,14 @@ class Backend(Protocol):
 
     @property
     def binding(self) -> Binding: ...
+
+    def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
+        """Once, at start (§5.5.3, §8.1): fix the solution of every kernel definition each phase calls,
+        from the backend configured for that phase and the shapes in ``states`` (every layer's
+        declarations); ``forward`` then calls only those. A backend named explicitly that has no
+        fitting solution for one of them fails the start; ``auto`` may fall back to the reference.
+        Returns, per phase, the backend asked for and each definition's solution, for the log."""
+        ...
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None: ...
 

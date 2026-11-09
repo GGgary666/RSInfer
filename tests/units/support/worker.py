@@ -86,7 +86,8 @@ class Worker:
     """The worker units, loaded and started; ``config`` overrides the defaults."""
 
     def __init__(self, hf_config: dict[str, Any], **config: Any) -> None:
-        overrides: dict[str, Any] = {"model.hf_config": hf_config, "model.dtype": "f32", "state.kv.page_size": PAGE_SIZE,
+        overrides: dict[str, Any] = {"model.hf_config": hf_config, "model.dtype": "f32", "state.gdn.conv_dtype": "f32",
+                                     "state.kv.page_size": PAGE_SIZE,
                                      "state.kv.pages": 32, "state.gdn.slots": 6, "batch.max_rows": 8,
                                      "batch.max_context_len": 64, **config}
         self.specs = [spec(u) for u in WORKER_UNITS]

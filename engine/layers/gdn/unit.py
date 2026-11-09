@@ -5,12 +5,13 @@ from SGLang's ``RadixLinearAttention`` and ``GDNAttnBackend`` (srt/layers/attent
 gdn_backend.py, hybrid_linear_attn_backend.py, e838360; LICENSE.sglang), the plain paths without
 speculation, state tracking or fused projections. ``prepare`` is ``_forward_metadata``
 (``query_start_loc``, ``mamba_cache_indices``) plus ``has_initial_state``; ``forward`` is
-``forward_decode`` / ``forward_extend`` (prefill and mixed steps, as SGLang's MIXED mode).
+``forward_decode`` / ``forward_extend`` (prefill and mixed steps, as SGLang's MIXED mode), with the
+solutions ``resolve`` fixed at start from ``gdn.backend`` and its per-phase overrides.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,8 @@ import torch
 
 from core.contracts.plan import GDNBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
+from core.contracts.state import StateDecl
+from layers.solutions import Kernels
 
 KIND = "gdn.slots"
 
@@ -43,14 +46,21 @@ class Metadata:
 class GDNAttnBackend:
     """``layers.gdn@1``."""
 
-    def __init__(self, catalog: Any, states: Any) -> None:
-        self.catalog = catalog
+    def __init__(self, kernels: Kernels, states: Any) -> None:
+        self.kernels = kernels
         self.states = states
         self.forward_metadata: Metadata | None = None
 
     @property
     def binding(self) -> NoBuffers:
         return NoBuffers()
+
+    def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
+        _, head_v_dim, head_k_dim = next(d.tensors["temporal"][0] for d in states if d.kind == KIND)
+        shape = {"head_k_dim": head_k_dim, "head_v_dim": head_v_dim}
+        return self.kernels.resolve({
+            "prefill": {"gdn.conv1d_fn@1": shape, "gdn.gating@1": shape, "gdn.chunk_delta_rule@1": shape},
+            "decode": {"gdn.conv1d_update@1": shape, "gdn.recurrent_update@1": shape}})
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
@@ -81,36 +91,37 @@ class GDNAttnBackend:
         conv_states, ssm_states = cache["conv"], cache["temporal"]
         q_dim = k_dim = num_k_heads * head_k_dim
         v_dim = num_v_heads * head_v_dim
-        shape = {"head_k_dim": head_k_dim, "head_v_dim": head_v_dim}
         cache_indices = m.mamba_cache_indices
         if m.decode:
-            mixed_qkv = self.catalog.call("gdn.conv1d_update@1", shape, mixed_qkv, conv_states, conv_weights, bias,
-                                          activation, cache_indices)
+            mixed_qkv = self.kernels("decode", "gdn.conv1d_update@1")(mixed_qkv, conv_states, conv_weights, bias,
+                                                                     activation, cache_indices)
             bs = mixed_qkv.shape[0]
             query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
             query = query.view(1, bs, num_k_heads, head_k_dim)
             key = key.view(1, bs, num_k_heads, head_k_dim)
             value = value.view(1, bs, num_v_heads, head_v_dim)
-            return self.catalog.call("gdn.recurrent_update@1", shape, A_log, dt_bias, query, key, value, a, b,
-                                     ssm_states, cache_indices, m.query_start_loc)
+            return self.kernels("decode", "gdn.recurrent_update@1")(A_log, dt_bias, query, key, value, a, b,
+                                                                   ssm_states, cache_indices, m.query_start_loc)
 
-        mixed_qkv = self.catalog.call(  # _convolve_prefill
-            "gdn.conv1d_fn@1", shape, mixed_qkv.transpose(0, 1), conv_weights, bias, activation, conv_states,
+        mixed_qkv = self.kernels("prefill", "gdn.conv1d_fn@1")(  # _convolve_prefill
+            mixed_qkv.transpose(0, 1), conv_weights, bias, activation, conv_states,
             m.has_initial_state, cache_indices, m.query_start_loc).transpose(0, 1)[: mixed_qkv.shape[0]]
         actual_seq_len = mixed_qkv.shape[0]
         query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
         query = query.view(1, actual_seq_len, num_k_heads, head_k_dim)
         key = key.view(1, actual_seq_len, num_k_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_v_heads, head_v_dim)
-        g, beta = self.catalog.call("gdn.gating@1", shape, A_log, a, b, dt_bias)  # _prefill_gates
-        core_attn_out, _, _ = self.catalog.call("gdn.chunk_delta_rule@1", shape, query, key, value, g, beta,
-                                                ssm_states, cache_indices, m.query_start_loc)
+        g, beta = self.kernels("prefill", "gdn.gating@1")(A_log, a, b, dt_bias)  # _prefill_gates
+        core_attn_out, _, _ = self.kernels("prefill", "gdn.chunk_delta_rule@1")(query, key, value, g, beta,
+                                                                              ssm_states, cache_indices,
+                                                                              m.query_start_loc)
         return core_attn_out
 
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        ctx.provide("layers.gdn@1", GDNAttnBackend(ctx.use("kernels.catalog@1"), ctx.use("state.gdn.slots@1")))
+        kernels = Kernels(ctx.use("kernels.catalog@1"), config, "gdn")
+        ctx.provide("layers.gdn@1", GDNAttnBackend(kernels, ctx.use("state.gdn.slots@1")))
 
 
 if TYPE_CHECKING:
