@@ -61,6 +61,9 @@
 | `engine/core/deps/` | 影响分析（动作计划、dry-run）`core.deps` | `control-plane.md` §4 |
 | `engine/core/api/` | 控制接口 `core.api` | `control-plane.md` §5 |
 | `engine/core/sourcetree.py` | 读源码树（清单、模块）的库，`core.manifest` 和 `core.deps` 共用；不是单元 | |
+| `engine/core/contracts/` | 单元目录之外的共享接口库，避免 `manifest.cross_unit_import`；只放实际交接的数据和必要调用，不 import torch，不放内部算法和整对象镜像；修改原则见本文件末尾 | `stage2-contract.md` §3 |
+
+`engine/core/state/alloc/prefix.py` 保存账本内部的联合前缀匹配算法；当前仅有该辅助库，账本单元由后续实现补充。
 
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
@@ -74,7 +77,8 @@
   - `unit_runtime/`、`context/`、`ipc/`、`platforms/`、`change/`、`cluster/`：按组件划分。`ipc/test_location_transparency.py` 扫描整个 `engine/`，禁止写死本机地址或用 PID 当地址（P7）。
   - `adversarial/`：对抗与故障边界测试，对应 `doc/evaluations/` 的记录。
   - `formal/`：TLA+ 有限模型（`models/`）、runner（`run.py`）、对真实实现的轨迹回放和契约测试。细节见 `tests/framework/formal/README.md`。
-- `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。
+- `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。`units/contracts/`：接口库 `core.contracts`（编码往返、单元能 import 它、每个模块只 import 到本接缝的模块）。
+- `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
@@ -95,7 +99,7 @@
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、状态单元的变更（`state-changes.md`：排空与版本迁移，只有规格）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、状态单元的变更（`state-changes.md`：排空与版本迁移，只有规格）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
@@ -132,3 +136,10 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 - 测试用 `@pytest.mark.covers(edges=..., ladder=..., kinds=...)` 声明自己走到了哪些边、动作阶梯的哪几级、哪些模块种类，并在测试里断言；`tests/scenarios/test_coverage.py` 要求每一项至少有一个测试覆盖。
 - 框架代码不写死本机地址、路径或 PID（P7）；超时、心跳之类的可调参数一律做成带默认值的配置项（`doc/specs/README.md`）。
 - 框架本体对外返回 `Ok` / `Failed`，不靠异常跨进程边界。
+- 改 `engine/core/contracts/`（理由见 `doc/specs/stage2-contract.md` §3）：
+  - 只共享真正跨单元、跨进程交接的数据和必要调用。内部对象字段、算法、队列和辅助类型留在实现里，现有多余定义也应收缩；
+  - 同一个 RSI agent 可以同时修改接口与全部使用者。沿用交接方式的算法/kernel/策略改动直接改实现；交接内容或语义变化时才更新共享定义，需要旧新版本并存时才新增版本；
+  - 原地改消息定义时，接收方必须兼容在途旧消息的格式和语义；否则先停止该流生产并排空，或使用新分段/版本。步循环的 `quiesce` 不替代前端流的处理；
+  - 两位负责人审核仅为当前团队 PR 协作流程，不是运行时的人类审批要求；
+  - 模块按实际交接边界隔离，只 import 所需定义；`__init__.py` 只留 docstring；
+  - 新加模块或模块之间新加 import，要同时改 `tests/units/contracts/test_contracts.py` 的 `REACHES`。

@@ -17,6 +17,7 @@
 | [change.md](change.md) | 变更事务 `core.change` | 控制面进程 |
 | [control-plane.md](control-plane.md) | 控制面进程 `core.control`，以及控制面单元 `core.identity`、`core.manifest`、`core.deps`、`core.api` | 控制面进程 |
 | [state-changes.md](state-changes.md) | 状态单元的变更：排空与版本迁移（只有规格，实现在阶段 2） | 调度宿主、worker、控制面 |
+| [stage2-contract.md](stage2-contract.md) | 阶段 2 的单元契约：单元清单、每步记录（含一步重叠）、状态、kernel 目录、plan 和 graph、平台 v2、分工和里程碑（草案） | 全部 |
 
 前四个和单元在同一个 Python 进程里，只能用 Python；后三个是独立进程，只通过版本化消息交互，以后可以单独换成 Rust（v0 全部 Python）。
 

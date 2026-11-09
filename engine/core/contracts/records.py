@@ -1,0 +1,152 @@
+"""Per-step records between the scheduler host and the workers (stage2-contract.md §4).
+Each class is one section of an ``OpenRecord`` (doc/specs/ipc.md §3), named by ``SECTION``;
+a receiver decodes the sections it knows. The records between the frontend and the
+scheduler host are in ``core.contracts.requests``.
+
+The epoch of a record is its step number, assigned by the scheduler (change.md 4.2 step 4).
+The scheduler may issue step ``N + 1`` before it has the result of step ``N`` (one step of
+overlap, §4.4), so nothing in a plan may need a value only the result of the previous step
+carries: a decode input token is named, not given (``BatchPlan.from_previous``).
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar, Literal
+
+import msgspec
+
+from core.contracts.columns import Column
+from core.contracts.sampling import SamplingParams
+
+STEP_PLAN = "sched.step_plan@1"
+"""Schema of the scheduler -> worker record, one per rank (P3)."""
+STEP_RESULT = "worker.step_result@1"
+"""Schema of the worker -> scheduler record."""
+
+
+# ------------------------------------------------------------------ scheduler -> worker
+
+
+class AddedRow(msgspec.Struct, frozen=True):
+    row: int
+    """Index into the worker's persistent batch (``worker.batch``)."""
+    request: int
+    sampling: SamplingParams = SamplingParams()
+
+
+class RowDelta(msgspec.Struct, frozen=True):
+    """How the persistent batch changes before this step. Deltas arrive in order on a
+    lossless stream; ``full`` drops every row first (the answer to ``Resync``). A full delta
+    re-adds every row the scheduler keeps, and the plan's ``StateOps`` assigns each of them
+    every item it holds, not only new ones."""
+
+    SECTION: ClassVar[str] = "sched.rows@1"
+    added: list[AddedRow] = []
+    removed: Column = Column("i32")
+    full: bool = False
+
+
+class BatchPlan(msgspec.Struct, frozen=True):
+    """What every row computes in this step. ``num_tokens``, ``positions`` and ``from_previous``
+    hold one value per row of ``rows``. Checking a plan against these rules is the worker's
+    code, not part of the contract (stage2-contract.md §3, §4.2)."""
+
+    SECTION: ClassVar[str] = "sched.batch@1"
+    rows: Column
+    """``i32``: rows of the persistent batch that run in this step."""
+    num_tokens: Column
+    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step. How speculation
+    counts drafts is decided in M2d, following the compatibility rules in spec §3."""
+    positions: Column
+    """``i32`` per row: position of the row's first token in this step."""
+    tokens: Column
+    """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order:
+    such a row takes the next ``num_tokens`` of them, a ``from_previous`` row none. So its
+    length is the sum of those rows' ``num_tokens``."""
+    from_previous: Column
+    """``u8`` per row: 1 = the row's single input token is the token the worker sampled for it
+    the last time the row ran, resolved on the device without a host round trip. Only for a
+    row that has run since it was last added (a full delta adds every row again) and whose
+    last run ended its prompt or decoded; otherwise its token is given in ``tokens``. A worker
+    with no token to resolve answers ``Resync`` and runs nothing."""
+    phase: Literal["prefill", "decode", "mixed"]
+    bucket: int
+    """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
+
+
+class StateAssign(msgspec.Struct, frozen=True):
+    """Items of one state kind newly given to rows: pages for paged kinds, a slot at admission
+    for slot kinds. Row ``rows[i]`` appends ``ids[offsets[i]:offsets[i + 1]]``."""
+
+    kind: str
+    rows: Column
+    offsets: Column
+    ids: Column
+
+
+class StateCopy(msgspec.Struct, frozen=True):
+    """Item copies of one state kind: restore a snapshot into a row's slot on a prefix hit
+    (``before`` the step, from ``admit``), or snapshot a slot at a block boundary (``after``
+    it, from ``snapshot``). ``after`` sees only the state at the end of the row's chunk in
+    this step: a snapshot boundary the chunk crosses inside it cannot be copied (§5.4)."""
+
+    kind: str
+    when: Literal["before", "after"]
+    src: Column
+    dst: Column
+
+
+class StateOps(msgspec.Struct, frozen=True):
+    """Every state kind's part of a step plan, in one section."""
+
+    SECTION: ClassVar[str] = "state.ops@1"
+    assign: list[StateAssign] = []
+    copy: list[StateCopy] = []
+
+
+# ------------------------------------------------------------------ worker -> scheduler
+
+
+class Sampled(msgspec.Struct, frozen=True):
+    """Tokens sampled in step ``epoch`` (the record's epoch). ``counts`` is 1 per row without
+    speculation, the accepted length plus one with it."""
+
+    SECTION: ClassVar[str] = "worker.sampled@1"
+    rows: Column
+    counts: Column
+    tokens: Column
+
+
+class StepStats(msgspec.Struct, frozen=True):
+    """Where the time of one step went; how an agent sees that the CPU is the bottleneck.
+    Device times come from events, so they may arrive one record late (``step``)."""
+
+    SECTION: ClassVar[str] = "worker.stats@1"
+    step: int
+    host_us: float
+    """Worker CPU time for the step: apply the delta, prepare, launch."""
+    device_us: float
+    idle_before_us: float
+    """How long the device sat idle between the previous step's work and this one's."""
+
+
+class Capacity(msgspec.Struct, frozen=True):
+    """Usable items per state kind, scratch excluded; sent at start and after a grow."""
+
+    SECTION: ClassVar[str] = "state.capacity@1"
+    items: dict[str, int]
+
+
+class Resync(msgspec.Struct, frozen=True):
+    """The worker lost its persistent batch (``worker.batch`` was rebuilt), or got a plan it
+    cannot apply to it: send ``full``.
+
+    Until a full delta arrives the worker runs no plan: it answers each with ``Resync`` and no
+    ``Sampled``. The scheduler counts every step answered so as not run (with overlap, the next
+    one may already be on its way): its tokens were not computed and its copies not made, the
+    requests' lengths go back to the last step that returned ``Sampled``. Items assigned in
+    those steps stay with their requests; the full delta assigns them again. Further
+    ``Resync`` answers, to plans sent before the full delta, are expected."""
+
+    SECTION: ClassVar[str] = "worker.resync@1"
+    reason: str = ""
