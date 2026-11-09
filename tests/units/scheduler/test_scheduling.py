@@ -207,8 +207,10 @@ def test_a_cancelled_request_keeps_its_items_until_its_last_step_retired() -> No
         b.run_until(lambda: len(b.client.outputs[1].tokens) >= 3)
         for w in b.workers:
             w.fixture.held = True
-        b.run_until(lambda: len(b.engine.loop.flights) == 2 and not any(
-            all(f.epoch in w.fixture.answered for w in b.workers) for f in b.engine.loop.flights))
+        # Every step in flight lacks some rank's answer, and no worker has one queued to go out: an
+        # answer queued before the hold is still written, and would retire the step.
+        b.run_until(lambda: len(b.engine.loop.flights) == 2 and all(not w.fixture.outbox for w in b.workers)
+                    and not any(all(f.epoch in w.fixture.answered for w in b.workers) for f in b.engine.loop.flights))
         b.client.send(abort=[1])
         b.run_until(b.finished(1))
         assert b.client.outputs[1].finished == "abort"
