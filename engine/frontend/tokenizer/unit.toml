@@ -8,4 +8,5 @@ entry = "frontend.tokenizer.unit:Unit"
 services = ["frontend.tokenizer@1"]
 
 [config]
+"frontend.model_path" = { type = "str", default = "", binding = "startup", doc = "Model directory whose config.json and generation_config.json name the stop tokens; empty: frontend.tokenizer_path" }
 "frontend.tokenizer_path" = { type = "str", default = "", binding = "startup", doc = "Local HF tokenizer directory; install the frontend extra." }

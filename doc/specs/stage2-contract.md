@@ -48,6 +48,8 @@
 | M2c | decode graph：graph 和 eager 按下面的口径一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
 | M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
+2026-11-09：M2a 的链路跑通了（`tests/scenarios/test_m2a.py`，进 CI）。Qwen3.8-27B 真实结构的前 4 层在 RTX 4090 D 上和 HF 对齐，参照 kernel，fp32 逐字相同（`tests/gpu/`）。用的还是参照 kernel，不是 M2b 要的真 kernel；完整模型在 SM100 上的端到端验证交给 Devin，用同一套 `deploy/qwen38.py` 和 `tests/gpu/test_qwen38_serve.py`。
+
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
 - 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比按下面的口径一致；
@@ -310,6 +312,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 - `kv.paged`：16 层 full attention，每层的 K、V。24 个 q 头、4 个 kv 头，head dim 256。
 - `gdn.slots`：48 层 GDN，每层的 conv state `[槽, 10240, 3]` bf16 和 recurrent state `[槽, 48, 128, 128]` fp32。TP1 时每个请求约 147 MiB，256 个并发就是约 37 GiB（探针报告第 9 条）。槽位数在启动时由 `core.state.holder` 按显存预算确定，不要求在线扩槽位。
+  - 2026-11-09 实现（#32）：照 SGLang 的分法。权重和状态池一共占设备的 `holder.mem_fraction`（`mem_fraction_static`，默认 0.85），状态池分到其中扣掉权重后剩下的部分，再按 `holder.state_ratio`（`mamba_full_memory_ratio`，默认 0.9）分给 GDN 槽，其余给 KV 页；`holder.max_slots`（`max_mamba_cache_size`）可以直接定槽数。CPU 上的预算是 `holder.cpu_bytes`。模型在分配完权重之后、两个存储单元分配之前统一定好各种状态的条目数，`state.kv.pages`、`state.gdn.slots` 配了具体数时以配置为准。代码在 `engine/core/state/holder/`，契约是 `storage.py` 的 `StateHolder`。
 - 前缀复用：GDN 状态只在块边界有快照。快照占同一个池里的槽位，打快照、恢复快照都是条目拷贝（`StateCopy`）。所以 `gdn.slots` 的 `reusable` 只能对齐到快照边界。
 - **快照只能在一步的末尾打**（2026-11-08，PR #19 评审）：
   - GDN 的状态在一步之内原地往前推，`StateCopy(after)` 只拷得到这一行在这一步 chunk 末尾的状态。

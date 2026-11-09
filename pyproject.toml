@@ -63,7 +63,7 @@ markers = [
 ]
 
 [tool.pyright]
-include = ["engine", "tests"]
+include = ["engine", "tests", "deploy"]
 extraPaths = ["engine", "."]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"

@@ -1,0 +1,17 @@
+[unit]
+id = "core.worker"
+kind = "logic"
+process = ["worker"]
+entry = "core.worker.unit:Unit"
+
+[provides]
+services = ["proc.loop@1"]
+
+[requires]
+services = ["executor@1", "proc.streams@1"]
+
+[config]
+"worker.scheduler" = { type = "dict", default = {}, binding = "startup", doc = "ProcId of the scheduler host; this worker's rank is its own process index." }
+"worker.idle_wait_s" = { type = "float", default = 0.01, binding = "startup", doc = "Longest wait for a plan when nothing runs." }
+"worker.announce_every_s" = { type = "float", default = 1.0, binding = "startup", doc = "How often an idle worker sends Capacity again, so that a scheduler restarted while nothing ran finds it" }
+"worker.quiesce_timeout_s" = { type = "float", default = 30.0, binding = "startup", doc = "How long a pause waits for the scheduler to take the last answers." }
