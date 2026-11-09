@@ -30,7 +30,11 @@ What is ours (stage2-contract.md §4):
   end with an error at once, the steps sent there and not answered are given up, and serving
   goes on; nothing waits for a reload. Which requests: those whose plans went over the old
   connection. The two streams see one replacement at different times, so the second sighting
-  is paired with the first, and requests first sent to the new worker are not touched.
+  is paired with the first, and requests first sent to the new worker are not touched. A step
+  already on its way to the new worker is refused there (it waits for a full delta) while the
+  other ranks may run it: then it counts as not run. A request with nothing computed starts over
+  from position 0 on every rank, which clears its state first (``StateStore.clear``); a request
+  further on, whose ranks now differ, ends.
 - **Never blocking on a peer.** Plans and tokens are written without waiting; what a reader does
   not take yet stays queued and is tried again next turn. A frontend that takes nothing for
   ``sched.frontend_timeout_s`` loses its requests (they are cancelled), not the scheduler.
@@ -174,6 +178,9 @@ class Flight:
     """Sent after a step the workers refused (``Resync``): they refuse this one too."""
     written: dict[int, int] = field(default_factory=dict[int, int])
     """rank -> the generation of the plan connection it went over."""
+    refused_by: set[int] = field(default_factory=set[int])
+    """Ranks whose new worker refuses this step: it reached them after a replacement, before the
+    full delta. A ``Resync`` from them while other ranks ran it is expected."""
 
 
 class Outbox:
@@ -421,6 +428,9 @@ class Scheduler:
         for f in void:
             lost |= set(f.rows.values())
         self.full = True
+        for f in self.flights:  # not given up: on their way to the new worker, which refuses them
+            if f not in void and rank not in f.answers:
+                f.refused_by.add(rank)
         if not lost:
             self._note(f"{why}; no request was on it")
             return
@@ -458,6 +468,10 @@ class Scheduler:
             for rid in ready:
                 self._reap(rid)
             return
+        refused = {r for r, a in enumerate(answers) if isinstance(a, Resync)}
+        if refused and refused <= flight.refused_by and all(isinstance(a, (Resync, Sampled)) for a in answers):
+            self._ran_on_some(flight, refused)
+            return
         if flight.void:
             self.flights.appendleft(flight)
             self._fail(flight.epoch, None, f"step {flight.epoch} ran after the workers refused the step "
@@ -484,6 +498,25 @@ class Scheduler:
         self.ledger.retire(flight.epoch)
         ready = self.table.retire(flight.epoch)
         self._emit(events, flight.epoch)
+        for rid in ready:
+            self._reap(rid)
+
+    def _ran_on_some(self, flight: Flight, refused: set[int]) -> None:
+        """A replaced rank's new worker refused ``flight`` and the others ran it. It counts as not
+        run. A request with nothing computed starts over from position 0 on every rank, and
+        starting from 0 clears its state first. A request further on now has a different state on
+        different ranks: it ends."""
+        self.ledger.retire(flight.epoch, ran=False)
+        ready = self.table.retire(flight.epoch, ran=False)
+        for rid in flight.rows.values():
+            request = self.table.get(rid)
+            if request is not None and not request.finished() and request.computed > 0:
+                self._error(request, f"rank(s) {sorted(refused)} were replaced and refused step {flight.epoch}, "
+                                     "which the others ran: the request's state differs between ranks")
+        self.full = True
+        for later in self.flights:
+            later.void = True
+        self._note(f"step {flight.epoch} not run: refused by the new worker(s) of rank(s) {sorted(refused)}")
         for rid in ready:
             self._reap(rid)
 

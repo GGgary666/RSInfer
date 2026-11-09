@@ -327,10 +327,11 @@ def test_planning_that_fails_after_an_admission_gives_back_what_it_took(monkeypa
         check(b, [r])
 
 
-def test_a_worker_replaced_while_idle_serves_the_next_request() -> None:
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_a_worker_replaced_while_idle_serves_the_next_request(ranks: int) -> None:
     """Codex on #31: the results moved first, with nothing on the worker; the first plan to the new
     one then moves the plans too. That is one replacement, and the new request is not touched."""
-    with bed(ranks=1) as b:
+    with bed(ranks=ranks) as b:
         b.client.send([request(1, [1, 2, 3], 3)])
         b.run_until(b.finished(1))
         b.run_until(b.idle)
@@ -343,12 +344,18 @@ def test_a_worker_replaced_while_idle_serves_the_next_request() -> None:
         check(b, [fresh])
 
 
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("ranks", [1, 2])
 @pytest.mark.parametrize("first", ["plans", "results"])
-def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: str) -> None:
+def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: str, ranks: int, overlap: bool) -> None:
     """Codex on #31: request 1 holds a row on the old worker but is in no step when the replacement
     shows; it must not go on from state the new worker does not have. Request 2, sent to the new
-    worker first, runs."""
-    with bed(ranks=1, delay_s=0.002, token_budget=4) as b:
+    worker first, runs. With two ranks and the plans first, request 2's first step reaches the new
+    rank 0 before anyone knows (it refuses it, waiting for a full delta) and rank 1 runs it
+    (Codex's second review): the step counts as not run, and request 2 starts over from 0. With
+    overlap its first two chunks are refused so; nothing of it was computed, so it still starts
+    over."""
+    with bed(ranks=ranks, delay_s=0.002, token_budget=4, overlap=overlap) as b:
         b.client.send([request(1, [1, 2, 3], 40)])
         b.run_until(lambda: len(b.client.outputs[1].tokens) >= 2)
         b.engine.loop.quiesce()  # nothing in flight on the old worker
@@ -362,4 +369,6 @@ def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: 
         assert b.client.outputs[2].error is None
         moves = [d for d in b.engine.loop.report().diagnostics if "new connection" in d or "new producer" in d]
         assert ("plans to" if first == "plans" else "results of") in moves[0], moves  # the order this test is for
+        if ranks == 2 and first == "plans":
+            assert any("refused by the new worker" in d for d in b.engine.loop.report().diagnostics)
         check(b, [fresh])
