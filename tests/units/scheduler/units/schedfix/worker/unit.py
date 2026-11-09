@@ -89,10 +89,13 @@ class Row:
 
 class FixtureWorker:
     def __init__(self, plans: Reader, results: Writer, *, rank: int, capacity: dict[str, int],
-                 pages: dict[str, int], max_batch: int, delay_s: float = 0.0,
+                 pages: dict[str, int], max_batch: int, delay_s: float = 0.0, announce_after_s: float = 0.0,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.plans, self.results, self.rank = plans, results, rank
         self.capacity, self.pages, self.max_batch, self.delay_s, self.clock = capacity, pages, max_batch, delay_s, clock
+        self.announce_after_s = announce_after_s
+        """How long after it starts the worker sends ``Capacity``; plans are answered meanwhile."""
+        self.started = clock()
         self.rows: dict[int, Row] = {}
         self.pages_held: dict[tuple[str, int], tuple[int, list[int]]] = {}
         """(kind, page) -> (request, tokens written to it)."""
@@ -119,10 +122,11 @@ class FixtureWorker:
         for this follower to reach the step its leader stopped after."""
 
     def turn(self, wait: float = 0.0) -> None:
-        if not self.announced:
-            self._answer(0, Capacity.SECTION, Capacity(dict(self.capacity)), due=self.clock())
-            self.announced = True
         now = self.clock()
+        if not self.announced and now - self.started >= self.announce_after_s:
+            record = RecordBuilder(STEP_RESULT, 0, self.rank).add(Capacity.SECTION, Capacity(dict(self.capacity))).build()
+            self.outbox.append((0, encode_record(record)))  # the plans' answers keep their order
+            self.announced = True
         while self.due and self.due[0][0] <= now and not self.held:
             _, epoch, data = self.due.popleft()
             self.outbox.append((epoch, data))
@@ -289,13 +293,13 @@ class FixtureWorker:
 
 
 class Unit:
-    """The fixture as the loop unit of a worker process. A unit is not told its process, so the
-    rank comes from the host it runs on (``schedfix.ranks``): one worker per host."""
+    """The fixture as the loop unit of a worker process; its rank is its process's index (a role
+    with one process per rank)."""
 
     def __init__(self, ctx: Any, config: Any) -> None:
         streams = ctx.use("proc.streams@1")
         scheduler = msgspec.convert(config["schedfix.scheduler"], ProcId)
-        rank = int(config["schedfix.ranks"][str(streams.local)])
+        rank = ctx.instance.proc.index
         self.worker = FixtureWorker(streams.reader("plans", scheduler.host),
                                     streams.writer(scheduler, f"results.{rank}"), rank=rank,
                                     capacity=dict(config["schedfix.capacity"]), pages=dict(config["schedfix.pages"]),

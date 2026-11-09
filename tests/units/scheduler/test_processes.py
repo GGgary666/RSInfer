@@ -109,8 +109,7 @@ async def engine(tmp: Path, *, overlap: bool) -> AsyncGenerator[Running]:
         # reports back, and look like a new value to the next change).
         config = {"alloc.states": msgspec.json.decode(msgspec.json.encode(DECLS)), "sched.workers": msgspec.to_builtins(WORKERS),
                   "sched.frontend_host": "client", "sched.max_batch": 8, "sched.token_budget": 16,
-                  "sched.overlap": overlap, "schedfix.scheduler": msgspec.to_builtins(SCHED),
-                  "schedfix.ranks": {"host-a": 0, "host-b": 1}, "schedfix.capacity": CAPACITY,
+                  "sched.overlap": overlap, "schedfix.scheduler": msgspec.to_builtins(SCHED), "schedfix.capacity": CAPACITY,
                   "schedfix.pages": dict(PAGES), "schedfix.max_batch": 8, "schedfix.delay_s": 0.01}
         started = (await cp.boot(ingest(cp.blobs, workspace), topology(tmp), config)).unwrap()
         assert started.status == "committed", started.diagnostics

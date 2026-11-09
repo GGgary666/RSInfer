@@ -19,13 +19,18 @@ What is ours (stage2-contract.md §4):
   refused too, so the next plan waits for them and goes out with nothing in flight, as a full
   delta. Ranks that disagree (one ran it, one did not) cannot be put back together: that is a
   failure.
-- **Failures.** ``StepFailure``, a step without an answer for ``sched.step_timeout_s``, ranks that
-  disagree, or a worker whose plans or results go through a new connection while it holds
-  requests: the worker's state is unknown. Then no more steps go out, new requests get an error,
-  the requests it holds stay as they are, and ``report()`` says what happened. Nothing is frozen:
-  control requests, reloads and config keep working. Until changes can choose how to deal with
-  such a state (stage 2's step 5), a new instance of this unit (a reload) ends the requests of
-  steps that never came back with an error and carries on with the rest.
+- **Failures.** ``StepFailure``, a step without an answer for ``sched.step_timeout_s``, or ranks
+  that disagree: the worker's state is unknown. Then no more steps go out, new requests get an
+  error, the requests it holds stay as they are, and ``report()`` says what happened. Nothing is
+  frozen: control requests, reloads and config keep working. Until changes can choose how to deal
+  with such a state (stage 2's step 5), a new instance of this unit (a reload) ends the requests
+  of steps that never came back with an error and carries on with the rest.
+- **A replaced worker.** Plans or results of a rank going over a new connection mean a new
+  worker process (or a broken connection): what the requests had there is gone. Those requests
+  end with an error at once, the steps sent there and not answered are given up, and serving
+  goes on; nothing waits for a reload. Which requests: those whose plans went over the old
+  connection. The two streams see one replacement at different times, so the second sighting
+  is paired with the first, and requests first sent to the new worker are not touched.
 - **Never blocking on a peer.** Plans and tokens are written without waiting; what a reader does
   not take yet stays queued and is tried again next turn. A frontend that takes nothing for
   ``sched.frontend_timeout_s`` loses its requests (they are cancelled), not the scheduler.
@@ -77,6 +82,7 @@ class Writer(Protocol):
     generation: int
 
     def write(self, data: bytes, timeout: float | None = None) -> bool: ...
+    def abandon(self) -> None: ...
 
 
 class Request(Protocol):
@@ -166,31 +172,40 @@ class Flight:
     answers: dict[int, Answer] = field(default_factory=dict[int, Answer])
     void: bool = False
     """Sent after a step the workers refused (``Resync``): they refuse this one too."""
+    written: dict[int, int] = field(default_factory=dict[int, int])
+    """rank -> the generation of the plan connection it went over."""
 
 
 class Outbox:
     """Records for one reader, written in order without waiting. ``since`` is when the oldest
-    one was queued."""
+    one was queued; each record has a tag (a plan's epoch)."""
 
     def __init__(self, writer: Writer) -> None:
         self.writer = writer
-        self.queue: deque[tuple[float, bytes]] = deque()
+        self.queue: deque[tuple[float, bytes, int]] = deque()
 
-    def put(self, data: bytes, now: float) -> None:
-        self.queue.append((now, data))
+    def put(self, data: bytes, now: float, tag: int = 0) -> None:
+        self.queue.append((now, data, tag))
 
     @property
     def since(self) -> float | None:
         return self.queue[0][0] if self.queue else None
 
-    def flush(self) -> None:
+    def flush(self) -> list[int]:
+        """Write what the reader takes; the tags written. They all went over one connection: a
+        connection that breaks stops the flush, and the next one is made by the next write."""
+        written: list[int] = []
         while self.queue:
             try:
                 if not self.writer.write(self.queue[0][1], timeout=0):
-                    return
+                    break
             except TimeoutError:
-                return
-            self.queue.popleft()
+                break
+            written.append(self.queue.popleft()[2])
+        return written
+
+    def drop(self, tags: set[int]) -> None:
+        self.queue = deque(e for e in self.queue if e[2] not in tags)
 
 
 class Scheduler:
@@ -221,6 +236,11 @@ class Scheduler:
         # A new instance takes over the connections as they are (they belong to the host).
         self.result_gens = [r.generation for r in self.results]
         self.plan_gens = [w.generation for w in plans]
+        self.home: dict[int, dict[int, int]] = {}
+        """request -> rank -> the plan connection its first plan to that rank went over."""
+        self.expect_results = [False] * len(plans)
+        self.expect_plans = [False] * len(plans)
+        """One replacement, seen on one stream already: the other stream's change is the same one."""
         self.adopted = False
 
     # ------------------------------------------------------------------ the loop
@@ -298,6 +318,9 @@ class Scheduler:
         earlier instance after a worker failure: their requests end with an error, the rest
         carry on from what retired."""
         self.adopted = True
+        for request in self.table.entries():
+            if request.row is not None:
+                self.home[request.input.request] = dict(enumerate(self.plan_gens))
         for epoch in sorted(self.table.steps):
             rows = dict(cast(Mapping[int, int], self.table.steps[epoch].rows))
             for rid in rows.values():
@@ -331,7 +354,7 @@ class Scheduler:
             replaced = self.result_gens[rank] != 0
             self.result_gens[rank] = reader.generation
             if replaced:
-                self._replaced(rank, "results")
+                self._results_moved(rank)
         try:
             record = decode_record(raw)
             if record.schema != STEP_RESULT or record.rank != rank:
@@ -367,16 +390,53 @@ class Scheduler:
         except ValueError as e:
             self._note(f"capacity {lowest} not taken: {e}")
 
-    def _replaced(self, rank: int, channel: str) -> None:
-        """A new connection to or from a worker: what went over the old one may be lost, and a
-        new worker process has none of the requests' state."""
-        holds = bool(self.flights) or any(r.row is not None for r in self.table.entries())
-        if holds:
-            step = self.flights[0].epoch if self.flights else self.table.last_submitted
-            self._fail(step, rank, f"rank {rank}'s {channel} went over a new connection (a new worker "
-                                   "process?) while it held requests")
+    def _plans_moved(self, rank: int, gen: int) -> None:
+        """Plans to ``rank`` now go over a new connection: to a new worker process, or the old
+        one's connection broke and records on it may be lost. Requests sent over the old one
+        lose what they had there."""
+        if self.expect_plans[rank]:
+            self.expect_plans[rank] = False
         else:
-            self.full = True
+            self.expect_results[rank] = True
+        self._lose(rank, lambda first: first < gen, f"plans to rank {rank} go over a new connection "
+                                                   "(a new worker process?)")
+
+    def _results_moved(self, rank: int) -> None:
+        """Results of ``rank`` come from a new producer. If plans moved first, it is the same
+        replacement. Otherwise the plan writer may still be connected to the old reader: it looks
+        the reader up again at the next write, and that move is paired with this one."""
+        if self.expect_results[rank]:
+            self.expect_results[rank] = False
+            return
+        self.expect_plans[rank] = True
+        self.plans[rank].writer.abandon()
+        self._lose(rank, lambda first: True, f"results of rank {rank} come from a new producer "
+                                            "(a new worker process?)")
+
+    def _lose(self, rank: int, old: Callable[[int], bool], why: str) -> None:
+        """End the requests whose plans went to ``rank`` over the old connection, and give up the
+        steps sent there that it did not answer (their answers may never come)."""
+        lost = {rid for rid, first in self.home.items() if rank in first and old(first[rank])}
+        void = [f for f in self.flights if rank in f.written and old(f.written[rank]) and rank not in f.answers]
+        for f in void:
+            lost |= set(f.rows.values())
+        self.full = True
+        if not lost:
+            self._note(f"{why}; no request was on it")
+            return
+        for rid in sorted(lost):
+            request = self.table.get(rid)
+            if request is not None and not request.finished():
+                self._error(request, f"{why}: what the request had there is gone")
+        tags = {f.epoch for f in void}
+        for f in void:
+            self.flights.remove(f)
+            self.ledger.retire(f.epoch, ran=False)
+            for rid in self.table.retire(f.epoch, ran=False):
+                self._reap(rid)
+        for outbox in self.plans:
+            outbox.drop(tags)
+        self._note(f"{why}: {len(lost)} request(s) ended" + (f", step(s) {sorted(tags)} given up" if tags else ""))
 
     def _retire_ready(self) -> None:
         while self.fault is None and self.flights and len(self.flights[0].answers) == len(self.results):
@@ -515,10 +575,8 @@ class Scheduler:
             if not added.ok:
                 self._refuse(route, new.request, "; ".join(d.reason for d in added.diagnostics))
                 continue
-            extent = len(new.prompt) + new.max_tokens
-            if self.ledger.ready and not self.ledger.fits(extent):
-                self._error(added.value, f"{extent} tokens (prompt plus max_tokens) need more state than the "
-                                         "engine has")
+            if self.ledger.ready and (why := self._too_long(len(new.prompt) + new.max_tokens)):
+                self._error(added.value, why)
         for abort in requests.abort:
             request = self.table.get(abort.request)
             if request is None or request.route != route:
@@ -526,6 +584,12 @@ class Scheduler:
             self._emit(self.table.cancel(abort.request, self.identity()), self.table.last_submitted)
             if request.reclaimable:
                 self._reap(abort.request)
+
+    def _too_long(self, extent: int) -> str:
+        """Why a request of ``extent`` tokens (prompt plus max_tokens) can never run, or ``""``."""
+        if not self.ledger.fits(extent):
+            return f"{extent} tokens (prompt plus max_tokens) need more state than the engine has"
+        return ""
 
     def _refuse(self, route: StreamAddress, rid: int, message: str) -> None:
         events = TokenEvents(self.identity(), Column.of("i64", [rid]), Column.of("i32", [0, 0]),
@@ -599,23 +663,32 @@ class Scheduler:
         self.ledger.release(rid, self.table.last_retired)
         if request.row is not None:
             self.removed.append(request.row)
+        self.home.pop(rid, None)
         self.table.reap(rid)
 
     # ------------------------------------------------------------------ planning
 
     def _flush(self) -> None:
         for rank, outbox in enumerate(self.plans):
+            written: list[int] = []
             try:
-                outbox.flush()
+                written = outbox.flush()
             except Exception as e:  # noqa: BLE001
                 self._fail(self.flights[0].epoch if self.flights else self.table.last_submitted, rank,
                            f"writing a plan to rank {rank} failed: {type(e).__name__}: {e}")
-            writer = outbox.writer
-            if writer.generation != self.plan_gens[rank]:
-                replaced = self.plan_gens[rank] != 0
-                self.plan_gens[rank] = writer.generation
-                if replaced:
-                    self._replaced(rank, "plans")
+            gen = outbox.writer.generation
+            if gen != self.plan_gens[rank]:
+                moved = self.plan_gens[rank] != 0
+                self.plan_gens[rank] = gen
+                if moved:  # before the plans just written are counted: they went to the new reader
+                    self._plans_moved(rank, gen)
+            flights = {f.epoch: f for f in self.flights}
+            for epoch in written:
+                flight = flights.get(epoch)
+                if flight is not None:
+                    flight.written[rank] = gen
+                    for rid in flight.rows.values():
+                        self.home.setdefault(rid, {}).setdefault(rank, gen)
         self._flush_routes()
 
     def _plan(self) -> bool:
@@ -675,7 +748,7 @@ class Scheduler:
             else:
                 continue  # its last token is being sampled
             kinds[rid] = kind, request, planned
-        return kinds, waiting, prefilling, decoding, self.settings.max_batch - len(used)
+        return kinds, waiting, prefilling, decoding, max(0, self.settings.max_batch - len(used))
 
     def _decide(self, waiting: list[Candidate], prefilling: list[Candidate], decoding: list[Candidate],
                 free_rows: int) -> list[Take]:
@@ -747,9 +820,8 @@ class Scheduler:
                 if refused:
                     continue
                 extent = len(request.prompt_tokens) + request.input.max_tokens
-                if not self.ledger.fits(extent):
-                    self._error(request, f"{extent} tokens (prompt plus max_tokens) need more state than "
-                                         "the engine has")
+                if why := self._too_long(extent):
+                    self._error(request, why)
                     continue
                 got = self.ledger.admit(rid, extent, step.epoch)
                 if got is None:
@@ -804,7 +876,7 @@ class Scheduler:
         self.table.start_step(step.epoch, step.rows, step.counts)
         now = self.clock()
         for rank, outbox in enumerate(self.plans):
-            outbox.put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)), now)
+            outbox.put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)), now, step.epoch)
         self.flights.append(Flight(step.epoch, dict(step.rows), dict(step.counts), frozenset(step.samples), now))
         self.full = False
         self.removed.clear()

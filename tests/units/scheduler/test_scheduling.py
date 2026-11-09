@@ -325,3 +325,41 @@ def test_planning_that_fails_after_an_admission_gives_back_what_it_took(monkeypa
         assert any("planning failed" in d for d in loop.report().diagnostics)
         b.run_until(b.finished(1))
         check(b, [r])
+
+
+def test_a_worker_replaced_while_idle_serves_the_next_request() -> None:
+    """Codex on #31: the results moved first, with nothing on the worker; the first plan to the new
+    one then moves the plans too. That is one replacement, and the new request is not touched."""
+    with bed(ranks=1) as b:
+        b.client.send([request(1, [1, 2, 3], 3)])
+        b.run_until(b.finished(1))
+        b.run_until(b.idle)
+        b.replace_worker(0)
+        b.run_until(lambda: b.engine.loop.result_gens[0] == 2)
+        fresh = request(2, [4, 5, 6], 3)
+        b.client.send([fresh])
+        b.run_until(b.finished(2))
+        assert b.client.outputs[2].error is None
+        check(b, [fresh])
+
+
+@pytest.mark.parametrize("first", ["plans", "results"])
+def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: str) -> None:
+    """Codex on #31: request 1 holds a row on the old worker but is in no step when the replacement
+    shows; it must not go on from state the new worker does not have. Request 2, sent to the new
+    worker first, runs."""
+    with bed(ranks=1, delay_s=0.002, token_budget=4) as b:
+        b.client.send([request(1, [1, 2, 3], 40)])
+        b.run_until(lambda: len(b.client.outputs[1].tokens) >= 2)
+        b.engine.loop.quiesce()  # nothing in flight on the old worker
+        b.replace_worker(0, announce_after_s=1.0 if first == "plans" else 0.0)
+        if first == "results":
+            time.sleep(0.3)  # the new worker's Capacity waits for the scheduler's next turn
+        fresh = request(2, list(range(1, 21)), 3)
+        b.client.send([fresh])
+        b.run_until(b.finished(1, 2))
+        assert "gone" in (b.client.outputs[1].error or ""), b.client.outputs[1]
+        assert b.client.outputs[2].error is None
+        moves = [d for d in b.engine.loop.report().diagnostics if "new connection" in d or "new producer" in d]
+        assert ("plans to" if first == "plans" else "results of") in moves[0], moves  # the order this test is for
+        check(b, [fresh])

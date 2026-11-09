@@ -75,10 +75,10 @@ class WorkerThread:
     """A fixture worker on a thread, with data channels of its own."""
 
     def __init__(self, directory: Directory, rank: int, *, max_batch: int, capacity: dict[str, int],
-                 delay_s: float) -> None:
+                 delay_s: float, announce_after_s: float = 0.0) -> None:
         self.directory, self.rank, self.proc = directory, rank, WORKERS[rank]
         self.kw: dict[str, Any] = {"rank": rank, "capacity": capacity, "pages": PAGES, "max_batch": max_batch,
-                                   "delay_s": delay_s}
+                                   "delay_s": delay_s, "announce_after_s": announce_after_s}
         self.ready, self.stopping = threading.Event(), threading.Event()
         self.error: BaseException | None = None
         self.worker: FixtureWorker | None = None
@@ -303,6 +303,16 @@ class Bed:
 
     def errors(self) -> list[str]:
         return [e for w in self.workers for e in w.fixture.errors]
+
+    def replace_worker(self, rank: int, *, announce_after_s: float = 0.0) -> None:
+        """A new worker process for ``rank``: new readers and writers, none of the old state."""
+        old = self.workers[rank]
+        errors = old.fixture.errors
+        old.close()
+        assert errors == [], errors
+        self.workers[rank] = WorkerThread(old.directory, rank, max_batch=old.kw["max_batch"],
+                                          capacity=old.kw["capacity"], delay_s=old.kw["delay_s"],
+                                          announce_after_s=announce_after_s)
 
 
 @contextmanager
