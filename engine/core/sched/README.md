@@ -139,7 +139,7 @@
 |---|---|---|---|
 | `sched.workers` | `[]` | startup | 每个 rank 的 worker 的 ProcId，rank 0 在前 |
 | `sched.frontend_host` | `""` | startup | 往读端 `requests` 写请求的前端在哪台主机 |
-| `sched.max_batch` | 32 | startup | worker 持久 batch 的行数 |
+| `sched.max_batch` | 32 | startup | 计划最多用多少行，不超过 worker 的 `batch.max_rows` |
 | `sched.token_budget` | 2048 | startup | 每步最多算多少 prompt token |
 | `sched.overlap` | `false` | live | 一步重叠 |
 | `sched.step_timeout_s` | 3600 | startup | GPU 的第一步可能要编译好几分钟 |
@@ -164,9 +164,9 @@
   - 调度器能发现账本在请求运行中被重建，并判为故障；请求表被重建则发现不了。
   - 第 5 步的冲突检查要拒绝这种变更，并报告现状。
 - **worker 进程被换**：受影响的请求结束并回错误（见上面"worker 被换"），按 token 历史退回重算还没做。
-- **单行上限（等 #30 合入）**：worker 每行能放多少 token、有多少行，是 `worker.batch` 的配置项 `batch.max_context_len`、`batch.max_rows`，调度器现在看不到。所以 prompt 加 `max_tokens` 超过一行容量的请求会被准入，接着在 worker 里报错，引擎因此停下。
-  - 和 #30 商定（spec §4.3）：调度器用 `[reads]` 读这两个键，准入时拒绝放不下的请求，行数取它和 `sched.max_batch` 里小的那个。
-  - 这两个键要等 #30 合进来才有人声明。在那之前加 `[reads]` 过不了清单检查（`manifest.undeclared_read`），所以 #30 合入后再补。
+- **单行上限**（2026-11-09，#30 合入后补上）：调度器用 `[reads]` 读 `worker.batch` 的 `batch.max_context_len` 和 `batch.max_rows`（stage2-contract.md §4.3）。
+  - 准入时，prompt 加 `max_tokens` 超过一行容量的请求直接回错误，不再发给 worker 让它报错。
+  - 计划最多用 `min(sched.max_batch, batch.max_rows)` 行。
 - **配置值的形式**：控制面比较配置的新旧值时，tuple 和 list 不相等。所以客户端传的配置要用 JSON 的形式，否则下一次无关的变更会以为配置变了，把账本重新加载掉。测试里就踩到了这一点（`msgspec.to_builtins` 不会把 tuple 转成 list）。
 - **快照对象的开销**：决策点的快照每步给每个请求建一个 `Candidate` 对象，§4.5 担心的正是这种开销。M2a 的规模可以接受，量大了可以改成列。
 
@@ -195,6 +195,7 @@
   - 账本被重建；
   - 前端失联；
   - 请求太大；
+  - 准入守住 worker 每行的容量和行数；
   - worker 被换：空闲时换，以及占着行时换。占着行时换的那一组覆盖了计划通道先发现、结果通道先发现两种顺序，1 个和 2 个 rank，开或不开重叠。
 - `test_processes.py`：控制面真的启动调度宿主进程和两个夹具 worker 进程，worker 0 走共享内存，worker 1 走 TCP。开着重叠生成到一半，通过控制接口重载 `core.sched`；同一个请求在新旧两个身份下都收到了 token，和直接算出来的逐个一致。
 - 夹具 worker（`units/schedfix/worker`）：

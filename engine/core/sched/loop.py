@@ -36,7 +36,10 @@ What is ours (stage2-contract.md §4):
   from position 0 on every rank, which clears its state first (``StateStore.clear``); a request
   further on, whose ranks now differ, ends.
 - **Never blocking on a peer.** Plans and tokens are written without waiting; what a reader does
-  not take yet stays queued and is tried again next turn. A frontend that takes nothing for
+  not take yet stays queued and is tried again next turn.
+- **What a row holds.** Admission refuses a request longer than one row of the workers'
+  persistent batch (``batch.max_context_len``), and plans use at most ``batch.max_rows`` rows:
+  the worker raises on a plan beyond them (stage2-contract.md §4.3). A frontend that takes nothing for
   ``sched.frontend_timeout_s`` loses its requests (they are cancelled), not the scheduler.
 """
 
@@ -132,7 +135,9 @@ class Table(Protocol):
 @dataclass(frozen=True)
 class Settings:
     max_batch: int = 32
-    """Rows of the workers' persistent batch."""
+    """Rows plans use: ``sched.max_batch``, at most the workers' ``batch.max_rows``."""
+    max_context: int = 0
+    """Tokens one row of the workers holds (``batch.max_context_len``); 0: no limit."""
     token_budget: int = 2048
     """Prompt tokens per step; sglang's smallest ``chunked_prefill_size``."""
     step_timeout_s: float = 3600.0
@@ -624,6 +629,8 @@ class Scheduler:
         """Why a request of ``extent`` tokens (prompt plus max_tokens) can never run, or ``""``."""
         if not self.ledger.fits(extent):
             return f"{extent} tokens (prompt plus max_tokens) need more state than the engine has"
+        if self.settings.max_context and extent > self.settings.max_context:
+            return f"{extent} tokens (prompt plus max_tokens); a row of the workers holds {self.settings.max_context}"
         return ""
 
     def _refuse(self, route: StreamAddress, rid: int, message: str) -> None:

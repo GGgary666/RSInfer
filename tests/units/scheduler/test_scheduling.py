@@ -376,3 +376,18 @@ def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: 
         fulls = [e for e, _, d in b.workers[0].fixture.plans_seen if d.full]
         assert len(fulls) == 1, fulls  # one full delta for the new worker, not one per sighting
         check(b, [fresh])
+
+
+def test_admission_keeps_to_what_a_row_of_the_workers_holds() -> None:
+    """#30's ``batch.max_context_len`` and ``batch.max_rows`` (stage2-contract.md §4.3): a request
+    longer than a row is refused, not sent to a worker that would raise; plans use the rows the
+    workers have, even when ``sched.max_batch`` says more."""
+    with bed(max_batch=8, config={"batch.max_context_len": 16, "batch.max_rows": 2}) as b:
+        long = request(1, list(range(1, 11)), 10)
+        fits = [request(rid, [rid, rid + 1, rid + 2], 13) for rid in (2, 3, 4)]
+        b.client.send([long, *fits])
+        b.run_until(b.finished(1, 2, 3, 4))
+        assert "a row of the workers holds 16" in (b.client.outputs[1].error or "")
+        rows = {a.row for _, _, d in b.workers[0].fixture.plans_seen for a in d.added}
+        assert rows <= {0, 1}
+        check(b, fits)

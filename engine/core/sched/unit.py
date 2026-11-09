@@ -26,7 +26,8 @@ class Unit:
             raise ValueError("sched.workers lists no worker")
         channels = cast(Channels, ctx.use("proc.streams@1"))
         control = ctx.use("proc.control@1")
-        settings = Settings(max_batch=config["sched.max_batch"], token_budget=config["sched.token_budget"],
+        settings = Settings(max_batch=min(config["sched.max_batch"], config["batch.max_rows"]),
+                            max_context=config["batch.max_context_len"], token_budget=config["sched.token_budget"],
                             step_timeout_s=config["sched.step_timeout_s"],
                             quiesce_timeout_s=config["sched.quiesce_timeout_s"],
                             frontend_timeout_s=config["sched.frontend_timeout_s"],

@@ -19,7 +19,7 @@ import zmq
 import zmq.asyncio
 
 from core.change.config import ChangeTunables
-from core.common.ids import HostId, ProcId
+from core.common.ids import HostId, ProcId, UnitId
 from core.common.manifest import MANIFEST_FILE, load_manifest
 from core.common.result import Failed, Ok
 from core.control.client import ControlClient
@@ -38,8 +38,11 @@ HOSTS = ("host-a", "host-b")
 SCHED = ProcId(HostId("host-a"), "sched", 0)
 WORKERS = [ProcId(HostId("host-a"), "worker", 0), ProcId(HostId("host-b"), "worker", 1)]
 CAPACITY = {"kv.paged": 600, "gdn.slots": 8}
-KEEP = {"sched.reqs", "core.state.alloc", "policies.fcfs", "policies.prefill_first", "core.sched"}
-"""The repo's units outside the control plane that the workspace keeps (no frontend, no kernels)."""
+SCHED_UNITS = ["sched.reqs", "core.state.alloc", "policies.fcfs", "policies.prefill_first", "core.sched"]
+KEEP = {*SCHED_UNITS, "worker.batch", "state.kv_paged"}
+"""The repo's units outside the control plane that the workspace keeps (no frontend, no kernels):
+the scheduler host's, and the worker units that declare the keys the scheduler reads. The roles
+list their units, so those two are in the tree only; the workers run the fixture."""
 
 
 def build_workspace(root: Path) -> Path:
@@ -62,8 +65,9 @@ def build_workspace(root: Path) -> Path:
 def topology(tmp: Path) -> Topology:
     return Topology(hosts=[HostSpec(HostId(h), ADDRESS, str(tmp / h / "snapshots")) for h in HOSTS],
                     mesh=Mesh({"tp": 2}), placement=[RankPlacement(i, HostId(h), i) for i, h in enumerate(HOSTS)],
-                    roles=[RoleSpec("sched", [], hosts=[HostId("host-a")], leads_epochs=True),
-                           RoleSpec("worker", [], per_rank=True)])
+                    roles=[RoleSpec("sched", [UnitId(u) for u in SCHED_UNITS], hosts=[HostId("host-a")],
+                                    leads_epochs=True),
+                           RoleSpec("worker", [UnitId("schedfix.worker")], per_rank=True)])
 
 
 @dataclass
