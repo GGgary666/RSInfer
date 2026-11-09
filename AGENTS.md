@@ -2,9 +2,8 @@
 
 给在本仓库工作的 agent：东西在哪、怎么验证、改目录结构的规矩。项目是什么见 [README.md](README.md)。
 
-## 分支与框架改动
+## 框架改动
 
-- 新工作从最新 `master` 开分支，PR 直接以 `master` 为目标；`madoka/dev` 已停用。
 - 做单元、模型、kernel、部署或文档任务时，优先在对应实现中完成。框架本体的边界以 `engine/framework.toml` 为准；不要顺手修改框架里的注释、诊断文案、格式或做无关重构。
 - 确实需要修框架 bug 或补框架能力时，保持最小改动，在 PR 中说明具体故障、为何单元侧无法解决和验证结果。与当前任务无关的框架改进另开 PR，避免夹带。
 - 框架改动会要求引擎重启，并触发框架测试；`tests/framework/`、共用测试设置、依赖和 CI 改动也会触发框架测试。
@@ -38,7 +37,7 @@
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行）。只接收目标为 `master` 的 PR 和 `master` 的 push；两者均按改动范围筛选测试。PR 比较 merge base 到当前代码；push 比较 `before` 到当前代码。没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/`；比较基准缺失或判断失败时跑全量 |
+| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行）。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
