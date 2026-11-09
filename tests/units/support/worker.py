@@ -27,7 +27,7 @@ from unit.runtime import ProcessPlan, UnitRuntime, UnitSpec
 ENGINE = Path(__file__).resolve().parents[3] / "engine"
 WORKER_UNITS = ("core.kernels", "kernels.reference", "core.state.weights", "state.kv_paged", "state.gdn_slots",
                 "worker.batch", "layers.linear", "layers.embedding", "layers.norm", "layers.rope",
-                "layers.activation", "layers.sampler", "layers.attn", "layers.gdn", "models.qwen38",
+                "layers.activation", "layers.sampler", "layers.attn", "layers.gdn", "models.qwen38", "core.plan",
                 "executors.pytorch")
 PAGE_SIZE = 4
 
@@ -135,6 +135,8 @@ class Driver:
     Item ids start at 0, as the ledger hands them out; the first delta is full, as a scheduler's is."""
 
     worker: Worker
+    executor: Any = None
+    """The executor to submit to; ``None``: the worker's ``executor@1``."""
     requests: dict[int, Request] = field(default_factory=dict[int, Request])
     next_page: int = 0
     next_slot: int = 0
@@ -197,7 +199,7 @@ class Driver:
 
     def step(self, chunks: dict[int, int], copies: list[StateCopy] | None = None,
              fresh_slots: bool = True) -> Any:
-        executor = self.worker.service("executor@1")
+        executor = self.executor or self.worker.service("executor@1")
         delta, plan, state = self.records(chunks, copies, fresh_slots)
         self.epoch += 1
         result = executor.submit(self.epoch, delta, plan, state)

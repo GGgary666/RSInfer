@@ -71,7 +71,8 @@ class BatchPlan(msgspec.Struct, frozen=True):
     with no token to resolve answers ``Resync`` and runs nothing."""
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
-    """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
+    """The scheduler's bucket hint (padded batch size); 0 = eager. The worker picks the plan it runs
+    itself, from those ready (stage2-contract.md §9.1)."""
 
 
 class StateAssign(msgspec.Struct, frozen=True):

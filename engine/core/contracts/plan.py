@@ -18,25 +18,43 @@ type Phase = Literal["prefill", "decode"]
 
 class PlanKey(msgspec.Struct, frozen=True):
     phase: Phase
+    """``prefill`` also for a mixed step, which runs as an extend (§8.7)."""
     bucket: int
-    """Padded batch size; 0 = eager (prefill always is in v0)."""
+    """A graph's captured capacity, in rows for a decode graph; 0 = eager. Prefill and mixed steps
+    are eager in v0 (§9.1)."""
 
 
 class Plan(Protocol):
-    def run(self) -> None:
-        """Replay the graph (or run eagerly) over the inputs already in the bound buffers.
-        Raises ``platforms.base.StaleGraph`` if a dependency changed."""
+    """One way to run the model forward for a step (stage2-contract.md §9.1): embedding, every
+    layer with its state updates, the final norm and the LM head; sampling is outside. The eager
+    plan and the graph plans of ``plan@1`` take the same call, as SGLang's ``EagerRunner`` and
+    ``DecodeCudaGraphRunner`` do under one ``ModelRunner``."""
+
+    def run(self, batch: PersistentBatch, plan: BatchPlan, input_ids: Tensor, positions: Tensor,
+            last_index: Tensor) -> Tensor:
+        """Every backend prepares for this plan's key, then the model runs eagerly or the graph
+        replays; a graph copies the inputs into its fixed buffers and pads the rows to its bucket
+        itself. ``input_ids`` and ``positions`` ``[tokens]`` are the step's tokens in row order,
+        ``last_index`` ``[rows]`` each row's last one. Returns the logits ``[rows, vocab]`` of the
+        real rows, valid until the next run of any plan of the service; the work may still be
+        running on the step stream. A graph whose dependencies changed raises
+        ``platforms.base.StaleGraph`` before it writes anything (§9.3)."""
         ...
 
 
 class PlanService(Protocol):
-    """``plan@1`` in every worker. The only unit that may record graphs (``captures_graph``)."""
+    """``plan@1`` in every worker: the eager plan and the graph plans of the current configuration.
+    The only unit that may record graphs (``captures_graph``). The worker picks the plan of each
+    step itself, before it changes any state (§9.1)."""
 
     def buckets(self, phase: Phase) -> list[int]:
-        """Buckets with a ready plan; from the bucketing policy (powers of 2 by default)."""
+        """The graph buckets that are ready and whose dependencies hold, from the bucketing policy
+        (powers of 2 by default). The eager plan, bucket 0, is always there and not listed."""
         ...
 
-    def get(self, key: PlanKey) -> Plan: ...
+    def get(self, key: PlanKey) -> Plan:
+        """The plan for ``key``; ``LookupError`` if no such plan is ready."""
+        ...
 
 
 class Backend(Protocol):

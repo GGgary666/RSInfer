@@ -8,5 +8,4 @@ entry = "executors.pytorch.unit:Unit"
 services = ["executor@1"]
 
 [requires]
-services = ["worker.batch@1", "model@1", "layers.attn@1", "layers.gdn@1", "layers.sampler@1", "state.kv.paged@1",
-            "state.gdn.slots@1"]
+services = ["worker.batch@1", "plan@1", "layers.sampler@1", "state.kv.paged@1", "state.gdn.slots@1"]

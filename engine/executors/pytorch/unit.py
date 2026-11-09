@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """``executors.pytorch``: the worker's one executor (``executor@1``), on every torch platform.
 Adapted from SGLang's ``ModelRunner`` (srt/model_executor/model_runner.py, e838360;
-LICENSE.sglang): the state slots of rows starting from position 0 are cleared and snapshots
-restored before the step
-(``mamba_clear_indices``, copy-on-write sources),
-the ``ForwardBatch`` inputs are built (``input_ids``, ``positions``), every backend initializes
-its metadata, the model runs with its logits processor, and the sampler draws at the position of
-each row's last token (``positions`` for decode, ``seq_lens - 1`` for extend). The rows, their
-lengths and their state items come from the scheduler's records instead of ``ScheduleBatch``.
+LICENSE.sglang): the step's plan is picked first, a ready graph bucket for a decode step that
+fits it, the eager plan otherwise (``_forward_raw``; stage2-contract.md §9.1), before any state
+changes; then the state slots of rows starting from position 0 are cleared and snapshots
+restored (``mamba_clear_indices``, copy-on-write sources), the ``ForwardBatch`` inputs are built
+(``input_ids``, ``positions``), the plan runs the model with its logits processor, and the
+sampler draws at the position of each row's last token (``positions`` for decode,
+``seq_lens - 1`` for extend). A graph found stale runs eagerly instead. The rows, their lengths
+and their state items come from the scheduler's records instead of ``ScheduleBatch``.
 
 Every row samples, as in SGLang; the scheduler drops what a prefill chunk that does not end its
 prompt sampled.
@@ -17,15 +18,15 @@ prompt sampled.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from core.contracts.columns import Column
-from core.contracts.plan import PlanKey
+from core.contracts.plan import Plan, PlanKey, PlanService
 from core.contracts.records import BatchPlan, Capacity, Resync, RowDelta, Sampled, StateOps, StepStats
+from platforms.base import StaleGraph
 
 
 @dataclass(frozen=True)
@@ -67,10 +68,8 @@ def check_plan(plan: BatchPlan) -> None:
 class PyTorchExecutor:
     """``executor@1``."""
 
-    def __init__(self, platform: Any, batch: Any, model: Any, sampler: Any, backends: dict[str, Any],
-                 stores: dict[str, Any]) -> None:
-        self.platform, self.batch, self.model, self.sampler = platform, batch, model, sampler
-        self.backends, self.stores = backends, stores
+    def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any]) -> None:
+        self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
 
     def capacity(self) -> Capacity:
         return Capacity({kind: store.capacity() for kind, store in self.stores.items()})
@@ -84,6 +83,7 @@ class PyTorchExecutor:
         reason = self.batch.check(delta, plan)
         if reason:
             return Resync(reason)
+        chosen, eager = self._plans(plan)
         self.batch.apply(delta, state)
         rows = [int(r) for r in plan.rows.values()]
         num_tokens = [int(n) for n in plan.num_tokens.values()]
@@ -114,10 +114,12 @@ class PyTorchExecutor:
         pos = torch.cat([torch.arange(p, p + n, device=device) for p, n in zip(positions, num_tokens, strict=True)])
         last_index = torch.cumsum(torch.tensor(num_tokens, device=device), dim=0) - 1
 
-        key = PlanKey("decode" if plan.phase == "decode" else "prefill", 0)
-        for backend in self.backends.values():
-            backend.prepare(self.batch, plan, key)
-        logits = self.model.forward(input_ids, pos, last_index)
+        try:
+            logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
+        except StaleGraph:
+            if chosen is eager:
+                raise
+            logits = eager.run(self.batch, plan, input_ids, pos, last_index)
         next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
                                              [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
         self.batch.record(rows, next_token_ids)
@@ -127,6 +129,15 @@ class PyTorchExecutor:
                           Column.of("i64", next_token_ids.tolist()))
         host_us = (time.perf_counter() - start) * 1e6
         return Step(sampled, StepStats(epoch, host_us, 0.0, 0.0), logits)
+
+    def _plans(self, plan: BatchPlan) -> tuple[Plan, Plan]:
+        """The step's plan and the eager one. A decode step takes the smallest ready graph bucket
+        that holds its rows; any other step, or one no graph holds, the eager plan (bucket 0). The
+        scheduler's ``bucket`` is only a hint."""
+        phase = "decode" if plan.phase == "decode" else "prefill"
+        eager = self.plans.get(PlanKey(phase, 0))
+        fits = [b for b in self.plans.buckets(phase) if b >= len(plan.rows)] if phase == "decode" else []
+        return (self.plans.get(PlanKey(phase, min(fits))) if fits else eager), eager
 
     def _copies(self, state: StateOps, when: str) -> None:
         for c in state.copy:
@@ -138,9 +149,6 @@ class Unit:
     STORES = (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
 
     def __init__(self, ctx: Any, config: Any) -> None:
-        model = ctx.use("model@1")
-        layers: Sequence[str] = model.assembly.layers
-        backends = {name: ctx.use(name) for name in dict.fromkeys(layers)}
         stores = {kind: ctx.use(name) for kind, name in self.STORES}
-        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, ctx.use("worker.batch@1"), model,
-                                                ctx.use("layers.sampler@1"), backends, stores))
+        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, ctx.use("worker.batch@1"), ctx.use("plan@1"),
+                                                ctx.use("layers.sampler@1"), stores))

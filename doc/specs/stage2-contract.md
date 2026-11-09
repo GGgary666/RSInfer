@@ -75,7 +75,7 @@
   2. 后合的分支先把新的 master 合进来，在自己分支上解决冲突、跑通 CI，再开 PR 到 master。
   3. 两条都合完，各自从 master 接着做（个人分支 fast-forward 到 master）。
 - **先后顺序**：谁的改动是对方的前提，谁先合。通常是 @wutianyuan1 先合：GPU 这边的单元插在整条链路里，它们的 GPU 测试要用到链路；链路反过来只要 CPU 替身就能跑。
-- **第一个依赖**：M2a 的 worker 通过 `plan@1` 跑 eager，而 `core.plan` 归 @gaow0007。所以 `core.plan` 的 eager 路径（只有分桶 0，不录 graph）要先做，在 M2a 之前单独汇合一次。在那之前，@wutianyuan1 这边在测试里用一个只走 eager 的替身。
+- **第一个依赖**：M2a 的 worker 通过 `plan@1` 跑 eager，而 `core.plan` 归 @gaow0007。所以 `core.plan` 的 eager 路径（只有分桶 0，不录 graph）要先做，在 M2a 之前单独汇合一次。在那之前，@wutianyuan1 这边在测试里用一个只走 eager 的替身。2026-11-09：eager 路径已经由 @wutianyuan1 这边在 `madoka/fix-gaps` 里做了（`engine/core/plan/`，只有 eager），graph 由 @gaow0007 在 M2c 加进同一个单元。
 
 ## 2. 进程和单元
 
@@ -92,8 +92,8 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | | `core.state.alloc` | 状态 | `ledger@1` | 各类池先作为内部实现，按实际独立替换需求再拆分 | |
 | worker（每 rank 一个） | `core.worker` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `worker.batch@1`、`plan@1`、`model@1` | |
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
-| | `core.plan` | 逻辑，录 graph | `plan@1` | `model@1`、各 backend、各状态单元 | ✓ |
-| | `executors.pytorch` | 逻辑 | `executor@1`（worker 唯一的 executor，2026-11-09） | `worker.batch@1`、`model@1`、各 backend、各状态单元 | |
+| | `core.plan` | 逻辑，录 graph | `plan@1`（eager plan 和 graph plan；2026-11-09 先只有 eager） | `model@1`、各 backend、各状态单元 | ✓ |
+| | `executors.pytorch` | 逻辑 | `executor@1`（worker 唯一的 executor，2026-11-09） | `worker.batch@1`、`plan@1`、`layers.sampler@1`、各状态单元 | |
 | | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1` | |
 | | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1` | |
 | | `core.kernels` | 逻辑 | `kernels.catalog@1` | | |
@@ -499,6 +499,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   | `executors.pytorch`（原名 `executors.eager`） | `executor@1` | `ModelRunner`：从 position 0 开始的行先清 GDN 槽（`mamba_clear_indices`）、恢复快照、组装 `input_ids` / `positions`、各 backend 准备、前向、在每行最后一个 token 的位置采样 |
 
   - 接缝：worker 循环只调 `executor@1`（`core/contracts/execution.py`），持久 batch、backend、模型、采样器都在它后面。~~`executors.eager` 和 `executors.cuda` 是同一个服务的两种实现，一个 worker 角色只加载其中一个~~（2026-11-09，#30 评审）。2026-11-09 改：两者二选一就做不到“同一个 worker 里有的 bucket 走 graph、有的走 eager”（§9.1、§9.4.3），所以只留一个 executor，叫 `executors.pytorch`，在 `torch_eager` 和 `cuda_sm100` 上都用它；graph 由 `core.plan` 提供，照 SGLang 的 `ModelRunner` 和它的 runner。不再有 `executors.cuda`。
+  - 每一步（2026-11-09）：先选 plan，再动状态。decode 步取 `plan@1.buckets("decode")` 里装得下这些行的最小 bucket，别的步或者没有装得下的，取 bucket 0（eager）；然后应用 delta、清新请求的槽、做 `StateCopy(before)`；再 `plan.run(...)`（plan 里先让各 backend `prepare`，再前向或 replay），在 plan 外采样，做 `StateCopy(after)`。graph 报 `StaleGraph` 就改走 eager。`BatchPlan.bucket` 只是调度器的提示。测试：`tests/units/executors/test_plans.py`，用一个补 padding 后 eager 执行的假 graph 验证路由、失效退回，以及 padding 行只写 padding 条目。
   - 契约随之补了：`WeightStore.register` / `load`、`Model`、`PersistentBatch.check` / `sampling` / `record`、`StateStore.clear`。
   - 每一行都采样（SGLang 也是）。prefill 中间块采到的 token 由调度器在调 `RequestTable.sample()` 之前丢掉。
   - 测试（`tests/units/executors/test_pytorch.py`，CPU fp32）：贪心生成和 HF 逐 token 相同，logits 在 1e-4 内；批量对单条、分块 prefill 对不分块、batch 重建（先回 `Resync`，收到全量增量后接着生成）对不重建、快照恢复对从头算，token 相同，logits 在容差内；条目从 0 开始分（和账本一样），每步之间改写 scratch 条目，token 不变。
