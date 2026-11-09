@@ -46,6 +46,14 @@ TOP_K_ALL = 1 << 30
 SAMPLING_EPS = 1e-6
 
 
+def _on_device(values: Sequence[float] | Sequence[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Per-request sampling values on ``device`` without waiting for the queued work: from pinned
+    memory, ``non_blocking``, as SGLang's ``SamplingBatchInfo`` copies them."""
+    if device.type != "cuda":
+        return torch.tensor(list(values), dtype=dtype, device=device)
+    return torch.tensor(list(values), dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+
+
 # ------------------------------------------------------------------ norms
 
 
@@ -598,12 +606,11 @@ def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence
     if all(k == 1 for k in ks):  # sampling_info.is_all_greedy
         return torch.argmax(logits, dim=-1).to(torch.int32)
     device = logits.device
-    logits = logits.float().div_(torch.tensor(temps, dtype=torch.float32, device=device).view(-1, 1))
+    logits = logits.float().div_(_on_device(temps, torch.float32, device).view(-1, 1))
     probs = torch.softmax(logits, dim=-1)
-    seed = torch.tensor(list(seeds), dtype=torch.int64, device=device)
-    pos = torch.tensor(list(positions), dtype=torch.int64, device=device)
+    seed = _on_device(seeds, torch.int64, device)
+    pos = _on_device(positions, torch.int64, device)
     if all(k == TOP_K_ALL for k in ks) and all(p == 1.0 for p in top_ps):  # simple_sampling_case
         return multinomial_with_seed(torch.log(probs), seed, pos).view(-1).to(torch.int32)
     return _top_k_top_p_sampling_from_probs_torch(
-        probs, torch.tensor(ks, dtype=torch.int64, device=device),
-        torch.tensor(list(top_ps), dtype=torch.float32, device=device), seed, pos)
+        probs, _on_device(ks, torch.int64, device), _on_device(top_ps, torch.float32, device), seed, pos)

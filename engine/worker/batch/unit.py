@@ -23,6 +23,15 @@ from core.contracts.records import BatchPlan, RowDelta, StateOps
 from core.contracts.sampling import SamplingParams
 
 PAGED_KIND = "kv.paged"
+
+
+def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host ``values`` on ``device`` without waiting for the work queued there: from pinned memory,
+    ``non_blocking``, as SGLang's ``ForwardBatch`` copies its inputs. A blocking copy would wait
+    for the step still running, and so would the next step's preparation."""
+    if device.type != "cuda":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
 """The kind whose items are pages of ``page_size`` token slots; every other kind is one item per row."""
 
 
@@ -140,7 +149,7 @@ class PersistentBatch:
             start, end = len(held) * self.page_size, (len(held) + len(new)) * self.page_size
             pages = torch.tensor(new, dtype=torch.int32) + 1
             slots = (pages[:, None] * self.page_size + torch.arange(self.page_size, dtype=torch.int32)).flatten()
-            self.tensors["req_to_token"][r + 1, start:end] = slots.to(self.tensors["req_to_token"].device)
+            self.tensors["req_to_token"][r + 1, start:end] = on_device(slots, self.tensors["req_to_token"].device)
         else:
             name = f"slots.{kind}"
             if name not in self.tensors:
@@ -156,7 +165,7 @@ class PersistentBatch:
         return [self.rows[r].sampling for r in rows]
 
     def record(self, rows: Sequence[int], tokens: torch.Tensor) -> None:
-        index = torch.tensor(list(rows), dtype=torch.int64, device=tokens.device) + 1
+        index = on_device(torch.tensor(list(rows), dtype=torch.int64) + 1, tokens.device)
         self.tensors["last_token"][index] = tokens.to(torch.int64)
         for r in rows:
             self.rows[r].has_previous = True

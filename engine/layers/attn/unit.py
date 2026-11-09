@@ -25,6 +25,15 @@ from layers.solutions import Kernels
 KIND = "kv.paged"
 
 
+def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host ``values`` on ``device`` without waiting for the work queued there: from pinned memory,
+    ``non_blocking``, as SGLang's ``ForwardBatch`` copies its inputs. A blocking copy would wait
+    for the step still running, and so would the next step's preparation."""
+    if device.type != "cuda":
+        return values.to(device)
+    return values.pin_memory().to(device, non_blocking=True)
+
+
 @dataclass(frozen=True)
 class NoBuffers:
     """``Binding``: eager attention keeps no fixed buffers."""
@@ -73,9 +82,9 @@ class TorchNativeAttnBackend:
         req_pool_indices = rows + 1
         out_cache_loc = torch.cat([req_to_token[int(r), int(p):int(p + n)]
                                    for r, p, n in zip(req_pool_indices, prefix, extend, strict=True)])
-        self.forward_metadata = Metadata(plan.phase == "decode", req_to_token, req_pool_indices.to(device),
-                                         (prefix + extend).to(device), prefix.to(device), extend.to(device),
-                                         out_cache_loc.to(torch.int64))
+        self.forward_metadata = Metadata(plan.phase == "decode", req_to_token, on_device(req_pool_indices, device),
+                                         on_device(prefix + extend, device), on_device(prefix, device),
+                                         on_device(extend, device), out_cache_loc.to(torch.int64))
 
     def forward(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int,
                 num_kv_heads: int, head_dim: int, scaling: float) -> torch.Tensor:

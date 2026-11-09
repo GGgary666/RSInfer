@@ -135,6 +135,26 @@ def test_a_failure_is_answered_and_the_loop_goes_on() -> None:
     assert (3, Sampled.SECTION) in pipe.answers() and w.epoch == 4 and w.failures == 2
 
 
+def test_a_device_error_reported_while_asking_whether_a_step_is_ready_is_answered_as_a_failure() -> None:
+    """A CUDA event query may raise the error of the device work, before ``finish`` is called
+    (Codex, #41): the step is answered ``StepFailure`` and the loop goes on, instead of asking
+    again until the scheduler's step timeout."""
+
+    @dataclass
+    class Faulted(Pending):
+        def ready(self) -> bool:
+            raise RuntimeError("CUDA error: device-side assert triggered")
+
+    ex = FakeExecutor({1: Faulted(1)})
+    pipe = Pipe([plan(1), plan(2)])
+    w = loop(ex, pipe)
+    for _ in range(3):
+        w.step()
+    assert pipe.answers() == [(0, Capacity.SECTION), (1, StepFailure.SECTION), (2, Sampled.SECTION),
+                              (2, StepStats.SECTION)]
+    assert w.failures == 1 and not w.taken and w.epoch == 2
+
+
 def test_a_new_reader_of_the_answers_gets_capacity_again() -> None:
     """A new scheduler process starts with an empty ledger: it learns the capacity from the worker."""
     pipe = Pipe()
