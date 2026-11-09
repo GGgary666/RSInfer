@@ -400,11 +400,13 @@ class Scheduler:
     def _plans_moved(self, rank: int, gen: int) -> None:
         """Plans to ``rank`` now go over a new connection: to a new worker process, or the old
         one's connection broke and records on it may be lost. Requests sent over the old one
-        lose what they had there."""
+        lose what they had there. If results moved first, it is the same replacement, handled
+        then: the plan writer was abandoned at once, so no plan went over the old connection
+        since, and the plan just written is the full delta for the new worker."""
         if self.expect_plans[rank]:
             self.expect_plans[rank] = False
-        else:
-            self.expect_results[rank] = True
+            return
+        self.expect_results[rank] = True
         self._lose(rank, lambda first: first < gen, f"plans to rank {rank} go over a new connection "
                                                    "(a new worker process?)")
 

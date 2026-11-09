@@ -341,6 +341,7 @@ def test_a_worker_replaced_while_idle_serves_the_next_request(ranks: int) -> Non
         b.client.send([fresh])
         b.run_until(b.finished(2))
         assert b.client.outputs[2].error is None
+        assert len([e for e, _, d in b.workers[0].fixture.plans_seen if d.full]) == 1
         check(b, [fresh])
 
 
@@ -371,4 +372,7 @@ def test_a_replaced_worker_ends_the_requests_it_held_and_serves_new_ones(first: 
         assert ("plans to" if first == "plans" else "results of") in moves[0], moves  # the order this test is for
         if ranks == 2 and first == "plans":
             assert any("refused by the new worker" in d for d in b.engine.loop.report().diagnostics)
+        assert len(moves) == 1, moves  # the second sighting is paired, not handled again
+        fulls = [e for e, _, d in b.workers[0].fixture.plans_seen if d.full]
+        assert len(fulls) == 1, fulls  # one full delta for the new worker, not one per sighting
         check(b, [fresh])
