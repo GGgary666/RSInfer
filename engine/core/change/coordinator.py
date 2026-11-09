@@ -372,9 +372,8 @@ class Coordinator:
         if item.dry_run:
             return self._done(cid, self._result("planned", cid, cs, new_identity, None, notes, plan=plan))
         if plan.restart_engine:
-            why = "; ".join(plan.notes) or "the change touches the framework core"
             return self._done(cid, self._result("failed", cid, cs, None, None, [*notes, diag(
-                COMPONENT, "plan", f"the engine must restart: {why}", code="escalate.restart_engine",
+                COMPONENT, "plan", "the change touches the framework core", code="escalate.restart_engine",
                 hint="restart the engine from the new source")], plan=plan))
         run = _Run(cid, cs, plan, new_identity, old_topology=self.sup.topology)
         run.diags += notes

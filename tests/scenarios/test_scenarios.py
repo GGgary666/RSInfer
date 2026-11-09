@@ -331,8 +331,6 @@ def test_a_framework_change_needs_an_engine_restart(tmp_path: Path) -> None:
             r = await s.apply()
             assert r.status == "failed" and r.plan is not None and r.plan.restart_engine
             assert "escalate.restart_engine" in {d.code for d in r.diagnostics}
-            assert any("framework modules changed: ['core.change.queue']" in d.reason for d in r.diagnostics
-                       if d.code == "escalate.restart_engine")
             assert (await s.status()).identity == before and {p: s.pid(p) for p in ALL} == pids
 
     run(main())
