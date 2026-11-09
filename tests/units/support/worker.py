@@ -73,27 +73,28 @@ def hf_greedy(model: Qwen3_5ForCausalLM, prompt: list[int], steps: int) -> tuple
     tokens: list[int] = []
     logits: list[torch.Tensor] = []
     with torch.no_grad():
-        ids = torch.tensor([prompt])
+        device = next(model.parameters()).device
+        ids = torch.tensor([prompt], device=device)
         for _ in range(steps):
             out = model(ids, past_key_values=cache, use_cache=True)
             step = out.logits[0, -1]
             logits.append(step)
             tokens.append(int(step.argmax()))
-            ids = torch.tensor([[tokens[-1]]])
+            ids = torch.tensor([[tokens[-1]]], device=device)
     return tokens, logits
 
 
 class Worker:
     """The worker units, loaded and started; ``config`` overrides the defaults."""
 
-    def __init__(self, hf_config: dict[str, Any], **config: Any) -> None:
+    def __init__(self, hf_config: dict[str, Any], platform: Any = None, **config: Any) -> None:
         overrides: dict[str, Any] = {"model.hf_config": hf_config, "model.dtype": "f32", "state.kv.page_size": PAGE_SIZE,
                                      "state.kv.pages": 32, "state.gdn.slots": 6, "batch.max_rows": 8,
                                      "batch.max_context_len": 64, **config}
         self.specs = [spec(u) for u in WORKER_UNITS]
         entries = {key: ConfigEntry(s.id, decl, overrides.get(key, decl.default))
                    for s in self.specs for key, decl in s.manifest.config.items()}
-        self.runtime = UnitRuntime(PROC, platform=TorchEagerPlatform())
+        self.runtime = UnitRuntime(PROC, platform=platform or TorchEagerPlatform())
         self.runtime.load_process_plan(ProcessPlan(PROC, Identity("w"), self.specs, config=entries,
                                                    code_root=str(ENGINE))).unwrap()
 

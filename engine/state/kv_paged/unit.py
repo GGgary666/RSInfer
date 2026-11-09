@@ -84,8 +84,9 @@ class KVPool:
 
     def slots(self, items: Sequence[int]) -> torch.Tensor:
         """The token slots of ``items``, in order."""
-        return ((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
-                + torch.arange(self.page_size)).flatten()
+        device = next(iter(self.k_buffer.values())).device if self.k_buffer else None
+        return ((torch.tensor(list(items), dtype=torch.int64, device=device)[:, None] + 1) * self.page_size
+                + torch.arange(self.page_size, device=device)).flatten()
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``move_kv_cache`` by page: every layer's ``buffer[dst slots] = buffer[src slots]``."""

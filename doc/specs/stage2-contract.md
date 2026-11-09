@@ -48,6 +48,8 @@
 | M2c | decode graph：graph 和 eager 逐位一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
 | M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
+2026-11-09：M2a 的链路跑通了（`tests/scenarios/test_m2a.py`，进 CI）。Qwen3.8-27B 真实结构的前 4 层在 RTX 4090 D 上和 HF 对齐，参照 kernel，fp32 逐字相同（`tests/gpu/`）。用的还是参照 kernel，不是 M2b 要的真 kernel；完整模型在 SM100 上的端到端验证交给 Devin，用同一套 `deploy/qwen38.py` 和 `tests/gpu/test_qwen38_serve.py`。
+
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
 - 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致；

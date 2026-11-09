@@ -84,10 +84,10 @@ class MambaPool:
     def scratch(self) -> Sequence[int]:
         return [-1]
 
-    @staticmethod
-    def indices(items: Sequence[int]) -> torch.Tensor:
-        """The slots of ``items``."""
-        return torch.tensor(list(items), dtype=torch.int64) + 1
+    def indices(self, items: Sequence[int]) -> torch.Tensor:
+        """The slots of ``items``, on the device of the states (``index_fill_`` wants them there)."""
+        conv, _ = self._tensors()
+        return torch.tensor(list(items), dtype=torch.int64, device=conv.device) + 1
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``copy_from``: clone conv and temporal state from ``src`` slots into ``dst`` slots."""
