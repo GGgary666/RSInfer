@@ -45,6 +45,10 @@ class MambaPool:
     temporal: torch.Tensor | None = None
     allocated: list[Any] = field(default_factory=list[Any])
     generation: int = 0
+    sized_from: dict[str, Any] = field(default_factory=dict[str, Any])
+    """The dtype keys the model declares the states in. Read here so that changing one reloads this
+    unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
+    (the checkpoint's config) the weight store reads."""
 
     def declare(self, decls: Sequence[StateDecl]) -> None:
         decls = sorted(decls, key=lambda d: d.layer)
@@ -78,10 +82,10 @@ class MambaPool:
     def scratch(self) -> Sequence[int]:
         return [-1]
 
-    @staticmethod
-    def indices(items: Sequence[int]) -> torch.Tensor:
-        """The slots of ``items``."""
-        return torch.tensor(list(items), dtype=torch.int64) + 1
+    def indices(self, items: Sequence[int]) -> torch.Tensor:
+        """The slots of ``items``, on the device of the states (``index_fill_`` wants them there)."""
+        conv, _ = self._tensors()
+        return torch.tensor(list(items), dtype=torch.int64, device=conv.device) + 1
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``copy_from``: clone conv and temporal state from ``src`` slots into ``dst`` slots."""
@@ -109,6 +113,7 @@ class MambaPool:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        self.pool = MambaPool(ctx.platform, config["state.gdn.slots"])
+        self.pool = MambaPool(ctx.platform, config["state.gdn.slots"], sized_from={
+            "state.gdn.ssm_dtype": config["state.gdn.ssm_dtype"], "state.gdn.conv_dtype": config["state.gdn.conv_dtype"]})
         ctx.effect(lambda: self.pool.free, label="gdn states")
         ctx.provide("state.gdn.slots@1", self.pool)

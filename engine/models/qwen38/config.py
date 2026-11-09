@@ -57,7 +57,7 @@ class Qwen3_5TextConfig(msgspec.Struct, frozen=True):
             attn_output_gate=d.get("attn_output_gate", True),
             tie_word_embeddings=d.get("tie_word_embeddings", False),
             hidden_act=d.get("hidden_act", "silu"),
-            mamba_ssm_dtype=d.get("mamba_ssm_dtype") or "",
+            mamba_ssm_dtype=d.get("mamba_ssm_dtype") or raw.get("mamba_ssm_dtype") or "",
         )
 
     @property

@@ -43,8 +43,12 @@ class KVPool:
     decls: dict[int, StateDecl] = field(default_factory=dict[int, StateDecl])
     k_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
     v_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
-    allocated: list[Any] = field(default_factory=list[Any])
+    allocated: dict[int, list[Any]] = field(default_factory=dict[int, list[Any]])
     generation: int = 0
+    sized_from: dict[str, Any] = field(default_factory=dict[str, Any])
+    """The dtype key the model declares the KV in. Read here so that changing it reloads this
+    unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
+    (``model.dtype``) the weight store reads."""
 
     @property
     def size(self) -> int:
@@ -60,9 +64,11 @@ class KVPool:
             (k_shape, k_dtype), (v_shape, v_dtype) = d.tensors["k"], d.tensors["v"]
             # The padded page (slot 0's page) absorbs dummy padded-token writes.
             total_slots = self.size + self.page_size
+            for buf in self.allocated.pop(d.layer, []):
+                self.platform.free(buf)
             k = self.platform.alloc(0, 0, shape=(total_slots, *k_shape[1:]), dtype=k_dtype)
             v = self.platform.alloc(0, 0, shape=(total_slots, *v_shape[1:]), dtype=v_dtype)
-            self.allocated += [k, v]
+            self.allocated[d.layer] = [k, v]
             self.generation += d.layer in self.decls
             self.k_buffer[d.layer], self.v_buffer[d.layer] = self.platform.tensor(k), self.platform.tensor(v)
             self.decls[d.layer] = d
@@ -77,9 +83,10 @@ class KVPool:
         return [-1]
 
     def slots(self, items: Sequence[int]) -> torch.Tensor:
-        """The token slots of ``items``, in order."""
-        return ((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
-                + torch.arange(self.page_size)).flatten()
+        """The token slots of ``items``, in order, on the device of the buffers."""
+        device = next(iter(self.k_buffer.values())).device if self.k_buffer else None
+        return ((torch.tensor(list(items), dtype=torch.int64, device=device)[:, None] + 1) * self.page_size
+                + torch.arange(self.page_size, device=device)).flatten()
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``move_kv_cache`` by page: every layer's ``buffer[dst slots] = buffer[src slots]``."""
@@ -95,13 +102,15 @@ class KVPool:
         """Nothing to do here: the ledger drops its prefix index, so no request reads old contents."""
 
     def free(self) -> None:
-        for buf in self.allocated:
-            self.platform.free(buf)
+        for bufs in self.allocated.values():
+            for buf in bufs:
+                self.platform.free(buf)
         self.allocated.clear()
 
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        self.pool = KVPool(ctx.platform, config["state.kv.page_size"], config["state.kv.pages"])
+        self.pool = KVPool(ctx.platform, config["state.kv.page_size"], config["state.kv.pages"],
+                           sized_from={"state.kv.dtype": config["state.kv.dtype"]})
         ctx.effect(lambda: self.pool.free, label="kv buffers")
         ctx.provide("state.kv.paged@1", self.pool)

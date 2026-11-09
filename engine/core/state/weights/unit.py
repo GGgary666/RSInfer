@@ -185,6 +185,10 @@ class Refit:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         self.store = WeightStore(ctx.platform, config["weights.path"], config["weights.dummy_seed"])
+        self.model = {"model.path": config["model.path"], "model.hf_config": config["model.hf_config"],
+                      "model.dtype": config["model.dtype"]}
+        """The model config the parameters are declared from (and the state dtypes' ``auto``). Read here
+        so that changing it reloads this unit, which ``core.deps`` refuses in place (§5.5.5)."""
         ctx.effect(lambda: self.store.free, label="weights")
         ctx.provide("state.weights@1", self.store)
         ctx.on_action("refit", Refit(self.store))
