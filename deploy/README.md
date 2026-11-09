@@ -63,7 +63,7 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
     - 重载 `core.sched`、`layers.sampler`，以及改 `sched.overlap` 这个 live 配置：都在 2 秒内提交。改动期间在跑的长请求，输出和不改时逐字相同。
     - 重载 `frontend.detok`：提交成功，但正在进行的 HTTP 请求被断开，回了 500。原因是单元运行时会连同使用者（`frontend.http`）一起重载，HTTP 服务就跟着重启了。这是 `engine/frontend/README.md` 里"还没做"的那一条。
 - **注意**：
-  - 停引擎（Ctrl-C 或 SIGTERM）要等进程依次退出，GPU 上大约一分半钟。
+  - 停引擎（Ctrl-C 或 SIGTERM）在 GPU 上要 60～90 秒，原因还没查。各进程是并行停的（`Supervisor.stop_all`），哪一段最费时，记录在 PR #32 的评论里。
   - 命令行退出时会带走引擎：起子进程时设了 `PR_SET_PDEATHSIG`，就算命令行被 SIGKILL，引擎也会收到 SIGTERM，不会留下占着显存的进程。
   - `checkpoint` 生成 4 层的随机权重要 7.6 GiB 磁盘，跑完记得删掉。
 - **完整的 27B 模型**（真权重，SM100）：交给 Devin 跑，交接说明在这个 PR 的评论里。
