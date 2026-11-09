@@ -91,6 +91,8 @@ class WeightStore:
     generation: int = 0
     loads: int = 0
     loaded_from: str = ""
+    source: str = ""
+    """What ``fill`` last read: a checkpoint path, or ``""`` for the dummy weights."""
 
     @property
     def version(self) -> str:
@@ -133,6 +135,7 @@ class WeightStore:
         else:
             initialize_dummy_weights(self.tensors, seed=self.seed)
             self.loaded_from = f"dummy:{self.seed}"
+        self.source = path
         self.filled = set(self.decls)
         self.loads += 1
 
@@ -149,12 +152,15 @@ class WeightStore:
 class Refit:
     """``refit``: new contents from a checkpoint, same tensors (so no graph records again).
     ``args``: ``{"path": ...}``, default the configured path. Prepare checks the path; execute
-    keeps the old contents until commit, and abort puts them back."""
+    loads it in place and keeps no copy; abort loads the previous contents again from where they
+    came from (their checkpoint, or the dummy weights of the same seed). SGLang's
+    ``update_weights_from_disk`` (model_runner_components/weight_updater.py) rolls back the same
+    way, by loading again, so a refit needs no second copy of the weights in device memory."""
 
     def __init__(self, store: WeightStore) -> None:
         self.store = store
         self.path = ""
-        self.old: tuple[dict[str, torch.Tensor], int, str] | None = None
+        self.previous: tuple[str, int, str] | None = None
 
     def prepare(self, args: dict[str, Any]) -> None:
         self.path = str(args.get("path", self.store.path))
@@ -162,18 +168,18 @@ class Refit:
 
     def execute(self, args: dict[str, Any]) -> None:
         s = self.store
-        self.old = ({n: t.clone() for n, t in s.tensors.items()}, s.loads, s.loaded_from)
+        self.previous = (s.source, s.loads, s.loaded_from)
         s.fill(self.path)
 
     def commit(self) -> None:
-        self.old = None
+        self.previous = None
 
     def abort(self) -> None:
-        if self.old is not None:
-            backup, self.store.loads, self.store.loaded_from = self.old
-            for name, t in backup.items():
-                self.store.tensors[name].copy_(t)
-            self.old = None
+        if self.previous is not None:
+            source, loads, loaded_from = self.previous
+            self.store.fill(source)
+            self.store.loads, self.store.loaded_from = loads, loaded_from
+            self.previous = None
 
 
 class Unit:

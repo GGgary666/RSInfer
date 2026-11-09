@@ -3,7 +3,9 @@
 """``state.kv_paged``: paged KV of the full-attention layers (``state.kv.paged@1``). Adapted from
 SGLang's ``MHATokenToKVPool`` (srt/mem_cache/memory_pool.py, e838360; LICENSE.sglang): per layer
 one K and one V buffer ``[size + page_size, kv_heads, head_dim]`` indexed by token slot, the page of
-slot 0 absorbing padded-token writes. An item is a page; its slots are ``page * page_size + i``.
+slot 0 absorbing padded-token writes. An item is a page: item ``i`` is page ``i + 1``, the pages
+SGLang's ``PagedTokenToKVPoolAllocator`` hands out, so its slots are ``(i + 1) * page_size + j``
+and page 0 is the scratch item ``-1``.
 """
 
 from __future__ import annotations
@@ -72,11 +74,11 @@ class KVPool:
         return self.pages
 
     def scratch(self) -> Sequence[int]:
-        return [0]
+        return [-1]
 
-    def slots(self, pages: Sequence[int]) -> torch.Tensor:
-        """The token slots of ``pages``, in order."""
-        return (torch.tensor(list(pages), dtype=torch.int64)[:, None] * self.page_size
+    def slots(self, items: Sequence[int]) -> torch.Tensor:
+        """The token slots of ``items``, in order."""
+        return ((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
                 + torch.arange(self.page_size)).flatten()
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:

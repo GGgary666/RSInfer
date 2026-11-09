@@ -80,6 +80,32 @@ def test_dummy_weights_then_refit_in_place_and_abort(tmp_path: Path) -> None:
     assert {n: t.data_ptr() for n, t in store.tensors.items()} == addresses and store.generation == 0
 
 
+def test_a_refit_that_fails_halfway_is_undone_by_loading_the_previous_checkpoint_again(tmp_path: Path) -> None:
+    """The new checkpoint lacks a weight, so the refit fails after overwriting the others. It kept
+    no copy, only where the old contents came from; abort loads that again, as SGLang's
+    ``update_weights_from_disk`` rolls back."""
+    hf_cfg = tiny_config()
+    cfg = Config.from_hf(hf_cfg.to_dict())
+    first = save_checkpoint(hf_model(hf_cfg, seed=0), tmp_path / "a")
+    broken = hf_model(hf_cfg, seed=1)
+    del broken.lm_head
+    broken.config.tie_word_embeddings = True
+    second = save_checkpoint(broken, tmp_path / "b")
+    store, _ = store_for(str(first), cfg)
+    store.load()
+    want = {n: t.clone() for n, t in store.tensors.items()}
+    addresses = {n: t.data_ptr() for n, t in store.tensors.items()}
+    refit = Refit(store)
+    refit.prepare({"path": str(second)})
+    with pytest.raises(RuntimeError, match="no weights for"):
+        refit.execute({})
+    assert not torch.equal(store.tensors["model.norm.weight"], want["model.norm.weight"])
+    assert refit.previous == (str(first), 1, str(first))
+    refit.abort()
+    assert all(torch.equal(store.tensors[n], t) for n, t in want.items()) and store.version == f"1:{first}"
+    assert {n: t.data_ptr() for n, t in store.tensors.items()} == addresses and refit.previous is None
+
+
 def test_the_worker_units_pass_the_manifest_rules() -> None:
     errors, _ = check_tree(ENGINE, None, FrameworkModules.default())
     assert [e for e in errors if e.subject in WORKER_UNITS] == []

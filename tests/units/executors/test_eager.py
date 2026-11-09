@@ -84,7 +84,7 @@ def test_a_rebuilt_batch_answers_resync_until_a_full_delta_then_continues(worker
     d.generate([0, 1], 2)
     worker.runtime.reload(ReloadPlan(units_to_reload=[spec("worker.batch")])).unwrap()
     resync = d.step({0: 1, 1: 1})  # the rebuilt batch has none of these rows, nor their last tokens
-    assert isinstance(resync, Resync) and "row 0 is not in the persistent batch" in resync.reason
+    assert isinstance(resync, Resync) and "waits for a full delta" in resync.reason
     assert worker.service("worker.batch@1").rows == {}  # nothing applied, nothing ran
     d.rebuilt()
     d.generate([0, 1], STEPS)
@@ -112,6 +112,25 @@ def test_a_request_restored_from_a_snapshot_continues_as_one_computed_from_scrat
     logits += d.generate([1], STEPS)[1]
     assert b.outputs == scratch_tokens[1]
     close(torch.stack(logits), torch.stack(scratch[1]))
+
+
+def test_writing_the_scratch_items_between_steps_changes_no_request(worker: Worker) -> None:
+    """The driver hands out items from 0, as the ledger does. Between steps every store's scratch
+    items are overwritten from item 0 and from the last item, then cleared, as warm-up and padded
+    rows would (§5.2, probe P6); the tokens stay those of an undisturbed run."""
+    want, _ = run(worker, [0, 1])
+    d = Driver(worker)
+    for row in PROMPTS:
+        d.add(row, PROMPTS[row])
+    stores = [worker.service("state.kv.paged@1"), worker.service("state.gdn.slots@1")]
+    for n in range(1, STEPS + 1):
+        d.generate([0, 1], n)
+        for store in stores:
+            store.copy([0], store.scratch())
+            store.copy([store.capacity() - 1], store.scratch())
+            store.clear(store.scratch())
+    assert d.requests[0].pages[0] == 0 and d.requests[0].slot == 0
+    assert {row: d.requests[row].outputs for row in PROMPTS} == want
 
 
 def test_capacity_counts_the_usable_items_of_each_kind(worker: Worker) -> None:

@@ -4,7 +4,8 @@
 Adapted from SGLang's ``MambaPool`` (srt/mem_cache/memory_pool.py, e838360; LICENSE.sglang):
 conv ``[num_mamba_layers, size + 1, conv_dim, K - 1]`` and temporal
 ``[num_mamba_layers, size + 1, HV, V, K]``, zero-filled; slot 0 is the padding slot. An item is a
-slot; ``copy`` is ``copy_from`` and ``clear`` is ``clear_slots``.
+slot: item ``i`` is slot ``i + 1``, the slots SGLang's ``MambaSlotAllocator`` hands out, and slot 0
+is the scratch item ``-1``. ``copy`` is ``copy_from`` and ``clear`` is ``clear_slots``.
 """
 
 from __future__ import annotations
@@ -75,19 +76,24 @@ class MambaPool:
         return self.size
 
     def scratch(self) -> Sequence[int]:
-        return [0]
+        return [-1]
+
+    @staticmethod
+    def indices(items: Sequence[int]) -> torch.Tensor:
+        """The slots of ``items``."""
+        return torch.tensor(list(items), dtype=torch.int64) + 1
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
         """``copy_from``: clone conv and temporal state from ``src`` slots into ``dst`` slots."""
         conv, temporal = self._tensors()
-        src_indices, dst_indices = torch.tensor(list(src)), torch.tensor(list(dst))
+        src_indices, dst_indices = self.indices(src), self.indices(dst)
         conv[:, dst_indices] = conv[:, src_indices]
         temporal[:, dst_indices] = temporal[:, src_indices]
 
     def clear(self, items: Sequence[int]) -> None:
         """``clear_slots``: zero out the state at the given slots."""
         conv, temporal = self._tensors()
-        idx64 = torch.tensor(list(items), dtype=torch.int64)
+        idx64 = self.indices(items)
         conv.index_fill_(1, idx64, 0)
         if temporal.numel() > 0:
             temporal.index_fill_(1, idx64, 0)

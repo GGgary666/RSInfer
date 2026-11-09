@@ -131,14 +131,15 @@ class Request:
 @dataclass
 class Driver:
     """Writes each step's ``RowDelta``, ``BatchPlan`` and ``StateOps`` as a scheduler would, and keeps
-    the tokens it gets back (a chunk that does not end the prompt samples a token that is dropped)."""
+    the tokens it gets back (a chunk that does not end the prompt samples a token that is dropped).
+    Item ids start at 0, as the ledger hands them out; the first delta is full, as a scheduler's is."""
 
     worker: Worker
     requests: dict[int, Request] = field(default_factory=dict[int, Request])
-    next_page: int = 1
-    next_slot: int = 1
+    next_page: int = 0
+    next_slot: int = 0
     epoch: int = 0
-    full: bool = False
+    full: bool = True
     removed: list[int] = field(default_factory=list[int])
 
     def add(self, row: int, prompt: list[int], seed: int = 0, temperature: float = 0.0) -> Request:
@@ -184,7 +185,7 @@ class Driver:
             prev.append(int(use_previous))
             if not use_previous:
                 tokens += r.known[r.computed:r.computed + n]
-        delta = RowDelta(added, Column.of("i32", self.removed), self.full)
+        delta = RowDelta(added, Column.of("i32", [] if self.full else self.removed), self.full)
         state = StateOps([StateAssign(kind, Column.of("i32", list(m)), *ragged("i32", m.values()))
                           for kind, m in assign.items() if m], copies or [])
         decoding = all(chunks[row] == 1 and reqs[row].computed >= len(reqs[row].known) - 1 for row in rows)
