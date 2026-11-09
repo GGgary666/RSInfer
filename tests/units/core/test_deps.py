@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from msgspec.structs import replace
+
 from core.change.blobs import content_hash
 from core.change.state import IdentityManifest
 from core.change.types import ActionPlan, ChangeSet, ProcActions, StateRequest, UnitAction
@@ -21,6 +23,7 @@ from core.common.result import Failed
 from core.deps.planner import World, plan
 from core.sourcetree import read_tree
 from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
+from core.supervisor.topology import desired_procs
 from core.supervisor.protocol import ProcIntrospection, ReadRecord, UnitBrief
 from tests.framework.support import manifest_toml, write_tree
 from unit.runtime import DerivedArtifact, InstanceState
@@ -258,6 +261,27 @@ def test_a_mesh_change_restarts_the_ranks_and_starts_new_ones(tmp_path: Path) ->
     assert not isinstance(p, Failed)
     assert [pa.proc for pa in p.procs if pa.restart is not None] == [W0]
     assert [s.proc for s in p.spawn] == [W1] and p.topology == topology(2)
+
+
+def test_a_platform_change_restarts_the_role_processes(tmp_path: Path) -> None:
+    """A platform is chosen when the process starts (``make_platform``): a role moving to another
+    platform restarts its processes, and a topology naming no known platform is refused."""
+    base = topology()
+    eager = replace(base, roles=[replace(r, platform="torch_eager") for r in base.roles])
+    p = Case(tmp_path / "1", topo=eager).plan()
+    assert not isinstance(p, Failed)
+    assert [pa.proc for pa in p.procs if pa.restart is not None] == [W0]
+    assert any("its platform changed fake {} -> torch_eager {}" in n for n in p.notes)
+    assert [d.platform for d in desired_procs(eager).values()] == ["torch_eager"]
+    cuda = replace(eager, roles=[replace(r, platform_options={"cuda": 1}) for r in eager.roles])
+    assert [pa.proc for pa in only_restarts(Case(tmp_path / "2", topo=cuda).plan())] == [W0]
+    bad = replace(base, roles=[replace(r, platform="tpu") for r in base.roles])
+    assert bad.check() == ["role worker names an unknown platform 'tpu'; known: ['fake', 'torch_eager']"]
+
+
+def only_restarts(p: ActionPlan | Failed) -> list[ProcActions]:
+    assert not isinstance(p, Failed), p
+    return [pa for pa in p.procs if pa.restart is not None]
 
 
 def test_state_requests_become_the_state_units_own_actions(tmp_path: Path) -> None:

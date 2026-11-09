@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import msgspec
 
@@ -24,6 +24,23 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     name: str
     versions: dict[str, str] = {}
     """driver, cuda, torch, nic, nvshmem, ..."""
+
+
+def check_extent(nbytes: int = 0, shape: tuple[int, ...] = ()) -> None:
+    """Sizes and shapes are explicit on every platform: no negative size, and no negative
+    (inferred) dimension, which would size a buffer from what happens to be behind it."""
+    if nbytes < 0:
+        raise ValueError(f"negative size {nbytes}")
+    if any(d < 0 for d in shape):
+        raise ValueError(f"negative dimension in shape {shape}")
+
+
+def check_view(offset: int, itemsize: int) -> None:
+    """A view starts inside its range, on a whole element."""
+    if offset < 0:
+        raise ValueError(f"negative view offset {offset}")
+    if offset % itemsize:
+        raise ValueError(f"view offset {offset} is not aligned to {itemsize}-byte elements")
 
 
 class StaleGraph(RuntimeError):
@@ -59,7 +76,9 @@ class VirtualRange(Protocol):
     def reserved(self) -> int: ...
     @property
     def mapped(self) -> int: ...
-    def view(self, offset: int, shape: tuple[int, ...], dtype: str) -> Buffer: ...
+    def view(self, offset: int, shape: tuple[int, ...], dtype: str) -> Buffer:
+        """Inside the mapped prefix, at an element-aligned offset; see ``check_extent``."""
+        ...
 
 
 class Stream(Protocol):
@@ -84,11 +103,21 @@ class GraphRecorder(Protocol):
 class Platform(Protocol):
     def devices(self) -> list[DeviceInfo]: ...
     def alloc(self, nbytes: int, device: int, *, shape: tuple[int, ...] | None = None,
-              dtype: str = "u8") -> Buffer: ...
+              dtype: str = "u8") -> Buffer:
+        """A buffer of at least ``max(nbytes, size of shape)`` bytes; without ``shape``, as many
+        whole ``dtype`` elements as fit in ``nbytes``. Every call naming a device checks it."""
+        ...
     def free(self, buf: Buffer) -> None: ...
+    def tensor(self, buf: Buffer) -> Any:
+        """The tensor behind ``buf`` (a ``torch.Tensor`` on the torch platforms; opaque to the
+        framework). The fake platform has no tensors and raises ``TypeError``."""
+        ...
     def reserve(self, nbytes: int, device: int) -> VirtualRange: ...
     def map(self, vr: VirtualRange, offset: int, nbytes: int) -> None: ...
     def stream(self, device: int) -> Stream: ...
+    def synchronize(self, device: int) -> None:
+        """Return once all work queued on ``device`` has finished (a worker's ``quiesce()``)."""
+        ...
     def graph(self) -> GraphRecorder: ...
     def info(self) -> PlatformInfo: ...
 
