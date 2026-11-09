@@ -146,7 +146,7 @@ SGLang v0.4 把调度和执行重叠起来：GPU 在跑第 N 步时，CPU 已经
 
 我们比它们更需要这一条：调度宿主和 worker 是两个进程。不重叠的话，每一步的关键路径上都要多一次跨进程往返，再加上调度器的全部 CPU 时间。所以契约从一开始就按“最多提前一步”来设计，哪怕阶段 2 默认跑的是同步循环。
 
-[step-overhead.md](../evaluations/step-overhead.md) 的结论（“保持同步”）只针对一件事：进程宿主的循环用 asyncio 还是同步。它测的是空 `step()` 外面的框架开销，不涉及 CPU 和 GPU 的重叠。同步的循环完全可以做重叠：mini-sglang 的 `overlap_loop()` 就是一个普通的 `while` 循环，靠异步 launch 和晚一步收结果。
+[step-overhead.md](../evaluations/step-overhead.md) 的结论（“保持同步”）只针对一件事：进程宿主的循环用 asyncio 还是同步。它测的是空 `step()` 外面的框架开销，不涉及 CPU 和 GPU 的重叠。同步的循环完全可以做重叠：mini-sglang 的 [overlap_loop()](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/scheduler/scheduler.py) 就是一个普通的 `while` 循环，靠异步 launch 和晚一步收结果。
 
 ### 4.2 记录和分段
 
@@ -394,11 +394,11 @@ state_layouts:
 
 #### 5.5.7 SGLang 配置空间与兼容约束清单（2026-11-09）
 
-以下来自 `/Users/gaowei/Desktop/Promo/rsiLib/sglang` 的本地源码静态检查。该目录没有 Git 元数据，不能据此声称与某个上游发布版本一致。下表区分可配置选项、代码里实际检查的约束和 agxinfer 的设计决定；没有运行 GPU 性能或全组合正确性实验。SGLang 可通过注册扩展选项，枚举的是当前内置项。
+以下是 [SGLang](https://github.com/sgl-project/sglang) 的源码静态分析记录。本节的远程源码入口固定到 [`ff762d6`](https://github.com/sgl-project/sglang/tree/ff762d62f8d236e95903620ff0b7e82ac89890db)，便于定位与后续复核。原始分析所用源码副本未记录上游提交，部分文件与该链接版本不同，因此不声称下表与链接版本逐项一致；实际接入时须按选定版本复核能力约束。下表区分可配置选项、原始检查到的代码约束和 agxinfer 的设计决定；没有运行 GPU 性能或全组合正确性实验。SGLang 可通过注册扩展选项，枚举的是原始检查中的内置项。
 
 **attention/backend 维度。** prefill 与 decode 可分别选择；draft 模型和 linear-attention verify 还有自己的 backend。名字出现在 choices 中不代表适用于每种模型、dtype 或设备。
 
-| 家族 | 本地内置 backend/结构 | 对布局的含义 |
+| 家族 | 检查到的内置 backend/结构 | 对布局的含义 |
 |---|---|---|
 | 通用与常规 attention | `triton`、`torch_native`、`flex_attention`、`fa3`、`fa4`、`flashinfer`、`trtllm_mha`、`hpc_ops` | MHA/GQA/MQA 保存 K/V；页内布局、stride 和量化格式由具体路径约束；`hpc_ops` 的选项注释限定 Hopper、page size 64 |
 | MLA | `flashmla`、`trtllm_mla`、`cutedsl_mla`（旧别名 `tokenspeed_mla`） | 压缩 latent/位置分量及可能的量化元数据；不能套用普通多头 NHD/HND 选择 |
@@ -407,11 +407,11 @@ state_layouts:
 | GDN/KDA 等 linear attention | `triton`、`cutedsl`、`flashinfer`、`flashkda`、`nvidia_kda`、`ptx_kda`、`helion`、`intel_xpu`；verify 另有 `nv_cutedsl` | 多项是 KDA 专用或阶段受限，不能全部用于 GDN；recurrent/conv 的轴、dtype、槽位 stride 分别匹配 |
 | SWA / full+SWA / full+GDN | 属于模型状态组合，不是 NHD/HND 的别名 | full、window、recurrent/conv 分池或通过兼容视图组合；窗口回收与页内顺序分开决定 |
 
-来源：SGLang `python/sglang/srt/arg_groups/choices.py` 的 `ATTENTION_BACKEND_CHOICES`、`DRAFT_ATTENTION_BACKEND_CHOICES`、`LINEAR_ATTN_KERNEL_BACKEND_CHOICES`；`mem_cache/kv_cache_configurator.py` 的 pool 分派。
+远程参考：SGLang [arg_groups/choices.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/choices.py) 的 `ATTENTION_BACKEND_CHOICES`、`DRAFT_ATTENTION_BACKEND_CHOICES`、`LINEAR_ATTN_KERNEL_BACKEND_CHOICES`；[mem_cache/kv_cache_configurator.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/kv_cache_configurator.py) 的 pool 分派。
 
 **prefix cache 与其他配置轴。** 这些维度与 attention 组合形成候选空间，但不是任意笛卡尔积都合法。
 
-| 配置轴 | 本地选项或模式 | 需要纳入布局校验的内容 |
+| 配置轴 | 检查到的选项或模式 | 需要纳入布局校验的内容 |
 |---|---|---|
 | GPU prefix cache | `disable_radix_cache`；默认 unified radix、pure SWA 的专用路径；session 引用；可注册 cache backend | 命中/关闭不自动更换物理布局；共享、窗口保留和引用计数由缓存实现负责 |
 | GDN prefix state | `auto` / `no_buffer` / `extra_buffer` / `extra_buffer_lazy`；路径快照数量限制；可选 int8 checkpoint 池 | 活跃状态和缓存快照可能使用不同 dtype/池；快照恢复需要匹配位置、格式及转换精度 |
@@ -426,20 +426,20 @@ state_layouts:
 | PD / CPU offload | prefill/decode 分离、host 迁移、decode 回退 | 以具体 pool 和传输实现的格式能力为准，不从 attention 名称推导支持 |
 | chunk / graph / overlap | chunked prefill、eager/graph、一步 overlap | 不自行决定页内布局；会约束 scratch、地址稳定性、元数据时序和快照边界 |
 
-来源：SGLang `arg_groups/fields/{memory,model,exec_,spec,parallel,disagg,schedule}.py`；`mem_cache/registry.py::default_radix_cache_factory`。文件路径均相对 `python/sglang/srt/`。
+远程参考：SGLang 配置字段 [memory.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/memory.py)、[model.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/model.py)、[exec_.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/exec_.py)、[spec.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/spec.py)、[parallel.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/parallel.py)、[disagg.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/disagg.py)、[schedule.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/fields/schedule.py)；[mem_cache/registry.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/registry.py) 中的 `default_radix_cache_factory`。
 
-**已检查到的具体约束。** 这些是本地路径的约束，不是 HND、SWA 或某个算法的普遍限制。
+**已检查到的具体约束。** 这些是原始检查中具体实现路径的约束，不是 HND、SWA 或某个算法的普遍限制。
 
-| 本地路径 | 代码证据 | 对 agxinfer 的处理 |
+| 实现路径 | 代码证据 | 对 agxinfer 的处理 |
 |---|---|---|
-| 普通 FlashInfer wrapper | `layers/attention/flashinfer_backend.py` 多处以 `NHD` 初始化；部分直连路径要求 direct NHD | NHD 作为该路线基线；HND 不能仅靠改配置宣称支持 |
-| TRT-LLM MHA | `trtllm_mha_backend.py::_reshape_paged_kv_cache` 经 `paged_kv_view`/`permute` 交出 HND 形状，可能仍是 NHD 物理 stride | 区分 kernel 形状和物理排列；适配能力按具体调用验证，不默认整个池必须复制，也不默认任意 stride 都可用 |
-| MHA pool 的 PD / CPU offload | `memory_pool.py` 的 `get_contiguous_buf_infos`、`get_cpu_copy`、`load_cpu_copy` 路径拒绝 `use_hnd` | 未实现并验收 HND 传输适配前，HND 与这些路径组合 fail-fast |
-| MXFP8 pool | `memory_pool.py::MHATokenToKVPoolMXFP8` 拒绝 `SGLANG_USE_HND_KVCACHE` | 量化是独立布局能力，不能继承普通 HND 的支持结论 |
-| page-major / unified pool | `arg_groups/kv_cache_hook.py` 按完整、线性、prefill/decode backend 校验；部分 prefill 需要 gather/scatter 连续状态 | 默认保持逐层池；跨层组织作为独立扩展，公开适配成本 |
-| CP sharded padded | `mem_cache/registry.py` 拒绝 radix cache 或 streaming session；`page_interleave_pool.py` 的相应 KV sharding 路径只接受 NHD | 明确标为不支持的组合，不把 prefix cache 开关当成万能兼容项 |
-| HiCache IO | `arg_groups/hicache_hook.py` 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；agxinfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
-| SM100 FlashInfer GDN | `arg_groups/attention_hook.py` 的该 decode/verify 路径要求 BF16 recurrent state；`gdn_triton.py` 声明 K-last 池 | 保留 FP32 参照路线；请求该 FlashInfer 路径时显式选择并验收 BF16，不静默降精度 |
+| 普通 FlashInfer wrapper | [layers/attention/flashinfer_backend.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/flashinfer_backend.py) 多处以 `NHD` 初始化；部分直连路径要求 direct NHD | NHD 作为该路线基线；HND 不能仅靠改配置宣称支持 |
+| TRT-LLM MHA | [trtllm_mha_backend.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/trtllm_mha_backend.py) 的 `_reshape_paged_kv_cache` 经 `paged_kv_view`/`permute` 交出 HND 形状，可能仍是 NHD 物理 stride | 区分 kernel 形状和物理排列；适配能力按具体调用验证，不默认整个池必须复制，也不默认任意 stride 都可用 |
+| MHA pool 的 PD / CPU offload | [memory_pool.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/memory_pool.py) 的 `get_contiguous_buf_infos`、`get_cpu_copy`、`load_cpu_copy` 路径拒绝 `use_hnd` | 未实现并验收 HND 传输适配前，HND 与这些路径组合 fail-fast |
+| MXFP8 pool | [memory_pool.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/memory_pool.py) 中的 `MHATokenToKVPoolMXFP8` 拒绝 `SGLANG_USE_HND_KVCACHE` | 量化是独立布局能力，不能继承普通 HND 的支持结论 |
+| page-major / unified pool | [arg_groups/kv_cache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/kv_cache_hook.py) 按完整、线性、prefill/decode backend 校验；部分 prefill 需要 gather/scatter 连续状态 | 默认保持逐层池；跨层组织作为独立扩展，公开适配成本 |
+| CP sharded padded | [mem_cache/registry.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/registry.py) 拒绝 radix cache 或 streaming session；[page_interleave_pool.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/page_interleave_pool.py) 的相应 KV sharding 路径只接受 NHD | 明确标为不支持的组合，不把 prefix cache 开关当成万能兼容项 |
+| HiCache IO | [arg_groups/hicache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/hicache_hook.py) 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；agxinfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
+| SM100 FlashInfer GDN | [arg_groups/attention_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/attention_hook.py) 的该 decode/verify 路径要求 BF16 recurrent state；[gdn_triton.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) 声明 K-last 池 | 保留 FP32 参照路线；请求该 FlashInfer 路径时显式选择并验收 BF16，不静默降精度 |
 
 #### 5.5.8 agxinfer 首版确定的布局与选择顺序
 
@@ -487,7 +487,7 @@ state_layouts:
 
 ## 8. attention 和 GDN 的 backend（@gaow0007 审）
 
-代码：`core/contracts/plan.py` 的 `Backend`。以下补充记录 2026-11-09 的评审结论；是待实现的契约，不表示当前接口和 GPU 路径已经全部落实。模型/backend 的计算边界、分阶段执行及状态处理参考本地 SGLang，资源管理和配置变更接入 agxinfer 的 state store、worker 与 plan。
+代码：`core/contracts/plan.py` 的 `Backend`。以下补充记录 2026-11-09 的评审结论；是待实现的契约，不表示当前接口和 GPU 路径已经全部落实。模型/backend 的计算边界、分阶段执行及状态处理参考 [SGLang](https://github.com/sgl-project/sglang)（源码入口及版本范围见 §5.5.7），资源管理和配置变更接入 agxinfer 的 state store、worker 与 plan。
 
 **职责总则：backend 准备元数据、组织计算及状态更新；worker 保证执行顺序和配置切换边界；plan 管理 graph 的捕获、选择和失效。** backend 不在每步调用中自行切换配置或重录 graph。
 
@@ -522,7 +522,7 @@ state_layouts:
 - **GDN 是整体的执行、更新和验证边界。** 改 conv 的实现也属于 GDN backend 变更，无需同时修改 recurrent 代码，但须检查两阶段衔接、各执行阶段和状态恢复。即使 shape 不变，conv 语义改变也可能使已有 recurrent state 失效；必须声明兼容、迁移、重新计算或排空方案，不能只重录 graph 后继续使用旧状态。
 - Full attention 的 KV 位置分配、引用共享和写前复制由调度/存储层安排。backend 消费已分配的写入位置，调用存储写入能力或使用融合 kernel；不得自行分配 page 或覆盖仍共享的 prefix 内容。
 
-参考路径：SGLang `models/qwen3_next.py::Qwen3GatedDeltaNet`、`layers/radix_linear_attention.py`、`layers/attention/linear/gdn_backend.py` 与 `linear/kernels/gdn_{triton,flashinfer}.py`；mini-sglang `layers/attention.py` 和 `attention/fi.py` 展示 full attention 的层/backend/存储分工。本地 mini-sglang 没有 GDN 实现，不能作为 GDN 状态恢复方案的依据。
+远程参考：SGLang [models/qwen3_next.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/models/qwen3_next.py) 中的 `Qwen3GatedDeltaNet`、[layers/radix_linear_attention.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/radix_linear_attention.py)、[gdn_backend.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/gdn_backend.py) 与 [gdn_triton.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) / [gdn_flashinfer.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_flashinfer.py)；mini-sglang [layers/attention.py](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/layers/attention.py) 和 [attention/fi.py](https://github.com/sgl-project/mini-sglang/blob/9a91cfafe754aa85daee49998176275667eb58f2/python/minisgl/attention/fi.py) 展示 full attention 的层/backend/存储分工。mini-sglang 链接固定到 `9a91cfa`；该版本没有 GDN 实现，不能作为 GDN 状态恢复方案的依据。
 
 ### 8.3 各阶段执行与状态操作顺序
 
