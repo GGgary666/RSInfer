@@ -13,6 +13,9 @@ and their state items come from the scheduler's records instead of ``ScheduleBat
 
 Every row samples, as in SGLang; the scheduler drops what a prefill chunk that does not end its
 prompt sampled.
+
+With CUDA, ``submit`` returns once the step's work is queued (``Step``): the worker takes the
+next plan while the device runs this one (one step of overlap, stage2-contract.md §4.4).
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ class Mark:
         else:
             self.at = time.perf_counter()
 
+    def passed(self) -> bool:
+        return self.event is None or self.event.query()
+
     def wait(self) -> None:
         if self.event is not None:
             self.event.synchronize()
@@ -55,9 +61,14 @@ class Mark:
 
 @dataclass(frozen=True)
 class Step:
-    """``PendingStep``; on the CPU and with eager CUDA, finished when ``submit`` returns."""
+    """``PendingStep``. With CUDA ``submit`` returns once the step's work is queued on the stream:
+    the sampled tokens come back through pinned host memory (SGLang's ``copy_done`` event, srt/
+    managers/utils.py), so the worker can take the next plan while the device runs this one. On
+    the CPU the step has finished when ``submit`` returns."""
 
-    sampled: Sampled
+    rows: list[int]
+    tokens: torch.Tensor
+    """The sampled tokens on the host: filled once ``end`` is passed."""
     epoch: int
     host_us: float
     begin: Mark
@@ -70,10 +81,12 @@ class Step:
     """Each row's last-token logits; for evaluation and tests."""
 
     def ready(self) -> bool:
-        return True
+        return self.end.passed()
 
     def finish(self) -> Sampled:
-        return self.sampled
+        self.end.wait()
+        return Sampled(Column.of("i32", self.rows), Column.of("i32", [1] * len(self.rows)),
+                       Column.of("i64", self.tokens.tolist()))
 
     def stats(self) -> StepStats:
         """``device_us`` spans the step's device work, gaps between its kernels included;
@@ -161,14 +174,15 @@ class PyTorchExecutor:
         next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
                                              [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
         self.batch.record(rows, next_token_ids)
+        tokens = next_token_ids
+        if device.type == "cuda":  # async_d2h: into pinned memory, without waiting for the device
+            tokens = torch.empty(next_token_ids.shape, dtype=next_token_ids.dtype, pin_memory=True)
+            tokens.copy_(next_token_ids, non_blocking=True)
         self._copies(state, "after")
         end, previous = Mark(device), self.last_end
         self.last_end = end
-
-        sampled = Sampled(Column.of("i32", rows), Column.of("i32", [1] * len(rows)),
-                          Column.of("i64", next_token_ids.tolist()))
         host_us = (time.perf_counter() - start) * 1e6
-        return Step(sampled, epoch, host_us, begin, end, previous, logits)
+        return Step(rows, tokens, epoch, host_us, begin, end, previous, logits)
 
     def _plans(self, plan: BatchPlan) -> tuple[Plan, Plan]:
         """The step's plan and the eager one. A decode step takes the smallest ready graph bucket
