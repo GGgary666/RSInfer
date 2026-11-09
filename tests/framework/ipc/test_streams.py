@@ -9,18 +9,14 @@ import struct
 import time
 import uuid
 
-import msgspec
 import pytest
 import zmq
 
 from core.common.ids import HostId
 from core.ipc import PeerLost, StreamClosed, backend_for, open_reader, open_writer
-from tests.framework.ipc.peers import BIND, PATIENT, TUN, read_forever, write_records
+from tests.framework.ipc.peers import BIND, LOADED, PATIENT, TUN, read_forever, write_records
 
 SPAWN = mp.get_context("spawn")
-LOADED = msgspec.structs.replace(PATIENT, peer_timeout_s=30.0)
-"""For a reader whose writer is a busy child process: on a loaded CI runner its heartbeat thread
-can go unscheduled for seconds."""
 
 # (reader host, writer host): same host -> shm, two fake hosts -> TCP
 BACKENDS = {"shm": ("host-a", "host-a"), "tcp": ("host-a", "host-b")}

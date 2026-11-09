@@ -25,6 +25,9 @@ TUN = IpcTunables(heartbeat_interval_s=0.05, peer_timeout_s=0.5, stream_hwm=4,
 PATIENT = msgspec.structs.replace(TUN, peer_timeout_s=5.0)
 """For the tests whose peers all live: a runner busy under ``pytest -n auto`` can stall a
 process past 0.5 s, and a live peer must not be declared lost then."""
+LOADED = msgspec.structs.replace(PATIENT, peer_timeout_s=30.0)
+"""For both ends of a stream that carries many records between the test and a child process:
+on a loaded CI runner either side's heartbeat thread can go unscheduled for seconds."""
 
 
 class Ping(msgspec.Struct, frozen=True):
@@ -57,7 +60,7 @@ def stamp(i: int, size: int) -> bytes:
 
 def write_records(address: StreamAddress, host: str, sizes: list[int], close: bool, then_sleep: float) -> None:
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
-    w = open_writer(zctx, local=HostId(host), address=address, tun=PATIENT)  # no test kills its reader
+    w = open_writer(zctx, local=HostId(host), address=address, tun=LOADED)  # no test kills its reader
     for i, size in enumerate(sizes):
         w.write(stamp(i, size), timeout=30)
     if close:
