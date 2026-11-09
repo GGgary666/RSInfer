@@ -137,7 +137,8 @@ class StepStats(msgspec.Struct, frozen=True):
 
 class Capacity(msgspec.Struct, frozen=True):
     """Usable items per state kind: the ledger hands out ids ``0 .. n - 1``, and a store keeps its
-    padding and scratch items outside that range (``StateStore``). Sent at start and after a grow."""
+    padding and scratch items outside that range (``StateStore``). Sent at start, and again once a
+    supported capacity change has taken effect."""
 
     SECTION: ClassVar[str] = "state.capacity@1"
     items: dict[str, int]

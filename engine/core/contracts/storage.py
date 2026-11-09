@@ -18,6 +18,7 @@ class StateStore(Protocol):
     memory, never the accounting. Required: ``bind``, ``capacity``, ``scratch``, ``copy``,
     ``clear``, ``invalidate``. ``grow``, ``refit``, ``relocate``, ``export_state`` / ``import_state``
     are optional; the unit declares the ones it has (``capabilities.actions``, ``[state] migrate``).
+    Stage 2 sizes the pools once at start and grows none of them (stage2-contract.md §5.2, §10.2).
 
     Item ids are ``0 .. capacity() - 1``, as the ledger hands them out; where an item lives in the
     buffers is the store's layout. The SGLang-layout stores keep item ``i`` at index ``i + 1`` (page
@@ -29,8 +30,8 @@ class StateStore(Protocol):
         ...
 
     def bind(self, layer: int) -> Binding:
-        """The layer's buffers. For VMM-backed kinds the page-indexed view spans the whole
-        reservation; only page-indexed kernels may touch it (§10.3)."""
+        """The layer's buffers, shared views the store keeps owning: a user reads and writes their
+        contents but never resizes, replaces or frees them (stage2-contract.md §10.2)."""
         ...
 
     def capacity(self) -> int:
