@@ -40,6 +40,7 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
   - 启动时等进程签到、等启动变更准备，各用这个时长。单元会在签到之前加载权重，大模型要几分钟。
   - 前端两次响应之间最长的沉默，也是这个时长。
 - `--overlap`：一步重叠（`sched.overlap`）。
+- `--gpu`：worker 用哪张卡（物理编号）。不给时取 `CUDA_VISIBLE_DEVICES` 的第一张，没设就是 0。节点代理只按拓扑设卡，所以靠 `CUDA_VISIBLE_DEVICES` 选卡时也是经这里生效。
 - `--device cpu`：整个引擎跑在 CPU 上（`tests/scenarios/test_m2a.py` 就是这样跑的）。
 
 ## 跑过的（2026-11-09）
@@ -66,4 +67,16 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
   - 停引擎（Ctrl-C 或 SIGTERM）在 GPU 上要 60～90 秒，原因还没查。各进程是并行停的（`Supervisor.stop_all`），哪一段最费时，记录在 PR #32 的评论里。
   - 命令行退出时会带走引擎：起子进程时设了 `PR_SET_PDEATHSIG`，就算命令行被 SIGKILL，引擎也会收到 SIGTERM，不会留下占着显存的进程。
   - `checkpoint` 生成 4 层的随机权重要 7.6 GiB 磁盘，跑完记得删掉。
-- **完整的 27B 模型**（真权重，SM100）：交给 Devin 跑，交接说明在这个 PR 的评论里。
+- **完整的 27B 模型**（真权重，SM100，TP1，参照 kernel，eager；2026-11-09，#37）：
+  - `tests/gpu/test_qwen38_serve.py`：bf16 和 f32 各 2 passed（开、不开重叠）；f32 下经 HTTP 的文本和 HF 逐字相同。`test_qwen38_partial.py` 2 passed。
+  - 常驻 `serve`（bf16，默认参数）：
+    - 约 37 秒到 "engine up"（权重已在页缓存里；冷读 `/shared-fs` 会更慢）；
+    - holder：`101.36 GiB for states: gdn.slots 334 (47.89 GiB), kv.paged 54753 (53.47 GiB)`，即约 87.6 万个 token 的 KV；GPU 上共用 155992 MiB；
+    - `core.plan` 的记录：attention 和 GDN 都是 `reference`（fallback），KV bf16、页 16，conv bf16，temporal f32；
+    - prefill 1081 个 token 0.564 秒（约 1900 tok/s）；单个请求 decode 11.9 tok/s（约 84 ms 一个 token）；8 个请求并发、各 128 个 token，一起在 18.0 秒完成，合计 56.9 tok/s。
+  - 不停引擎热改（请求生成到一半时 `apply`）：改 `policies.fcfs` 的代码、改 `kernels.reference` 的 `ops.py`、改 `layers.attn` 的代码（连带重载模型、`core.plan`、executor、`core.worker`）、改 `attn.decode_backend`、改 live 键 `sched.overlap`，都在 1.2–1.8 秒内提交。暂停（pause）约 0.09 秒，请求看到的最大 token 间隔 0.21–0.23 秒（平时 0.09 秒），输出和不改时逐字相同。改 `kernels.reference` 以后，backend 在下一步重新解析了 kernel（worker 日志里的 `layers: kernels resolved again`）。改 `state.kv.dtype` 被拒，要求重启引擎。
+  - 这次修掉的问题：
+    - `--gpu` 不给时，worker 总在 GPU 0 上：节点代理只按拓扑给引擎进程设 `CUDA_VISIBLE_DEVICES`，调用方自己设的被丢掉，同一台机器起两个引擎就挤在同一张卡上。现在 `--gpu` 默认取调用方 `CUDA_VISIBLE_DEVICES` 的第一张卡（`worker_gpu`），没设才是 0。
+    - 要求重启引擎时，诊断一律说 "the change touches the framework core"，连 `state.kv.dtype` 这种"会丢在途状态"的情况也这么说。现在诊断里是计划给出的原因（`core.change` 的协调者）。
+    - f32 和 HF 对比时，cuDNN 的卷积默认走 TF32，部分模型的首步 logits 差到 8e-3：GPU 测试现在关掉 TF32（`tests/gpu/support.py`）。
+    - conv state 默认 bf16（照 SGLang，#35），f32 对比要加 `--conv-dtype f32`；`serve` 新增 `--kv-dtype`、`--ssm-dtype`、`--conv-dtype`。

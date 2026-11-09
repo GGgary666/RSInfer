@@ -95,3 +95,18 @@ def test_requests_through_the_whole_engine_follow_hf(model: Path, tokenizer: Pat
         streamed = cli("chat", "w5 w6 w7", "--url", url, "--max-tokens", "10")  # the CLI streams it (SSE)
         assert streamed == text
     assert sum(len(t.split()) for t in texts) >= 12, texts  # the model generated, rather than stopped at once
+
+
+def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
+    the topology has to place the worker on the GPU the caller was given: before, every engine of a
+    machine landed on GPU 0."""
+    from deploy.qwen38 import worker_gpu
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert worker_gpu(None) == 0
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,5")
+    assert (worker_gpu(None), worker_gpu(1)) == (3, 1)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-5f0e")
+    with pytest.raises(SystemExit, match="--gpu"):
+        worker_gpu(None)

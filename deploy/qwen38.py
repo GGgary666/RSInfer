@@ -88,7 +88,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
     host = HostId(HOST)
     topology = Topology(
         hosts=[HostSpec(host, args.bind, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
-        placement=[RankPlacement(0, host, args.gpu)],
+        placement=[RankPlacement(0, host, worker_gpu(args.gpu))],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
                RoleSpec("worker", [], per_rank=True, platform="torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
@@ -115,6 +115,21 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
     config_file.write_text(json.dumps(config, indent=1))
     tunables = {"supervisor.checkin_timeout_s": float(args.timeout), "change.prepare_timeout_s": float(args.timeout)}
     return topo_file, config_file, tunables
+
+
+def worker_gpu(requested: int | None) -> int:
+    """The physical GPU the topology places the worker on. The node agent sets each engine
+    process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so without ``--gpu`` the caller's
+    own ``CUDA_VISIBLE_DEVICES`` decides here, or every engine of a machine lands on GPU 0."""
+    if requested is not None:
+        return requested
+    first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    if not first:
+        return 0
+    if not first.isdigit():
+        raise SystemExit(f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}: give the worker's GPU "
+                         "by index with --gpu")
+    return int(first)
 
 
 def serve_command(args: argparse.Namespace, topo: Path, config: Path, tunables: dict[str, float]) -> list[str]:
@@ -257,7 +272,8 @@ def main(argv: list[str]) -> int:
         s.add_argument("--tokenizer", type=Path, help="tokenizer directory (default: the model directory)")
         s.add_argument("--layers", type=int, default=0, help="keep only the first N decoder layers")
         s.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-        s.add_argument("--gpu", type=int, default=0, help="the worker's CUDA device")
+        s.add_argument("--gpu", type=int, help="the worker's CUDA device, by physical index (default: the first "
+                       "of CUDA_VISIBLE_DEVICES, else 0)")
         s.add_argument("--dtype", choices=("bf16", "f32"), default="bf16")
         s.add_argument("--page-size", type=int, default=16)
         s.add_argument("--kv-dtype", default="auto", help="state.kv.dtype (SGLang's --kv-cache-dtype)")
