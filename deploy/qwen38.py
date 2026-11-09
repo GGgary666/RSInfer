@@ -96,6 +96,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
     config: dict[str, Any] = {
         # frontend
         "frontend.model": args.name, "frontend.tokenizer_path": str((args.tokenizer or model).resolve()),
+        "frontend.model_path": str(model.resolve()),
         "frontend.http_bind": args.bind, "frontend.http_port": args.port, "frontend.scheduler": SCHED,
         "frontend.response_timeout_s": float(args.timeout),
         # scheduler host

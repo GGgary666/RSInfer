@@ -78,5 +78,7 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
   - 这次修掉的问题：
     - `--gpu` 不给时，worker 总在 GPU 0 上：节点代理只按拓扑给引擎进程设 `CUDA_VISIBLE_DEVICES`，调用方自己设的被丢掉，同一台机器起两个引擎就挤在同一张卡上。现在 `--gpu` 默认取调用方 `CUDA_VISIBLE_DEVICES` 的第一张卡（`worker_gpu`），没设才是 0。
     - 要求重启引擎时，诊断一律说 "the change touches the framework core"，连 `state.kv.dtype` 这种"会丢在途状态"的情况也这么说（真正的原因在同一个结果的 `plan.notes` 里）。改法要动框架本体（`core.change` 的协调者），另开 PR 到 master（#39），不在这里。
+    - 调度宿主在没有请求时重启，引擎就一直不接活（Codex，#37）：worker 只在结果连接换了时补发 `Capacity`，而连接要在写消息时才发现换了，空闲的 worker 不写消息；新调度器等容量，worker 等计划。现在空闲的 worker 每 `worker.announce_every_s`（1 秒）补发一次 `Capacity`。
+    - `--model A --tokenizer B` 时丢了模型的结束 token（Codex，#37）：结束 token 只从 tokenizer 目录 B 的配置里读，A 声明的（比如 `[0, 5]`）丢了，模型输出结束符以后还接着生成。现在照 SGLang 从模型目录读（`frontend.model_path`），再并上 tokenizer 自己的。
     - f32 和 HF 对比时，cuDNN 的卷积默认走 TF32，部分模型的首步 logits 差到 8e-3：GPU 测试现在关掉 TF32（`tests/gpu/support.py`）。
     - conv state 默认 bf16（照 SGLang，#35），f32 对比要加 `--conv-dtype f32`；`serve` 新增 `--kv-dtype`、`--ssm-dtype`、`--conv-dtype`。
