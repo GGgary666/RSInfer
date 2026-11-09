@@ -77,6 +77,6 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
   - 不停引擎热改（请求生成到一半时 `apply`）：改 `policies.fcfs` 的代码、改 `kernels.reference` 的 `ops.py`、改 `layers.attn` 的代码（连带重载模型、`core.plan`、executor、`core.worker`）、改 `attn.decode_backend`、改 live 键 `sched.overlap`，都在 1.2–1.8 秒内提交。暂停（pause）约 0.09 秒，请求看到的最大 token 间隔 0.21–0.23 秒（平时 0.09 秒），输出和不改时逐字相同。改 `kernels.reference` 以后，backend 在下一步重新解析了 kernel（worker 日志里的 `layers: kernels resolved again`）。改 `state.kv.dtype` 被拒，要求重启引擎。
   - 这次修掉的问题：
     - `--gpu` 不给时，worker 总在 GPU 0 上：节点代理只按拓扑给引擎进程设 `CUDA_VISIBLE_DEVICES`，调用方自己设的被丢掉，同一台机器起两个引擎就挤在同一张卡上。现在 `--gpu` 默认取调用方 `CUDA_VISIBLE_DEVICES` 的第一张卡（`worker_gpu`），没设才是 0。
-    - 要求重启引擎时，诊断一律说 "the change touches the framework core"，连 `state.kv.dtype` 这种"会丢在途状态"的情况也这么说。现在诊断里是计划给出的原因（`core.change` 的协调者）。
+    - 要求重启引擎时，诊断一律说 "the change touches the framework core"，连 `state.kv.dtype` 这种"会丢在途状态"的情况也这么说（真正的原因在同一个结果的 `plan.notes` 里）。改法要动框架本体（`core.change` 的协调者），另开 PR 到 master，不在这里。
     - f32 和 HF 对比时，cuDNN 的卷积默认走 TF32，部分模型的首步 logits 差到 8e-3：GPU 测试现在关掉 TF32（`tests/gpu/support.py`）。
     - conv state 默认 bf16（照 SGLang，#35），f32 对比要加 `--conv-dtype f32`；`serve` 新增 `--kv-dtype`、`--ssm-dtype`、`--conv-dtype`。

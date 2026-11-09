@@ -82,12 +82,14 @@ def test_a_state_dtype_stage_2_does_not_keep_fails_the_start() -> None:
         Worker(tiny_config().to_dict(), **{"state.kv.dtype": "fp8_e4m3"})
 
 
-@pytest.mark.parametrize(("key", "value"), [("state.kv.dtype", "bf16"), ("state.gdn.ssm_dtype", "bf16"),
-                                            ("state.gdn.conv_dtype", "f16"), ("model.dtype", "bf16")])
-def test_changing_what_a_state_dtype_comes_from_under_a_request_restarts_the_engine(key: str, value: str) -> None:
-    """The stores read the keys the model resolves their dtypes from, so ``core.deps``, planning
-    from the running worker's own introspection, refuses to reload them in place (§5.5.5): the
-    model's reload would otherwise reallocate them empty under the request."""
+@pytest.mark.parametrize(("key", "value"), [
+    ("state.kv.dtype", "bf16"), ("state.gdn.ssm_dtype", "bf16"), ("state.gdn.conv_dtype", "f16"), ("model.dtype", "bf16"),
+    ("state.kv.pages", 16), ("state.gdn.slots", 4), ("holder.mem_fraction", 0.5), ("holder.state_ratio", 0.5),
+    ("holder.max_slots", 3), ("holder.cpu_bytes", 1 << 24)])
+def test_changing_what_the_state_pools_are_built_from_under_a_request_restarts_the_engine(key: str, value: Any) -> None:
+    """The stores read the keys the model resolves their dtypes from, and the holder those that size
+    them, so ``core.deps``, planning from the running worker's own introspection, refuses to reload
+    them in place (§5.5.5): a reload would otherwise reallocate them empty under the request."""
     from core.change.state import IdentityManifest
     from core.change.types import ChangeSet
     from core.common.framework import FrameworkModules

@@ -88,7 +88,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
     host = HostId(HOST)
     topology = Topology(
         hosts=[HostSpec(host, args.bind, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
-        placement=[RankPlacement(0, host, worker_gpu(args.gpu))],
+        placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
                RoleSpec("worker", [], per_rank=True, platform="torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
