@@ -2,7 +2,7 @@ name: ci
 on:
   # Pull requests run once per push; pushes run only where pull requests land.
   push:
-    branches: [master, madoka/dev]
+    branches: [master]
   pull_request:
 jobs:
   check:
@@ -19,7 +19,7 @@ jobs:
         # If this fails, it shows as failed and every test runs: an unknown scope never skips tests.
         continue-on-error: true
         run: |
-          framework=$(PYTHONPATH=engine uv run python .github/scripts/framework_changed.py "${{ github.event.pull_request.base.sha }}")
+          framework=$(PYTHONPATH=engine uv run python .github/scripts/framework_changed.py "${{ github.event.pull_request.base.sha || github.event.before }}")
           case "$framework" in
             true|false) echo "framework=$framework" >> "$GITHUB_OUTPUT" ;;
             *) echo "unexpected answer: '$framework'"; exit 1 ;;
