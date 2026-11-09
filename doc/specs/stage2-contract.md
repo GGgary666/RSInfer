@@ -45,13 +45,18 @@
 |---|---|---|
 | M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_eager` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
 | M2b | SM100 上的 TP1，换成真 kernel，仍然 eager，全模型和 HF 参照在容差内对齐 | 两边集成 |
-| M2c | decode graph：graph 和 eager 逐位一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
+| M2c | decode graph：graph 和 eager 按下面的口径一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
 | M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
-- 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致；
+- 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比按下面的口径一致；
 - 能服务流式请求。
+
+**对比的口径**（2026-11-09 @wutianyuan1 定，暂定，以后可能再修）：数值和逻辑算对就行。kernel 本身带来的差异不纳入验收：bf16 的舍入，以及 batch 怎么拼带来的累加顺序不同（§6 `batch_invariant`）。测试这样写：
+- fp32 下 logits 在容差内；
+- greedy 采到的 token，只在第一名和第二名的 logit 之差大于容差时才要求相同；差得更少时选了不同的 token，不算失败；
+- bf16 只报告从哪里开始不同，不判失败。
 
 ### 1.4 分支和合并（2026-11-08，提议，待两人确认）
 
@@ -207,7 +212,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
    - worker 的 `quiesce()`：等 GPU 上的工作都做完。
    - 领头的调度器先停，跟随的 worker 跑到同一步再停。所以执行阶段卸掉的东西，不会还有在途的工作在用。
 7. **投机解码**：开投机时，下一步的位置取决于这一步接受了几个草稿 token，这个数只在 GPU 上才知道。v0 规定开投机时不重叠。以后位置也可以写成引用，具体记录形式在 M2d 决定，是否新增分段或版本按 §3 判断。
-8. **同步循环是特例**：收到第 N 步的结果才发第 N+1 步，记录完全相同。阶段 2 默认走同步循环；M2d 加开关 `sched.overlap`（live 键），并加一组对比：开重叠和不开重叠，token 完全一致（要求所用的 kernel 和 batch 怎么拼无关）。2026-11-08 更新：开关和在途步队列在第 3 步就做了（默认关），对比先用测试夹具跑（`engine/core/sched/README.md`）。
+8. **同步循环是特例**：收到第 N 步的结果才发第 N+1 步，记录完全相同。阶段 2 默认走同步循环；M2d 加开关 `sched.overlap`（live 键），并加一组对比：开重叠和不开重叠，按 §1.3 的口径一致。2026-11-08 更新：开关和在途步队列在第 3 步就做了（默认关），对比先用测试夹具跑（`engine/core/sched/README.md`）。
 9. **可观测**：`StepStats` 给出每步的 CPU 时间、GPU 时间、GPU 空闲时间。RSI agent 靠它判断瓶颈在不在 CPU，再决定开不开重叠、怎么调。
 
 ### 4.5 按列编码
@@ -311,9 +316,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - decode 每步只算一个 token，正好落在边界上的那一步打快照。开投机时，一步接受几个 token 事先不知道，所以 v0 开投机时 decode 期间不打快照。
 - MTP：config 里有 1 层 MTP，它的 KV 是 `kv.paged` 的另一层声明。
 
-### 5.5 可配置、可扩展的状态布局（2026-11-09，@gaow0007 负责 GPU 侧设计）
+### 5.5 状态布局：严格照 SGLang（2026-11-09）
 
-本节定义后续实现的选择规则和验收要求；布局注册、配置解析和能力匹配尚未实现。模型声明需要保存的状态，存储与 backend 协商物理布局。不能仅按 attention 类型写死 NHD/HND，也不能因开启 prefix caching 就固定选择 NHD。存储单元由 @wutianyuan1 这边实现，GPU 布局与 kernel 约束由 @gaow0007 提供，实际交接由双方确认。
+**2026-11-09 @wutianyuan1 和 @gaow0007 定：KV cache 和 GDN 状态池的组织方式不变，严格照 SGLang**（`MHATokenToKVPool`、`MambaPool`，§5.5.8）；配置项、默认值和启动时的兼容性检查也照 SGLang（§5.5.3）。阶段 2 每种状态只有这一种物理布局，不做开放的布局注册，也不要求第二种物理布局（HND 等）。§5.5.1 的分层、§5.5.4 和 §5.5.5 的规则继续适用；§5.5.7 是 SGLang 的配置空间记录，以后加布局时照它来。
+
+以下是 @gaow0007 的原设计（2026-11-09），按上面的决定改过 §5.5.2、§5.5.3、§5.5.6、§5.5.8。存储单元由 @wutianyuan1 这边实现，GPU kernel 的约束由 @gaow0007 提供。
 
 #### 5.5.1 分开描述语义、布局和分配
 
@@ -330,40 +337,31 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - §5.4 的 shape、FP32 recurrent 和显存数字是当前模型的基线。改变精度、conv 历史容量或投机临时状态后，需要重新计算预算并验证数值；持久状态精度和 kernel 的累加精度分别记录。
 - page size 是逻辑缓存页的 token 数，分配字节数与对齐由实际存储实现确定。
 
-#### 5.5.2 布局作为开放实现接入
+#### 5.5.2 布局：照 SGLang，不做开放注册（2026-11-09 改）
 
-- 布局使用开放的名称与参数，由实现登记能力；不在框架本体维护封闭的 NHD/HND 枚举。新增布局应能随实现接入，不要求修改模型或所有 backend。
-- 实现负责给出 buffer 组织、合法参数和可用的写入/复制路径；量化布局还要描述 scale 等辅助 buffer。登记随单元生命周期撤销，不能在 reload 后留下旧实现引用。
-- backend 必须声明实际支持的组合；形状匹配不等于物理布局兼容。`permute()` 产生的视图可能不连续，只有消费者接受对应 stride 时才能直接使用。
-- 按 §3 保持最小共享交接面：布局选择算法、候选评分和注册表内部结构留在实现。只有消费者实际需要的布局标识、轴语义和 buffer 约束才进入共享定义；不预先建立覆盖全部框架的布局对象模型。
-- 当前 `StateDecl.tensors` 和 `Binding.buffers()` 尚不能完整表达这些约束。实现第一组存储/backend 时同步补齐必要交接与测试，不把现有 shape/dtype 字段视为已完成布局协商。
+- 阶段 2 每种状态的物理布局就是 SGLang 的那一种（§5.5.8），写在存储单元里。不建布局注册表，`StateDecl` 和 `Binding` 里也不加布局名：只有一种布局时，这些字段没有消费者（§3）。
+- 以后要加第二种布局，照 SGLang 的方式加：做成存储单元的一个配置项（例如 SGLang 用 `SGLANG_USE_HND_KVCACHE` 选 HND），消费它的 kernel 在启动校验时检查（§5.5.3）。到那时再按 §3 补需要交接的字段。
+- 原设计里仍然成立的两条：形状对得上不等于物理布局兼容；`permute()` 得到的视图可能不连续，只有消费者接受对应的 stride 时才能直接用。
 
-#### 5.5.3 显式配置与自动选择
+#### 5.5.3 配置项与启动时的检查：照 SGLang（2026-11-09 改）
 
-支持按状态种类配置，并允许兼容的层组覆盖默认值。共享同一物理池的层必须满足该池的布局约束；重叠或矛盾的层组配置在分配前拒绝。
+配置项只对应 SGLang 已有的参数，默认值和 `auto` 的含义也照 SGLang。都是 startup 键：
 
-下面仅示意配置意图，名称与配置键在实际接入时定义，不是当前可用的启动参数：
+| agxinfer 的键 | SGLang | 默认值 |
+|---|---|---|
+| `state.kv.page_size` | `--page-size` | 16 |
+| `state.kv.dtype` | `--kv-cache-dtype` | `auto`：等于模型的 dtype |
+| `state.gdn.ssm_dtype` | `--mamba-ssm-dtype` | `auto`：模型 config 里的 `mamba_ssm_dtype`，没有就是 f32（`mamba2_state_dtype`） |
+| `state.gdn.conv_dtype` | 环境变量 `SGLANG_MAMBA_CONV_DTYPE` | bf16（SGLang 的 conv state 不跟模型 dtype） |
+| `attn.backend`；`attn.prefill_backend`、`attn.decode_backend` | `--attention-backend`；`--prefill-attention-backend`、`--decode-attention-backend` | `auto`；按阶段的两个键为空时跟 `attn.backend` |
+| `gdn.backend`；`gdn.prefill_backend`、`gdn.decode_backend` | `--linear-attn-backend`；`--linear-attn-prefill-backend`、`--linear-attn-decode-backend` | `auto`；同上 |
 
-```yaml
-state_layouts:
-  kv.paged:
-    layout: auto             # 也可显式指定 kv.nhd / kv.hnd
-    dtype: bfloat16
-    page_size: 16            # 示例值，不是所有 backend 的默认值
-  gdn.slots:
-    recurrent:
-      layout: gdn.k_last
-      dtype: float32
-    conv:
-      layout: gdn.conv_ds
-      dtype: bfloat16
-```
-
-- **显式配置**：严格验证，不兼容时 fail-fast；诊断指出状态/层组、消费者、执行阶段和冲突参数。不能静默换布局、降精度或关闭已启用功能。
-- **`auto`**：结合模型尺寸、硬件、dtype、已选或候选 backend，联合选择兼容方案。至少检查 prefill、decode，以及启用的 verify、graph、copy、prefix restore、PD/offload 路径。未启用的功能不强加约束；以后启用时重新校验。
-- 先过滤不合法组合，再根据明确的偏好与性能数据选择。固定实现版本、硬件与配置时，选择应可复现；没有性能数据时使用记录在实现中的确定性优先级，不宣称最优。
-- 无兼容方案时默认报错。转换只能作为显式允许的适配路径，说明临时空间、数据移动、同步和 graph 限制；不能隐藏每步转换整个状态池的代价。参照 kernel fallback 同样必须满足布局约束。
-- 解析结果在启动信息与 introspection 中可见：各状态/层组的实际布局、dtype、page size、消费者与选择理由。`auto` 在分配时解析，不能在每个 step 中悄悄切换物理布局。
+- backend 的名字就是 kernel 目录里 solution 所属的那一组（§6），例如 `reference`，以后的 `flashinfer`、`triton`。
+- **显式指定的 backend 是硬约束**：这一组的 solution 必须覆盖该阶段要用的每个 definition，并且适配这个模型的 shape 和平台，否则启动失败；不退回参照实现。
+- **`auto`**：按 kernel 目录的规则选（§6），选不到就用参照实现，并在日志里标出 fallback。
+- dtype 的约束照 SGLang 在启动时检查（如 `handle_linear_attn_backend`：SM100 上 flashinfer 的 GDN decode / verify 要求 `mamba_ssm_dtype` 为 bf16），不兼容就报错，不悄悄降精度。这类检查随对应的 kernel 一起接入。
+- 解析在 worker 启动时做一次，结果打一条 INFO 日志：平台；每种状态的 dtype 和页大小；prefill、decode 两个阶段各自的 backend 和每个 definition 选中的 solution，是否 fallback；verify 标为 disabled。运行中不再换。
+- fp32 的对齐测试把三种状态的 dtype 都显式配成 f32；默认配置下 conv state 是 bf16，和 SGLang 一样。
 
 #### 5.5.4 前缀复用、投机与 buffer 交接
 
@@ -391,9 +389,9 @@ state_layouts:
 
 #### 5.5.6 分阶段实现与验收
 
-- 首版只实现当前模型和选定 kernel 真正需要的布局；扩展机制至少用两种真实物理布局验证，例如 NHD 与 HND。该项不要求首版完成 PD、所有量化格式或所有 attention 类型。
-- M2a 用 CPU 参照验证配置解析、轴语义、stride、页/槽寻址、复制和不兼容配置的拒绝；M2b 在 SM100 验证真实 kernel，覆盖 prefill → decode 及支持的布局组合。
-- M2c 覆盖地址相同但 stride/布局解释改变时的 graph 失效、capture scratch 隔离、候选失败清理，以及在途工作完成后释放旧资源。
+- 首版只实现 SGLang 的这一种布局（§5.5.8），不要求第二种物理布局，也不要求 PD、量化格式或其他 attention 类型（2026-11-09 改）。
+- M2a 用 CPU 参照验证页/槽寻址、copy、clear、padding 条目，以及 §5.5.3 里不兼容的显式配置在启动时被拒绝；M2b 在 SM100 验证真实 kernel，覆盖 prefill → decode（2026-11-09 改）。
+- M2c 覆盖地址相同但 stride 改变时的 graph 失效、capture scratch 隔离、候选失败清理，以及在途工作完成后释放旧资源。
 - M2d 随功能落地覆盖 prefix hit/miss、共享页续写保护、GDN 快照恢复、投机部分接受后的 recurrent/conv 一致性，以及启用的 overlap/传输路径。
 - 比较逻辑结果，不比较不同布局的原始字节顺序。使用非对称内容和非平凡 stride；参照实现支持时用不等的 K/V 维度，避免方阵掩盖转置错误。保持 dtype 和计算路径时验证布局转换不改变语义；精度变化另设明确容差与长序列验证。
 - 延续 A/B/C 方法：A 缺少待验收能力或存在原缺陷，B 为正确实现；C 植入忽略 stride、遗漏 generation 更新、共享页被写入或提前释放等缺陷。加强测试直到 A/C 失败而 B 通过。性能测试计入状态写入、适配复制和同步成本，不只测 attention kernel。
@@ -447,38 +445,19 @@ state_layouts:
 | HiCache IO | [arg_groups/hicache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/hicache_hook.py) 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；agxinfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
 | SM100 FlashInfer GDN | [arg_groups/attention_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/attention_hook.py) 的该 decode/verify 路径要求 BF16 recurrent state；[gdn_triton.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) 声明 K-last 池 | 保留 FP32 参照路线；请求该 FlashInfer 路径时显式选择并验收 BF16，不静默降精度 |
 
-#### 5.5.8 agxinfer 首版确定的布局与选择顺序
+#### 5.5.8 阶段 2 的布局：严格照 SGLang（2026-11-09 改）
 
-以下是本设计的默认值和扩展边界，不代表实现已经支持，也不声称是 SM100 性能最优组合。适用范围是阶段 2 的 Qwen3.8 TP1；实现后以契约与 GPU 测试解锁对应组合。
+原设计的默认值表和 auto 的选择顺序（逐层独立池、`[P,16,Hkv,D]`、HND 扩展等）按 §5.5 开头的决定作废，改成下表。这就是 #30 实现的布局（2026-11-08），代码不变。
 
-| 状态/模式 | 默认或显式选择 | 约束 |
-|---|---|---|
-| 普通 full-attention KV | **逐层独立 K、V 池；物理 NHD；BF16；page size 16**。每层每个 tensor 为 `[P,16,Hkv,D]` | 16 是首版工程默认，可配置且须满足所有消费者；该模型 TP1 的 Hkv=4、D=256。缓存引用按页管理 |
-| 普通 KV 的 HND 扩展 | 显式 `kv.hnd`，物理 `[P,Hkv,N,D]` | 先用它验证扩展机制；prefill/decode/verify、append/copy 均通过后才接受。普通 NHD wrapper 不自动变成 HND backend |
-| prefix cache 开/关 | **不改变上述 KV 物理布局**；首版仅发布完整页 | 命中引用已有页；未满页由请求独占，不提前共享。未来部分页共享须先实现 copy-on-write |
-| SWA | 扩展时优先沿用相同的页内 NHD/BF16，独立 window 池和回收规则 | 需实现窗口对齐、前缀可恢复范围；不因声明了默认值就视为阶段 2 已支持 SWA |
-| GDN recurrent | **逐层独立池；K-last `[S,Hv,V,K]`；FP32**。当前模型为 `[S,48,128,128]` | 基线对接 CPU 参照及兼容的 Triton/FLA 路径；输出、状态连续演进须验证 |
-| GDN conv | **逐层独立池；DS `[S,C,W]`；BF16**。非投机基线为 `[S,10240,3]` | W 按实际 conv/verify 算法决定；投机历史和临时状态另外预算，不将 3 写死为所有模式的容量 |
-| FlashInfer GDN BF16 路线 | 显式 BF16 recurrent 配置，保留 K-last；兼容的 prefill/decode/verify 组合 | 单独做长序列、prefix restore 和部分接受验证。FP32 配置与要求 BF16 的 kernel 冲突时拒绝 |
-| GDN 前缀与 capture | 基线快照沿用对应状态格式，恢复到独占槽；scratch 与运行条目隔离 | int8 快照、ReplaySSM 等作为后续能力，不进入默认组合 |
-| MLA、稀疏/压缩、FP8/FP4 | 各自的开放布局实现 | 首版不以 `kv.nhd` 冒充支持；缺失实现或消费者能力时拒绝 |
-| 跨层打包、HiCache、PD、offload、CP | 独立配置与扩展能力；首版不默认启用 | 物理层视图、host/传输格式、索引和生命周期通过专项测试后接入；不能因选择 NHD 就自动开启 |
+| 状态 | 布局（SGLang） | dtype（§5.5.3） | 说明 |
+|---|---|---|---|
+| full-attention KV（`kv.paged`） | `MHATokenToKVPool`：每层一份 K、一份 V，`[容量 + page_size, kv 头数, head_dim]`，按 token 槽寻址（物理上是 NHD）；槽 0 所在的页做 padding | `state.kv.dtype`，默认等于模型的 dtype（bf16） | page size 16；前缀缓存只发布完整页，没写满的页归请求自己（§5.5.4） |
+| GDN recurrent（`gdn.slots` 的 temporal） | `MambaPool`：`[GDN 层, 槽 + 1, v 头, v_dim, k_dim]`（K-last）。所有 GDN 层叠放在一块里，每层的切片是连续的；槽 0 做 padding | `state.gdn.ssm_dtype`，默认 f32 | temporal 是 `[v_dim, k_dim]`，和 HF 的 `[k_dim, v_dim]` 互为转置；参照 kernel 按 SGLang 的排法写，和 HF 比时转置（`tests/units/kernels/test_reference.py`） |
+| GDN conv | `MambaPool`：`[GDN 层, 槽 + 1, conv_dim, kernel - 1]`（DS） | `state.gdn.conv_dtype`，默认 bf16 | |
+| 持久 batch 的表 | `HybridReqToTokenPool`：`req_to_token` `[行 + 1, 最大上下文]` int32，以及行到 GDN 槽的映射 | | |
+| HND、跨层打包、量化 KV、MLA、SWA、HiCache、PD、offload、CP | 阶段 2 不做 | | 以后照 SGLang 对应的开关加（§5.5.2、§5.5.7） |
 
-**auto 的确定性规则：**
-
-1. 读取模型状态、精度要求和启用功能；明确的 backend/layout/dtype/page size 均为硬约束。target 与 draft 分别解析，共享池时再检查交接一致性。
-2. 枚举已注册且已验收的存储/backend/适配组合，过滤上述不兼容项。没有组合时在分配及 capture 前失败，并报告具体原因；不改变用户指定的精度或关闭功能。
-3. 在普通 BF16 KV 的剩余组合中优先选择逐层 NHD；仅在显式 backend 排除了 NHD、且 HND 全部消费者已支持时，auto 才选择物理 HND。接受 NHD 的无复制 HND 形状视图不构成更换物理布局的理由。
-4. GDN 默认 K-last/FP32 + conv DS/BF16；仅指定 backend 不授权降精度。BF16 recurrent 路线需显式选择相应精度。没有兼容实现就报错。
-5. 记录实际物理布局和 kernel 视图的 shape/stride、转换路径及选择理由。性能测量可以在后续版本调整 auto 优先级，但已分配池只能通过 §5.5.5 的变更过程切换。
-
-**组合验收范围：** 不穷举所有 CLI 参数，而是按上述能力轴建立约束矩阵。对首版支持的物理 NHD/HND，覆盖 prefix 开/关与 hit/miss、eager/graph、支持的 prefill/decode；M2d 再交叉加入投机开/关和 overlap 开/关（按 §4.4，投机+overlap 必须被拒绝）。GDN 每条精度路线覆盖运行/快照恢复/部分接受，包含 KV 命中长度与 GDN 快照位置不一致的混合状态。所有列明的拒绝组合也要有 fail-fast 测试。跨层非连续 stride、非整页长度、共享页续写和在途释放是独立边界用例；未验收的组合不能由 auto 选中。
-
-**当前实现（#30，2026-11-08）：严格照 SGLang。**
-- KV：`MHATokenToKVPool` 的 NHD，每层一份 K、一份 V，`[容量 + page_size, kv 头数, head_dim]`，按 token 槽寻址，槽 0 所在的页做 padding；
-- GDN：`MambaPool`，conv `[GDN 层, 槽 + 1, conv_dim, kernel - 1]`，temporal `[GDN 层, 槽 + 1, v 头, v_dim, k_dim]` fp32；
-- 持久 batch 的表：`req_to_token` `[行 + 1, 最大上下文]` int32，以及行到 GDN 槽的映射。
-- 注意 temporal 是 `[v_dim, k_dim]`，和 HF 的 `[k_dim, v_dim]` 互为转置；参照 kernel 按 sglang 的排法写，和 HF 比时转置（`tests/units/kernels/test_reference.py`）。
+**组合验收**：§5.5.3 每一种不兼容的显式配置都有一条启动失败的测试；prefix 开/关、eager/graph、投机和重叠的交叉，随对应功能在 M2c、M2d 覆盖。
 
 ## 6. kernel 目录
 
@@ -498,7 +477,7 @@ state_layouts:
   - **和 batch 怎么拼是否无关**（`Definition.batch_invariant`，默认否，2026-11-09 更正）：
     - 声明为是的只有按构造成立的：`attn.extend` / `attn.decode`、`gdn.conv1d_fn`、`gdn.chunk_delta_rule` 逐个序列算，lookup 和 store 只搬数据。decode 的 conv / delta rule 一步和采样是整批一个算子，不声明。
     - norm、RoPE、激活、linear、gating 是一个 torch 算子作用在整个 batch 上，PyTorch 会随行数换计算路径和累加顺序，不声明。实测 CPU fp32 的 linear，同一行单独算和放进 batch 里算，最后几位不同；两个 logit 很接近时，greedy 会选出不同的 token。
-    - 已定（2026-11-09）：§1 验收里的“批量对单条”和 §4.4 第 8 条的“开重叠对不开”不要求逐位一致，logits 在容差内、token 相同即可。
+    - 所以五组对比不要求逐位一致，按 §1.3 的口径（2026-11-09）。
   - 测试：`tests/units/kernels/`，对照 HF 的实现、分块等于不分块；声明和 batch 怎么拼无关的参照，单独算和放进 batch 里算逐位相同。
 
 ## 7. 层、模型、权重
@@ -532,6 +511,8 @@ state_layouts:
 **职责总则：backend 准备元数据、组织计算及状态更新；worker 保证执行顺序和配置切换边界；plan 管理 graph 的捕获、选择和失效。** backend 不在每步调用中自行切换配置或重录 graph。
 
 ### 8.1 layout 与各阶段 backend/kernel 的联合选择（2026-11-09 讨论确认）
+
+2026-11-09 补充：阶段 2 每种状态只有 SGLang 的那一种布局（§5.5），下面说的显式配置就是 §5.5.3 那张表里的键，解析和日志按 §5.5.3 做。
 
 - **显式 layout 是硬约束。** 用户指定 layout、其余选项为 `auto` 时，参考 SGLang 在对应设备、模型和精度下的默认搭配，从 agxinfer 已注册且已验收的组合中选择。遵守 §5.5.8 的布局和精度约束；不能为了套用默认 backend 而更换显式 layout、降低精度或关闭功能。SGLang 的默认搭配是选择依据，不代表 agxinfer 已支持该组合。
 - **启动或配置变更时统一解析、校验完整组合。** 一次解析启用阶段的 prefill/decode/verify backend 与具体 kernel/solution，并校验模型语义、设备、物理 layout/stride、dtype、page size，以及启用的 prefix、speculation 和 graph 能力。未启用的 verify 标为 disabled；以后启用时重新校验。不能让各阶段独立选择后，等执行时才发现状态不兼容。
@@ -927,8 +908,8 @@ state_layouts:
 
 ## 15. 待定
 
-1. §9.4 里还没测过的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿；不能分片时选哪种做法。
+1. §9.4 里还没测过、还没做的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿。不能分片时走哪条路径，按 §9.4.1 的表选。
 2. ~~`torch_eager` 平台上的 graph~~：已定（2026-11-08），`torch_eager` 不录 graph；“录制时写死 Python 标量”这类错误由 `fake` 和 GPU 层抓。
 3. 前端和调度之间的流在 M2a 用每步记录流。前端以后要不要拆成多个进程，到时再定。
-4. 采样放在 graph 里还是 graph 外，由 @gaow0007 在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。
+4. ~~采样放在 graph 里还是 graph 外~~：已定（2026-11-09，§9.1），首版采样在模型 graph 外，采到的 token 留在显存里给 `from_previous` 用。以后要不要融进 graph，另行评估。
 5. 投机的记录：草稿放在哪、验证步的 `num_tokens` 怎么数。M2d 定，是否新增分段或版本按 §3 判断（§4.2）。
