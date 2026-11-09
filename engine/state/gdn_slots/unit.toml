@@ -8,4 +8,7 @@ entry = "state.gdn_slots.unit:Unit"
 services = ["state.gdn.slots@1"]
 
 [config]
-"state.gdn.slots" = { type = "int", default = 8, binding = "startup", doc = "Usable GDN state slots; slot 0 is padding" }
+"state.gdn.slots" = { type = "int", default = 0, binding = "startup", doc = "Usable GDN state slots, slot 0 being padding; 0: as many as core.state.holder gives" }
+
+[requires]
+services = ["state.holder@1"]

@@ -302,6 +302,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 - `kv.paged`：16 层 full attention，每层的 K、V。24 个 q 头、4 个 kv 头，head dim 256。
 - `gdn.slots`：48 层 GDN，每层的 conv state `[槽, 10240, 3]` bf16 和 recurrent state `[槽, 48, 128, 128]` fp32。TP1 时每个请求约 147 MiB，256 个并发就是约 37 GiB（探针报告第 9 条）。所以槽位数在启动时由 `core.state.holder` 按显存定，以后可以像 KV 一样用 VMM 扩槽位。
+  - 2026-11-09 实现（先不做 VMM）：照 SGLang 的分法。权重和状态池一共占设备的 `holder.mem_fraction`（`mem_fraction_static`，默认 0.85），状态池分到其中扣掉权重后剩下的部分，再按 `holder.state_ratio`（`mamba_full_memory_ratio`，默认 0.9）分给 GDN 槽，其余给 KV 页；`holder.max_slots`（`max_mamba_cache_size`）可以直接定槽数。CPU 上的预算是 `holder.cpu_bytes`。模型在分配完权重之后、两个存储单元分配之前统一定好各种状态的条目数，`state.kv.pages`、`state.gdn.slots` 配了具体数时以配置为准。代码在 `engine/core/state/holder/`，契约是 `storage.py` 的 `StateHolder`。
 - 前缀复用：GDN 状态只在块边界有快照。快照占同一个池里的槽位，打快照、恢复快照都是条目拷贝（`StateCopy`）。所以 `gdn.slots` 的 `reusable` 只能对齐到快照边界。
 - **快照只能在一步的末尾打**（2026-11-08，PR #19 评审）：
   - GDN 的状态在一步之内原地往前推，`StateCopy(after)` 只拷得到这一行在这一步 chunk 末尾的状态。

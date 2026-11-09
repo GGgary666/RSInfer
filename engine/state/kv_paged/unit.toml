@@ -9,4 +9,7 @@ services = ["state.kv.paged@1"]
 
 [config]
 "state.kv.page_size" = { type = "int", default = 16, binding = "startup", doc = "Tokens per KV page" }
-"state.kv.pages" = { type = "int", default = 64, binding = "startup", doc = "Usable KV pages; page 0 is padding" }
+"state.kv.pages" = { type = "int", default = 0, binding = "startup", doc = "Usable KV pages, page 0 being padding; 0: as many as core.state.holder gives" }
+
+[requires]
+services = ["state.holder@1"]

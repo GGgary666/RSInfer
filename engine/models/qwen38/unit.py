@@ -96,6 +96,7 @@ class Qwen3_5ForCausalLM:
         self.cfg, self.dims = cfg, Dims.of(cfg)
         s = services
         self.weights, self.kv, self.gdn_states = s["state.weights@1"], s["state.kv.paged@1"], s["state.gdn.slots@1"]
+        self.holder = s["state.holder@1"]
         self.linear, self.embedding, self.norm = s["layers.linear@1"], s["layers.embedding@1"], s["layers.norm@1"]
         self.rope, self.act, self.attn, self.gdn = (s["layers.rope@1"], s["layers.activation@1"], s["layers.attn@1"],
                                                     s["layers.gdn@1"])
@@ -111,6 +112,9 @@ class Qwen3_5ForCausalLM:
     def start(self) -> None:
         a = self._assembly
         self.weights.declare(a.weights)
+        # The pools are sized from what is left once the weights are allocated (state.holder@1).
+        weights = self.weights.bind("").buffers().values()
+        self.holder.size(a.states, sum(t.numel() * t.element_size() for t in weights))
         self.kv.declare([s for s in a.states if s.kind == "kv.paged"])
         self.gdn_states.declare([s for s in a.states if s.kind == "gdn.slots"])
         self.weights.load()
@@ -300,8 +304,9 @@ def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
 
 
 class Unit:
-    SERVICES = ("state.weights@1", "state.kv.paged@1", "state.gdn.slots@1", "layers.linear@1", "layers.embedding@1",
-                "layers.norm@1", "layers.rope@1", "layers.activation@1", "layers.attn@1", "layers.gdn@1")
+    SERVICES = ("state.weights@1", "state.holder@1", "state.kv.paged@1", "state.gdn.slots@1", "layers.linear@1",
+                "layers.embedding@1", "layers.norm@1", "layers.rope@1", "layers.activation@1", "layers.attn@1",
+                "layers.gdn@1")
 
     def __init__(self, ctx: Any, config: Any) -> None:
         cfg = Qwen3_5TextConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))

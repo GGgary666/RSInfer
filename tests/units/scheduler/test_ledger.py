@@ -85,3 +85,11 @@ def test_capacity_must_name_the_declared_kinds() -> None:
     with pytest.raises(ValueError, match="declared kinds"):
         ledger.set_capacity({"kv.paged": 4})
     assert not ledger.fits(16)
+
+
+def test_the_ledger_refuses_pages_of_another_size_than_the_workers() -> None:
+    from core.state.alloc.unit import check_page_size
+
+    check_page_size([PAGES, SLOTS], 16)
+    with pytest.raises(ValueError, match="pages of 16 tokens, the workers' state.kv.page_size is 32"):
+        check_page_size([PAGES, SLOTS], 32)

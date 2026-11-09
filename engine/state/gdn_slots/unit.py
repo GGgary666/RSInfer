@@ -39,6 +39,8 @@ class MambaPool:
 
     platform: Any
     size: int
+    """Usable slots; 0: as many as the holder gave ``gdn.slots`` (``state.holder@1``)."""
+    holder: Any = None
     mamba_layer_ids: list[int] = field(default_factory=list[int])
     decls: list[StateDecl] = field(default_factory=list[StateDecl])
     conv: torch.Tensor | None = None
@@ -50,6 +52,10 @@ class MambaPool:
         decls = sorted(decls, key=lambda d: d.layer)
         if decls == self.decls:
             return
+        if not self.size:
+            self.size = self.holder.items(KIND) if self.holder is not None else 0
+            if not self.size:
+                raise RuntimeError(f"{KIND}: no slot count: set state.gdn.slots, or size the states first (state.holder@1)")
         if any(d.kind != KIND or d.tensors != decls[0].tensors for d in decls):
             raise ValueError(f"{KIND} holds one state shape for every GDN layer")
         (conv_shape, conv_dtype), (temporal_shape, ssm_dtype) = decls[0].tensors["conv"], decls[0].tensors["temporal"]
@@ -109,6 +115,6 @@ class MambaPool:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        self.pool = MambaPool(ctx.platform, config["state.gdn.slots"])
+        self.pool = MambaPool(ctx.platform, config["state.gdn.slots"], holder=ctx.use("state.holder@1"))
         ctx.effect(lambda: self.pool.free, label="gdn states")
         ctx.provide("state.gdn.slots@1", self.pool)
