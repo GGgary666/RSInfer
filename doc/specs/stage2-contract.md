@@ -28,12 +28,12 @@
 
 | | 负责 | 说明 |
 |---|---|---|
-| @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、`executors.cuda`、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
-| @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_cpu`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
+| @gaow0007（GPU、CUDA graph） | `platforms.cuda_sm100`、`core.plan`（包括 plan 编译）、attention 和 GDN 的 kernel 包装（`kernels.flashinfer`、`kernels.fla`、对应的 backend）、自己这几块在 GPU 上的验证 | 状态在显存里怎么排（§5.5），由 @gaow0007 决定 |
+| @wutianyuan1 和 agent 们 | 其余全部：前端、调度、账本、请求表、每步执行循环、持久 batch、模型、层、kernel 目录和参照实现、状态单元、权重存储、`platforms.torch_eager`、控制面单元的新规则、集成测试和全模型对齐 | Devin 在 SM100 上做集成验证和补测 |
 | 本文和 `engine/core/contracts/` | 两边共有 | 团队 PR 由双方 review；同一 RSI agent 可一起修改接口与全部使用者，不增加运行时审批 |
 
 分工的边界划在**可用 CPU 参照实现验证的接口**上：
-- 平台有 `torch_cpu` 和 `fake`；
+- 平台有 `torch_eager` 和 `fake`；
 - kernel 有 PyTorch 参照实现；
 - graph 有 eager 路径。
 
@@ -43,15 +43,20 @@
 
 | 里程碑 | 内容 | 主要靠谁 |
 |---|---|---|
-| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_cpu` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
+| M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_eager` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
 | M2b | SM100 上的 TP1，换成真 kernel，仍然 eager，全模型和 HF 参照在容差内对齐 | 两边集成 |
-| M2c | decode graph：graph 和 eager 逐位一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
+| M2c | decode graph：graph 和 eager 按下面的口径一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
 | M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
-- 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致；
+- 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比按下面的口径一致；
 - 能服务流式请求。
+
+**对比的口径**（2026-11-09 @wutianyuan1 定，暂定，以后可能再修）：数值和逻辑算对就行。kernel 本身带来的差异不纳入验收：bf16 的舍入，以及 batch 怎么拼带来的累加顺序不同（§6 `batch_invariant`）。测试这样写：
+- fp32 下 logits 在容差内；
+- greedy 采到的 token，只在第一名和第二名的 logit 之差大于容差时才要求相同；差得更少时选了不同的 token，不算失败；
+- bf16 只报告从哪里开始不同，不判失败。
 
 ### 1.4 分支和合并（2026-11-08，提议，待两人确认）
 
@@ -70,7 +75,7 @@
   2. 后合的分支先把新的 master 合进来，在自己分支上解决冲突、跑通 CI，再开 PR 到 master。
   3. 两条都合完，各自从 master 接着做（个人分支 fast-forward 到 master）。
 - **先后顺序**：谁的改动是对方的前提，谁先合。通常是 @wutianyuan1 先合：GPU 这边的单元插在整条链路里，它们的 GPU 测试要用到链路；链路反过来只要 CPU 替身就能跑。
-- **第一个依赖**：M2a 的 worker 通过 `plan@1` 跑 eager，而 `core.plan` 归 @gaow0007。所以 `core.plan` 的 eager 路径（只有分桶 0，不录 graph）要先做，在 M2a 之前单独汇合一次。在那之前，@wutianyuan1 这边在测试里用一个只走 eager 的替身。
+- **第一个依赖**：M2a 的 worker 通过 `plan@1` 跑 eager，而 `core.plan` 归 @gaow0007。所以 `core.plan` 的 eager 路径（只有分桶 0，不录 graph）要先做，在 M2a 之前单独汇合一次。在那之前，@wutianyuan1 这边在测试里用一个只走 eager 的替身。2026-11-09：eager 路径已经由 @wutianyuan1 这边在 `madoka/fix-gaps` 里做了（`engine/core/plan/`，只有 eager），graph 由 @gaow0007 在 M2c 加进同一个单元。
 
 ## 2. 进程和单元
 
@@ -87,8 +92,8 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | | `core.state.alloc` | 状态 | `ledger@1` | 各类池先作为内部实现，按实际独立替换需求再拆分 | |
 | worker（每 rank 一个） | `core.worker` | 逻辑 | `proc.loop@1`（带 `quiesce`） | `worker.batch@1`、`plan@1`、`model@1` | |
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
-| | `core.plan` | 逻辑，录 graph | `plan@1` | `model@1`、各 backend、各状态单元 | ✓ |
-| | `executors.cuda` | 逻辑 | `executor@1` | | ✓ |
+| | `core.plan` | 逻辑，录 graph | `plan@1`（eager plan 和 graph plan；2026-11-09 先只有 eager） | `model@1`、各 backend、各状态单元 | ✓ |
+| | `executors.pytorch` | 逻辑 | `executor@1`（worker 唯一的 executor，2026-11-09） | `worker.batch@1`、`plan@1`、`layers.sampler@1`、各状态单元 | |
 | | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1` | |
 | | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1` | |
 | | `core.kernels` | 逻辑 | `kernels.catalog@1` | | |
@@ -104,7 +109,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 - 控制面单元要加的规则：
   - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就重录：能分片的在准备阶段，不能的在暂停期内，§9.4），以及容量变更的影响；dry-run 报出重录造成的停顿；
   - `core.manifest`：单元不许自己建 stream（§10.4）。
-- 新平台 `platforms.torch_cpu` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
+- 新平台 `platforms.torch_eager` 和 `platforms.cuda_sm100` 都属于框架本体，要加进 `engine/framework.toml`。
 
 ## 3. 最小共享交接面（2026-11-08 更新）
 
@@ -125,10 +130,12 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | 模块 | 实际交接 |
 |---|---|
 | `requests`、`sampling`、`columns` | 前端、调度器和 worker 使用的消息与采样数据 |
+| `serving` | 前端的 token 返回地址（`ReturnRoute`），随每条请求记录一起发给调度器 |
 | `records` | 调度器发给 worker 的步计划和结果 |
 | `state`、`storage`、`tensor` | 模型向存储/账本提供的当前状态声明，以及 buffer 交接 |
 | `kernels`、`model` | kernel 注册和选择，以及模型向 plan/权重存储提供的数据 |
 | `plan` | worker 获取 plan，以及 backend 与持久 batch 的必要调用 |
+| `ledger`、`policy` | 调度器调用账本的最小调用集；调度器的两个决策点（准入和排序、这一步怎么组成）的快照和决定（2026-11-08，第 3 步） |
 
 本轮收缩：删除共享 `ledger.py`（账本插件尚是本组内部实现），`common_prefix` 移到 `core.state.alloc.prefix`；删除 graph 的内部 `GraphDep`、强制公开的重录流程、重复的可选状态动作 Protocol，以及未实际交接的状态/模型预留字段。请求表与账本的内部字段不建立共享镜像。状态声明先保留 request/slot，跨层借用、host 放置和分区等在实际实现需要交接时再加入。
 
@@ -186,9 +193,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - 一行被重新加入以后（`full` 增量会重新加入所有行），它下一次跑的输入 token 由调度器给出，跑过一次以后才能再用 `from_previous = 1`。恢复以后隔了几步才再排进 batch 的行也是这样。`full` 增量里的 `StateOps` 给每行分配它持有的全部条目，不只是新的。
   - 收到 `full` 之前，worker 不跑任何计划，每份都回 `Resync`、不带 `Sampled`。调度器把这些步当作没跑过：token 没算，拷贝没做，请求的长度退回到最后一个回了 `Sampled` 的步。这些步分出去的条目仍归原来的请求，`full` 里会再分一次。开了重叠时，`full` 之前已经发出的那份计划也会回 `Resync`，这是预期的。
   - worker 碰到 `from_previous = 1` 却没有可接的 token，也回 `Resync`，不跑。
+  - 2026-11-09 更新（#30 评审）：新建的持久 batch 也算“重建以后”，收到第一份 `full` 之前什么都不跑。调度器启动后的第一份增量本来就是 `full`。
   - 采样不在 worker 里留随机状态：客户端没给 seed 的话，调度器在接纳请求时补一个，worker 按（seed, 位置）取随机数。所以重建前后采到的 token 一样，和 batch 怎么拼也无关。
   - 开投机时，下一步要验证的草稿如果留在显存里，也一起丢掉；重建后每行的第一步不带草稿。
-  - 契约测试（M2a，`torch_cpu`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
+  - 契约测试（M2a，`torch_eager`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
+- **上限**（2026-11-09，#30 评审）：持久 batch 最多 `batch.max_rows` 行，每行最多 `batch.max_context_len` 个 token（按整页留表）。超出上限的增量，`apply` 在改动任何东西之前就报错，不回 `Resync`：再发一份 `full` 也装不下。调度器通过 `[reads]` 读这两个键，接纳时拒绝装不下的请求（#31）。
 
 ### 4.4 一步重叠
 
@@ -202,7 +211,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
    - worker 的 `quiesce()`：等 GPU 上的工作都做完。
    - 领头的调度器先停，跟随的 worker 跑到同一步再停。所以执行阶段卸掉的东西，不会还有在途的工作在用。
 7. **投机解码**：开投机时，下一步的位置取决于这一步接受了几个草稿 token，这个数只在 GPU 上才知道。v0 规定开投机时不重叠。以后位置也可以写成引用，具体记录形式在 M2d 决定，是否新增分段或版本按 §3 判断。
-8. **同步循环是特例**：收到第 N 步的结果才发第 N+1 步，记录完全相同。阶段 2 默认走同步循环；M2d 加开关 `sched.overlap`（live 键），并加一组对比：开重叠和不开重叠，token 完全一致（要求所用的 kernel 和 batch 怎么拼无关）。
+8. **同步循环是特例**：收到第 N 步的结果才发第 N+1 步，记录完全相同。阶段 2 默认走同步循环；M2d 加开关 `sched.overlap`（live 键），并加一组对比：开重叠和不开重叠，按 §1.3 的口径一致。2026-11-08 更新：开关和在途步队列在第 3 步就做了（默认关），对比先用测试夹具跑（`engine/core/sched/README.md`）。
 9. **可观测**：`StepStats` 给出每步的 CPU 时间、GPU 时间、GPU 空闲时间。RSI agent 靠它判断瓶颈在不在 CPU，再决定开不开重叠、怎么调。
 
 ### 4.5 按列编码
@@ -237,10 +246,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - 可选：`grow`、`refit`、`relocate`、`export_state` / `import_state`，用 `capabilities.actions` 和 `[state] migrate` 声明。`grow` 仅保留为实现可声明的动作，不要求阶段 2 实现在线扩容，也不承诺地址不变或免重录。
 - **绑定代数**：交出去的 buffer 只要有一个换了地址、shape 或 dtype，代数就加一；同地址换内容不加。graph 在 replay 前，每个提供者只比对一个整数（§9.3）。
 - **scratch 条目**：capture 前的 warm-up 会真的跑起来，GDN 的 recurrent state 会被推进，KV 会被写入。如果用在途请求的条目来 warm-up，它们的状态就坏了（探针 P6）。所以每种状态都留出 scratch 条目，永远不分给请求。
+- **条目编号**（2026-11-09，#30 评审）：账本分出去的编号是 `0 .. capacity - 1`，scratch 条目的编号在这个范围之外（`scratch()` 给出）。条目在 buffer 里放在哪是存储单元自己的事。SGLang 布局的两个存储单元把条目 `i` 放在页或槽 `i + 1`，和行 `r` 在表里是 `r + 1` 一样；页或槽 0 是 SGLang 的 padding，也就是 scratch 条目，编号 `-1`。持久 batch 的表里存的是页号和槽号，所以 padding 行的 0 指向的正是 padding。
 
 ### 5.3 联合账本与内部状态池（调度宿主里，`ledger@1`）
 
-2026-11-08 更新：以下是 M2d 前缀缓存的设计目标。池与联合准入算法归 `core.state.alloc` 实现所有，不预先要求拆成独立单元；共享 `AccountingPlugin` 已删除。需要独立替换插件时，再围绕实际交接提取必要接口。本 PR 只保留已有的 `common_prefix` 辅助算法，账本实现由后续 PR 提供。
+2026-11-08 更新：以下是 M2d 前缀缓存的设计目标。池与联合准入算法归 `core.state.alloc` 实现所有，不预先要求拆成独立单元；共享 `AccountingPlugin` 已删除。需要独立替换插件时，再围绕实际交接提取必要接口。本 PR 只保留已有的 `common_prefix` 辅助算法，账本实现由后续 PR 提供。2026-11-08 更新：第 3 步接入了 #22 的不带前缀缓存的账本，调度器调用的最小调用集在 `core/contracts/ledger.py`。
 
 `core.sched` 调用状态单元 `core.state.alloc` 的 `ledger@1`，仍然是真实跨单元交接。M2a 接入时，将调度器实际需要的最小调用集定义到 `core.contracts`；本节的准入、预留/快照、发布、取消、延迟释放和退休语义继续约束它，随当期功能实现相应调用。每类池的 `reusable`、`declare`、`set_capacity` 等内部细节留在账本实现里。
 
@@ -305,9 +315,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - decode 每步只算一个 token，正好落在边界上的那一步打快照。开投机时，一步接受几个 token 事先不知道，所以 v0 开投机时 decode 期间不打快照。
 - MTP：config 里有 1 层 MTP，它的 KV 是 `kv.paged` 的另一层声明。
 
-### 5.5 可配置、可扩展的状态布局（2026-11-09，@gaow0007 负责 GPU 侧设计）
+### 5.5 状态布局：严格照 SGLang（2026-11-09）
 
-本节定义后续实现的选择规则和验收要求；布局注册、配置解析和能力匹配尚未实现。模型声明需要保存的状态，存储与 backend 协商物理布局。不能仅按 attention 类型写死 NHD/HND，也不能因开启 prefix caching 就固定选择 NHD。存储单元由 @wutianyuan1 这边实现，GPU 布局与 kernel 约束由 @gaow0007 提供，实际交接由双方确认。
+**2026-11-09 @wutianyuan1 和 @gaow0007 定：KV cache 和 GDN 状态池的组织方式不变，严格照 SGLang**（`MHATokenToKVPool`、`MambaPool`，§5.5.8）；配置项、默认值和启动时的兼容性检查也照 SGLang（§5.5.3）。阶段 2 每种状态只有这一种物理布局，不做开放的布局注册，也不要求第二种物理布局（HND 等）。§5.5.1 的分层、§5.5.4 和 §5.5.5 的规则继续适用；§5.5.7 是 SGLang 的配置空间记录，以后加布局时照它来。
+
+以下是 @gaow0007 的原设计（2026-11-09），按上面的决定改过 §5.5.2、§5.5.3、§5.5.6、§5.5.8。存储单元由 @wutianyuan1 这边实现，GPU kernel 的约束由 @gaow0007 提供。
 
 #### 5.5.1 分开描述语义、布局和分配
 
@@ -324,40 +336,32 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - §5.4 的 shape、FP32 recurrent 和显存数字是当前模型的基线。改变精度、conv 历史容量或投机临时状态后，需要重新计算预算并验证数值；持久状态精度和 kernel 的累加精度分别记录。
 - page size 是逻辑缓存页的 token 数，分配字节数与对齐由实际存储实现确定。
 
-#### 5.5.2 布局作为开放实现接入
+#### 5.5.2 布局：照 SGLang，不做开放注册（2026-11-09 改）
 
-- 布局使用开放的名称与参数，由实现登记能力；不在框架本体维护封闭的 NHD/HND 枚举。新增布局应能随实现接入，不要求修改模型或所有 backend。
-- 实现负责给出 buffer 组织、合法参数和可用的写入/复制路径；量化布局还要描述 scale 等辅助 buffer。登记随单元生命周期撤销，不能在 reload 后留下旧实现引用。
-- backend 必须声明实际支持的组合；形状匹配不等于物理布局兼容。`permute()` 产生的视图可能不连续，只有消费者接受对应 stride 时才能直接使用。
-- 按 §3 保持最小共享交接面：布局选择算法、候选评分和注册表内部结构留在实现。只有消费者实际需要的布局标识、轴语义和 buffer 约束才进入共享定义；不预先建立覆盖全部框架的布局对象模型。
-- 当前 `StateDecl.tensors` 和 `Binding.buffers()` 尚不能完整表达这些约束。实现第一组存储/backend 时同步补齐必要交接与测试，不把现有 shape/dtype 字段视为已完成布局协商。
+- 阶段 2 每种状态的物理布局就是 SGLang 的那一种（§5.5.8），写在存储单元里。不建布局注册表，`StateDecl` 和 `Binding` 里也不加布局名：只有一种布局时，这些字段没有消费者（§3）。
+- 以后要加第二种布局，照 SGLang 的方式加：做成存储单元的一个配置项（例如 SGLang 用 `SGLANG_USE_HND_KVCACHE` 选 HND），消费它的 kernel 在启动校验时检查（§5.5.3）。到那时再按 §3 补需要交接的字段。
+- 原设计里仍然成立的两条：形状对得上不等于物理布局兼容；`permute()` 得到的视图可能不连续，只有消费者接受对应的 stride 时才能直接用。
 
-#### 5.5.3 显式配置与自动选择
+#### 5.5.3 配置项与启动时的检查：照 SGLang（2026-11-09 改）
 
-支持按状态种类配置，并允许兼容的层组覆盖默认值。共享同一物理池的层必须满足该池的布局约束；重叠或矛盾的层组配置在分配前拒绝。
+配置项只对应 SGLang 已有的参数，默认值和 `auto` 的含义也照 SGLang。都是 startup 键：
 
-下面仅示意配置意图，名称与配置键在实际接入时定义，不是当前可用的启动参数：
+| agxinfer 的键 | SGLang | 默认值 |
+|---|---|---|
+| `state.kv.page_size` | `--page-size` | 16 |
+| `state.kv.dtype` | `--kv-cache-dtype` | `auto`：等于模型的 dtype |
+| `state.gdn.ssm_dtype` | `--mamba-ssm-dtype` | `auto`：模型 config 里的 `mamba_ssm_dtype`，没有就是 f32（`mamba2_state_dtype`） |
+| `state.gdn.conv_dtype` | 环境变量 `SGLANG_MAMBA_CONV_DTYPE` | bf16（SGLang 的 conv state 不跟模型 dtype） |
+| `attn.backend`；`attn.prefill_backend`、`attn.decode_backend` | `--attention-backend`；`--prefill-attention-backend`、`--decode-attention-backend` | `auto`；按阶段的两个键为空时跟 `attn.backend` |
+| `gdn.backend`；`gdn.prefill_backend`、`gdn.decode_backend` | `--linear-attn-backend`；`--linear-attn-prefill-backend`、`--linear-attn-decode-backend` | `auto`；同上 |
 
-```yaml
-state_layouts:
-  kv.paged:
-    layout: auto             # 也可显式指定 kv.nhd / kv.hnd
-    dtype: bfloat16
-    page_size: 16            # 示例值，不是所有 backend 的默认值
-  gdn.slots:
-    recurrent:
-      layout: gdn.k_last
-      dtype: float32
-    conv:
-      layout: gdn.conv_ds
-      dtype: bfloat16
-```
-
-- **显式配置**：严格验证，不兼容时 fail-fast；诊断指出状态/层组、消费者、执行阶段和冲突参数。不能静默换布局、降精度或关闭已启用功能。
-- **`auto`**：结合模型尺寸、硬件、dtype、已选或候选 backend，联合选择兼容方案。至少检查 prefill、decode，以及启用的 verify、graph、copy、prefix restore、PD/offload 路径。未启用的功能不强加约束；以后启用时重新校验。
-- 先过滤不合法组合，再根据明确的偏好与性能数据选择。固定实现版本、硬件与配置时，选择应可复现；没有性能数据时使用记录在实现中的确定性优先级，不宣称最优。
-- 无兼容方案时默认报错。转换只能作为显式允许的适配路径，说明临时空间、数据移动、同步和 graph 限制；不能隐藏每步转换整个状态池的代价。参照 kernel fallback 同样必须满足布局约束。
-- 解析结果在启动信息与 introspection 中可见：各状态/层组的实际布局、dtype、page size、消费者与选择理由。`auto` 在分配时解析，不能在每个 step 中悄悄切换物理布局。
+- backend 的名字就是 kernel 目录里 solution 所属的那一组（§6），例如 `reference`，以后的 `flashinfer`、`triton`。
+- **显式指定的 backend 是硬约束**：这一组的 solution 必须覆盖该阶段要用的每个 definition，并且适配这个模型的 shape 和平台，否则启动失败；不退回参照实现。
+- **`auto`**：按 kernel 目录的规则选（§6），选不到就用参照实现，并在日志里标出 fallback。
+- dtype 的约束照 SGLang 在启动时检查（如 `handle_linear_attn_backend`：SM100 上 flashinfer 的 GDN decode / verify 要求 `mamba_ssm_dtype` 为 bf16），不兼容就报错，不悄悄降精度。这类检查随对应的 kernel 一起接入。
+- 解析在 worker 启动时做一次，结果打一条 INFO 日志：平台；每种状态的 dtype 和页大小；prefill、decode 两个阶段各自的 backend 和每个 definition 选中的 solution，是否 fallback；verify 标为 disabled。运行中不再换。
+- **实现（2026-11-09）**：dtype 键由 `state.kv_paged`、`state.gdn_slots` 声明，模型单元读它们生成 `StateDecl`；backend 键由 `layers.attn`、`layers.gdn` 声明。`core.plan` 启动时让每个 backend `resolve`（`Backend.resolve`，共享代码在库 `engine/layers/solutions.py`），把结果打成一行 `core.plan: {json}`，也放在 `plan@1` 的 `resolved` 上；之后 backend 只调用固定下来的 solution。kernel 目录按名字选 backend 的规则见 §6。测试：`tests/units/executors/test_config.py`。
+- fp32 的对齐测试把三种状态的 dtype 都显式配成 f32；默认配置下 conv state 是 bf16，和 SGLang 一样。
 
 #### 5.5.4 前缀复用、投机与 buffer 交接
 
@@ -380,14 +384,15 @@ state_layouts:
 | 状态 dtype/量化格式改变 | 验证数值并转换或重建；明确前缀快照是否失效，不自动继续复用 |
 | 已支持的状态池容量变更 | 按实际资源变化检查绑定；重新分配或改变视图结构时递增 binding generation、使受影响 graph 失效，并按 §9.4 处理状态迁移和重录；无实现则拒绝 |
 
+- **实现（2026-11-09，最小版本）**：排空和迁移实现之前（第 5 步，[state-changes.md](state-changes.md)），`core.deps` 对“会让持有在途状态的状态单元重载”的配置变更不做重载，改为要求重启引擎（`restart_engine`，`apply` 以 `escalate.restart_engine` 失败，dry-run 的 notes 说明原因）。判断：这次变更改了某个单元读的 startup 键（或没有 hook 的键），使它重载；运行时会把提供者的使用者一起重载，所以连带算上；其中有 `kind = "state"` 且 `[state] drain_on_reload` 为真的单元（`state.kv_paged`、`state.gdn_slots`、账本、请求表、权重存储）就命中。§5.5.3 的 dtype、页大小、池子大小都属于这种键。改这些单元自己的代码引起的重载不在这条规则里，留到第 5 步。测试：`tests/units/core/test_deps.py`。
 - 只有数值语义保持且引用/索引能正确重映射时，迁移才可保留前缀缓存；否则明确失效或排空。
 - 旧 buffer、graph 与复制源必须等在途使用结束后再释放。迁移或 capture 失败时清理候选资源；只有确认旧状态完整才能恢复服务，否则进入恢复流程，不能报告切换成功。
 
 #### 5.5.6 分阶段实现与验收
 
-- 首版只实现当前模型和选定 kernel 真正需要的布局；扩展机制至少用两种真实物理布局验证，例如 NHD 与 HND。该项不要求首版完成 PD、所有量化格式或所有 attention 类型。
-- M2a 用 CPU 参照验证配置解析、轴语义、stride、页/槽寻址、复制和不兼容配置的拒绝；M2b 在 SM100 验证真实 kernel，覆盖 prefill → decode 及支持的布局组合。
-- M2c 覆盖地址相同但 stride/布局解释改变时的 graph 失效、capture scratch 隔离、候选失败清理，以及在途工作完成后释放旧资源。
+- 首版只实现 SGLang 的这一种布局（§5.5.8），不要求第二种物理布局，也不要求 PD、量化格式或其他 attention 类型（2026-11-09 改）。
+- M2a 用 CPU 参照验证页/槽寻址、copy、clear、padding 条目，以及 §5.5.3 里不兼容的显式配置在启动时被拒绝；M2b 在 SM100 验证真实 kernel，覆盖 prefill → decode（2026-11-09 改）。
+- M2c 覆盖地址相同但 stride 改变时的 graph 失效、capture scratch 隔离、候选失败清理，以及在途工作完成后释放旧资源。
 - M2d 随功能落地覆盖 prefix hit/miss、共享页续写保护、GDN 快照恢复、投机部分接受后的 recurrent/conv 一致性，以及启用的 overlap/传输路径。
 - 比较逻辑结果，不比较不同布局的原始字节顺序。使用非对称内容和非平凡 stride；参照实现支持时用不等的 K/V 维度，避免方阵掩盖转置错误。保持 dtype 和计算路径时验证布局转换不改变语义；精度变化另设明确容差与长序列验证。
 - 延续 A/B/C 方法：A 缺少待验收能力或存在原缺陷，B 为正确实现；C 植入忽略 stride、遗漏 generation 更新、共享页被写入或提前释放等缺陷。加强测试直到 A/C 失败而 B 通过。性能测试计入状态写入、适配复制和同步成本，不只测 attention kernel。
@@ -441,41 +446,41 @@ state_layouts:
 | HiCache IO | [arg_groups/hicache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/hicache_hook.py) 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；agxinfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
 | SM100 FlashInfer GDN | [arg_groups/attention_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/attention_hook.py) 的该 decode/verify 路径要求 BF16 recurrent state；[gdn_triton.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) 声明 K-last 池 | 保留 FP32 参照路线；请求该 FlashInfer 路径时显式选择并验收 BF16，不静默降精度 |
 
-#### 5.5.8 agxinfer 首版确定的布局与选择顺序
+#### 5.5.8 阶段 2 的布局：严格照 SGLang（2026-11-09 改）
 
-以下是本设计的默认值和扩展边界，不代表实现已经支持，也不声称是 SM100 性能最优组合。适用范围是阶段 2 的 Qwen3.8 TP1；实现后以契约与 GPU 测试解锁对应组合。
+原设计的默认值表和 auto 的选择顺序（逐层独立池、`[P,16,Hkv,D]`、HND 扩展等）按 §5.5 开头的决定作废，改成下表。这就是 #30 实现的布局（2026-11-08），代码不变。
 
-| 状态/模式 | 默认或显式选择 | 约束 |
-|---|---|---|
-| 普通 full-attention KV | **逐层独立 K、V 池；物理 NHD；BF16；page size 16**。每层每个 tensor 为 `[P,16,Hkv,D]` | 16 是首版工程默认，可配置且须满足所有消费者；该模型 TP1 的 Hkv=4、D=256。缓存引用按页管理 |
-| 普通 KV 的 HND 扩展 | 显式 `kv.hnd`，物理 `[P,Hkv,N,D]` | 先用它验证扩展机制；prefill/decode/verify、append/copy 均通过后才接受。普通 NHD wrapper 不自动变成 HND backend |
-| prefix cache 开/关 | **不改变上述 KV 物理布局**；首版仅发布完整页 | 命中引用已有页；未满页由请求独占，不提前共享。未来部分页共享须先实现 copy-on-write |
-| SWA | 扩展时优先沿用相同的页内 NHD/BF16，独立 window 池和回收规则 | 需实现窗口对齐、前缀可恢复范围；不因声明了默认值就视为阶段 2 已支持 SWA |
-| GDN recurrent | **逐层独立池；K-last `[S,Hv,V,K]`；FP32**。当前模型为 `[S,48,128,128]` | 基线对接 CPU 参照及兼容的 Triton/FLA 路径；输出、状态连续演进须验证 |
-| GDN conv | **逐层独立池；DS `[S,C,W]`；BF16**。非投机基线为 `[S,10240,3]` | W 按实际 conv/verify 算法决定；投机历史和临时状态另外预算，不将 3 写死为所有模式的容量 |
-| FlashInfer GDN BF16 路线 | 显式 BF16 recurrent 配置，保留 K-last；兼容的 prefill/decode/verify 组合 | 单独做长序列、prefix restore 和部分接受验证。FP32 配置与要求 BF16 的 kernel 冲突时拒绝 |
-| GDN 前缀与 capture | 基线快照沿用对应状态格式，恢复到独占槽；scratch 与运行条目隔离 | int8 快照、ReplaySSM 等作为后续能力，不进入默认组合 |
-| MLA、稀疏/压缩、FP8/FP4 | 各自的开放布局实现 | 首版不以 `kv.nhd` 冒充支持；缺失实现或消费者能力时拒绝 |
-| 跨层打包、HiCache、PD、offload、CP | 独立配置与扩展能力；首版不默认启用 | 物理层视图、host/传输格式、索引和生命周期通过专项测试后接入；不能因选择 NHD 就自动开启 |
+| 状态 | 布局（SGLang） | dtype（§5.5.3） | 说明 |
+|---|---|---|---|
+| full-attention KV（`kv.paged`） | `MHATokenToKVPool`：每层一份 K、一份 V，`[容量 + page_size, kv 头数, head_dim]`，按 token 槽寻址（物理上是 NHD）；槽 0 所在的页做 padding | `state.kv.dtype`，默认等于模型的 dtype（bf16） | page size 16；前缀缓存只发布完整页，没写满的页归请求自己（§5.5.4） |
+| GDN recurrent（`gdn.slots` 的 temporal） | `MambaPool`：`[GDN 层, 槽 + 1, v 头, v_dim, k_dim]`（K-last）。所有 GDN 层叠放在一块里，每层的切片是连续的；槽 0 做 padding | `state.gdn.ssm_dtype`，默认 f32 | temporal 是 `[v_dim, k_dim]`，和 HF 的 `[k_dim, v_dim]` 互为转置；参照 kernel 按 SGLang 的排法写，和 HF 比时转置（`tests/units/kernels/test_reference.py`） |
+| GDN conv | `MambaPool`：`[GDN 层, 槽 + 1, conv_dim, kernel - 1]`（DS） | `state.gdn.conv_dtype`，默认 bf16 | |
+| 持久 batch 的表 | `HybridReqToTokenPool`：`req_to_token` `[行 + 1, 最大上下文]` int32，以及行到 GDN 槽的映射 | | |
+| HND、跨层打包、量化 KV、MLA、SWA、HiCache、PD、offload、CP | 阶段 2 不做 | | 以后照 SGLang 对应的开关加（§5.5.2、§5.5.7） |
 
-**auto 的确定性规则：**
-
-1. 读取模型状态、精度要求和启用功能；明确的 backend/layout/dtype/page size 均为硬约束。target 与 draft 分别解析，共享池时再检查交接一致性。
-2. 枚举已注册且已验收的存储/backend/适配组合，过滤上述不兼容项。没有组合时在分配及 capture 前失败，并报告具体原因；不改变用户指定的精度或关闭功能。
-3. 在普通 BF16 KV 的剩余组合中优先选择逐层 NHD；仅在显式 backend 排除了 NHD、且 HND 全部消费者已支持时，auto 才选择物理 HND。接受 NHD 的无复制 HND 形状视图不构成更换物理布局的理由。
-4. GDN 默认 K-last/FP32 + conv DS/BF16；仅指定 backend 不授权降精度。BF16 recurrent 路线需显式选择相应精度。没有兼容实现就报错。
-5. 记录实际物理布局和 kernel 视图的 shape/stride、转换路径及选择理由。性能测量可以在后续版本调整 auto 优先级，但已分配池只能通过 §5.5.5 的变更过程切换。
-
-**组合验收范围：** 不穷举所有 CLI 参数，而是按上述能力轴建立约束矩阵。对首版支持的物理 NHD/HND，覆盖 prefix 开/关与 hit/miss、eager/graph、支持的 prefill/decode；M2d 再交叉加入投机开/关和 overlap 开/关（按 §4.4，投机+overlap 必须被拒绝）。GDN 每条精度路线覆盖运行/快照恢复/部分接受，包含 KV 命中长度与 GDN 快照位置不一致的混合状态。所有列明的拒绝组合也要有 fail-fast 测试。跨层非连续 stride、非整页长度、共享页续写和在途释放是独立边界用例；未验收的组合不能由 auto 选中。
+**组合验收**：§5.5.3 每一种不兼容的显式配置都有一条启动失败的测试；prefix 开/关、eager/graph、投机和重叠的交叉，随对应功能在 M2c、M2d 覆盖。
 
 ## 6. kernel 目录
 
 代码：`core/contracts/kernels.py`。schema 和 flashinfer-bench 的 Definition / Solution 对齐。
 
-- **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_cpu` 上跑，是 CI 的基准，也是检验 solution 的标准。
+- **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_eager` 上跑，是 CI 的基准，也是检验 solution 的标准。
 - **solution** 写怎么算：用哪个库的哪个版本、支持哪些 shape、能不能录进 graph、需要哪些平台能力、要不要进程级初始化、能不能跨机。
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
+- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）仍在每次调用时按 `auto` 选。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
+- **实现（2026-11-08）**：
+  - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
+  - 选择：符合 shape 和平台能力的非参照 solution 里按 id 取第一个；没有就用参照实现，`Selected.fallback` 为真。`Definition.reference` 是参照 solution 的 id。
+  - definition 的名字和 solution 的 id 在目录里唯一，重复登记会报错，所以查找结果和登记顺序无关。重载时旧实例的登记先撤掉，新实例再登记，不会撞名。参照 solution 的 id 带版本（`reference.gemm.linear@1`），同一 definition 的新旧版本可以同时登记（2026-11-09）。
+  - `kernels.reference`（`engine/kernels/reference/`）登记 Qwen3.8 要的全部 definition 和 PyTorch 参照：`norm.gemma_rms`、`norm.rms_gated`、`pos.rope`、`act.silu_and_mul`、`gemm.linear`、`embed.lookup`、`kv.store`、`attn.extend`、`attn.decode`、`gdn.conv1d_fn`、`gdn.conv1d_update`、`gdn.gating`、`gdn.chunk_delta_rule`、`gdn.recurrent_update`、`sample.seeded`（都是 `@1`）。
+  - **2026-11-09 改为从 SGLang（`e838360`）搬运**：每个 definition 的签名就是它对应的 SGLang kernel 的签名，参照实现是 SGLang 的 native 路径，或 SGLang 用来检验 CPU kernel 的 torch 参照（`test/registered/cpu/test_mamba.py`、`test_causal_conv1d.py`，最初来自 vLLM 和 fla）。attention 是 `TorchNativeAttnBackend` 的 SDPA，采样是 `Sampler` 加 `multinomial_with_seed`，murmur hash 从 Triton 改写成 torch。原来自己写的 `pos.rope_neox`、`attn.paged`、`gdn.conv1d`、`gdn.delta_rule` 已删除。
+  - 和 HF `qwen3_5` 对照测试；conv 和 delta rule 按 SGLang kernel 的接口在状态池上按槽读写，可以接着上一块的状态继续算。采样按（seed, 位置）取随机数。
+  - **和 batch 怎么拼是否无关**（`Definition.batch_invariant`，默认否，2026-11-09 更正）：
+    - 声明为是的只有按构造成立的：`attn.extend` / `attn.decode`、`gdn.conv1d_fn`、`gdn.chunk_delta_rule` 逐个序列算，lookup 和 store 只搬数据。decode 的 conv / delta rule 一步和采样是整批一个算子，不声明。
+    - norm、RoPE、激活、linear、gating 是一个 torch 算子作用在整个 batch 上，PyTorch 会随行数换计算路径和累加顺序，不声明。实测 CPU fp32 的 linear，同一行单独算和放进 batch 里算，最后几位不同；两个 logit 很接近时，greedy 会选出不同的 token。
+    - 所以五组对比不要求逐位一致，按 §1.3 的口径（2026-11-09）。
+  - 测试：`tests/units/kernels/`，对照 HF 的实现、分块等于不分块；声明和 batch 怎么拼无关的参照，单独算和放进 batch 里算逐位相同。
 
 ## 7. 层、模型、权重
 
@@ -484,6 +489,23 @@ state_layouts:
 - 逻辑张量 = 格式（插件）+ 放置（数据）。层不持有权重，只从权重存储拿视图，所以 refit 是原地换内容，graph 不用重录。
 - 模型单元在启动时给出 `Assembly`：用哪些层、每层存什么状态、有哪些权重。各项尺寸从 checkpoint 的 config 读，不写死。
 - Qwen3.8：64 层，48 层 GDN、16 层 full attention，排列是 3 层 GDN 加 1 层 full attention 重复。M2a 用同样的结构、小尺寸、随机权重。
+- **实现（2026-11-09，worker 循环以下的 eager 路径，全部从 SGLang `e838360` 搬运后适配）**：
+
+  | 单元 | 提供 | 来自 SGLang |
+  |---|---|---|
+  | `core.state.weights` | `state.weights@1` | `DefaultModelLoader` / `DummyModelLoader`：`safetensors_weights_iterator`、`initialize_dummy_weights`；参数放在这个状态单元里，模型重载不丢；`refit` 原地换内容，不留副本，abort 时重新读原来的来源（和 `update_weights_from_disk` 的回滚一样） |
+  | `models.qwen38` | `model@1` | `Qwen3_5ForCausalLM`（TP1，无投机、量化、LoRA、融合 kernel）：参数名用 SGLang 的（融合后的 `qkv_proj`、`gate_up_proj`、`in_proj_qkvz`、`in_proj_ba`），`load_weights` 原样搬运，作为 loader 登记到权重存储 |
+  | `layers.linear`、`embedding`、`norm`、`rope`、`activation`、`sampler` | `layers.<名字>@1` | `LinearBase`、`VocabParallelEmbedding` 和 `LogitsProcessor` 的 LM head、`GemmaRMSNorm`、`RMSNormGated`、`RotaryEmbedding`、`SiluAndMul`、`Sampler`；都按 definition 调目录 |
+  | `layers.attn`、`layers.gdn` | `layers.attn@1`、`layers.gdn@1`（`Backend`） | `RadixAttention` + `TorchNativeAttnBackend`；`RadixLinearAttention` + `GDNAttnBackend` 的普通路径。`prepare` 就是 `init_forward_metadata`；MIXED 步走 extend |
+  | `state.kv_paged`、`state.gdn_slots` | `state.kv.paged@1`、`state.gdn.slots@1` | `MHATokenToKVPool`（每层 `[size + page_size, kv 头, head_dim]`，槽 0 所在页是 padding）；`MambaPool`（conv `[层, 槽 + 1, conv_dim, K-1]`、temporal `[层, 槽 + 1, HV, V, K]` fp32，槽 0 是 padding），`copy` 即 `copy_from`，`clear` 即 `clear_slots`；条目 `i` 是页或槽 `i + 1`（§5.2） |
+  | `worker.batch` | `worker.batch@1` | `HybridReqToTokenPool`：`req_to_token`、行到 GDN 槽的映射；记录里的行 `r` 是表里的 `r + 1`，条目 `i` 是页或槽 `i + 1` |
+  | `executors.pytorch`（原名 `executors.eager`） | `executor@1` | `ModelRunner`：从 position 0 开始的行先清 GDN 槽（`mamba_clear_indices`）、恢复快照、组装 `input_ids` / `positions`、各 backend 准备、前向、在每行最后一个 token 的位置采样 |
+
+  - 接缝：worker 循环只调 `executor@1`（`core/contracts/execution.py`），持久 batch、backend、模型、采样器都在它后面。~~`executors.eager` 和 `executors.cuda` 是同一个服务的两种实现，一个 worker 角色只加载其中一个~~（2026-11-09，#30 评审）。2026-11-09 改：两者二选一就做不到“同一个 worker 里有的 bucket 走 graph、有的走 eager”（§9.1、§9.4.3），所以只留一个 executor，叫 `executors.pytorch`，在 `torch_eager` 和 `cuda_sm100` 上都用它；graph 由 `core.plan` 提供，照 SGLang 的 `ModelRunner` 和它的 runner。不再有 `executors.cuda`。
+  - 每一步（2026-11-09）：先选 plan，再动状态。decode 步取 `plan@1.buckets("decode")` 里装得下这些行的最小 bucket，别的步或者没有装得下的，取 bucket 0（eager）；然后应用 delta、清新请求的槽、做 `StateCopy(before)`；再 `plan.run(...)`（plan 里先让各 backend `prepare`，再前向或 replay），在 plan 外采样，做 `StateCopy(after)`。graph 报 `StaleGraph` 就改走 eager。`BatchPlan.bucket` 只是调度器的提示。测试：`tests/units/executors/test_plans.py`，用一个补 padding 后 eager 执行的假 graph 验证路由、失效退回，以及 padding 行只写 padding 条目。
+  - 契约随之补了：`WeightStore.register` / `load`、`Model`、`PersistentBatch.check` / `sampling` / `record`、`StateStore.clear`。
+  - 每一行都采样（SGLang 也是）。prefill 中间块采到的 token 由调度器在调 `RequestTable.sample()` 之前丢掉。
+  - 测试（`tests/units/executors/test_pytorch.py`，CPU fp32）：贪心生成和 HF 逐 token 相同，logits 在 1e-4 内；批量对单条、分块 prefill 对不分块、batch 重建（先回 `Resync`，收到全量增量后接着生成）对不重建、快照恢复对从头算，token 相同，logits 在容差内；条目从 0 开始分（和账本一样），每步之间改写 scratch 条目，token 不变。
 
 ## 8. attention 和 GDN 的 backend（@gaow0007 审）
 
@@ -492,6 +514,8 @@ state_layouts:
 **职责总则：backend 准备元数据、组织计算及状态更新；worker 保证执行顺序和配置切换边界；plan 管理 graph 的捕获、选择和失效。** backend 不在每步调用中自行切换配置或重录 graph。
 
 ### 8.1 layout 与各阶段 backend/kernel 的联合选择（2026-11-09 讨论确认）
+
+2026-11-09 补充：阶段 2 每种状态只有 SGLang 的那一种布局（§5.5），下面说的显式配置就是 §5.5.3 那张表里的键，解析和日志按 §5.5.3 做。
 
 - **显式 layout 是硬约束。** 用户指定 layout、其余选项为 `auto` 时，参考 SGLang 在对应设备、模型和精度下的默认搭配，从 agxinfer 已注册且已验收的组合中选择。遵守 §5.5.8 的布局和精度约束；不能为了套用默认 backend 而更换显式 layout、降低精度或关闭功能。SGLang 的默认搭配是选择依据，不代表 agxinfer 已支持该组合。
 - **启动或配置变更时统一解析、校验完整组合。** 一次解析启用阶段的 prefill/decode/verify backend 与具体 kernel/solution，并校验模型语义、设备、物理 layout/stride、dtype、page size，以及启用的 prefix、speculation 和 graph 能力。未启用的 verify 标为 disabled；以后启用时重新校验。不能让各阶段独立选择后，等执行时才发现状态不兼容。
@@ -564,11 +588,11 @@ state_layouts:
 
 | 待落实项 | 当前边界与建议 |
 |---|---|
-| Mixed batch | `BatchPlan.phase` 有 `mixed`，但 `PlanKey.phase` 只有 prefill/decode。建议首版明确走 eager，由 backend 按行组织执行；拆分方式及接口映射仍需落实，不能伪装成 decode graph。未支持的组合在状态更新前拒绝 |
+| Mixed batch | `BatchPlan.phase` 有 `mixed`，但 `PlanKey.phase` 只有 prefill/decode。建议首版明确走 eager，由 backend 按行组织执行；拆分方式及接口映射仍需落实，不能伪装成 decode graph。未支持的组合在状态更新前拒绝。2026-11-09 定：照 SGLang 的 `EagerRunner`，mixed 步当作 extend，走 bucket 0（eager），`PlanKey.phase` 记为 prefill（`core/contracts/plan.py` 的 `Backend`） |
 | GDN speculative 部分接受 | M2d 根据所选 SGLang 路径确定中间状态保存或恢复重算方案、历史容量、tree/chain 能力及验收范围；实现前拒绝对应 verify 组合 |
-| Backend 输入与绑定 | `forward(layer, *args)` 尚未表达 full attention/GDN 的参数语义。分别明确 tensor 顺序、shape/dtype、是否已经 normalization/scale/gate 变换，以及权重/状态绑定来源；在模型层与 backend 分别实现前落实 |
+| Backend 输入与绑定 | `forward(layer, *args)` 尚未表达 full attention/GDN 的参数语义。分别明确 tensor 顺序、shape/dtype、是否已经 normalization/scale/gate 变换，以及权重/状态绑定来源；在模型层与 backend 分别实现前落实。2026-11-09 已落实：`AttentionBackend.forward`、`GDNBackend.forward` |
 
-当前 `core/contracts/plan.py` 的 docstring 仍将 prepare 描述为 host 工作、forward 描述为只在 graph 内运行；stride/layout 的绑定失效条件和阶段表示也需在对应实现时与本节同步，本次仅补设计文档。
+~~当前 `core/contracts/plan.py` 的 docstring 仍将 prepare 描述为 host 工作、forward 描述为只在 graph 内运行~~：2026-11-09 已按 §8.4 改写，并补了 `Binding.generation` 的 stride 和提供者实例规则（§9.3）。
 
 **验收要求：** 按 §5.5.8 的支持矩阵覆盖连续执行与 chunk/prefix 恢复后的输出及状态、verify 接受零个/部分/全部 token、eager/graph 等价性，以及配置切换前后的执行版本一致性。增加 A/B/C 对抗用例：只恢复 recurrent 而遗漏 conv、重复 normalization、提前覆盖下一步元数据、混用 A 的 prepare 与 B 的 graph、候选 capture 改写活跃状态、依赖失效后仍 replay。错误实现应被测试拒绝；stream 时序、capture 隔离和切换中的在途工作必须有真实 GPU 测试，不能仅靠 fake 平台通过就宣称正确。
 
@@ -724,11 +748,11 @@ state_layouts:
 | 平台 | 用途 | 有没有计算 | graph |
 |---|---|---|---|
 | `fake`（已有） | 测引擎的机制：变更、重载、故障 | 没有，只有按名字调用的假 kernel | 记录依赖，replay 时检查 |
-| `torch_cpu`（新，@wutianyuan1） | 在 CPU 上跑真模型语义：M2a、CI 里的单元测试和五组对比 | torch CPU 张量、参照 kernel | 记下 capture 时的调用，replay 时检查依赖、重新执行 |
+| `torch_eager`（PR #24 已合入 master，2026-11-08） | 在 CPU 或进程自己的 CUDA 卡上跑真模型语义：M2a、CI 里的单元测试和五组对比、SM100 上的 eager | torch 张量、参照 kernel | 不录 graph（`graph()` 报错），见 platform.md §2.3 |
 | `cuda_sm100`（新，@gaow0007） | SM100 | torch.cuda | 真 CUDA graph |
 
-- `torch_cpu` 和 `cuda_sm100` 跑同一套平台契约测试。
-- `torch_cpu` 上，“graph 对 eager”自然完全一致，这组对比只在 GPU 层有意义。
+- `torch_eager` 和 `cuda_sm100` 跑同一套平台契约测试。
+- `torch_eager` 上，“graph 对 eager”自然完全一致，这组对比只在 GPU 层有意义。
 
 ### 10.2 buffer
 
@@ -811,8 +835,8 @@ state_layouts:
 
 | 层 | 位置 | 平台 | 谁跑 |
 |---|---|---|---|
-| 单元的 CPU 测试 | `tests/units/<单元路径>/` | `torch_cpu`、`fake` | CI |
-| 引擎级 | `tests/scenarios/` | `fake`，M2a 以后加 `torch_cpu` | CI |
+| 单元的 CPU 测试 | `tests/units/<单元路径>/` | `torch_eager`、`fake` | CI |
+| 引擎级 | `tests/scenarios/` | `fake`，M2a 以后加 `torch_eager` | CI |
 | GPU | `tests/gpu/` | `cuda_sm100` | 在 SM100 上手动跑，像 formal 一样由 `addopts` 排除；@gaow0007 跑自己那几块，Devin 跑集成 |
 
 - 平台契约测试和 kernel 契约测试（solution 对参照实现）对每个平台、每个 solution 各跑一遍，用参数化，不用 skip。
@@ -887,8 +911,8 @@ state_layouts:
 
 ## 15. 待定
 
-1. §9.4 里还没测过的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿；不能分片时选哪种做法。
-2. `torch_cpu` 平台上的 graph：要不要模拟“录制时写死 Python 标量”。不模拟的话，这类错误只有 GPU 层才抓得到。
+1. §9.4 里还没测过、还没做的几件事：capture 前不清显存缓存、每个版本只 warm-up 一次、GPU 正忙时停下并切换；dry-run 怎么报重录造成的停顿。不能分片时走哪条路径，按 §9.4.1 的表选。
+2. ~~`torch_eager` 平台上的 graph~~：已定（2026-11-08），`torch_eager` 不录 graph；“录制时写死 Python 标量”这类错误由 `fake` 和 GPU 层抓。
 3. 前端和调度之间的流在 M2a 用每步记录流。前端以后要不要拆成多个进程，到时再定。
-4. 采样放在 graph 里还是 graph 外，由 @gaow0007 在 M2c 时定；契约只要求采到的 token 留在显存里，给 `from_previous` 用。
+4. ~~采样放在 graph 里还是 graph 外~~：已定（2026-11-09，§9.1），首版采样在模型 graph 外，采到的 token 留在显存里给 `from_previous` 用。以后要不要融进 graph，另行评估。
 5. 投机的记录：草稿放在哪、验证步的 `num_tokens` 怎么数。M2d 定，是否新增分段或版本按 §3 判断（§4.2）。
