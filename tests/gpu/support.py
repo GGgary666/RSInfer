@@ -1,4 +1,8 @@
-"""Shared by the GPU tests: a Qwen3.8-27B checkpoint cut to a few layers, and HF's model on it."""
+"""Shared by the GPU tests: a Qwen3.8-27B checkpoint cut to a few layers, and HF's model on it.
+
+Importing it turns TF32 off, here and in the engines the tests start (``NVIDIA_TF32_OVERRIDE``):
+cuDNN's convolutions default to TF32 on these GPUs, and the f32 comparisons with HF are meant to
+be f32 (on a SM100 the first logits of the partial model differed by 8e-3 with it on)."""
 
 from __future__ import annotations
 
@@ -14,6 +18,9 @@ import torch
 from safetensors.torch import load_file
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
+torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
 
 REPO = Path(__file__).resolve().parents[2]
 TEXT = {  # Qwen3.8-27B's text_config
