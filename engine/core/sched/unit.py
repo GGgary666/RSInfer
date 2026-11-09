@@ -16,6 +16,7 @@ from core.contracts.ledger import Ledger
 from core.contracts.policy import COMPOSE, ORDER, ComposePolicy, OrderPolicy
 from core.ipc.channels import Channels
 
+from .drain import Drain
 from .loop import Scheduler, Settings, Table
 
 
@@ -41,5 +42,6 @@ class Unit:
             tokens_to=channels.writer_to, discard=channels.discard, identity=lambda: str(control.identity),
             depth=lambda: 2 if config["sched.overlap"] else 1, settings=settings)
         ctx.on_config("sched.overlap", lambda value: None)  # read when planning: no reload needed
+        ctx.on_action("drain", Drain(self.loop))  # a change applies to an empty engine
         ctx.provide("proc.loop@1", self.loop)
         ctx.provide("sched.status@1", self.loop)

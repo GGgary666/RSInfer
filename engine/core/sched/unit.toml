@@ -12,6 +12,7 @@ services = ["sched.reqs@1", "ledger@1", "policy.order@1", "policy.compose@1", "p
 
 [capabilities]
 accept_config = true
+actions = ["drain"]  # a change applies to an empty engine (doc/specs/empty-apply.md)
 
 [reads]
 # What one row of the workers' persistent batch holds (worker.batch; stage2-contract.md §4.3).

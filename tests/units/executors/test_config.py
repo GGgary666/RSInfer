@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 import torch
 
-from tests.units.support.worker import Worker, tiny_config
+from core.change.types import ProcActions
+from tests.units.support.worker import Driver, Worker, tiny_config
 
 
 def worker(config: dict[str, Any] | None = None, capsys: pytest.CaptureFixture[str] | None = None,
@@ -82,14 +83,17 @@ def test_a_state_dtype_stage_2_does_not_keep_fails_the_start() -> None:
         Worker(tiny_config().to_dict(), **{"state.kv.dtype": "fp8_e4m3"})
 
 
-@pytest.mark.parametrize(("key", "value"), [
-    ("state.kv.dtype", "bf16"), ("state.gdn.ssm_dtype", "bf16"), ("state.gdn.conv_dtype", "f16"), ("model.dtype", "bf16"),
-    ("state.kv.pages", 16), ("state.gdn.slots", 4), ("holder.mem_fraction", 0.5), ("holder.state_ratio", 0.5),
-    ("holder.max_slots", 3), ("holder.cpu_bytes", 1 << 24)])
-def test_changing_what_the_state_pools_are_built_from_under_a_request_restarts_the_engine(key: str, value: Any) -> None:
-    """The stores read the keys the model resolves their dtypes from, and the holder those that size
-    them, so ``core.deps``, planning from the running worker's own introspection, refuses to reload
-    them in place (§5.5.5): a reload would otherwise reallocate them empty under the request."""
+READER = {"state.kv.dtype": "state.kv_paged", "state.gdn.ssm_dtype": "state.gdn_slots",
+          "state.gdn.conv_dtype": "state.gdn_slots", "model.dtype": "core.state.weights",
+          "state.kv.pages": "state.kv_paged", "state.gdn.slots": "state.gdn_slots",
+          "holder.mem_fraction": "core.state.holder", "holder.state_ratio": "core.state.holder",
+          "holder.max_slots": "core.state.holder", "holder.cpu_bytes": "core.state.holder"}
+"""The unit that reads each key the state pools are built from: the stores their dtype keys, the
+weight store the model config ``auto`` follows, the holder its sizing keys."""
+
+
+def plan_change(w: Worker, key: str, value: Any) -> ProcActions:
+    """``core.deps``'s plan for setting ``key`` on the running worker ``w``, from its own introspection."""
     from core.change.state import IdentityManifest
     from core.change.types import ChangeSet
     from core.common.framework import FrameworkModules
@@ -99,23 +103,58 @@ def test_changing_what_the_state_pools_are_built_from_under_a_request_restarts_t
     from core.sourcetree import read_tree
     from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
     from tests.framework.support import PROC
-    from tests.units.support.worker import ENGINE, Driver
+    from tests.units.support.worker import ENGINE
     from unit.runtime.host import introspection
 
+    intro = introspection(w.runtime, PROC, Identity("b"))
+    topo = Topology([HostSpec(PROC.host, "addr", "/snapshots", gpus=[0])], Mesh({"tp": 1}),
+                    [RankPlacement(0, PROC.host, 0)], [RoleSpec("worker", [], per_rank=True)])
+    tree = read_tree(ENGINE)
+    config = {**intro.config, key: value}
+    r = plan(World(ChangeSet(base=Identity("b"), config=config), IdentityManifest(topology=topo),
+                   IdentityManifest(config=config, topology=topo), tree, tree, {PROC: intro}, None,
+                   FrameworkModules.default()))
+    assert isinstance(r, Ok) and not r.value.restart_engine, r
+    (pa,) = r.value.procs
+    return pa
+
+
+@pytest.mark.parametrize("key", sorted(READER))
+def test_changing_what_the_state_pools_are_built_from_rebuilds_them_in_place(key: str) -> None:
+    """A change applies to an empty engine (doc/specs/empty-apply.md): ``core.deps`` reloads the
+    unit reading the key, and the runtime rebuilds the stores with it (their users go along),
+    instead of restarting the engine as it did while requests could be in it."""
+    value = {"state.kv.pages": 16, "state.gdn.slots": 4, "holder.mem_fraction": 0.5, "holder.state_ratio": 0.5,
+             "holder.max_slots": 3, "holder.cpu_bytes": 1 << 24, "state.gdn.conv_dtype": "f16"}.get(key, "bf16")
     w, _ = worker()
     try:
-        d = Driver(w)
-        d.add(0, [5, 17, 3, 44])
-        d.step({0: 4})
-        intro = introspection(w.runtime, PROC, Identity("b"))
-        topo = Topology([HostSpec(PROC.host, "addr", "/snapshots", gpus=[0])], Mesh({"tp": 1}),
-                        [RankPlacement(0, PROC.host, 0)], [RoleSpec("worker", [], per_rank=True)])
-        tree = read_tree(ENGINE)
-        config = {**intro.config, key: value}
-        r = plan(World(ChangeSet(base=Identity("b"), config=config), IdentityManifest(topology=topo),
-                       IdentityManifest(config=config, topology=topo), tree, tree, {PROC: intro}, None,
-                       FrameworkModules.default()))
-        assert isinstance(r, Ok) and r.value.restart_engine, r
-        assert key in r.value.notes[0] and "restart the engine" in r.value.notes[0]
+        pa = plan_change(w, key, value)
+        assert pa.reload is not None and READER[key] in [u.id for u in pa.reload.units_to_reload]
     finally:
         w.close()
+
+
+@pytest.mark.parametrize(("key", "value"), [("state.kv.dtype", "bf16"), ("state.gdn.conv_dtype", "bf16"),
+                                            ("state.kv.pages", 16)])
+def test_a_worker_rebuilt_for_new_state_config_generates_as_one_started_with_it(key: str, value: Any) -> None:
+    """The plan carried out on an empty worker: the next request's tokens equal those of a worker
+    built with the new value from the start, and the capacity follows the new pools."""
+    prompt = [5, 17, 3, 44, 9, 2]
+    rebuilt, _ = worker()
+    fresh, _ = worker({key: value})
+    try:
+        pa = plan_change(rebuilt, key, value)
+        assert pa.reload is not None
+        rebuilt.runtime.reload(pa.reload, values=pa.config).unwrap()
+        tokens = []
+        for w in (rebuilt, fresh):
+            d = Driver(w)
+            d.add(0, prompt)
+            d.generate([0], 4)
+            tokens.append(d.requests[0].outputs)
+        assert tokens[0] == tokens[1]
+        assert (rebuilt.service("executor@1").capacity().items
+                == fresh.service("executor@1").capacity().items)
+    finally:
+        rebuilt.close()
+        fresh.close()

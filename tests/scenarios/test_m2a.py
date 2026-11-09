@@ -6,6 +6,12 @@ worker process, equals what HF's model computes, greedy, token by token."""
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +21,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
-from tests.scenarios.deploy import cli, post, served
+from tests.scenarios.deploy import ENV, REPO, cli, post, served
 from tests.units.support.tokenizer import save_tokenizer
 from tests.units.support.worker import hf_greedy, tiny_config
 
@@ -95,6 +101,75 @@ def test_requests_through_the_whole_engine_follow_hf(model: Path, tokenizer: Pat
         streamed = cli("chat", "w5 w6 w7", "--url", url, "--max-tokens", "10")  # the CLI streams it (SSE)
         assert streamed == text
     assert sum(len(t.split()) for t in texts) >= 12, texts  # the model generated, rather than stopped at once
+
+
+def test_a_change_applies_to_an_empty_engine_refused_forced_or_waited_for(model: Path, tokenizer: Path,
+                                                                          tmp_path: Path) -> None:
+    """doc/specs/empty-apply.md through the whole engine and the operator's client: with a request
+    open, ``apply`` is refused and says how to go on; ``--force`` ends the request (its stream says
+    why) and applies; on an empty engine ``apply`` just applies; ``--wait-empty`` lets the request
+    run to its end, then applies. Serving goes on after each."""
+    args = ["--model", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype", "f32",
+            "--page-size", "4", "--max-rows", "8", "--max-context", "4096", "--token-budget", "8",
+            "--cpu-bytes", str(1 << 28), "--timeout", "120"]
+    workspace = tmp_path / "workspace"
+    shutil.copytree(REPO / "engine", workspace / "engine", ignore=shutil.ignore_patterns("__pycache__"))
+    policy = workspace / "engine" / "policies" / "fcfs" / "unit.py"
+    with served(tmp_path / "run", *args) as url:
+        control = json.loads((tmp_path / "run" / "control" / "control.json").read_text())["control"]
+
+        def apply(version: int, *flags: str) -> tuple[int, dict[str, Any]]:
+            policy.write_text(policy.read_text() + f"\n# version {version}\n")
+            out = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, "apply",
+                                  "--source", str(workspace), *flags], env=ENV, capture_output=True, text=True,
+                                 timeout=600)
+            return out.returncode, json.loads(out.stdout)
+
+        def stream(frames: list[str], max_tokens: int) -> threading.Thread:
+            body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3", "max_tokens": max_tokens, "temperature": 0.0,
+                    "stream": True, "ignore_eos": True}
+
+            def run() -> None:
+                req = urllib.request.Request(url + "/v1/completions", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    for line in r:
+                        if line.startswith(b"data: "):
+                            frames.append(line[6:].strip().decode())
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            deadline = time.monotonic() + 60
+            while len(frames) < 3:
+                assert time.monotonic() < deadline and t.is_alive(), frames
+                time.sleep(0.05)
+            return t
+
+        forced_frames: list[str] = []
+        long = stream(forced_frames, 4000)
+        code, refused = apply(2)
+        assert code == 1 and refused["status"] != "committed", refused
+        reasons = " ".join(d["reason"] for d in refused["diagnostics"])
+        assert "open request" in reasons and "--wait-empty" in reasons and "--force" in reasons, reasons
+
+        code, forced = apply(3, "--force")
+        assert code == 0 and forced["status"] == "committed", forced
+        long.join(60)
+        assert not long.is_alive() and any("apply --force" in f for f in forced_frames), forced_frames[-3:]
+
+        code, plain = apply(4)  # nothing in the engine now
+        assert code == 0 and plain["status"] == "committed", plain
+
+        waited_frames: list[str] = []
+        short = stream(waited_frames, 200)
+        code, waited = apply(5, "--wait-empty", "120")
+        assert code == 0 and waited["status"] == "committed", waited
+        short.join(60)
+        last = json.loads(next(f for f in reversed(waited_frames) if f != "[DONE]"))
+        assert last["choices"][0]["finish_reason"] == "length" and last["usage"]["completion_tokens"] == 200
+        assert waited["identity"]["new"] not in last["engine_identities"]  # it ran to its end before the change
+        got = post(url + "/v1/completions", {"model": "Qwen3.8-27B", "prompt": "w1 w2", "max_tokens": 4})
+        assert got["choices"][0]["text"] is not None
 
 
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:

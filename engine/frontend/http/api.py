@@ -5,6 +5,9 @@ See ../LICENSE.mini-sglang. Retains FrontendManager's per-request ack/event maps
 listener, wait_for_ack and StreamingResponse cancellation flow. Changes are the
 agxinfer record channel, instance-owned app/lifespan, identity metadata, actual
 finish reasons and token counts, and disconnect/stop cleanup.
+
+The frontend is the gate of the engine for changes (doc/specs/empty-apply.md): while one runs it
+takes no new requests (503 with ``Retry-After``), and ``Gate`` tells the change how many are open.
 """
 
 from __future__ import annotations
@@ -28,6 +31,13 @@ from core.contracts.requests import AbortRequest, FinishReason, NewRequest, Requ
 from core.contracts.sampling import SamplingParams
 from frontend.interfaces import Detokenizer, Message, TextStream, Tokenizer
 from frontend.transport import Channel
+
+CLOSED = "the engine is being changed; retry shortly"
+"""Why a request is turned away while a change empties the engine."""
+RETRY_AFTER_S = 1
+HINT = ("A change applies to an empty engine. Run the same apply with --wait-empty [SECONDS] to take no new "
+        "requests and apply once these ended (3600 s at most by default), or with --force to end them now with "
+        "an error and apply.")
 
 
 class ChatMessage(BaseModel):
@@ -91,6 +101,13 @@ class FrontendManager:
         self.failure: str | None = None
         """The token stream broke for good (two schedulers writing at once); a reload fixes it."""
         self.incarnation = 0
+        self.gate: str | None = None
+        """Closed (the change's mode) while a change empties the engine: new requests are turned away."""
+        self.entering = 0
+        """Requests between the gate and ``states``: a change that closes the gate waits for them too."""
+
+    def open_requests(self) -> int:
+        return len(self.states) + self.entering
 
     async def start(self) -> None:
         await self.channel.start()
@@ -173,6 +190,15 @@ class FrontendManager:
             self._ack(UserReply(uid, piece.text, state.finished, reason))
 
     async def submit(self, request: OpenAICompletionRequest, *, chat: bool) -> int:
+        self.entering += 1  # before the gate: a change closing it now still sees this request
+        try:
+            if self.gate is not None:
+                raise HTTPException(503, CLOSED, headers={"Retry-After": str(RETRY_AFTER_S)})
+            return await self._submit(request, chat=chat)
+        finally:
+            self.entering -= 1
+
+    async def _submit(self, request: OpenAICompletionRequest, *, chat: bool) -> int:
         if self.failure is not None:
             raise HTTPException(503, self.failure)
         if request.model != self.model:
@@ -319,7 +345,7 @@ def create_app(manager: FrontendManager) -> FastAPI:
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
         kind = "invalid_request_error" if exc.status_code < 500 else "server_error"
         return JSONResponse({"error": {"message": str(exc.detail), "type": kind}},
-                            status_code=exc.status_code)
+                            status_code=exc.status_code, headers=exc.headers)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -388,3 +414,34 @@ def create_app(manager: FrontendManager) -> FastAPI:
         return await completion(req, request, False)
 
     return app
+
+
+class Gate:
+    """``frontend.http``'s ``drain`` action (doc/specs/empty-apply.md). Called by the process host
+    at its safe points, while the requests run on the server's thread: it only sets and reads
+    plain attributes. In every mode the gate closes until the change committed or was undone;
+    ``refuse`` fails the change if a request is open. With ``force`` the scheduler ends them,
+    and their responses close here."""
+
+    def __init__(self, manager: FrontendManager) -> None:
+        self.manager = manager
+
+    def start_drain(self, args: dict[str, Any]) -> None:
+        mode = str(args.get("mode", "refuse"))
+        if mode == "refuse" and (n := self.manager.open_requests()):
+            raise RuntimeError(f"the frontend has {n} open request(s). {HINT}")
+        self.manager.gate = mode
+
+    def drained(self) -> bool:
+        return self.manager.gate is None or self.manager.open_requests() == 0
+
+    def drain_deadline(self) -> dict[str, int]:
+        raise TimeoutError(f"the frontend still has {self.manager.open_requests()} open request(s); nothing was "
+                           "ended for this change, and requests come in again. Retry with a longer --wait-empty, "
+                           "or with --force.")
+
+    def commit(self) -> None:
+        self.manager.gate = None
+
+    def abort(self) -> None:
+        self.manager.gate = None

@@ -4,12 +4,19 @@ Answers "what must move because of this change, and how": the cheapest rung of
 the action ladder (modules.html ③ §3) that is still correct, for every process.
 It never executes anything; ``apply --dry-run`` returns exactly what it builds.
 When it cannot tell, it picks the more expensive action and says so in ``notes``.
+
+A change applies to an empty engine (doc/specs/empty-apply.md): unless it only sets live config
+keys, every unit of a process changed in place that holds requests (it declares the action
+``drain``) empties its part of the engine first, as the change asks when it finds requests there
+(``ChangeMeta.when_busy``). So a reload may rebuild state units: nothing is in them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+import msgspec
 
 from core.change.state import IdentityManifest
 from core.change.types import EMPTY, ActionPlan, ChangeSet, ProcActions, UnitAction
@@ -27,6 +34,10 @@ from unit.runtime.types import ProcessPlan, ReloadPlan, UnitSpec
 COMPONENT = "core.deps"
 CONTROL_ROLE = "control"
 NATIVE_SUFFIXES = (".so", ".pyd")
+DRAIN = "drain"
+"""The action of the units that hold requests: they empty the engine before a change."""
+FORCE_DRAIN_S = 60.0
+"""With ``when_busy = "force"``: how long the steps in flight of the ended requests may take."""
 
 
 @dataclass
@@ -94,10 +105,18 @@ def plan(w: World) -> Result[ActionPlan]:
         c = p.in_place(w.control, units, _process_plan(w.control.proc, units, w.new_tree, w.new.config))
         if c.reload is not None or c.config or c.stage or c.actions:
             control = c
-    if p.state_lost:
-        return Ok(ActionPlan(restart_engine=True, notes=p.state_lost))
+    drain_timeout: float | None = None
+    live_only = not (spawn or stop or control is not None or w.cs.state or w.cs.topology is not None) and all(
+        pa.restart is None and pa.reload is None and not pa.stage and not pa.actions for pa in procs)
+    if not live_only:
+        procs = [p.with_drain(pa) for pa in procs]
+        if any(pa.drain for pa in procs):
+            mode = w.cs.meta.when_busy
+            drain_timeout = w.cs.meta.wait_s if mode == "wait" else FORCE_DRAIN_S if mode == "force" else None
+            w.notes.append(f"the engine is emptied first; with requests in it: {mode} (doc/specs/empty-apply.md)")
     return Ok(ActionPlan(procs=procs, control=control, spawn=spawn, stop=stop,
-                         topology=topo if w.cs.topology is not None else None, notes=w.notes))
+                         topology=topo if w.cs.topology is not None else None, drain_timeout_s=drain_timeout,
+                         notes=w.notes))
 
 
 def _desired(tree: Tree, topo: Topology) -> dict[ProcId, DesiredProc]:
@@ -145,8 +164,6 @@ class _Planner:
         self.new_graph = ImportGraph(w.new_tree.modules)
         self.base_graph = ImportGraph(w.base_tree.modules)
         self.owners = _owners(w.new_tree)
-        self.state_lost: list[str] = []
-        """Why the change restarts the engine: a config change would rebuild state in flight."""
 
     def _binding(self, key: str) -> str:
         owner = self.owners.get(key)
@@ -223,22 +240,16 @@ class _Planner:
         s = self.w.new_tree.units.get(uid)
         return list(s.manifest.provides.services) if s is not None else []
 
-    def reloaded_with(self, units: set[UnitId], present: set[UnitId]) -> set[UnitId]:
-        """``units`` and, transitively, the units of ``present`` that use a service one of them
-        provides: the runtime reloads a provider's users with it."""
-        out, todo = set(units), list(units)
-        while todo:
-            provided = set(self._provides_new(todo.pop()))
-            for u in sorted(present - out):
-                m = self.w.new_tree.units[u].manifest
-                if provided & {*m.requires.services, *m.requires.optional}:
-                    out.add(u)
-                    todo.append(u)
-        return out
-
-    def drains(self, uid: UnitId) -> bool:
-        m = self.w.new_tree.units[uid].manifest
-        return m.unit.kind == "state" and (m.state is None or m.state.drain_on_reload)
+    def with_drain(self, pa: ProcActions) -> ProcActions:
+        """``pa`` with a ``drain`` for each of its running units that holds requests. A process
+        restarted takes no part in place, so it drains nothing: the gate in front of it does."""
+        if pa.restart is not None:
+            return pa
+        units = sorted(UnitId(u.unit) for u in self.w.running[pa.proc].units
+                       if (s := self.base_tree.units.get(UnitId(u.unit))) is not None
+                       and DRAIN in s.manifest.capabilities.actions)
+        args = {"mode": self.w.cs.meta.when_busy}
+        return msgspec.structs.replace(pa, drain=[UnitAction(u, DRAIN, dict(args)) for u in units]) if units else pa
 
     def natives_touch(self, units: list[UnitId]) -> bool:
         changed = {p.removeprefix("engine/") for p in self.changed_paths}
@@ -285,7 +296,6 @@ class _Planner:
 
         actions: list[UnitAction] = []
         rebuild: dict[tuple[UnitId, str], tuple[str, set[str]]] = {}
-        by_config: dict[UnitId, set[str]] = {}
         for r in intro.reads:
             if r.key not in changed_keys or r.unit in reload or r.unit in removed:
                 continue
@@ -295,20 +305,12 @@ class _Planner:
                     w.notes.append(f"{intro.proc}: {r.unit} built {r.artifact!r} from {r.key!r} but did not "
                                    "register it; reloading it")
                     reload.add(r.unit)
-                    by_config.setdefault(r.unit, set()).add(r.key)
                 else:
                     rebuild.setdefault((art.owner, art.name), (art.rebuild, set()))[1].add(r.key)
             elif r.hooked and self._binding(r.key) != "startup":
                 pass  # rung 1: it takes the new value in place (ctx.on_config)
             else:
                 reload.add(r.unit)  # rung 2: a startup key, or read without a hook
-                by_config.setdefault(r.unit, set()).add(r.key)
-        lost = sorted(u for u in self.reloaded_with(set(by_config), before & target) if self.drains(u))
-        if lost:
-            keys = sorted({k for ks in by_config.values() for k in ks})
-            self.state_lost.append(
-                f"{intro.proc}: changing {keys} reloads {lost}, which hold state in flight ([state] drain_on_reload); "
-                "draining and migrating it are not implemented yet (stage2-contract.md §5.5.5): restart the engine")
         for a in intro.artifacts:
             if a.owner in reload or a.owner in removed:
                 continue

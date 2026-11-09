@@ -15,12 +15,12 @@ from msgspec.structs import replace
 
 from core.change.blobs import content_hash
 from core.change.state import IdentityManifest
-from core.change.types import ActionPlan, ChangeSet, ProcActions, StateRequest, UnitAction
+from core.change.types import ActionPlan, ChangeMeta, ChangeSet, ProcActions, StateRequest, UnitAction, WhenBusy
 from core.common.framework import FrameworkModules
 from core.common.ids import HostId, Identity, ProcId, UnitId
 from core.common.manifest import parse_manifest
 from core.common.result import Failed
-from core.deps.planner import World, plan
+from core.deps.planner import FORCE_DRAIN_S, World, plan
 from core.sourcetree import read_tree
 from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 from core.supervisor.topology import desired_procs
@@ -62,6 +62,7 @@ class Case:
     topo: Topology = field(default_factory=topology)
     state: list[StateRequest] = field(default_factory=list[StateRequest])
     units: tuple[str, ...] = ("pkg.a", "pkg.b")
+    meta: ChangeMeta = field(default_factory=ChangeMeta)
 
     def plan(self) -> ActionPlan | Failed:
         base_root = write_tree(self.tmp / "base" / "engine", self.base)
@@ -69,7 +70,7 @@ class Case:
         base = IdentityManifest(files=_hashes(base_root), topology=topology())
         new = IdentityManifest(files=_hashes(new_root), config=self.config, topology=self.topo)
         cs = ChangeSet(base=Identity("b"), config=self.config, topology=self.topo if self.topo != topology() else None,
-                       state=self.state)
+                       state=self.state, meta=self.meta)
         intro = ProcIntrospection(
             W0, Identity("b"), [UnitBrief(u, InstanceState.ACTIVE, None, 1) for u in self.units],
             reads=[ReadRecord("pkg.live", UnitId("pkg.b"), "runtime", hooked=self.hooked),
@@ -130,21 +131,48 @@ def state_a(drain: bool) -> str:
     }) + ("" if drain else "\n[state]\ndrain_on_reload = false\n")
 
 
-def test_a_config_change_that_would_rebuild_state_in_flight_restarts_the_engine(tmp_path: Path) -> None:
-    """Reloading a state unit that drains on reload empties it while requests use it, and draining
-    is not implemented yet (stage2-contract.md §5.5.5): the change asks for a restart instead."""
+def test_a_config_change_that_rebuilds_a_state_unit_reloads_it_in_place(tmp_path: Path) -> None:
+    """A change applies to an empty engine (doc/specs/empty-apply.md): a state unit rebuilt then
+    holds nothing in flight, so the change reloads it rather than restart the engine (as it did
+    until the engine was emptied first)."""
     tree = with_units(a=state_a(drain=True))
     p = Case(tmp_path, new=tree, base=tree, config={"pkg.start": 3}).plan()
-    assert not isinstance(p, Failed) and p.restart_engine and p.procs == []
-    assert "['pkg.start'] reloads ['pkg.a']" in p.notes[0] and "restart the engine" in p.notes[0]
+    assert not isinstance(p, Failed) and not p.restart_engine
+    assert reloaded(only(p)) == ["pkg.a"]
 
 
-def test_so_does_one_that_reloads_a_draining_user_of_a_provider(tmp_path: Path) -> None:
-    """The runtime reloads a provider's users with it: here the state unit pkg.b uses pkg.a."""
-    tree = with_units(b=manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"], reads=["pkg.live"],
-                                      kind="state"))
-    p = Case(tmp_path, new=tree, base=tree, config={"pkg.start": 3}).plan()
-    assert not isinstance(p, Failed) and p.restart_engine and "reloads ['pkg.b']" in p.notes[0]
+DRAINS = {"pkg/d/unit.toml": manifest_toml("pkg.d", "pkg.d.unit:Unit", capabilities='actions = ["drain"]'),
+          "pkg/d/unit.py": "class Unit:\n    pass\n"}
+"""A unit that holds requests (a scheduler, a frontend): it declares the action ``drain``."""
+
+
+def test_the_units_that_hold_requests_empty_the_engine_before_a_change(tmp_path: Path) -> None:
+    """Each gets ``drain`` with the change's mode; the change waits as long as it asked to (or,
+    forcing, for the steps in flight), and the plan says the engine is emptied first."""
+    tree = {**BASE, **DRAINS}
+    cases: list[tuple[WhenBusy, float | None]] = [("refuse", None), ("wait", 120.0), ("force", FORCE_DRAIN_S)]
+    for when, timeout in cases:
+        p = Case(tmp_path / when, new=tree, base=tree, config={"pkg.start": 3}, units=("pkg.a", "pkg.b", "pkg.d"),
+                 meta=ChangeMeta(when_busy=when, wait_s=120.0)).plan()
+        pa = only(p)
+        assert pa.drain == [UnitAction(UnitId("pkg.d"), "drain", {"mode": when})]
+        assert not isinstance(p, Failed) and p.drain_timeout_s == timeout
+        assert any(f"emptied first; with requests in it: {when}" in n for n in p.notes)
+
+
+def test_a_code_change_empties_the_engine_too(tmp_path: Path) -> None:
+    tree = {**BASE, **DRAINS}
+    pa = only(Case(tmp_path, new={**tree, "pkg/lib.py": "def helper():\n    return 2\n"}, base=tree,
+                   units=("pkg.a", "pkg.b", "pkg.d")).plan())
+    assert reloaded(pa) == ["pkg.b"] and [a.unit for a in pa.drain] == ["pkg.d"]
+
+
+def test_a_change_of_live_keys_only_waits_for_nothing(tmp_path: Path) -> None:
+    tree = {**BASE, **DRAINS}
+    p = Case(tmp_path, new=tree, base=tree, config={"pkg.live": 5}, units=("pkg.a", "pkg.b", "pkg.d")).plan()
+    pa = only(p)
+    assert pa.config == {"pkg.live": 5} and pa.drain == []
+    assert not isinstance(p, Failed) and p.drain_timeout_s is None
 
 
 def test_a_state_unit_that_need_not_drain_is_reloaded_for_a_config_change(tmp_path: Path) -> None:

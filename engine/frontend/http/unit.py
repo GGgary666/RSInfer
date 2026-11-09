@@ -21,7 +21,7 @@ from core.ipc.stream import StreamAddress
 from frontend.interfaces import Detokenizer, Tokenizer
 from frontend.transport import Directory, StepChannel
 
-from .api import FrontendManager, create_app
+from .api import FrontendManager, Gate, create_app
 
 
 class Server:
@@ -80,4 +80,5 @@ class Unit:
         server = Server(manager, config["frontend.http_bind"], config["frontend.http_port"],
                         config["frontend.start_timeout_s"], config["frontend.shutdown_timeout_s"])
         ctx.effect(server.start, "HTTP server and record streams")
+        ctx.on_action("drain", Gate(manager))  # the engine's gate for changes (doc/specs/empty-apply.md)
         ctx.provide("frontend.http@1", server)

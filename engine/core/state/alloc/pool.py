@@ -66,9 +66,15 @@ class Pool:
         return 1 if self.slot else (tokens + self.page - 1) // self.page
 
     def set_capacity(self, items: int) -> None:
+        """The workers' usable items (``Capacity``). It may shrink only while nothing is held: a
+        change applies to an empty engine (doc/specs/empty-apply.md), and rebuilding a store there
+        can change its size (a new dtype, another holder budget)."""
         if items < self.capacity:
-            raise ValueError("shrinking a live state pool requires rebuilding the ledger")
-        self.free.extend(range(self.capacity, items))
+            if self.holdings or self.reservations or self.releases:
+                raise ValueError("a state pool shrinks only while it holds nothing")
+            self.free = list(range(items))
+        else:
+            self.free.extend(range(self.capacity, items))
         self.capacity = items
 
     def reusable(self, block_hashes: Sequence[int], limit: int) -> int:

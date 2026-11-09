@@ -93,3 +93,17 @@ def test_the_ledger_refuses_pages_of_another_size_than_the_workers() -> None:
     check_page_size([PAGES, SLOTS], 16)
     with pytest.raises(ValueError, match="pages of 16 tokens, the workers' state.kv.page_size is 32"):
         check_page_size([PAGES, SLOTS], 32)
+
+
+def test_a_pool_shrinks_only_while_it_holds_nothing() -> None:
+    """A change rebuilding a store applies to an empty engine (doc/specs/empty-apply.md), and the
+    workers may then report fewer items (a new dtype, another holder budget)."""
+    ledger = JointLedger([PAGES, SLOTS])
+    ledger.set_capacity({"kv.paged": 8, "gdn.slots": 4})
+    assert ledger.admit(1, 20, 1) is not None
+    with pytest.raises(ValueError, match="shrinks only while it holds nothing"):
+        ledger.set_capacity({"kv.paged": 4, "gdn.slots": 4})
+    ledger.cancel(1, 1)
+    ledger.set_capacity({"kv.paged": 4, "gdn.slots": 2})
+    assert sorted(ledger.pools["kv.paged"].free) == [0, 1, 2, 3] and sorted(ledger.pools["gdn.slots"].free) == [0, 1]
+    assert ledger.check() == []

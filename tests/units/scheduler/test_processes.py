@@ -1,6 +1,8 @@
 """The scheduler host and two fixture workers as real processes started by a real control plane,
 on the hosts' data channels: worker 0 shares the scheduler's host (shared memory), worker 1 is on
-another (TCP). Requests keep going while ``core.sched`` is reloaded through the control interface.
+another (TCP). ``core.sched`` is reloaded through the control interface, and a change applies to an
+empty engine (doc/specs/empty-apply.md): refused while requests run, applied once they ended
+(``--wait-empty``), or after ending them (``--force``).
 """
 
 from __future__ import annotations
@@ -13,18 +15,20 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import msgspec
 import zmq
 import zmq.asyncio
 
 from core.change.config import ChangeTunables
+from core.change.types import ChangeResult
 from core.common.ids import HostId, ProcId, UnitId
 from core.common.manifest import MANIFEST_FILE, load_manifest
 from core.common.result import Failed, Ok
 from core.control.client import ControlClient
 from core.contracts.columns import Column
-from core.contracts.requests import TokenEvents
+from core.contracts.requests import NewRequest, TokenEvents
 from core.control.host import ControlPlane, ingest
 from core.ipc.channels import Channels
 from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, SupervisorTunables, Topology
@@ -140,33 +144,58 @@ async def until(cond: Callable[[], bool], what: Callable[[], object], timeout: f
         await asyncio.sleep(0.02)
 
 
-def test_requests_run_on_two_worker_processes_through_a_reload_of_the_scheduler(tmp_path: Path) -> None:
+def test_a_reload_of_the_scheduler_waits_for_an_empty_engine_or_ends_what_is_in_it(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path, overlap=True) as r:
             out = r.client.outputs
-            long = request(1, [5, 6, 7], 1500)  # outlasts the change, however slow it is; aborted then
-            reqs = [request(2, list(range(1, 25)), 60), request(3, [9], 70)]
-            r.client.send([long, *reqs])
             seen = lambda: {rid: (len(o.tokens), o.finished, o.error) for rid, o in out.items()}  # noqa: E731
-            await until(lambda: len(out[1].tokens) >= 3, seen)
             unit = r.workspace / "engine" / "core" / "sched" / "unit.py"
-            unit.write_text(unit.read_text() + "\n# a new version of the scheduler logic\n")
-            change = await r.control.change(r.workspace)
-            assert not isinstance(change, Failed), change
-            applied = await r.control.apply(change.value)
-            assert not isinstance(applied, Failed), applied
-            result = applied.value.result
-            assert result.status == "committed", result.diagnostics
-            assert 2 in rungs(result.plan, SCHED) and all(not rungs(result.plan, w) for w in WORKERS)  # a reload
-            await until(lambda: str(result.new_identity) in out[1].identities, seen)
-            assert len(out[1].identities) == 2  # the same request, before and after the reload
-            r.client.send(abort=[1])
-            await until(lambda: all(out[rid].finished for rid in (1, 2, 3)), seen, timeout=60)
-            assert out[1].finished == "abort" and len(out[1].tokens) < long.max_tokens
-            for q in [long, *reqs]:
+
+            async def apply(version: int, **busy: Any) -> ChangeResult:
+                unit.write_text(unit.read_text() + f"\n# version {version} of the scheduler logic\n")
+                change = await r.control.change(r.workspace, **busy)
+                assert not isinstance(change, Failed), change
+                applied = await r.control.apply(change.value)
+                assert not isinstance(applied, Failed), applied
+                return applied.value.result
+
+            def tokens_right(q: NewRequest) -> bool:
                 assert q.sampling.seed is not None
                 prompt = [int(x) for x in q.prompt.values()]
-                assert out[q.request].tokens == expected(prompt, q.sampling.seed, q.max_tokens)[:len(out[q.request].tokens)]
+                return out[q.request].tokens == expected(prompt, q.sampling.seed, q.max_tokens)[:len(out[q.request].tokens)]
+
+            long = request(1, [5, 6, 7], 1500)  # outlasts any change
+            reqs = [request(2, list(range(1, 25)), 60), request(3, [9], 70)]
+            r.client.send([long, *reqs])
+            await until(lambda: len(out[1].tokens) >= 3, seen)
+
+            # by default a busy engine refuses the change, says how to go on, and serves on
+            refused = await apply(2)
+            assert refused.status != "committed" and refused.new_identity is None
+            reasons = " ".join(d.reason for d in refused.diagnostics)
+            assert "running" in reasons and "--wait-empty" in reasons and "--force" in reasons, reasons
+
+            # --wait-empty: what is in the engine runs to its end, then the change applies
+            r.client.send(abort=[1])
+            waited = await apply(3, when_busy="wait", wait_s=60.0)
+            assert waited.status == "committed", waited.diagnostics
+            assert 2 in rungs(waited.plan, SCHED) and all(not rungs(waited.plan, w) for w in WORKERS)  # a reload
+            assert out[1].finished == "abort" and all(out[q.request].finished for q in reqs)
             assert [len(out[q.request].tokens) for q in reqs] == [q.max_tokens for q in reqs]
+            assert all(tokens_right(q) for q in [long, *reqs])
+
+            # --force: the request in the engine ends with an error, the change applies, serving goes on
+            long2 = request(4, [8, 1], 1500)
+            r.client.send([long2])
+            await until(lambda: len(out[4].tokens) >= 3, seen)
+            forced = await apply(4, when_busy="force")
+            assert forced.status == "committed", forced.diagnostics
+            await until(lambda: out[4].finished is not None, seen)
+            assert out[4].finished == "abort" and "apply --force" in (out[4].error or "") and tokens_right(long2)
+            after = request(5, [3, 4, 5], 20)
+            r.client.send([after])
+            await until(lambda: out[5].finished is not None, seen)
+            assert out[5].error is None and len(out[5].tokens) == 20 and tokens_right(after)
+            assert out[5].identities == {str(forced.new_identity)}
 
     asyncio.run(main())
