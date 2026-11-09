@@ -6,7 +6,7 @@ does not need another shared Protocol here.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from core.contracts.state import StateDecl
@@ -55,4 +55,21 @@ class StateStore(Protocol):
 
     def invalidate(self) -> None:
         """Everything held is void (new weights, a model change); the ledger drops its prefix index."""
+        ...
+
+
+class StateHolder(Protocol):
+    """``state.holder@1``: how many items each state kind gets from the device memory, as SGLang
+    sizes its pools (``mem_fraction_static``, ``mamba_full_memory_ratio``, ``max_mamba_cache_size``).
+    The model sizes every kind at once, once its weights are allocated and before the stores
+    allocate; a store with no count of its own takes the holder's. VMM reserve and grow come later
+    (stage2-contract.md §10.3)."""
+
+    def size(self, states: Sequence[StateDecl], weights_bytes: int) -> Mapping[str, int]:
+        """Items per kind for ``states`` (every layer's declarations), the weights taking
+        ``weights_bytes`` of the device. Raises if a kind would get none."""
+        ...
+
+    def items(self, kind: str) -> int:
+        """What ``size`` gave ``kind``; 0 if it was not sized."""
         ...

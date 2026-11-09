@@ -114,7 +114,8 @@ async def engine(tmp: Path, *, overlap: bool) -> AsyncGenerator[Running]:
         config = {"alloc.states": msgspec.json.decode(msgspec.json.encode(DECLS)), "sched.workers": msgspec.to_builtins(WORKERS),
                   "sched.frontend_host": "client", "sched.max_batch": 8, "sched.token_budget": 16,
                   "sched.overlap": overlap, "schedfix.scheduler": msgspec.to_builtins(SCHED), "schedfix.capacity": CAPACITY,
-                  "schedfix.pages": dict(PAGES), "schedfix.max_batch": 8, "schedfix.delay_s": 0.01}
+                  "schedfix.pages": dict(PAGES), "schedfix.max_batch": 8, "schedfix.delay_s": 0.01,
+                  "state.kv.page_size": PAGES["kv.paged"]}
         started = (await cp.boot(ingest(cp.blobs, workspace), topology(tmp), config)).unwrap()
         assert started.status == "committed", started.diagnostics
         client = ThreadClient(SupervisorLookup(cp))

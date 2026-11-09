@@ -40,6 +40,8 @@ class KVPool:
     platform: Any
     page_size: int
     pages: int
+    """Usable pages; 0: as many as the holder gave ``kv.paged`` (``state.holder@1``)."""
+    holder: Any = None
     decls: dict[int, StateDecl] = field(default_factory=dict[int, StateDecl])
     k_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
     v_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
@@ -56,6 +58,10 @@ class KVPool:
         return self.pages * self.page_size
 
     def declare(self, decls: Sequence[StateDecl]) -> None:
+        if not self.pages and decls:
+            self.pages = self.holder.items(KIND) if self.holder is not None else 0
+            if not self.pages:
+                raise RuntimeError(f"{KIND}: no page count: set state.kv.pages, or size the states first (state.holder@1)")
         for d in decls:
             if d.kind != KIND or d.tokens_per_item != self.page_size:
                 raise ValueError(f"{KIND} holds pages of {self.page_size} tokens, not {d.kind} {d.tokens_per_item}")
@@ -111,6 +117,6 @@ class KVPool:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         self.pool = KVPool(ctx.platform, config["state.kv.page_size"], config["state.kv.pages"],
-                           sized_from={"state.kv.dtype": config["state.kv.dtype"]})
+                           ctx.use("state.holder@1"), sized_from={"state.kv.dtype": config["state.kv.dtype"]})
         ctx.effect(lambda: self.pool.free, label="kv buffers")
         ctx.provide("state.kv.paged@1", self.pool)

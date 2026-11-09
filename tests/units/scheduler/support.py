@@ -55,8 +55,9 @@ DECLS = [StateDecl("kv.paged", 0, {"k": ((PAGE, 1, 8), "bf16")}, "request", toke
 PAGES = {"kv.paged": PAGE, "gdn.slots": 0}
 CAPACITY = {"kv.paged": 64, "gdn.slots": 8}
 UNITS = ("sched/reqs", "core/state/alloc", "policies/fcfs", "policies/prefill_first", "core/sched")
-READ = "worker/batch"
-"""The unit whose keys the scheduler reads (``batch.max_rows``, ``batch.max_context_len``); not loaded."""
+READ = ("worker/batch", "state/kv_paged")
+"""The worker units whose keys the scheduler host's units read (``batch.max_rows``,
+``batch.max_context_len``, ``state.kv.page_size``); not loaded."""
 
 
 class Directory:
@@ -236,9 +237,9 @@ class Engine:
         values: dict[str, Any] = {
             "alloc.states": msgspec.json.decode(msgspec.json.encode(DECLS)), "sched.workers": msgspec.to_builtins(list(WORKERS[:ranks])),
             "sched.frontend_host": str(CLIENT), "sched.max_batch": max_batch, "sched.token_budget": token_budget,
-            "sched.overlap": overlap, "sched.idle_wait_s": 0.002, "sched.frontend_timeout_s": 2.0,
-            "sched.quiesce_timeout_s": 5.0, **(config or {})}
-        owners = [*self.units, UnitSpec(load_manifest(ENGINE / READ / "unit.toml").unwrap())]
+            "sched.overlap": overlap, "sched.idle_wait_s": 0.002, "sched.frontend_timeout_s": 30.0,
+            "sched.quiesce_timeout_s": 30.0, "state.kv.page_size": PAGE, **(config or {})}
+        owners = [*self.units, *(UnitSpec(load_manifest(ENGINE / path / "unit.toml").unwrap()) for path in READ)]
         self.config = {key: ConfigEntry(unit.id, decl, values.get(key, decl.default))
                        for unit in owners for key, decl in unit.manifest.config.items()}
         self.zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()

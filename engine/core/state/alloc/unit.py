@@ -78,7 +78,17 @@ class JointLedger:
         return [error for pool in self.pools.values() for error in pool.check()]
 
 
+def check_page_size(declarations: Sequence[StateDecl], page_size: int) -> None:
+    """The ledger counts KV pages of the size the worker's store has (``state.kv.page_size``); a
+    different size would make it give rows fewer pages than they fill."""
+    for d in declarations:
+        if d.kind == "kv.paged" and d.tokens_per_item != page_size:
+            raise ValueError(f"alloc.states has kv.paged pages of {d.tokens_per_item} tokens, the workers' "
+                             f"state.kv.page_size is {page_size}")
+
+
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         declarations = msgspec.convert(config["alloc.states"], list[StateDecl])
+        check_page_size(declarations, config["state.kv.page_size"])
         ctx.provide("ledger@1", JointLedger(declarations))

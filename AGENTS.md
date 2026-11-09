@@ -34,6 +34,7 @@
 | `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行）。PR 每次 push 只跑一遍；push 只在 `master`、`madoka/dev` 上触发。PR 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
+| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`qwen38.py`：在一台机器上起 Qwen3.8（`plan` / `serve` / `chat` / `checkpoint`），说明见 `deploy/README.md`；在 pyright 的范围内 |
 
 ### `engine/`
 
@@ -83,9 +84,11 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 | `engine/models/qwen38/` | `models.qwen38`（`model@1`）：SGLang `Qwen3_5ForCausalLM` 的搬运，参数名、`load_weights`、前向 |
 | `engine/layers/` | `layers.linear`、`embedding`、`norm`、`rope`、`activation`、`sampler`；`layers.attn`、`layers.gdn` 是 attention / GDN 外壳加 backend（SGLang 的 `TorchNativeAttnBackend`、`GDNAttnBackend`）；`solutions.py` 是这两个 backend 共用的库：按 `attn.*` / `gdn.*` 的 backend 配置在启动时固定每个阶段的 kernel |
 | `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
+| `engine/core/state/holder/` | `core.state.holder`（`state.holder@1`）：按 SGLang 的分法定 KV 页数和 GDN 槽数（`mem_fraction_static`、`mamba_full_memory_ratio`、`max_mamba_cache_size`），启动时定，阶段 2 不在线扩容 |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
 | `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_sm100` 上都用它 |
 | `engine/core/plan/` | `core.plan`（`plan@1`）：worker 的执行 plan，SGLang 的 runner；现在只有 eager（bucket 0），graph 在 M2c 加。启动时让各 backend 按配置固定 kernel 并打一行 `core.plan: {json}` |
+| `engine/core/worker/` | worker 循环 `core.worker`（`proc.loop@1`）：读计划、交给 `executor@1`、按计划顺序回 `Sampled` / `Resync` / `StepFailure`，启动时和结果换了读端时报 `Capacity` |
 
 从 SGLang（`e838360`）搬运的代码在文件头注明出处，各目录带一份 `LICENSE.sglang`。改这些单元时先看 SGLang 的对应实现，能搬运的就搬运后适配，不自己另写。
 
@@ -105,9 +108,13 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 - `tests/units/scheduler/`：调度器、账本和前缀匹配算法的测试。`support.py` 把调度宿主的单元放进进程内的单元运行时，配上线程上的夹具 worker 和充当前端的客户端；`test_processes.py` 用真实控制面起调度宿主和两个夹具 worker 进程。`units/schedfix/` 是测试夹具单元（夹具 worker），真实进程测试把它拷进工作区。
 - `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
 - `tests/units/kernels/`：kernel 目录的选择和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`）。
+- `tests/units/worker/`：worker 循环。先对着假 executor 测循环本身，再把 worker 的全部单元加上循环放到线程上（`support.py` 的 `RealWorker`），接在 `tests/units/scheduler/support.py` 的真调度器下面，贪心生成和 HF 逐 token 相同。
 - `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。
+- `tests/units/support/tokenizer.py`：测试用的真 HF tokenizer（词级、带 Qwen 的 chat 标记和模板）。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
+- `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/qwen38.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
+  - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/qwen38.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区，但不拷 `engine/` 里控制面以外的单元（前端、请求表、kernel、模型等）。场景拓扑的角色不列单元，那些单元会在每个场景进程里加载；kernel 单元每次启动还要 import torch。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
 
@@ -151,7 +158,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 ```
 
 - 每次提交前跑 `uv run pyright` 和 `uv run pytest`（全量用 `-n 8` 并行；只跑一两个文件时别加 `-n`，起 worker 要 5 秒左右）。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
-- `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。`tests/gpu/`（要 SM100，手动跑）同样由 `addopts` 排除。
+- `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。`tests/gpu/`（要 GPU，手动跑）同样由 `addopts` 排除。
 - `pyproject.toml` 的 `timeout = 120` 是 pytest-timeout 给**单个测试**的上限，不是整个套件的。不要给 pytest 或 CI job 加总时长上限。
 - 生成物不进仓库：`tests/framework/formal/.tools/`、`.runs/` 已被忽略。
 
