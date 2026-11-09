@@ -1,0 +1,11 @@
+[unit]
+id = "layers.gdn"
+kind = "logic"
+process = ["worker"]
+entry = "layers.gdn.unit:Unit"
+
+[provides]
+services = ["layers.gdn@1"]
+
+[requires]
+services = ["kernels.catalog@1", "state.gdn.slots@1"]

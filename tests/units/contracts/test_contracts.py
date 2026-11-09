@@ -95,6 +95,7 @@ REACHES: dict[str, set[str]] = {
     "kernels": set(),
     "model": {"state", "tensor"},
     "plan": {"columns", "records", "sampling", "tensor"},
+    "execution": {"columns", "records", "sampling"},  # worker loop <-> executor
 }
 """Every contract module, and the other contract modules its imports reach (stage2-contract.md §3)."""
 

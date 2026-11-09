@@ -1,0 +1,11 @@
+[unit]
+id = "layers.attn"
+kind = "logic"
+process = ["worker"]
+entry = "layers.attn.unit:Unit"
+
+[provides]
+services = ["layers.attn@1"]
+
+[requires]
+services = ["kernels.catalog@1", "state.kv.paged@1"]

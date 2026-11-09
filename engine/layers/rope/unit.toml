@@ -1,0 +1,11 @@
+[unit]
+id = "layers.rope"
+kind = "logic"
+process = ["worker"]
+entry = "layers.rope.unit:Unit"
+
+[provides]
+services = ["layers.rope@1"]
+
+[requires]
+services = ["kernels.catalog@1"]
