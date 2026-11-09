@@ -1,0 +1,11 @@
+[unit]
+id = "layers.activation"
+kind = "logic"
+process = ["worker"]
+entry = "layers.activation.unit:Unit"
+
+[provides]
+services = ["layers.activation@1"]
+
+[requires]
+services = ["kernels.catalog@1"]

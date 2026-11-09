@@ -89,6 +89,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | | `worker.batch` | 状态（缓存） | `worker.batch@1` | | |
 | | `core.plan` | 逻辑，录 graph | `plan@1` | `model@1`、各 backend、各状态单元 | ✓ |
 | | `executors.cuda` | 逻辑 | `executor@1` | | ✓ |
+| | `executors.eager` | 逻辑 | `executor@1`（和 `executors.cuda` 二选一） | `worker.batch@1`、`model@1`、各 backend、各状态单元 | |
 | | `models.qwen38` | 逻辑 | `model@1` | `layers.*`、`state.weights@1` | |
 | | `layers.*`（linear、embedding、lm_head、norm、rope、attn 外壳、gdn 外壳、sampler） | 逻辑 | `layers.<名字>@1` | `kernels.catalog@1` | |
 | | `core.kernels` | 逻辑 | `kernels.catalog@1` | | |
@@ -187,9 +188,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - 一行被重新加入以后（`full` 增量会重新加入所有行），它下一次跑的输入 token 由调度器给出，跑过一次以后才能再用 `from_previous = 1`。恢复以后隔了几步才再排进 batch 的行也是这样。`full` 增量里的 `StateOps` 给每行分配它持有的全部条目，不只是新的。
   - 收到 `full` 之前，worker 不跑任何计划，每份都回 `Resync`、不带 `Sampled`。调度器把这些步当作没跑过：token 没算，拷贝没做，请求的长度退回到最后一个回了 `Sampled` 的步。这些步分出去的条目仍归原来的请求，`full` 里会再分一次。开了重叠时，`full` 之前已经发出的那份计划也会回 `Resync`，这是预期的。
   - worker 碰到 `from_previous = 1` 却没有可接的 token，也回 `Resync`，不跑。
+  - 2026-11-09 更新（#30 评审）：新建的持久 batch 也算“重建以后”，收到第一份 `full` 之前什么都不跑。调度器启动后的第一份增量本来就是 `full`。
   - 采样不在 worker 里留随机状态：客户端没给 seed 的话，调度器在接纳请求时补一个，worker 按（seed, 位置）取随机数。所以重建前后采到的 token 一样，和 batch 怎么拼也无关。
   - 开投机时，下一步要验证的草稿如果留在显存里，也一起丢掉；重建后每行的第一步不带草稿。
   - 契约测试（M2a，`torch_eager`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
+- **上限**（2026-11-09，#30 评审）：持久 batch 最多 `batch.max_rows` 行，每行最多 `batch.max_context_len` 个 token（按整页留表）。超出上限的增量，`apply` 在改动任何东西之前就报错，不回 `Resync`：再发一份 `full` 也装不下。调度器通过 `[reads]` 读这两个键，接纳时拒绝装不下的请求（#31）。
 
 ### 4.4 一步重叠
 
@@ -238,6 +241,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - 可选：`grow`、`refit`、`relocate`、`export_state` / `import_state`，用 `capabilities.actions` 和 `[state] migrate` 声明。
 - **绑定代数**：交出去的 buffer 只要有一个换了地址、shape 或 dtype，代数就加一；同地址换内容不加。graph 在 replay 前，每个提供者只比对一个整数（§9.3）。
 - **scratch 条目**：capture 前的 warm-up 会真的跑起来，GDN 的 recurrent state 会被推进，KV 会被写入。如果用在途请求的条目来 warm-up，它们的状态就坏了（探针 P6）。所以每种状态都留出 scratch 条目，永远不分给请求。
+- **条目编号**（2026-11-09，#30 评审）：账本分出去的编号是 `0 .. capacity - 1`，scratch 条目的编号在这个范围之外（`scratch()` 给出）。条目在 buffer 里放在哪是存储单元自己的事。SGLang 布局的两个存储单元把条目 `i` 放在页或槽 `i + 1`，和行 `r` 在表里是 `r + 1` 一样；页或槽 0 是 SGLang 的 padding，也就是 scratch 条目，编号 `-1`。持久 batch 的表里存的是页号和槽号，所以 padding 行的 0 指向的正是 padding。
 
 ### 5.3 联合账本与内部状态池（调度宿主里，`ledger@1`）
 
@@ -329,12 +333,13 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
   - 选择：符合 shape 和平台能力的非参照 solution 里按 id 取第一个；没有就用参照实现，`Selected.fallback` 为真。`Definition.reference` 是参照 solution 的 id。
   - definition 的名字和 solution 的 id 在目录里唯一，重复登记会报错，所以查找结果和登记顺序无关。重载时旧实例的登记先撤掉，新实例再登记，不会撞名。参照 solution 的 id 带版本（`reference.gemm.linear@1`），同一 definition 的新旧版本可以同时登记（2026-11-09）。
-  - `kernels.reference`（`engine/kernels/reference/`）登记 Qwen3.8 要的全部 definition 和 PyTorch 参照：`norm.gemma_rms`、`norm.rms_gated`、`pos.rope_neox`、`act.silu_and_mul`、`gemm.linear`、`embed.lookup`、`kv.store`、`attn.paged`、`gdn.conv1d`、`gdn.gating`、`gdn.delta_rule`、`sample.seeded`（都是 `@1`）。
-  - 参照按 HF `qwen3_5` 的算法和 dtype 转换写；conv 和 delta rule 可以接着上一块的状态继续算（HF 的 prefill 卷积不接受初始状态，这部分是补的）。采样按（seed, 位置）取随机数。
+  - `kernels.reference`（`engine/kernels/reference/`）登记 Qwen3.8 要的全部 definition 和 PyTorch 参照：`norm.gemma_rms`、`norm.rms_gated`、`pos.rope`、`act.silu_and_mul`、`gemm.linear`、`embed.lookup`、`kv.store`、`attn.extend`、`attn.decode`、`gdn.conv1d_fn`、`gdn.conv1d_update`、`gdn.gating`、`gdn.chunk_delta_rule`、`gdn.recurrent_update`、`sample.seeded`（都是 `@1`）。
+  - **2026-11-09 改为从 SGLang（`e838360`）搬运**：每个 definition 的签名就是它对应的 SGLang kernel 的签名，参照实现是 SGLang 的 native 路径，或 SGLang 用来检验 CPU kernel 的 torch 参照（`test/registered/cpu/test_mamba.py`、`test_causal_conv1d.py`，最初来自 vLLM 和 fla）。attention 是 `TorchNativeAttnBackend` 的 SDPA，采样是 `Sampler` 加 `multinomial_with_seed`，murmur hash 从 Triton 改写成 torch。原来自己写的 `pos.rope_neox`、`attn.paged`、`gdn.conv1d`、`gdn.delta_rule` 已删除。
+  - 和 HF `qwen3_5` 对照测试；conv 和 delta rule 按 SGLang kernel 的接口在状态池上按槽读写，可以接着上一块的状态继续算。采样按（seed, 位置）取随机数。
   - **和 batch 怎么拼是否无关**（`Definition.batch_invariant`，默认否，2026-11-09 更正）：
-    - 声明为是的只有按构造成立的：attention 和采样逐行算，conv 和 delta rule 每次只接一行、逐 token 算，lookup 和 store 只搬数据。
+    - 声明为是的只有按构造成立的：`attn.extend` / `attn.decode`、`gdn.conv1d_fn`、`gdn.chunk_delta_rule` 逐个序列算，lookup 和 store 只搬数据。decode 的 conv / delta rule 一步和采样是整批一个算子，不声明。
     - norm、RoPE、激活、linear、gating 是一个 torch 算子作用在整个 batch 上，PyTorch 会随行数换计算路径和累加顺序，不声明。实测 CPU fp32 的 linear，同一行单独算和放进 batch 里算，最后几位不同；两个 logit 很接近时，greedy 会选出不同的 token。
-    - 未决：§1 验收里的“批量对单条”和 §4.4 第 8 条的“开重叠对不开”要求完全一致，只靠这套参照做不到。M2d 之前要定：这些对比用逐行算的 solution，还是按容差比。
+    - 已定（2026-11-09）：§1 验收里的“批量对单条”和 §4.4 第 8 条的“开重叠对不开”不要求逐位一致，logits 在容差内、token 相同即可。
   - 测试：`tests/units/kernels/`，对照 HF 的实现、分块等于不分块；声明和 batch 怎么拼无关的参照，单独算和放进 batch 里算逐位相同。
 
 ## 7. 层、模型、权重
@@ -344,6 +349,22 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - 逻辑张量 = 格式（插件）+ 放置（数据）。层不持有权重，只从权重存储拿视图，所以 refit 是原地换内容，graph 不用重录。
 - 模型单元在启动时给出 `Assembly`：用哪些层、每层存什么状态、有哪些权重。各项尺寸从 checkpoint 的 config 读，不写死。
 - Qwen3.8：64 层，48 层 GDN、16 层 full attention，排列是 3 层 GDN 加 1 层 full attention 重复。M2a 用同样的结构、小尺寸、随机权重。
+- **实现（2026-11-09，worker 循环以下的 eager 路径，全部从 SGLang `e838360` 搬运后适配）**：
+
+  | 单元 | 提供 | 来自 SGLang |
+  |---|---|---|
+  | `core.state.weights` | `state.weights@1` | `DefaultModelLoader` / `DummyModelLoader`：`safetensors_weights_iterator`、`initialize_dummy_weights`；参数放在这个状态单元里，模型重载不丢；`refit` 原地换内容，不留副本，abort 时重新读原来的来源（和 `update_weights_from_disk` 的回滚一样） |
+  | `models.qwen38` | `model@1` | `Qwen3_5ForCausalLM`（TP1，无投机、量化、LoRA、融合 kernel）：参数名用 SGLang 的（融合后的 `qkv_proj`、`gate_up_proj`、`in_proj_qkvz`、`in_proj_ba`），`load_weights` 原样搬运，作为 loader 登记到权重存储 |
+  | `layers.linear`、`embedding`、`norm`、`rope`、`activation`、`sampler` | `layers.<名字>@1` | `LinearBase`、`VocabParallelEmbedding` 和 `LogitsProcessor` 的 LM head、`GemmaRMSNorm`、`RMSNormGated`、`RotaryEmbedding`、`SiluAndMul`、`Sampler`；都按 definition 调目录 |
+  | `layers.attn`、`layers.gdn` | `layers.attn@1`、`layers.gdn@1`（`Backend`） | `RadixAttention` + `TorchNativeAttnBackend`；`RadixLinearAttention` + `GDNAttnBackend` 的普通路径。`prepare` 就是 `init_forward_metadata`；MIXED 步走 extend |
+  | `state.kv_paged`、`state.gdn_slots` | `state.kv.paged@1`、`state.gdn.slots@1` | `MHATokenToKVPool`（每层 `[size + page_size, kv 头, head_dim]`，槽 0 所在页是 padding）；`MambaPool`（conv `[层, 槽 + 1, conv_dim, K-1]`、temporal `[层, 槽 + 1, HV, V, K]` fp32，槽 0 是 padding），`copy` 即 `copy_from`，`clear` 即 `clear_slots`；条目 `i` 是页或槽 `i + 1`（§5.2） |
+  | `worker.batch` | `worker.batch@1` | `HybridReqToTokenPool`：`req_to_token`、行到 GDN 槽的映射；记录里的行 `r` 是表里的 `r + 1`，条目 `i` 是页或槽 `i + 1` |
+  | `executors.eager` | `executor@1` | `ModelRunner`：从 position 0 开始的行先清 GDN 槽（`mamba_clear_indices`）、恢复快照、组装 `input_ids` / `positions`、各 backend 准备、前向、在每行最后一个 token 的位置采样 |
+
+  - 接缝：worker 循环只调 `executor@1`（`core/contracts/execution.py`），持久 batch、backend、模型、采样器都在它后面。`executors.eager` 和 `executors.cuda` 是同一个服务的两种实现，一个 worker 角色只加载其中一个（和 `policy.compose@1` 可以有几种实现一样），不算撞名（2026-11-09，#30 评审）。
+  - 契约随之补了：`WeightStore.register` / `load`、`Model`、`PersistentBatch.check` / `sampling` / `record`、`StateStore.clear`。
+  - 每一行都采样（SGLang 也是）。prefill 中间块采到的 token 由调度器在调 `RequestTable.sample()` 之前丢掉。
+  - 测试（`tests/units/executors/test_eager.py`，CPU fp32）：贪心生成和 HF 逐 token 相同，logits 在 1e-4 内；批量对单条、分块 prefill 对不分块、batch 重建（先回 `Resync`，收到全量增量后接着生成）对不重建、快照恢复对从头算，token 相同，logits 在容差内；条目从 0 开始分（和账本一样），每步之间改写 scratch 条目，token 不变。
 
 ## 8. attention 和 GDN 的 backend（@gaow0007 审）
 

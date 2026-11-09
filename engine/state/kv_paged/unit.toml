@@ -1,0 +1,12 @@
+[unit]
+id = "state.kv_paged"
+kind = "state"
+process = ["worker"]
+entry = "state.kv_paged.unit:Unit"
+
+[provides]
+services = ["state.kv.paged@1"]
+
+[config]
+"state.kv.page_size" = { type = "int", default = 16, binding = "startup", doc = "Tokens per KV page" }
+"state.kv.pages" = { type = "int", default = 64, binding = "startup", doc = "Usable KV pages; page 0 is padding" }

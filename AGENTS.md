@@ -72,7 +72,15 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 | 路径 | 内容 |
 |---|---|
 | `engine/core/kernels/` | kernel 目录 `core.kernels`（`kernels.catalog@1`）：登记 definition 和 solution，按 shape 和平台能力选，没有合适的就用参照实现 |
-| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），算法和 dtype 照 HF `qwen3_5`，状态排布照 sglang |
+| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），从 SGLang 搬运，签名和状态排布照 SGLang |
+| `engine/core/state/weights/` | `core.state.weights`（`state.weights@1`）：参数存储、safetensors 读取、dummy 权重、`refit` |
+| `engine/models/qwen38/` | `models.qwen38`（`model@1`）：SGLang `Qwen3_5ForCausalLM` 的搬运，参数名、`load_weights`、前向 |
+| `engine/layers/` | `layers.linear`、`embedding`、`norm`、`rope`、`activation`、`sampler`；`layers.attn`、`layers.gdn` 是 attention / GDN 外壳加 backend（SGLang 的 `TorchNativeAttnBackend`、`GDNAttnBackend`） |
+| `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
+| `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
+| `engine/executors/eager/` | `executors.eager`（`executor@1`）：一步 eager 执行，SGLang `ModelRunner` 的流程 |
+
+从 SGLang（`e838360`）搬运的代码在文件头注明出处，各目录带一份 `LICENSE.sglang`。改这些单元时先看 SGLang 的对应实现，能搬运的就搬运后适配，不自己另写。
 
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
@@ -90,6 +98,7 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 - `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
 - `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
 - `tests/units/kernels/`：kernel 目录的选择和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`）。
+- `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区，但不拷 `engine/` 里控制面以外的单元（前端、请求表、kernel、模型等）。场景拓扑的角色不列单元，那些单元会在每个场景进程里加载；kernel 单元每次启动还要 import torch。

@@ -1,0 +1,18 @@
+[unit]
+id = "worker.batch"
+kind = "state"
+process = ["worker"]
+entry = "worker.batch.unit:Unit"
+
+[provides]
+services = ["worker.batch@1"]
+
+[config]
+"batch.max_rows" = { type = "int", default = 64, binding = "startup", doc = "Rows of the persistent batch (running requests)" }
+"batch.max_context_len" = { type = "int", default = 4096, binding = "startup", doc = "Tokens of one request (prompt and output); a row holds the whole pages for them" }
+
+[reads]
+config = ["state.kv.page_size"]
+
+[state]
+drain_on_reload = false

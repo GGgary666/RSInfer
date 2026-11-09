@@ -76,7 +76,8 @@ class BatchPlan(msgspec.Struct, frozen=True):
 
 class StateAssign(msgspec.Struct, frozen=True):
     """Items of one state kind newly given to rows: pages for paged kinds, a slot at admission
-    for slot kinds. Row ``rows[i]`` appends ``ids[offsets[i]:offsets[i + 1]]``."""
+    for slot kinds. Row ``rows[i]`` appends ``ids[offsets[i]:offsets[i + 1]]``. Ids are the
+    ledger's, ``0 .. n - 1`` for the kind's ``n`` in ``Capacity``."""
 
     kind: str
     rows: Column
@@ -131,7 +132,8 @@ class StepStats(msgspec.Struct, frozen=True):
 
 
 class Capacity(msgspec.Struct, frozen=True):
-    """Usable items per state kind, scratch excluded; sent at start and after a grow."""
+    """Usable items per state kind: the ledger hands out ids ``0 .. n - 1``, and a store keeps its
+    padding and scratch items outside that range (``StateStore``). Sent at start and after a grow."""
 
     SECTION: ClassVar[str] = "state.capacity@1"
     items: dict[str, int]

@@ -1,0 +1,12 @@
+[unit]
+id = "executors.eager"
+kind = "logic"
+process = ["worker"]
+entry = "executors.eager.unit:Unit"
+
+[provides]
+services = ["executor@1"]
+
+[requires]
+services = ["worker.batch@1", "model@1", "layers.attn@1", "layers.gdn@1", "layers.sampler@1", "state.kv.paged@1",
+            "state.gdn.slots@1"]

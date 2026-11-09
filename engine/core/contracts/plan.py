@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 import msgspec
 
 from core.contracts.records import BatchPlan, RowDelta, StateOps
+from core.contracts.sampling import SamplingParams
 from core.contracts.tensor import Binding, Tensor
 
 type Phase = Literal["prefill", "decode"]
@@ -65,14 +66,32 @@ class PersistentBatch(Protocol):
 
     A rebuild loses the last sampled tokens too: the scheduler gives each row's next input
     token itself until the row has run again (``BatchPlan.from_previous``). It has them: the
-    rebuild happens while paused, after ``quiesce()`` collected every result."""
+    rebuild happens while paused, after ``quiesce()`` collected every result.
+
+    The device tables follow SGLang's ``HybridReqToTokenPool``: ``binding`` holds ``req_to_token``
+    (``[rows + 1, max_context_len]`` token slots of the paged kind, row ``r`` at index ``r + 1``,
+    index 0 the padding row), ``slots.<kind>`` (``[rows + 1]``, the item of each slot kind, as
+    ``req_index_to_mamba_index_mapping``) and ``last_token`` (``[rows + 1]``). Like rows, items are
+    shifted by one: item ``i`` is page ``i + 1`` (token slots ``(i + 1) * page_size + j``) or slot
+    ``i + 1`` of the store, so the padding row's zeros point at the padding items (``StateStore``)."""
 
     @property
     def binding(self) -> Binding: ...
 
+    def check(self, delta: RowDelta, plan: BatchPlan) -> str:
+        """Why the plan cannot run on the batch the delta leaves (built or rebuilt and not yet
+        given a full delta, an unknown row, a ``from_previous`` row without a token): the
+        ``Resync`` reason; ``""`` when it can. Changes nothing."""
+        ...
     def apply(self, delta: RowDelta, state: StateOps) -> None:
-        """Rows and item ids; the stores run ``state.copy`` themselves."""
+        """Rows and item ids; the stores run ``state.copy`` themselves. A delta beyond the batch's
+        limits (its rows, the tokens one row holds) raises and changes nothing: the scheduler
+        admitted what this worker cannot hold, which a full delta would not mend."""
         ...
     def ids(self, kind: str) -> Mapping[int, Sequence[int]]:
         """Host-side item ids per row, for the backends' ``prepare``."""
+        ...
+    def sampling(self, rows: Sequence[int]) -> list[SamplingParams]: ...
+    def record(self, rows: Sequence[int], tokens: Tensor) -> None:
+        """The tokens just sampled for ``rows``, which ``from_previous`` reads next."""
         ...
