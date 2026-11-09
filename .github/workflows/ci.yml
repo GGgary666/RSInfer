@@ -1,16 +1,17 @@
 name: ci
 on:
-  # Pull requests run once per push; pushes run only where pull requests land.
+  # Feature branches run through their PR; master also checks the merged changes.
   push:
-    branches: [master, madoka/dev]
+    branches: [master]
   pull_request:
+    branches: [master]
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # the base of a pull request, to see what it changed
+          fetch-depth: 0  # PR merge base or the commit before a master push
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --python 3.12 --extra cpu
       - run: uv run pyright
@@ -18,8 +19,11 @@ jobs:
         name: does the change touch the framework?
         # If this fails, it shows as failed and every test runs: an unknown scope never skips tests.
         continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          framework=$(PYTHONPATH=engine uv run python .github/scripts/framework_changed.py "${{ github.event.pull_request.base.sha }}")
+          framework=$(PYTHONPATH=engine uv run python .github/scripts/framework_changed.py "$BASE_SHA" --event "$EVENT_NAME")
           case "$framework" in
             true|false) echo "framework=$framework" >> "$GITHUB_OUTPUT" ;;
             *) echo "unexpected answer: '$framework'"; exit 1 ;;
