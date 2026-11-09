@@ -31,7 +31,7 @@
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行） |
+| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n auto`（Ubuntu，pytest-xdist 按核数并行）。PR 每次 push 只跑一遍；push 只在 `master`、`madoka/dev` 上触发。PR 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 
@@ -63,7 +63,31 @@
 | `engine/core/sourcetree.py` | 读源码树（清单、模块）的库，`core.manifest` 和 `core.deps` 共用；不是单元 | |
 | `engine/core/contracts/` | 单元目录之外的共享接口库，避免 `manifest.cross_unit_import`；只放实际交接的数据和必要调用，不 import torch，不放内部算法和整对象镜像；修改原则见本文件末尾 | `stage2-contract.md` §3 |
 
-`engine/core/state/alloc/prefix.py` 保存账本内部的联合前缀匹配算法；当前仅有该辅助库，账本单元由后续实现补充。
+调度宿主里的调度单元（阶段 2 第 3 步，来源、行为和已知缺口见 `engine/core/sched/README.md`）：
+
+| 路径 | 内容 |
+|---|---|
+| `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、出错不冻结（`loop.py`） |
+| `engine/policies/` | 决策点的策略单元：`fcfs`（`policy.order@1`）、`prefill_first`（`policy.compose@1`），接口在 `core/contracts/policy.py` |
+| `engine/core/state/alloc/` | 联合账本 `core.state.alloc`（`ledger@1`，接口在 `core/contracts/ledger.py`）；`prefix.py` 是账本内部的联合前缀匹配算法 |
+
+阶段 2 的文本前端：`engine/frontend/http/`、`tokenizer/`、`detok/` 是前端的三个单元，`frontend/interfaces.py`（它们之间的本地接口）和 `transport.py`（前端的两条记录流）是它们共用的库；`engine/sched/reqs/` 是调度宿主里的请求表状态单元 `sched.reqs`。来源、行为和运行方法见 `engine/frontend/README.md`。
+
+worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
+
+| 路径 | 内容 |
+|---|---|
+| `engine/core/kernels/` | kernel 目录 `core.kernels`（`kernels.catalog@1`）：登记 definition 和 solution，按 shape 和平台能力选，没有合适的就用参照实现 |
+| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），从 SGLang 搬运，签名和状态排布照 SGLang |
+| `engine/core/state/weights/` | `core.state.weights`（`state.weights@1`）：参数存储、safetensors 读取、dummy 权重、`refit` |
+| `engine/models/qwen38/` | `models.qwen38`（`model@1`）：SGLang `Qwen3_5ForCausalLM` 的搬运，参数名、`load_weights`、前向 |
+| `engine/layers/` | `layers.linear`、`embedding`、`norm`、`rope`、`activation`、`sampler`；`layers.attn`、`layers.gdn` 是 attention / GDN 外壳加 backend（SGLang 的 `TorchNativeAttnBackend`、`GDNAttnBackend`）；`solutions.py` 是这两个 backend 共用的库：按 `attn.*` / `gdn.*` 的 backend 配置在启动时固定每个阶段的 kernel |
+| `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
+| `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
+| `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_sm100` 上都用它 |
+| `engine/core/plan/` | `core.plan`（`plan@1`）：worker 的执行 plan，SGLang 的 runner；现在只有 eager（bucket 0），graph 在 M2c 加。启动时让各 backend 按配置固定 kernel 并打一行 `core.plan: {json}` |
+
+从 SGLang（`e838360`）搬运的代码在文件头注明出处，各目录带一份 `LICENSE.sglang`。改这些单元时先看 SGLang 的对应实现，能搬运的就搬运后适配，不自己另写。
 
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
@@ -78,9 +102,13 @@
   - `adversarial/`：对抗与故障边界测试，对应 `doc/evaluations/` 的记录。
   - `formal/`：TLA+ 有限模型（`models/`）、runner（`run.py`）、对真实实现的轨迹回放和契约测试。细节见 `tests/framework/formal/README.md`。
 - `tests/units/`：单元的测试（不是框架本体的测试）。`units/core/`：控制面单元 `core.identity`、`core.manifest`、`core.deps`，在小源码树上逐条测规则，不起进程。`units/contracts/`：接口库 `core.contracts`（编码往返、单元能 import 它、每个模块只 import 到本接缝的模块）。
-- `tests/units/scheduler/test_prefix.py`：账本内部联合前缀匹配算法的测试。
+- `tests/units/scheduler/`：调度器、账本和前缀匹配算法的测试。`support.py` 把调度宿主的单元放进进程内的单元运行时，配上线程上的夹具 worker 和充当前端的客户端；`test_processes.py` 用真实控制面起调度宿主和两个夹具 worker 进程。`units/schedfix/` 是测试夹具单元（夹具 worker），真实进程测试把它拷进工作区。
+- `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
+- `tests/units/kernels/`：kernel 目录的选择和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`）。
+- `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。
+- `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
-  - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区。
+  - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区，但不拷 `engine/` 里控制面以外的单元（前端、请求表、kernel、模型等）。场景拓扑的角色不列单元，那些单元会在每个场景进程里加载；kernel 单元每次启动还要 import torch。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
 
   | 模块 | 提供 |
@@ -136,6 +164,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/t
 - 测试用 `@pytest.mark.covers(edges=..., ladder=..., kinds=...)` 声明自己走到了哪些边、动作阶梯的哪几级、哪些模块种类，并在测试里断言；`tests/scenarios/test_coverage.py` 要求每一项至少有一个测试覆盖。
 - 框架代码不写死本机地址、路径或 PID（P7）；超时、心跳之类的可调参数一律做成带默认值的配置项（`doc/specs/README.md`）。
 - 框架本体对外返回 `Ok` / `Failed`，不靠异常跨进程边界。
+- 改框架本体要克制，能不改就不改，只改注释也算改：改了框架本体的变更，`apply` 直接以 `escalate.restart_engine` 失败，只能重启引擎；CI 也会因此多跑一遍 `tests/framework/`。单元需要的说明写在单元自己的代码和文档里。
 - 改 `engine/core/contracts/`（理由见 `doc/specs/stage2-contract.md` §3）：
   - 只共享真正跨单元、跨进程交接的数据和必要调用。内部对象字段、算法、队列和辅助类型留在实现里，现有多余定义也应收缩；
   - 同一个 RSI agent 可以同时修改接口与全部使用者。沿用交接方式的算法/kernel/策略改动直接改实现；交接内容或语义变化时才更新共享定义，需要旧新版本并存时才新增版本；

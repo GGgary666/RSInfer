@@ -1,0 +1,11 @@
+[unit]
+id = "executors.pytorch"
+kind = "logic"
+process = ["worker"]
+entry = "executors.pytorch.unit:Unit"
+
+[provides]
+services = ["executor@1"]
+
+[requires]
+services = ["worker.batch@1", "plan@1", "layers.sampler@1", "state.kv.paged@1", "state.gdn.slots@1"]

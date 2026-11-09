@@ -9,6 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+frontend = ["transformers>=5,<6", "jinja2>=3.1", "fastapi>=0.115", "uvicorn>=0.30"]
 # The torch platforms (platforms.torch_eager) and the model units need one of the two;
 # they exclude each other. CI and machines without a GPU use `cpu`; SM100 hosts use `gpu`.
 cpu = ["torch==2.11.0", "safetensors==0.8.0"]
@@ -21,6 +22,9 @@ dev = [
     "hypothesis>=6.100",
     "pyright>=1.1.390",
     "pytest-xdist>=3.5",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
     # The HF reference the model units are tested against (stage2-contract.md §1.3).
     "transformers==5.22.1",
 ]

@@ -71,12 +71,14 @@ class BatchPlan(msgspec.Struct, frozen=True):
     with no token to resolve answers ``Resync`` and runs nothing."""
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
-    """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
+    """The scheduler's bucket hint (padded batch size); 0 = eager. The worker picks the plan it runs
+    itself, from those ready (stage2-contract.md §9.1)."""
 
 
 class StateAssign(msgspec.Struct, frozen=True):
     """Items of one state kind newly given to rows: pages for paged kinds, a slot at admission
-    for slot kinds. Row ``rows[i]`` appends ``ids[offsets[i]:offsets[i + 1]]``."""
+    for slot kinds. Row ``rows[i]`` appends ``ids[offsets[i]:offsets[i + 1]]``. Ids are the
+    ledger's, ``0 .. n - 1`` for the kind's ``n`` in ``Capacity``."""
 
     kind: str
     rows: Column
@@ -109,7 +111,11 @@ class StateOps(msgspec.Struct, frozen=True):
 
 class Sampled(msgspec.Struct, frozen=True):
     """Tokens sampled in step ``epoch`` (the record's epoch). ``counts`` is 1 per row without
-    speculation, the accepted length plus one with it."""
+    speculation, the accepted length plus one with it.
+
+    Every row of the plan samples, also a row whose chunk does not end its prompt; the scheduler
+    drops that token, as sglang and mini-sglang drop a chunked request's (2026-11-08). The
+    worker keeps every row's last token for ``from_previous`` regardless."""
 
     SECTION: ClassVar[str] = "worker.sampled@1"
     rows: Column
@@ -131,7 +137,9 @@ class StepStats(msgspec.Struct, frozen=True):
 
 
 class Capacity(msgspec.Struct, frozen=True):
-    """Usable items per state kind, scratch excluded; sent at start and after a grow."""
+    """Usable items per state kind: the ledger hands out ids ``0 .. n - 1``, and a store keeps its
+    padding and scratch items outside that range (``StateStore``). Sent at start, and again once a
+    supported capacity change has taken effect."""
 
     SECTION: ClassVar[str] = "state.capacity@1"
     items: dict[str, int]
@@ -150,3 +158,14 @@ class Resync(msgspec.Struct, frozen=True):
 
     SECTION: ClassVar[str] = "worker.resync@1"
     reason: str = ""
+
+
+class StepFailure(msgspec.Struct, frozen=True):
+    """The worker failed while running step ``epoch`` (the record's epoch), after it began, so it
+    cannot say what the device did. Unlike ``Resync`` (a plan refused before anything ran), the
+    step is not taken as not run: the scheduler stops sending this rank's domain steps, answers
+    new requests with an error and reports it. Nothing is frozen; what happens to the requests
+    it holds is for whoever changes the engine next to choose."""
+
+    SECTION: ClassVar[str] = "worker.failure@1"
+    reason: str

@@ -22,8 +22,10 @@ from core.change.types import ActionPlan, ChangeResult, ProcActions, UnitAction
 from core.common.ids import UnitId
 from core.common.result import Failed, Ok, Result, fail
 from core.control.host import ControlTunables
+from core.sourcetree import read_tree
 from core.supervisor.protocol import ProcIntrospection
-from tests.scenarios.harness import ALL, SCHED, W0, W1, Scenario, generations, rungs, scenario, topology
+from tests.scenarios.harness import (ALL, SCHED, W0, W1, Scenario, build_workspace, generations, rungs, scenario,
+                                     topology)
 from unit.runtime import DerivedArtifact
 from unit.runtime.types import ReloadPlan, ReloadReport
 
@@ -55,6 +57,20 @@ async def everyone_on(s: Scenario, r: ChangeResult) -> None:
     st = await s.status()
     assert st.identity == r.new_identity
     assert {row.proc: row.identity for row in st.procs} == {str(p): r.new_identity for p in ALL}
+
+
+def test_a_workspace_runs_the_scenario_units_and_the_control_plane_only(tmp_path: Path) -> None:
+    """The repo's serving units (here ``core.kernels``, ``kernels.reference``) are not in a scenario
+    workspace: a scenario worker would load them, and torch with them, at every start."""
+    tree = read_tree(build_workspace(tmp_path) / "engine")
+    assert not tree.errors, tree.errors
+    assert {UnitId("core.kernels"), UnitId("kernels.reference")}.isdisjoint(tree.units)
+    assert {"core.contracts.kernels", "core.sourcetree"} <= set(tree.modules)
+    assert {u for u, s in tree.units.items() if s.manifest.unit.process == ["control"]} == {
+        "core.api", "core.deps", "core.identity", "core.manifest"}
+    assert all(u.startswith("scn.") for u, s in tree.units.items() if s.manifest.unit.process != ["control"])
+    assert tree.role_units(topology(tmp_path), "worker") == [
+        "scn.kernel_basic", "scn.kernels", "scn.logs", "scn.memory", "scn.native", "scn.plan", "scn.worker"]
 
 
 @pytest.mark.covers(edges=("call", "state", "derive", "decl"), kinds=("logic", "state"))

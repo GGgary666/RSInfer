@@ -6,6 +6,7 @@ Definition / Solution.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import msgspec
@@ -24,16 +25,20 @@ class Definition(msgspec.Struct, frozen=True):
     """Versioned, e.g. ``attn.paged_decode@1``."""
     doc: str
     reference: str
-    """``module:function``: the PyTorch reference. Every definition has one; it runs on
-    ``torch_cpu`` in CI and is what a solution is tested against."""
+    """Id of the PyTorch reference solution (registered by ``kernels.reference``). Every
+    definition has one; it runs on ``torch_eager`` in CI and is what a solution is tested against."""
     tolerance: Tolerance = Tolerance()
-    batch_invariant: bool = True
-    """The result for one row does not depend on the other rows of the batch."""
+    batch_invariant: bool = False
+    """The result for one row does not depend on the other rows of the batch, bit for bit.
+    Claimed only where it holds by construction: one torch op over the whole batch may take
+    another path or accumulation order for another number of rows."""
 
 
 class Solution(msgspec.Struct, frozen=True):
     id: str
-    """E.g. ``flashinfer.paged_decode``; selection results are by-value deps of a plan."""
+    """E.g. ``flashinfer.paged_decode``; selection results are by-value deps of a plan. The first
+    dot-separated part names the backend the solution belongs to (``reference``, ``flashinfer``,
+    ``triton``, ...), the name the backend config keys take (stage2-contract.md §5.5.3)."""
     definition: str
     entry: str
     """``module:function`` inside the kernel unit."""
@@ -55,10 +60,30 @@ class Selected(msgspec.Struct, frozen=True):
     """True: no solution fits, the reference runs; reported in the plan and the result."""
 
 
+@dataclass(frozen=True)
+class Implementation:
+    """What a kernel unit registers for a solution: its description and the function itself.
+    The reference of a definition is the solution whose id is ``Definition.reference``."""
+
+    solution: Solution
+    fn: KernelFn
+
+
 class Catalog(Protocol):
     """``kernels.catalog@1``. Kernel units register into it (``ctx.register``); layers ask
-    by definition and shape. A plan fixes its selections when it is built; the eager path
-    asks on each call."""
+    by definition and shape. A selection, once made, is kept by whoever made it (a plan, a
+    backend); ``version`` tells it that the registrations changed and its choice may be stale."""
 
-    def select(self, definition: str, shape: Mapping[str, int]) -> Selected: ...
+    @property
+    def version(self) -> int:
+        """Moves with every registration and undo, e.g. a kernel unit's reload."""
+        ...
+
+    def register(self, item: Definition | Implementation) -> Callable[[], None]:
+        """Add a definition or a solution; the returned undo removes it (a reload re-registers)."""
+        ...
+    def select(self, definition: str, shape: Mapping[str, int], backend: str = "auto") -> Selected:
+        """``auto``: a fitting solution, else the reference (``fallback``). A named backend: one of
+        its solutions that fits, or ``LookupError``; never the reference in its place."""
+        ...
     def resolve(self, solution: str) -> KernelFn: ...

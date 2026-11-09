@@ -1,0 +1,8 @@
+[unit]
+id = "policies.fcfs"
+kind = "logic"
+process = ["sched"]
+entry = "policies.fcfs.unit:Unit"
+
+[provides]
+services = ["policy.order@1"]

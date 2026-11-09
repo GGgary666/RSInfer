@@ -1,6 +1,7 @@
 """The scenario test bed: a real control plane (in the test's event loop) with its
 control-plane units, two fake hosts (node agents as child processes), and a
-workspace = this repo's ``engine/`` plus the scenario units as package ``scn``.
+workspace = this repo's ``engine/`` without its serving units, plus the scenario units as
+package ``scn``.
 
 Changes go through the control interface (``ControlClient``) exactly as an agent
 would send them: edit the workspace, upload, apply.
@@ -26,7 +27,8 @@ import zmq.asyncio
 from core.change.config import ChangeTunables
 from core.change.types import ActionPlan, ChangeResult
 from core.common.ids import HostId, ProcId
-from core.common.result import Failed
+from core.common.manifest import MANIFEST_FILE, load_manifest
+from core.common.result import Failed, Ok
 from core.control.client import ControlClient
 from core.control.host import ControlPlane, ingest
 from core.control.protocol import ApiChange, ApiStatusReport
@@ -47,10 +49,24 @@ AGENT_TUNABLES = {"nodeagent.heartbeat_interval_s": 0.1, "nodeagent.rpc_timeout_
 PROC_TUNABLES = {"host.idle_poll_s": 0.01}
 
 
+def serving_units(directory: str | os.PathLike[str], names: list[str]) -> set[str]:
+    """The repo's own units outside the control plane (request table, kernels, models, ...).
+    Scenario roles list no units, so they would run in every scenario process; the kernel units
+    import torch at each start."""
+    out: set[str] = set()
+    for name in names:
+        path = Path(directory, name, MANIFEST_FILE)
+        r = load_manifest(path) if path.is_file() else None
+        if isinstance(r, Ok) and "control" not in r.value.unit.process:
+            out.add(name)
+    return out
+
+
 def build_workspace(root: Path) -> Path:
-    """What an agent works on: a source tree whose ``engine/`` holds the framework and the units."""
+    """What an agent works on: a source tree whose ``engine/`` holds the framework, its libraries,
+    the control-plane units and the scenario units; the repo's serving units stay out."""
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-    shutil.copytree(ENGINE, root / "engine", ignore=ignore)
+    shutil.copytree(ENGINE, root / "engine", ignore=lambda d, names: ignore(d, names) | serving_units(d, names))
     shutil.copytree(UNITS / "scn", root / "engine" / "scn", ignore=ignore)
     return root
 

@@ -1,0 +1,13 @@
+[unit]
+id = "state.gdn_slots"
+kind = "state"
+process = ["worker"]
+entry = "state.gdn_slots.unit:Unit"
+
+[provides]
+services = ["state.gdn.slots@1"]
+
+[config]
+"state.gdn.ssm_dtype" = { type = "str", default = "auto", binding = "startup", doc = "Recurrent (SSM) state dtype (SGLang's --mamba-ssm-dtype): auto, the checkpoint config's mamba_ssm_dtype, else f32; or bf16, f16, f32" }
+"state.gdn.conv_dtype" = { type = "str", default = "bf16", binding = "startup", doc = "Conv state dtype (SGLang's SGLANG_MAMBA_CONV_DTYPE): bf16, f16 or f32" }
+"state.gdn.slots" = { type = "int", default = 8, binding = "startup", doc = "Usable GDN state slots; slot 0 is padding" }

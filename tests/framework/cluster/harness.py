@@ -377,9 +377,10 @@ async def cluster(tmp: Path, hosts: list[str], proc_tunables: dict[str, float] |
                   agent_tunables: dict[str, float] | None = None, sup_tunables: dict[str, float] | None = None,
                   ) -> AsyncGenerator[Cluster]:
     zctx = zmq.asyncio.Context()
-    # 2 s, as in tests/scenarios/harness.py: under `pytest -n auto` a busy runner can stall a node
-    # agent or this event loop for a second, and 1 s then declared a live machine lost.
-    tun = SupervisorTunables(**{"heartbeat_timeout_s": 2.0, "monitor_interval_s": 0.05,
+    # 10 s, as in tests/scenarios/harness.py (#29): under `pytest -n auto` a busy runner can stall a
+    # node agent or this event loop for seconds, and 2 s then declared a live machine lost. The
+    # machine-loss test, which measures detection, passes 2 s itself.
+    tun = SupervisorTunables(**{"heartbeat_timeout_s": 10.0, "monitor_interval_s": 0.05,
                                 "checkin_timeout_s": 30.0, "rpc_timeout_s": 10.0, **(sup_tunables or {})})
     sup = Supervisor(zctx, host=HostId("host-a"), bind_address=ADDRESS, blobs=BlobStore(tmp / "blobs"),
                      tun=tun, proc_tunables={"host.idle_poll_s": 0.01, **(proc_tunables or {})})

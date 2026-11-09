@@ -56,3 +56,5 @@ class TokenEvents(msgspec.Struct, frozen=True):
     offsets: Column
     tokens: Column
     finished: dict[int, FinishReason] = {}
+    errors: dict[int, str] = {}
+    """Requests the scheduler refused, with why; they also appear in ``finished`` (``abort``)."""

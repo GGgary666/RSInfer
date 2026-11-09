@@ -1,0 +1,14 @@
+[unit]
+id = "core.state.alloc"
+kind = "state"
+process = ["sched"]
+entry = "core.state.alloc.unit:Unit"
+
+[provides]
+services = ["ledger@1"]
+
+[state]
+drain_on_reload = true
+
+[config]
+"alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them. This first ledger takes request pages and request slots, without prefix snapshots." }

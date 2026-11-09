@@ -219,7 +219,7 @@ def test_killed_worker_is_reported_lost(tmp_path: Path) -> None:
 
 def test_silent_agent_means_the_machine_is_lost(tmp_path: Path) -> None:
     async def main() -> None:
-        async with cluster(tmp_path, ["host-a", "host-b"]) as c:
+        async with cluster(tmp_path, ["host-a", "host-b"], sup_tunables={"heartbeat_timeout_s": 2.0}) as c:
             identity, files = c.ingest(build_tree(tmp_path))
             topo = topology(tmp_path, ["host-a", "host-b"], ["host-a", "host-b"], [
                 role("sched", ["toyc.idle"], hosts=["host-a"]),

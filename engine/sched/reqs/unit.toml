@@ -1,0 +1,11 @@
+[unit]
+id = "sched.reqs"
+kind = "state"
+process = ["sched"]
+entry = "sched.reqs.unit:Unit"
+
+[provides]
+services = ["sched.reqs@1"]
+
+[state]
+drain_on_reload = true
