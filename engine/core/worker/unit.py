@@ -142,7 +142,14 @@ class WorkerLoop:
 
     def _finish_ready(self) -> None:
         for taken in self.taken:
-            if taken.step is not None and taken.step.ready():
+            if taken.step is None:
+                continue
+            try:
+                ready = taken.step.ready()
+            except Exception as e:  # noqa: BLE001 - asking may report the device work's error (a CUDA event)
+                self._failed(taken, e)
+                continue
+            if ready:
                 self._finish(taken)
         self._release()
 
