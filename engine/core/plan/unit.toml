@@ -1,0 +1,14 @@
+[unit]
+id = "core.plan"
+kind = "logic"
+process = ["worker"]
+entry = "core.plan.unit:Unit"
+
+[provides]
+services = ["plan@1"]
+
+[requires]
+services = ["model@1", "layers.attn@1", "layers.gdn@1"]
+
+[capabilities]
+captures_graph = true

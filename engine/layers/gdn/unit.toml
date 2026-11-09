@@ -9,3 +9,8 @@ services = ["layers.gdn@1"]
 
 [requires]
 services = ["kernels.catalog@1", "state.gdn.slots@1"]
+
+[config]
+"gdn.backend" = { type = "str", default = "auto", binding = "startup", doc = "GDN kernels (SGLang's --linear-attn-backend): auto, or a backend of the kernel catalog, e.g. reference" }
+"gdn.prefill_backend" = { type = "str", default = "", binding = "startup", doc = "For prefill and mixed steps (SGLang's --linear-attn-prefill-backend); empty: gdn.backend" }
+"gdn.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps (SGLang's --linear-attn-decode-backend); empty: gdn.backend" }

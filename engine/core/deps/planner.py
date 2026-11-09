@@ -94,6 +94,8 @@ def plan(w: World) -> Result[ActionPlan]:
         c = p.in_place(w.control, units, _process_plan(w.control.proc, units, w.new_tree, w.new.config))
         if c.reload is not None or c.config or c.stage or c.actions:
             control = c
+    if p.state_lost:
+        return Ok(ActionPlan(restart_engine=True, notes=p.state_lost))
     return Ok(ActionPlan(procs=procs, control=control, spawn=spawn, stop=stop,
                          topology=topo if w.cs.topology is not None else None, notes=w.notes))
 
@@ -143,6 +145,8 @@ class _Planner:
         self.new_graph = ImportGraph(w.new_tree.modules)
         self.base_graph = ImportGraph(w.base_tree.modules)
         self.owners = _owners(w.new_tree)
+        self.state_lost: list[str] = []
+        """Why the change restarts the engine: a config change would rebuild state in flight."""
 
     def _binding(self, key: str) -> str:
         owner = self.owners.get(key)
@@ -219,6 +223,23 @@ class _Planner:
         s = self.w.new_tree.units.get(uid)
         return list(s.manifest.provides.services) if s is not None else []
 
+    def reloaded_with(self, units: set[UnitId], present: set[UnitId]) -> set[UnitId]:
+        """``units`` and, transitively, the units of ``present`` that use a service one of them
+        provides: the runtime reloads a provider's users with it."""
+        out, todo = set(units), list(units)
+        while todo:
+            provided = set(self._provides_new(todo.pop()))
+            for u in sorted(present - out):
+                m = self.w.new_tree.units[u].manifest
+                if provided & {*m.requires.services, *m.requires.optional}:
+                    out.add(u)
+                    todo.append(u)
+        return out
+
+    def drains(self, uid: UnitId) -> bool:
+        m = self.w.new_tree.units[uid].manifest
+        return m.unit.kind == "state" and (m.state is None or m.state.drain_on_reload)
+
     def natives_touch(self, units: list[UnitId]) -> bool:
         changed = {p.removeprefix("engine/") for p in self.changed_paths}
         for uid in units:
@@ -264,6 +285,7 @@ class _Planner:
 
         actions: list[UnitAction] = []
         rebuild: dict[tuple[UnitId, str], tuple[str, set[str]]] = {}
+        by_config: dict[UnitId, set[str]] = {}
         for r in intro.reads:
             if r.key not in changed_keys or r.unit in reload or r.unit in removed:
                 continue
@@ -273,12 +295,20 @@ class _Planner:
                     w.notes.append(f"{intro.proc}: {r.unit} built {r.artifact!r} from {r.key!r} but did not "
                                    "register it; reloading it")
                     reload.add(r.unit)
+                    by_config.setdefault(r.unit, set()).add(r.key)
                 else:
                     rebuild.setdefault((art.owner, art.name), (art.rebuild, set()))[1].add(r.key)
             elif r.hooked and self._binding(r.key) != "startup":
                 pass  # rung 1: it takes the new value in place (ctx.on_config)
             else:
                 reload.add(r.unit)  # rung 2: a startup key, or read without a hook
+                by_config.setdefault(r.unit, set()).add(r.key)
+        lost = sorted(u for u in self.reloaded_with(set(by_config), before & target) if self.drains(u))
+        if lost:
+            keys = sorted({k for ks in by_config.values() for k in ks})
+            self.state_lost.append(
+                f"{intro.proc}: changing {keys} reloads {lost}, which hold state in flight ([state] drain_on_reload); "
+                "draining and migrating it are not implemented yet (stage2-contract.md §5.5.5): restart the engine")
         for a in intro.artifacts:
             if a.owner in reload or a.owner in removed:
                 continue

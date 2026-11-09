@@ -11,5 +11,8 @@ services = ["state.weights@1"]
 "weights.path" = { type = "str", default = "", binding = "startup", doc = "A safetensors file or a directory of them; empty: dummy weights" }
 "weights.dummy_seed" = { type = "int", default = 1234, binding = "startup", doc = "Seed of the dummy weights (initialize_dummy_weights)" }
 
+[reads]
+config = ["model.path", "model.hf_config", "model.dtype"]
+
 [capabilities]
 actions = ["refit"]

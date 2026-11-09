@@ -5,19 +5,24 @@ SGLang's ``RadixAttention`` and ``TorchNativeAttnBackend`` (srt/layers/attention
 torch_native_backend.py, e838360; LICENSE.sglang). ``prepare`` derives the ``ForwardBatch`` fields
 the backend reads (``req_pool_indices``, ``seq_lens``, ``extend_prefix_lens``, ``extend_seq_lens``,
 ``out_cache_loc``) from the persistent batch and the plan; ``forward`` stores K/V and runs
-``attn.extend@1`` (prefill and mixed steps, as SGLang's MIXED mode) or ``attn.decode@1``.
+``attn.extend@1`` (prefill and mixed steps, as SGLang's MIXED mode) or ``attn.decode@1``, with the
+solutions ``resolve`` fixed at start from ``attn.backend`` and its per-phase overrides.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import PersistentBatch, PlanKey
+from core.contracts.plan import AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
+from core.contracts.state import StateDecl
+from layers.solutions import Kernels
+
+KIND = "kv.paged"
 
 
 @dataclass(frozen=True)
@@ -44,14 +49,20 @@ class Metadata:
 class TorchNativeAttnBackend:
     """``layers.attn@1``."""
 
-    def __init__(self, catalog: Any, kv: Any) -> None:
-        self.catalog = catalog
+    def __init__(self, kernels: Kernels, kv: Any) -> None:
+        self.kernels = kernels
         self.kv = kv
         self.forward_metadata: Metadata | None = None
 
     @property
     def binding(self) -> NoBuffers:
         return NoBuffers()
+
+    def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
+        head_dim = next(d.tensors["k"][0][-1] for d in states if d.kind == KIND)
+        shape = {"head_dim": head_dim}
+        return self.kernels.resolve({"prefill": {"kv.store@1": {}, "attn.extend@1": shape},
+                                     "decode": {"kv.store@1": {}, "attn.decode@1": shape}})
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         req_to_token = batch.binding.buffers()["req_to_token"]
@@ -77,21 +88,27 @@ class TorchNativeAttnBackend:
         o = torch.empty_like(q)
         cache = self.kv.bind(layer).buffers()
         k_cache, v_cache = cache["k"], cache["v"]
-        self.catalog.call("kv.store@1", {}, k_cache, v_cache, m.out_cache_loc, k.view(-1, num_kv_heads, head_dim),
-                          v.view(-1, num_kv_heads, head_dim))
+        phase = "decode" if m.decode else "prefill"
+        self.kernels(phase, "kv.store@1")(k_cache, v_cache, m.out_cache_loc, k.view(-1, num_kv_heads, head_dim),
+                                          v.view(-1, num_kv_heads, head_dim))
         use_gqa = num_heads != num_kv_heads
         q_ = q.view(-1, num_heads, head_dim)
         o_ = o.view(-1, num_heads, head_dim)
-        shape = {"head_dim": head_dim}
         if m.decode:
-            self.catalog.call("attn.decode@1", shape, q_, o_, k_cache, v_cache, m.req_to_token, m.req_pool_indices,
-                              m.seq_lens, scaling, use_gqa, False)
+            self.kernels(phase, "attn.decode@1")(q_, o_, k_cache, v_cache, m.req_to_token, m.req_pool_indices,
+                                                 m.seq_lens, scaling, use_gqa, False)
         else:
-            self.catalog.call("attn.extend@1", shape, q_, o_, k_cache, v_cache, m.req_to_token, m.req_pool_indices,
-                              m.seq_lens, m.extend_prefix_lens, m.extend_seq_lens, scaling, use_gqa, True)
+            self.kernels(phase, "attn.extend@1")(q_, o_, k_cache, v_cache, m.req_to_token, m.req_pool_indices,
+                                                 m.seq_lens, m.extend_prefix_lens, m.extend_seq_lens, scaling, use_gqa,
+                                                 True)
         return o
 
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        ctx.provide("layers.attn@1", TorchNativeAttnBackend(ctx.use("kernels.catalog@1"), ctx.use("state.kv.paged@1")))
+        kernels = Kernels(ctx.use("kernels.catalog@1"), config, "attn")
+        ctx.provide("layers.attn@1", TorchNativeAttnBackend(kernels, ctx.use("state.kv.paged@1")))
+
+
+if TYPE_CHECKING:
+    _: type[AttentionBackend] = TorchNativeAttnBackend

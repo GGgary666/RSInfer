@@ -36,7 +36,9 @@ class Definition(msgspec.Struct, frozen=True):
 
 class Solution(msgspec.Struct, frozen=True):
     id: str
-    """E.g. ``flashinfer.paged_decode``; selection results are by-value deps of a plan."""
+    """E.g. ``flashinfer.paged_decode``; selection results are by-value deps of a plan. The first
+    dot-separated part names the backend the solution belongs to (``reference``, ``flashinfer``,
+    ``triton``, ...), the name the backend config keys take (stage2-contract.md §5.5.3)."""
     definition: str
     entry: str
     """``module:function`` inside the kernel unit."""
@@ -69,11 +71,19 @@ class Implementation:
 
 class Catalog(Protocol):
     """``kernels.catalog@1``. Kernel units register into it (``ctx.register``); layers ask
-    by definition and shape. A plan fixes its selections when it is built; the eager path
-    asks on each call."""
+    by definition and shape. A selection, once made, is kept by whoever made it (a plan, a
+    backend); ``version`` tells it that the registrations changed and its choice may be stale."""
+
+    @property
+    def version(self) -> int:
+        """Moves with every registration and undo, e.g. a kernel unit's reload."""
+        ...
 
     def register(self, item: Definition | Implementation) -> Callable[[], None]:
         """Add a definition or a solution; the returned undo removes it (a reload re-registers)."""
         ...
-    def select(self, definition: str, shape: Mapping[str, int]) -> Selected: ...
+    def select(self, definition: str, shape: Mapping[str, int], backend: str = "auto") -> Selected:
+        """``auto``: a fitting solution, else the reference (``fallback``). A named backend: one of
+        its solutions that fits, or ``LookupError``; never the reference in its place."""
+        ...
     def resolve(self, solution: str) -> KernelFn: ...

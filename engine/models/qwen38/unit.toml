@@ -17,4 +17,4 @@ services = ["state.weights@1", "state.kv.paged@1", "state.gdn.slots@1", "layers.
 "model.dtype" = { type = "str", default = "bf16", binding = "startup", doc = "Parameter and activation dtype: bf16, f16, f32" }
 
 [reads]
-config = ["state.kv.page_size"]
+config = ["state.kv.page_size", "state.kv.dtype", "state.gdn.conv_dtype", "state.gdn.ssm_dtype"]

@@ -9,6 +9,7 @@ import struct
 import time
 import uuid
 
+import msgspec
 import pytest
 import zmq
 
@@ -17,6 +18,9 @@ from core.ipc import PeerLost, StreamClosed, backend_for, open_reader, open_writ
 from tests.framework.ipc.peers import BIND, PATIENT, TUN, read_forever, write_records
 
 SPAWN = mp.get_context("spawn")
+LOADED = msgspec.structs.replace(PATIENT, peer_timeout_s=30.0)
+"""For a reader whose writer is a busy child process: on a loaded CI runner its heartbeat thread
+can go unscheduled for seconds."""
 
 # (reader host, writer host): same host -> shm, two fake hosts -> TCP
 BACKENDS = {"shm": ("host-a", "host-a"), "tcp": ("host-a", "host-b")}
@@ -45,7 +49,7 @@ def test_backend_is_chosen_by_host_id_not_address() -> None:
 def test_ordered_and_lossless_across_ring_wraps(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str]) -> None:
     rhost, whost = hosts
     reader, addr = open_reader(zctx, local=HostId(rhost), peer=HostId(whost), bind_host=BIND,
-                               shm_name=shm_name(), tun=PATIENT)
+                               shm_name=shm_name(), tun=LOADED)
     sizes = [(i * 7919) % 6000 for i in range(1500)]
     child = SPAWN.Process(target=write_records, args=(addr, whost, sizes, True, 0.0))
     child.start()

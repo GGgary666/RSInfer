@@ -118,6 +118,41 @@ def test_a_startup_key_reloads_only_its_readers(tmp_path: Path) -> None:
     assert reloaded(pa) == ["pkg.a"] and pa.actions == []
 
 
+def with_units(**manifests: str) -> dict[str, str]:
+    return {**BASE, **{f"pkg/{name}/unit.toml": m for name, m in manifests.items()}}
+
+
+def state_a(drain: bool) -> str:
+    return manifest_toml("pkg.a", "pkg.a.unit:Unit", provides=["pkg.a@1"], kind="state", config={
+        "pkg.live": {"type": "int", "default": 1, "binding": "live"},
+        "pkg.plan": {"type": "int", "default": 8, "binding": "plan"},
+        "pkg.start": {"type": "int", "default": 0, "binding": "startup"},
+    }) + ("" if drain else "\n[state]\ndrain_on_reload = false\n")
+
+
+def test_a_config_change_that_would_rebuild_state_in_flight_restarts_the_engine(tmp_path: Path) -> None:
+    """Reloading a state unit that drains on reload empties it while requests use it, and draining
+    is not implemented yet (stage2-contract.md §5.5.5): the change asks for a restart instead."""
+    tree = with_units(a=state_a(drain=True))
+    p = Case(tmp_path, new=tree, base=tree, config={"pkg.start": 3}).plan()
+    assert not isinstance(p, Failed) and p.restart_engine and p.procs == []
+    assert "['pkg.start'] reloads ['pkg.a']" in p.notes[0] and "restart the engine" in p.notes[0]
+
+
+def test_so_does_one_that_reloads_a_draining_user_of_a_provider(tmp_path: Path) -> None:
+    """The runtime reloads a provider's users with it: here the state unit pkg.b uses pkg.a."""
+    tree = with_units(b=manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"], reads=["pkg.live"],
+                                      kind="state"))
+    p = Case(tmp_path, new=tree, base=tree, config={"pkg.start": 3}).plan()
+    assert not isinstance(p, Failed) and p.restart_engine and "reloads ['pkg.b']" in p.notes[0]
+
+
+def test_a_state_unit_that_need_not_drain_is_reloaded_for_a_config_change(tmp_path: Path) -> None:
+    tree = with_units(a=state_a(drain=False))
+    pa = only(Case(tmp_path, new=tree, base=tree, config={"pkg.start": 3}).plan())
+    assert reloaded(pa) == ["pkg.a"]
+
+
 def test_a_library_change_reloads_the_units_that_import_it(tmp_path: Path) -> None:
     pa = only(Case(tmp_path, new={**BASE, "pkg/lib.py": "def helper():\n    return 2\n"}).plan())
     assert reloaded(pa) == ["pkg.b"] and pa.reload is not None and pa.reload.changed_modules == ["pkg.lib"]

@@ -24,7 +24,8 @@ class PendingStep(Protocol):
 
 class Executor(Protocol):
     def capacity(self) -> Capacity:
-        """Items per state kind; the worker sends it at start and after a grow."""
+        """Items per state kind; the worker sends it at start and whenever its answers go to a new
+        reader."""
         ...
     def submit(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps) -> PendingStep | Resync:
         """Run step ``epoch``, or answer ``Resync`` having changed nothing and queued no device work

@@ -71,7 +71,8 @@ class BatchPlan(msgspec.Struct, frozen=True):
     with no token to resolve answers ``Resync`` and runs nothing."""
     phase: Literal["prefill", "decode", "mixed"]
     bucket: int
-    """Plan bucket (padded batch size) chosen by the bucketing policy; 0 = eager."""
+    """The scheduler's bucket hint (padded batch size); 0 = eager. The worker picks the plan it runs
+    itself, from those ready (stage2-contract.md §9.1)."""
 
 
 class StateAssign(msgspec.Struct, frozen=True):
@@ -137,7 +138,8 @@ class StepStats(msgspec.Struct, frozen=True):
 
 class Capacity(msgspec.Struct, frozen=True):
     """Usable items per state kind: the ledger hands out ids ``0 .. n - 1``, and a store keeps its
-    padding and scratch items outside that range (``StateStore``). Sent at start and after a grow."""
+    padding and scratch items outside that range (``StateStore``). Sent at start, and again once a
+    supported capacity change has taken effect."""
 
     SECTION: ClassVar[str] = "state.capacity@1"
     items: dict[str, int]

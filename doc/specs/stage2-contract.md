@@ -384,7 +384,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 | 状态 dtype/量化格式改变 | 验证数值并转换或重建；明确前缀快照是否失效，不自动继续复用 |
 | 已支持的状态池容量变更 | 按实际资源变化检查绑定；重新分配或改变视图结构时递增 binding generation、使受影响 graph 失效，并按 §9.4 处理状态迁移和重录；无实现则拒绝 |
 
-- **实现（2026-11-09，最小版本）**：排空和迁移实现之前（第 5 步，[state-changes.md](state-changes.md)），`core.deps` 对“会让持有在途状态的状态单元重载”的配置变更不做重载，改为要求重启引擎（`restart_engine`，`apply` 以 `escalate.restart_engine` 失败，dry-run 的 notes 说明原因）。判断：这次变更改了某个单元读的 startup 键（或没有 hook 的键），使它重载；运行时会把提供者的使用者一起重载，所以连带算上；其中有 `kind = "state"` 且 `[state] drain_on_reload` 为真的单元（`state.kv_paged`、`state.gdn_slots`、账本、请求表、权重存储）就命中。§5.5.3 的 dtype、页大小、池子大小都属于这种键。改这些单元自己的代码引起的重载不在这条规则里，留到第 5 步。测试：`tests/units/core/test_deps.py`。
+- **实现（2026-11-09，最小版本）**：排空和迁移实现之前（第 5 步，[state-changes.md](state-changes.md)），`core.deps` 对“会让持有在途状态的状态单元重载”的配置变更不做重载，改为要求重启引擎（`restart_engine`，`apply` 以 `escalate.restart_engine` 失败，dry-run 的 notes 说明原因）。判断：这次变更改了某个单元读的 startup 键（或没有 hook 的键），使它重载；运行时会把提供者的使用者一起重载，所以连带算上；其中有 `kind = "state"` 且 `[state] drain_on_reload` 为真的单元（`state.kv_paged`、`state.gdn_slots`、账本、请求表、权重存储）就命中。§5.5.3 的 dtype、页大小、池子大小都属于这种键。dtype 键由模型解析，但存储单元自己也读它们；`auto` 依赖的模型配置（`model.dtype`、`model.hf_config`、`model.path`）由权重存储读，参数本来就按它们声明。这样规则才能看到会被重载的状态单元（2026-11-09，#35 评审）。改这些单元自己的代码引起的重载不在这条规则里，留到第 5 步。测试：`tests/units/core/test_deps.py`。
 - 只有数值语义保持且引用/索引能正确重映射时，迁移才可保留前缀缓存；否则明确失效或排空。
 - 旧 buffer、graph 与复制源必须等在途使用结束后再释放。迁移或 capture 失败时清理候选资源；只有确认旧状态完整才能恢复服务，否则进入恢复流程，不能报告切换成功。
 
@@ -467,7 +467,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_eager` 上跑，是 CI 的基准，也是检验 solution 的标准。
 - **solution** 写怎么算：用哪个库的哪个版本、支持哪些 shape、能不能录进 graph、需要哪些平台能力、要不要进程级初始化、能不能跨机。
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
-- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）仍在每次调用时按 `auto` 选。
+- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）按 `auto` 在第一次以某个 shape 调用时选定，之后按（definition，shape）一直用这一个，不再每次现选（2026-11-09 改）。目录的每次登记和撤销（比如 kernel 单元重载）都让 `Catalog.version` 加一：固定下来的选择在下一次调用时重新解析，所以热重载以后跑的是新代码。graph 对 solution 的依赖另按 §9.3 检查。已知缺口（2026-11-09，#35 评审）：如果一个 kernel 单元被删掉，而 `attn.backend` 之类的键还显式点着它的名字，重新解析会在前向里失败，表现为 `StepFailure`，而不是在变更时就被拒绝；第 5 步做变更计划时一起补。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
 - **实现（2026-11-08）**：
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。

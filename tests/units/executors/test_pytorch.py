@@ -1,4 +1,4 @@
-"""executors.eager with every worker unit of stage 2, on torch_eager (CPU, fp32): greedy
+"""executors.pytorch with every worker unit of stage 2, on torch_eager (CPU, fp32): greedy
 generation follows the HF model token by token, and the same requests give the same tokens and,
 within tolerance, the same logits however they are batched, chunked, rebuilt or restored from a
 snapshot (stage2-contract.md §1.3; the comparisons are not bitwise, §6)."""
