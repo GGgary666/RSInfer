@@ -88,3 +88,22 @@ def test_a_reloaded_kernel_unit_registers_again_and_an_unloaded_one_leaves_nothi
     assert {d.name for d in cat.definitions() if d.batch_invariant} == {n for n, *_, inv in DEFINITIONS if inv}
     rt.unload_all().unwrap()
     assert cat.definitions() == [] and cat.solutions("norm.gemma_rms@1") == []
+
+
+def test_a_kept_choice_follows_a_reload_of_the_kernel_unit_that_registered_it() -> None:
+    """Choices are fixed once made (``call`` per definition and shape, a backend at start); a
+    registration or undo moves ``version``, so the next call after a kernel unit's reload (undo,
+    then register again) runs the new code instead of the function kept before."""
+    from layers.solutions import Kernels
+
+    cat = KernelCatalog([])
+    cat.register(Definition("attn.paged@1", "", "reference.attn.paged"))
+    cat.register(Implementation(Solution("reference.attn.paged", "attn.paged@1", "m:f"), lambda: "ref"))
+    kernels = Kernels(cat, {"attn.backend": "auto", "attn.prefill_backend": "", "attn.decode_backend": ""}, "attn")
+    kernels.resolve({"prefill": {"attn.paged@1": {}}, "decode": {"attn.paged@1": {}}})
+    assert (kernels("decode", "attn.paged@1")(), cat.call("attn.paged@1", {})) == ("ref", "ref")
+    undo = cat.register(Implementation(Solution("fast.attn", "attn.paged@1", "m:g"), lambda: "fast v1"))
+    assert (kernels("decode", "attn.paged@1")(), cat.call("attn.paged@1", {})) == ("fast v1", "fast v1")
+    undo()  # the kernel unit reloads: its old registration goes, the new one comes
+    cat.register(Implementation(Solution("fast.attn", "attn.paged@1", "m:g"), lambda: "fast v2"))
+    assert (kernels("prefill", "attn.paged@1")(), cat.call("attn.paged@1", {})) == ("fast v2", "fast v2")

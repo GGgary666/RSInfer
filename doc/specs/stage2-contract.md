@@ -467,7 +467,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - **definition** 写算什么：名字带版本、语义说明、PyTorch 参照实现（必须有）、容差、结果和 batch 怎么拼是否无关。参照实现在 `torch_eager` 上跑，是 CI 的基准，也是检验 solution 的标准。
 - **solution** 写怎么算：用哪个库的哪个版本、支持哪些 shape、能不能录进 graph、需要哪些平台能力、要不要进程级初始化、能不能跨机。
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
-- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）仍在每次调用时按 `auto` 选。
+- 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）按 `auto` 在第一次以某个 shape 调用时选定，之后按（definition，shape）一直用这一个，不再每次现选（2026-11-09 改）。目录的每次登记和撤销（比如 kernel 单元重载）都让 `Catalog.version` 加一：固定下来的选择在下一次调用时重新解析，所以热重载以后跑的是新代码。graph 对 solution 的依赖另按 §9.3 检查。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
 - **实现（2026-11-08）**：
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
