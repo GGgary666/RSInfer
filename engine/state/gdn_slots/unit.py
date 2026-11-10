@@ -73,6 +73,10 @@ class MambaPool:
             raise ValueError(f"{KIND} holds one state shape for every GDN layer")
         (conv_shape, conv_dtype), (temporal_shape, ssm_dtype) = decls[0].tensors["conv"], decls[0].tensors["temporal"]
         self.free()
+        # Freed buffers stay in PyTorch's cache, and the next allocation may take part of a freed
+        # block: a new pool a little larger than the old one then fits neither there nor in what the
+        # device has left. Give them back first (doc/framework-bugs/2026-11-10-gdn-ssm-dtype-rebuild-oom.md).
+        torch.cuda.empty_cache()
         n = len(decls)
         conv = self.platform.alloc(0, 0, shape=(n, self.size + 1, *conv_shape), dtype=conv_dtype)
         temporal = self.platform.alloc(0, 0, shape=(n, self.size + 1, *temporal_shape), dtype=ssm_dtype)
