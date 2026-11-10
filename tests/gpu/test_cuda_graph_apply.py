@@ -1,4 +1,4 @@
-"""Real control-plane apply: kernel changes recapture, failed builds restore serving."""
+"""Real apply: config recapture/reuse, kernel changes and failed-build recovery."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ from tests.units.support.tokenizer import save_tokenizer
 from tests.units.support.worker import tiny_config
 
 
-@pytest.mark.timeout(600)
-@pytest.mark.parametrize("overlap", [False, True])
-def test_kernel_apply_and_failed_graph_build_restore_serving(tmp_path: Path, overlap: bool) -> None:
+def deployment(tmp_path: Path, overlap: bool = False) -> tuple[list[str], dict[str, Any]]:
     config = tmp_path / "config"
     config.mkdir()
     (config / "config.json").write_text(json.dumps({
@@ -30,41 +28,104 @@ def test_kernel_apply_and_failed_graph_build_restore_serving(tmp_path: Path, ove
     tokenizer = save_tokenizer(tmp_path / "tokenizer", 300, eos_in_config=False)
     source = tmp_path / "source"
     shutil.copytree(REPO / "engine", source / "engine", ignore=shutil.ignore_patterns("__pycache__"))
-    kernel = source / "engine/kernels/reference/ops.py"
-    original = kernel.read_text()
     args = ["--model", str(checkpoint), "--tokenizer", str(tokenizer), "--source", str(source),
             "--device", "cuda", "--cuda-graph", "required", "--max-rows", "4", "--max-context", "64",
             "--dtype", "f32", "--conv-dtype", "f32", "--page-size", "4", "--max-slots", "8",
             "--mem-fraction", "0.1", "--timeout", "120", *(["--overlap"] if overlap else [])]
     body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "temperature": 0.0,
             "max_tokens": 8, "ignore_eos": True}
+    return args, body
+
+
+def client(run: Path, *arguments: str) -> tuple[int, dict[str, Any]]:
+    control = json.loads((run / "control/control.json").read_text())["control"]
+    p = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, *arguments],
+                       env=ENV, capture_output=True, text=True, timeout=180)
+    assert p.stdout.strip(), p.stderr
+    return p.returncode, json.loads(p.stdout)
+
+
+def graph_state(run: Path) -> tuple[int, int, list[int]]:
+    code, intro = client(run, "introspect")
+    assert code == 0, intro
+    worker = next(p for p in intro["procs"] if p["proc"]["role"] == "worker")
+    plan = next(u for u in worker["units"] if u["unit"] == "core.plan")
+    assert plan["state"] == "ACTIVE", plan
+    logs = "\n".join(p.read_text() for p in (run / "host-a/snapshots/.run").rglob("log"))
+    records = [json.loads(line.split("core.plan: ", 1)[1]) for line in logs.splitlines() if "core.plan: " in line]
+    graph = records[-1]["cuda_graph"]
+    assert graph["mode"] == "required" and not graph["reason"], graph
+    assert set(graph["build"]) == {str(b) for b in graph["buckets"]}, graph
+    return plan["generation"], logs.count("TEST_GRAPH_CAPTURE_COMPLETED"), graph["buckets"]
+
+
+@pytest.mark.timeout(600)
+def test_config_changes_recapture_only_graph_dependencies(tmp_path: Path) -> None:
+    args, body = deployment(tmp_path)
+    graph_source = tmp_path / "source/engine/core/plan/graph.py"
+    original = graph_source.read_text()
+    # Observe completed capture contexts in the test snapshot, without changing production code.
+    target = "        plan.graph = graph\n"
+    assert original.count(target) == 1
+    graph_source.write_text(original.replace(target, target + '        print("TEST_GRAPH_CAPTURE_COMPLETED", flush=True)\n'))
+    run = tmp_path / "run"
+    cases: list[tuple[str, dict[str, Any], bool, list[int]]] = [
+        ("live overlap", {"sched.overlap": True}, False, [1, 2, 4]),
+        ("scheduler batch limit", {"sched.max_batch": 2}, False, [1, 2, 4]),
+        ("graph buckets", {"plan.graph_buckets": [1, 4]}, True, [1, 4]),
+        ("unchanged buckets", {"plan.graph_buckets": [1, 4]}, False, [1, 4]),
+        ("prefill-only backend", {"attn.prefill_backend": "reference"}, True, [1, 4]),
+        ("state slot capacity", {"state.gdn.slots": 12}, True, [1, 4]),
+    ]
+    with served(run, *args, ready_s=180) as url:
+        baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
+        assert baseline
+        before = graph_state(run)
+        assert before[1:] == (3, [1, 2, 4]), before
+        for name, values, recapture, buckets in cases:
+            code, dry = client(run, "apply", "--config", json.dumps(values), "--dry-run")
+            assert code == 0, (name, dry)
+            code, applied = client(run, "apply", "--config", json.dumps(values))
+            assert code == 0 and applied["status"] == "committed", (name, applied)
+            assert not applied.get("restarted") and not applied.get("restart_engine"), (name, applied)
+            after = graph_state(run)
+            assert after[0] == before[0] + int(recapture), (name, before, after, applied)
+            assert after[1] - before[1] == (len(buckets) if recapture else 0), (name, before, after)
+            assert after[2] == buckets, (name, after)
+            assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline, name
+            # Ordinary decode after apply must not trigger a lazy recapture.
+            assert graph_state(run) == after, name
+            print("GRAPH_CONFIG_CASE " + json.dumps({"case": name, "config": values,
+                  "plan_generation": [before[0], after[0]], "new_captures": after[1] - before[1],
+                  "buckets": after[2], "serving_matches": True}), flush=True)
+            before = after
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("overlap", [False, True])
+def test_kernel_apply_and_failed_graph_build_restore_serving(tmp_path: Path, overlap: bool) -> None:
+    args, body = deployment(tmp_path, overlap)
+    source = tmp_path / "source"
+    kernel = source / "engine/kernels/reference/ops.py"
+    original = kernel.read_text()
     run = tmp_path / "run"
     with served(run, *args, ready_s=180) as url:
-        control = json.loads((run / "control/control.json").read_text())["control"]
-
-        def client(*arguments: str) -> tuple[int, dict[str, Any]]:
-            p = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, *arguments],
-                               env=ENV, capture_output=True, text=True, timeout=180)
-            assert p.stdout.strip(), p.stderr
-            return p.returncode, json.loads(p.stdout)
-
         baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
         assert baseline
         kernel.write_text(original.replace("return F.linear(x, weight, bias)", "return F.linear(x, weight, bias) * 0"))
-        code, checked = client("check", "--source", str(source))
+        code, checked = client(run, "check", "--source", str(source))
         assert code == 0, checked
-        code, dry = client("apply", "--source", str(source), "--dry-run")
+        code, dry = client(run, "apply", "--source", str(source), "--dry-run")
         assert code == 0 and "core.plan" in json.dumps(dry), dry
-        code, applied = client("apply", "--source", str(source))
+        code, applied = client(run, "apply", "--source", str(source))
         assert code == 0 and applied["status"] == "committed", applied
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == ""
-        # A second bucket cannot fit this invalid configuration: rollback must recapture the
-        # old version and resume only with valid providers. No xfail on recovery failure.
-        code, failed = client("apply", "--config", '{"plan.graph_buckets": [0]}')
+        # Invalid buckets must roll back to a usable graph set before serving resumes.
+        code, failed = client(run, "apply", "--config", '{"plan.graph_buckets": [0]}')
         assert code != 0 and failed["status"] != "committed", failed
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == ""
         kernel.write_text(original)
-        code, restored = client("apply", "--source", str(source))
+        code, restored = client(run, "apply", "--source", str(source))
         assert code == 0 and restored["status"] == "committed", restored
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
         logs = "\n".join(p.read_text() for p in (run / "host-a/snapshots/.run").rglob("log"))
