@@ -120,7 +120,7 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、实现步骤和验收矩阵；待实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
