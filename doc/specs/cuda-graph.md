@@ -1,7 +1,7 @@
 # CUDA Graph 支持：实现方案
 
 - 日期：2026-11-10
-- 状态：首版实现已通过 SM90-80GB CUDA Graph 专项及真实控制面 apply 验证；范围和限制见 [验证记录](../evaluations/cuda-graph.md)。
+- 状态：首版实现已通过 SM90-80GB CUDA Graph 专项及真实控制面 apply 验证；已完成 [实现简化与 A/B/C 对抗验证](../evaluations/cuda-graph-abc.md)。早期范围和限制见 [验证记录](../evaluations/cuda-graph.md)。
 - 代码基线：`master@efce690`；开发分支：`gw/dev/cuda-graph`。该基线已记录 M2a 完成，下一步包含 M2b 的真实 kernel 与 M2c 的 graph。
 - 目标：在现有 Qwen3.8 TP1 worker 上运行完整 decode forward 的 CUDA Graph，并在 `apply` 后正确失效、重录和释放。
 - 实现原则：**minimal patch，fail fast**。先完成最小正确闭环，复用已有执行路径和变更协议；配置不兼容和资源不足尽早拒绝，执行失败不能伪装成正常 eager 回退。
