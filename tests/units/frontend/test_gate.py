@@ -91,3 +91,20 @@ def test_a_frontend_built_while_its_process_is_paused_stays_closed_until_it_resu
     finally:
         f.close()
         scheduler.close()
+
+
+def test_a_request_a_change_ended_is_a_503_however_the_drains_were_ordered() -> None:
+    """The scheduler may end it before this frontend closed its gate (Codex, #42): the error itself
+    says it was the change's doing, and the client is told to retry."""
+    from core.contracts.requests import ENDED_BY_CHANGE
+
+    scheduler = ScriptScheduler(refuse=ENDED_BY_CHANGE)
+    f = Frontend(scheduler)
+    try:
+        with httpx.Client(base_url=f.url, timeout=10) as client:
+            r = complete(client)  # the gate is open: only the scheduler saw the change
+            assert r.status_code == 503 and r.headers["retry-after"] == "1"
+            assert r.json()["error"]["type"] == "server_error"
+    finally:
+        f.close()
+        scheduler.close()

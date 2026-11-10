@@ -87,12 +87,9 @@ class WorkerLoop:
         self.announcing = False
         """A ``Capacity`` is queued."""
         self.failures = 0
-        # Now, not on the first step: built inside a change's Execute (its stores rebuilt, maybe
-        # smaller), it writes the new capacity while the scheduler is paused. The scheduler's first
-        # step after it resumes reads results before it admits anything, so it never plans with
-        # the old one (doc/specs/empty-apply.md).
-        self._announce()
-        self._flush()
+        # Not at once: built inside a change's Execute, its stores are a candidate the change may
+        # still undo (Codex, #42). It sends Capacity at its first step, after the process resumed,
+        # under the identity it serves then; the scheduler waits for that after a commit.
 
     # ------------------------------------------------------------------ the loop
 

@@ -107,11 +107,14 @@ def loop(executor: FakeExecutor, pipe: Pipe, **kw: Any) -> WorkerLoop:
     return WorkerLoop(executor, pipe, pipe, rank=0, idle_wait_s=0.0, **kw)
 
 
-def test_a_new_loop_writes_its_capacity_before_any_step() -> None:
-    """Built inside a change's Execute (its stores rebuilt, maybe smaller) while the scheduler is
-    paused: the scheduler reads it before it admits anything once it resumes (Antigravity, #42)."""
+def test_a_new_loop_says_its_capacity_at_its_first_step_not_when_it_is_built() -> None:
+    """Built inside a change's Execute, its stores are a candidate the change may undo: a Capacity
+    then would reach the scheduler as the current one (Codex, #42). It goes out at the first step,
+    after the process resumed."""
     pipe = Pipe()
-    loop(FakeExecutor(), pipe)
+    w = loop(FakeExecutor(), pipe)
+    assert pipe.answers() == []
+    w.step()
     assert pipe.answers() == [(0, Capacity.SECTION)]
 
 

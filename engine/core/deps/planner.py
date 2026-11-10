@@ -38,7 +38,7 @@ CONTROL_ROLE = "control"
 NATIVE_SUFFIXES = (".so", ".pyd")
 DRAIN = "drain"
 """The action of the units that hold requests: they empty the engine before a change."""
-FORCE_DRAIN_S = 60.0
+FORCE_DRAIN_S = 10.0
 """With ``when_busy = "force"``: how long the steps in flight of the ended requests may take."""
 
 

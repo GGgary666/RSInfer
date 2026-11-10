@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.contracts.columns import Column
-from core.contracts.requests import AbortRequest, FinishReason, NewRequest, Requests, TokenEvents
+from core.contracts.requests import ENDED_BY_CHANGE, AbortRequest, FinishReason, NewRequest, Requests, TokenEvents
 from core.contracts.sampling import SamplingParams
 from frontend.interfaces import Detokenizer, Message, TextStream, Tokenizer
 from frontend.transport import Channel
@@ -186,7 +186,8 @@ class FrontendManager:
             if uid in events.errors:
                 state.finished = True
                 # A change forcing the engine empty ended it: the server's doing, retry later (Devin, #42).
-                status = 503 if self.gate == "force" else 400
+                # Known by the error itself: the scheduler may see the change before this frontend (Codex).
+                status = 503 if events.errors[uid] == ENDED_BY_CHANGE else 400
                 self._ack(UserReply(uid, "", True, error=events.errors[uid], error_status=status))
                 continue
             state.last_epoch = epoch

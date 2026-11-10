@@ -73,13 +73,13 @@ from core.contracts.records import (
     StateOps,
     StepFailure,
 )
-from core.contracts.requests import REQUESTS, TOKENS, Requests, TokenEvents
+from core.contracts.requests import ENDED_BY_CHANGE, REQUESTS, TOKENS, Requests, TokenEvents
 from core.contracts.serving import ReturnRoute
 from core.ipc.records import OpenRecord, RecordBuilder, decode_record, encode_record, read_sections
 from core.ipc.stream import StreamAddress
 
 type Answer = Sampled | Resync | StepFailure
-FORCED = "ended: the engine is being changed (apply --force)"
+FORCED = ENDED_BY_CHANGE
 """The error of a request a change ended at once (doc/specs/empty-apply.md)."""
 type Kind = Literal["waiting", "prefilling", "decoding"]
 
