@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import GDNBackend, PersistentBatch, PlanKey
+from core.contracts.plan import GRAPH, GDNBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from layers.solutions import Kernels
@@ -35,13 +35,14 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
-class NoBuffers:
-    """``Binding``: eager GDN keeps no fixed buffers."""
+class GraphBinding:
+    """``Binding``: the fixed metadata buffers of the graph buckets; an eager step's are its own."""
 
-    generation: int = 0
+    generation: int
+    tensors: Mapping[str, torch.Tensor]
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {}
+        return self.tensors
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,8 @@ class Metadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
+    graph: bool = False
+    """The metadata of a graph bucket: fixed buffers, filled before each replay."""
 
 
 class GDNAttnBackend:
@@ -59,10 +62,13 @@ class GDNAttnBackend:
         self.kernels = kernels
         self.states = states
         self.forward_metadata: Metadata | None = None
+        self.graph_metadata: dict[int, Metadata] = {}
+        self.generation = 0
+        self.graph_buffers: dict[str, torch.Tensor] = {}
 
     @property
-    def binding(self) -> NoBuffers:
-        return NoBuffers()
+    def binding(self) -> GraphBinding:
+        return GraphBinding(self.generation, self.graph_buffers)
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         _, head_v_dim, head_k_dim = next(d.tensors["temporal"][0] for d in states if d.kind == KIND)
@@ -74,6 +80,25 @@ class GDNAttnBackend:
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
         device = mapping.device
+        if key.bucket:
+            # The bucket's fixed buffers; a padded lane takes the padding row's slot, index 0, as
+            # SGLang's padded rows do (get_mamba_indices of req_pool_indices padded with zeros).
+            size, n = key.bucket, len(plan.rows)
+            m = self.graph_metadata.get(size)
+            if m is None:
+                m = Metadata(True, torch.arange(size + 1, dtype=torch.int32, device=device),
+                             torch.zeros(size, dtype=mapping.dtype, device=device),
+                             torch.zeros(size, dtype=torch.bool, device=device), graph=True)
+                self.graph_metadata[size] = m
+                self.graph_buffers.update({f"{size}.query_start_loc": m.query_start_loc,
+                                           f"{size}.mamba_cache_indices": m.mamba_cache_indices})
+                self.generation += 1
+            m.mamba_cache_indices[n:].zero_()
+            if n:
+                rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
+                m.mamba_cache_indices[:n].copy_(mapping[rows])
+            self.forward_metadata = m
+            return
         rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64), device)
         extend = on_device(torch.tensor(list(plan.num_tokens.values()), dtype=torch.int32), device)
         prefix = on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64), device)
@@ -86,6 +111,12 @@ class GDNAttnBackend:
                                          torch.cumsum(extend, dim=0, dtype=torch.int32)])
         # get_mamba_indices: req_index_to_mamba_index_mapping[req_pool_indices]
         self.forward_metadata = Metadata(decode, query_start_loc, mapping[rows + 1], prefix > 0)
+
+    def release_graphs(self) -> None:
+        self.graph_metadata.clear()
+        self.graph_buffers.clear()
+        self.forward_metadata = None
+        self.generation += 1
 
     def forward(self, layer: int, mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                 conv_weights: torch.Tensor, bias: torch.Tensor | None, activation: str, A_log: torch.Tensor,
@@ -102,15 +133,16 @@ class GDNAttnBackend:
         v_dim = num_v_heads * head_v_dim
         cache_indices = m.mamba_cache_indices
         if m.decode:
-            mixed_qkv = self.kernels("decode", "gdn.conv1d_update@1")(mixed_qkv, conv_states, conv_weights, bias,
-                                                                     activation, cache_indices)
+            phase = GRAPH if m.graph else "decode"
+            mixed_qkv = self.kernels(phase, "gdn.conv1d_update@1")(mixed_qkv, conv_states, conv_weights, bias,
+                                                                  activation, cache_indices)
             bs = mixed_qkv.shape[0]
             query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
             query = query.view(1, bs, num_k_heads, head_k_dim)
             key = key.view(1, bs, num_k_heads, head_k_dim)
             value = value.view(1, bs, num_v_heads, head_v_dim)
-            return self.kernels("decode", "gdn.recurrent_update@1")(A_log, dt_bias, query, key, value, a, b,
-                                                                   ssm_states, cache_indices, m.query_start_loc)
+            return self.kernels(phase, "gdn.recurrent_update@1")(A_log, dt_bias, query, key, value, a, b,
+                                                                ssm_states, cache_indices, m.query_start_loc)
 
         mixed_qkv = self.kernels("prefill", "gdn.conv1d_fn@1")(  # _convolve_prefill
             mixed_qkv.transpose(0, 1), conv_weights, bias, activation, conv_states,

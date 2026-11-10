@@ -92,6 +92,11 @@ class PersistentBatch:
         return Tables(self.generation, dict(self.tensors))
 
     def check(self, delta: RowDelta, plan: BatchPlan) -> str:
+        if any(not 0 <= int(r) < self.max_rows for r in plan.rows.values()):
+            raise ValueError("plan row is outside batch.max_rows")
+        if any(int(p) + int(n) > self.max_context_len
+               for p, n in zip(plan.positions.values(), plan.num_tokens.values(), strict=True)):
+            raise ValueError("plan exceeds batch.max_context_len")
         if self.rebuilt and not delta.full:
             return "the persistent batch was rebuilt and waits for a full delta"
         known = set() if delta.full else set(self.rows)
@@ -143,6 +148,14 @@ class PersistentBatch:
                         raise ValueError(f"row {r} would hold {pages[r]} pages of {self.page_size} tokens, more than "
                                          f"{self.max_context_len} tokens")
 
+    def prepare(self, kinds: Sequence[str]) -> None:
+        """Allocate slot tables before capture; never replace an existing table."""
+        for kind in kinds:
+            name = f"slots.{kind}"
+            if kind != PAGED_KIND and name not in self.tensors:
+                self._alloc(name, (self.max_rows + 1,), "i32")
+                self.generation += 1
+
     def _assign(self, r: int, kind: str, new: list[int]) -> None:
         held = self.rows[r].ids.setdefault(kind, [])
         if kind == PAGED_KIND:  # req_to_token_pool.write: the token slots of the new pages
@@ -152,9 +165,7 @@ class PersistentBatch:
             self.tensors["req_to_token"][r + 1, start:end] = on_device(slots, self.tensors["req_to_token"].device)
         else:
             name = f"slots.{kind}"
-            if name not in self.tensors:
-                self._alloc(name, (self.max_rows + 1,), "i32")
-                self.generation += 1
+            self.prepare([kind])
             self.tensors[name][r + 1] = new[-1] + 1
         held.extend(new)
 
@@ -171,9 +182,11 @@ class PersistentBatch:
             self.rows[r].has_previous = True
 
     def free(self) -> None:
+        self.generation += 1
         for buf in self.allocated:
             self.platform.free(buf)
         self.allocated.clear()
+        self.tensors.clear()
 
 
 class Unit:

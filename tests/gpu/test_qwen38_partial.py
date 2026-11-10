@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from platforms.torch_eager import TorchEagerPlatform
+from platforms.cuda_graph import CudaGraphPlatform
 from tests.gpu.support import free_gpu, hf_model_from, make_checkpoint
 from tests.units.support.worker import Driver, Worker, hf_greedy
 
@@ -51,12 +52,14 @@ def hf_reference(checkpoint: Path, dtype: torch.dtype) -> tuple[dict[int, list[i
     return tokens, first
 
 
-def ours(checkpoint: Path, dtype: str) -> tuple[dict[int, list[int]], dict[int, torch.Tensor], dict[str, int]]:
+def ours(checkpoint: Path, dtype: str, graphs: bool) -> tuple[dict[int, list[int]], dict[int, torch.Tensor], dict[str, int]]:
     cfg = json.loads((checkpoint / "config.json").read_text())
-    w = Worker(cfg, platform=TorchEagerPlatform(cuda=True), **{
+    w = Worker(cfg, platform=CudaGraphPlatform() if graphs else TorchEagerPlatform(cuda=True), **{
         "model.dtype": dtype, "state.gdn.conv_dtype": dtype, "weights.path": str(checkpoint), "state.kv.page_size": 16, "state.kv.pages": 0,
-        "state.gdn.slots": 0, "batch.max_rows": 8, "batch.max_context_len": 256})
+        "state.gdn.slots": 0, "batch.max_rows": 8, "batch.max_context_len": 256,
+        "plan.cuda_graph": "required" if graphs else "off"})
     try:
+        assert w.service("plan@1").buckets("decode") == ([1, 2, 4, 8] if graphs else [])
         capacity = dict(w.service("executor@1").capacity().items)
         d = Driver(w)
         for row, prompt in PROMPTS.items():
@@ -77,9 +80,10 @@ def report(name: str, got: dict[int, list[int]], want: dict[int, list[int]]) -> 
 
 
 @pytest.mark.timeout(1800)
-def test_fp32_greedy_tokens_equal_hf(checkpoint: Path) -> None:
+@pytest.mark.parametrize("graphs", [False, True])
+def test_fp32_greedy_tokens_equal_hf(checkpoint: Path, graphs: bool) -> None:
     want, want_first = hf_reference(checkpoint, torch.float32)
-    got, got_first, capacity = ours(checkpoint, "f32")
+    got, got_first, capacity = ours(checkpoint, "f32", graphs)
     print(f"\npools sized by the holder: {capacity}")
     assert capacity["kv.paged"] > 0 and capacity["gdn.slots"] > 0
     assert report("fp32", got, want) == {row: STEPS for row in PROMPTS}
@@ -88,9 +92,10 @@ def test_fp32_greedy_tokens_equal_hf(checkpoint: Path) -> None:
 
 
 @pytest.mark.timeout(1800)
-def test_bf16_logits_close_to_hf(checkpoint: Path) -> None:
+@pytest.mark.parametrize("graphs", [False, True])
+def test_bf16_logits_close_to_hf(checkpoint: Path, graphs: bool) -> None:
     want, want_first = hf_reference(checkpoint, torch.bfloat16)
-    got, got_first, _ = ours(checkpoint, "bf16")
+    got, got_first, _ = ours(checkpoint, "bf16", graphs)
     report("bf16", got, want)
     for row in PROMPTS:
         a, b = got_first[row], want_first[row]

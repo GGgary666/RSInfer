@@ -312,6 +312,8 @@ class _Planner:
                     w.notes.append(f"{intro.proc}: {r.unit} built {r.artifact!r} from {r.key!r} but did not "
                                    "register it; reloading it")
                     reload.add(r.unit)
+                elif not art.rebuild:
+                    reload.add(r.unit)
                 else:
                     rebuild.setdefault((art.owner, art.name), (art.rebuild, set()))[1].add(r.key)
             elif r.hooked and self.binding(r.key) != "startup":
@@ -323,6 +325,18 @@ class _Planner:
                 continue
             keys = set(a.config) & set(changed_keys)
             built_from = set(a.units) & (reload | removed)
+            if not a.rebuild:
+                # No action rebuilds it in place: its owner is reloaded, after the units it was
+                # built from, and reloaded back after them if the change rolls back. An action
+                # would abort before that reverse reload, against the units being rolled back.
+                # A unit added here that registers with one of those units may change what the
+                # artifact would be built from (a kernel unit and the catalog), so it counts too.
+                registries = {s for u in a.units if u in w.new_tree.units
+                              for s in w.new_tree.units[u].manifest.provides.services}
+                joins = any(registries & set(w.new_tree.units[u].manifest.requires.services) for u in added)
+                if keys or built_from or joins:
+                    reload.add(a.owner)
+                continue
             if keys or built_from:
                 rebuild.setdefault((a.owner, a.name), (a.rebuild, set()))[1].update(keys)
         for (owner, name), (action, keys) in sorted(rebuild.items()):

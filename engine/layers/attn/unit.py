@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import AttentionBackend, PersistentBatch, PlanKey
+from core.contracts.plan import GRAPH, AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from layers.solutions import Kernels
@@ -35,13 +35,14 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
-class NoBuffers:
-    """``Binding``: eager attention keeps no fixed buffers."""
+class GraphBinding:
+    """``Binding``: the fixed metadata buffers of the graph buckets; an eager step's are its own."""
 
-    generation: int = 0
+    generation: int
+    tensors: Mapping[str, torch.Tensor]
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {}
+        return self.tensors
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,8 @@ class Metadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    graph: bool = False
+    """The metadata of a graph bucket: fixed buffers, filled before each replay."""
 
 
 class TorchNativeAttnBackend:
@@ -62,10 +65,13 @@ class TorchNativeAttnBackend:
         self.kernels = kernels
         self.kv = kv
         self.forward_metadata: Metadata | None = None
+        self.graph_metadata: dict[int, Metadata] = {}
+        self.generation = 0
+        self.graph_buffers: dict[str, torch.Tensor] = {}
 
     @property
-    def binding(self) -> NoBuffers:
-        return NoBuffers()
+    def binding(self) -> GraphBinding:
+        return GraphBinding(self.generation, self.graph_buffers)
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         head_dim = next(d.tensors["k"][0][-1] for d in states if d.kind == KIND)
@@ -73,9 +79,40 @@ class TorchNativeAttnBackend:
         return self.kernels.resolve({"prefill": {"kv.store@1": {}, "attn.extend@1": shape},
                                      "decode": {"kv.store@1": {}, "attn.decode@1": shape}})
 
+    def release_graphs(self) -> None:
+        self.graph_metadata.clear()
+        self.graph_buffers.clear()
+        self.forward_metadata = None
+        self.generation += 1
+
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         req_to_token = batch.binding.buffers()["req_to_token"]
         device = req_to_token.device
+        if key.bucket:
+            # init_forward_metadata_replay_cuda_graph: the bucket's fixed buffers, the rows padded
+            # as SGLang pads them (PaddingPolicy.ZERO): a padded lane is the padding row, index 0,
+            # with one token, so it reads and writes the padding slot only.
+            size, n = key.bucket, len(plan.rows)
+            m = self.graph_metadata.get(size)
+            if m is None:
+                none = torch.empty(0, dtype=torch.int64, device=device)
+                m = Metadata(True, req_to_token, torch.zeros(size, dtype=torch.int64, device=device),
+                             torch.ones(size, dtype=torch.int64, device=device), none, none,
+                             torch.zeros(size, dtype=torch.int64, device=device), graph=True)
+                self.graph_metadata[size] = m
+                self.graph_buffers.update({f"{size}.req_pool_indices": m.req_pool_indices, f"{size}.seq_lens": m.seq_lens,
+                                           f"{size}.out_cache_loc": m.out_cache_loc})
+                self.generation += 1
+            m.req_pool_indices[n:].zero_()
+            m.seq_lens[n:].fill_(1)
+            if n:
+                m.req_pool_indices[:n].copy_(on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1,
+                                                       device))
+                m.seq_lens[:n].copy_(on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64) + 1,
+                                              device))
+            m.out_cache_loc.copy_(req_to_token[m.req_pool_indices, m.seq_lens - 1])
+            self.forward_metadata = m
+            return
         rows = torch.tensor(list(plan.rows.values()), dtype=torch.int64)
         prefix = torch.tensor(list(plan.positions.values()), dtype=torch.int64)
         extend = torch.tensor(list(plan.num_tokens.values()), dtype=torch.int64)
@@ -97,7 +134,7 @@ class TorchNativeAttnBackend:
         o = torch.empty_like(q)
         cache = self.kv.bind(layer).buffers()
         k_cache, v_cache = cache["k"], cache["v"]
-        phase = "decode" if m.decode else "prefill"
+        phase = GRAPH if m.graph else "decode" if m.decode else "prefill"
         self.kernels(phase, "kv.store@1")(k_cache, v_cache, m.out_cache_loc, k.view(-1, num_kv_heads, head_dim),
                                           v.view(-1, num_kv_heads, head_dim))
         use_gqa = num_heads != num_kv_heads

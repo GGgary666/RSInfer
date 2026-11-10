@@ -45,6 +45,24 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
 
 ## 跑过的（2026-11-09）
 
+### CUDA Graph 参数（2026-11-10）
+
+默认 `--cuda-graph off`：worker 在 `torch_eager` 平台上，全部步都是 eager。`auto` 和 `required` 让 worker 用 `cuda_graph` 平台，给 decode 步录图；prefill 和 mixed 步仍然是 eager。
+
+```sh
+uv run python deploy/qwen38.py serve --model /path/to/model --cuda-graph auto
+uv run python deploy/qwen38.py serve --model /path/to/model \
+  --cuda-graph required --max-rows 16 --graph-buckets 1 2 4 8 16
+```
+
+- `auto`：能录就录；录不了（某个 decode kernel 不可捕获，或者图留下的显存超过 `--graph-memory-bytes`）就走 eager，原因在 worker 日志 `core.plan: {...}` 的 `cuda_graph.reason` 里。`required`：这些情况下启动失败，运行时没有图能装下的 decode 步也被拒绝。CPU 上 `auto` 是 eager，`required` 启动失败。
+- `--graph-buckets`：每张图的行数，默认是不超过 `min(--max-rows, 8)` 的 2 的幂；行数更多的步走 eager。`required` 要求最大的桶等于 `--max-rows`，行数多于 8 时要显式列出。
+- `--graph-memory-bytes`：全部图可以留下的设备显存，默认 1 GiB，来自 `--mem-fraction` 留给激活的那部分；状态池的大小与不开 graph 时相同。实际留下多少在日志的 `cuda_graph.kept_bytes`。
+- 回放的 decode 步用的是固定容量的 attention（`kernels.torch_graph`），代价随 `--max-context` 增长而不是随序列的实际长度；4090 D 上 4 层模型，8 行在 4096 时比 eager 快 1.1–1.2 倍，在 16384 时比 eager 慢。eager 的 decode 步仍然用参照实现。数字见 [cuda-graph-review-fixes.md](../doc/evaluations/cuda-graph-review-fixes.md)，设计见 [cuda-graph.md](../doc/specs/cuda-graph.md)。完整 27B 上改过以后还没有重新验收。
+- 改 `plan.*` 的配置或 kernel 单元的代码会在空引擎上重载 `core.plan` 并重录；范围以 `apply --dry-run` 为准。
+
+### 原 eager 验证记录
+
 - **CPU**（`tests/scenarios/test_m2a.py`，进 CI）：
   - 小随机模型，用 `checkpoint` 写成多模态布局；tokenizer 是 `tests/units/support/tokenizer.py` 生成的真 HF tokenizer。
   - `serve` 起整个引擎，completions、chat 和 `chat` 命令的流式输出，文本都和 HF 的贪心生成逐字相同，开、不开重叠都一样。

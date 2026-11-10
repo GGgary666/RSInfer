@@ -63,6 +63,7 @@ class Case:
     state: list[StateRequest] = field(default_factory=list[StateRequest])
     units: tuple[str, ...] = ("pkg.a", "pkg.b")
     meta: ChangeMeta = field(default_factory=ChangeMeta)
+    artifacts: list[DerivedArtifact] | None = None
 
     def plan(self) -> ActionPlan | Failed:
         base_root = write_tree(self.tmp / "base" / "engine", self.base)
@@ -76,7 +77,8 @@ class Case:
             reads=[ReadRecord("pkg.live", UnitId("pkg.b"), "runtime", hooked=self.hooked),
                    ReadRecord("pkg.start", UnitId("pkg.a"), "startup"),
                    ReadRecord("pkg.plan", UnitId("pkg.a"), "plan_build", artifact="g")],
-            artifacts=[DerivedArtifact(UnitId("pkg.a"), "g", "pkg.rebuild", ["pkg.plan"], [])],
+            artifacts=self.artifacts if self.artifacts is not None else
+                      [DerivedArtifact(UnitId("pkg.a"), "g", "pkg.rebuild", ["pkg.plan"], [])],
             config=dict(CURRENT))
         r = plan(World(cs, base, new, read_tree(base_root), read_tree(new_root), {W0: intro}, None,
                        FrameworkModules.default()))
@@ -117,6 +119,25 @@ def test_a_key_recorded_into_an_artifact_rebuilds_that_artifact(tmp_path: Path) 
 def test_a_startup_key_reloads_only_its_readers(tmp_path: Path) -> None:
     pa = only(Case(tmp_path, config={"pkg.start": 3}).plan())
     assert reloaded(pa) == ["pkg.a"] and pa.actions == []
+
+
+def test_an_artifact_without_a_rebuild_action_reloads_its_owner(tmp_path: Path) -> None:
+    """``ctx.derived(rebuild="")``: nothing rebuilds the artifact in place, so a change to a unit it
+    was built from reloads its owner too, after that unit; and so does a unit added that registers
+    with one of them (a new kernel unit may change what the artifact is built from). A rollback
+    then reloads the old owner over the restored units, which an action's abort could not wait for."""
+    tree = {**BASE, "pkg/b/unit.toml": manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"])}
+    artifact = DerivedArtifact(UnitId("pkg.b"), "g", "", [], [UnitId("pkg.a")])
+    changed = {**tree, "pkg/a/unit.py": "class Unit:\n    changed = True\n"}
+    pa = only(Case(tmp_path / "changed", base=tree, new=changed, artifacts=[artifact]).plan())
+    assert reloaded(pa) == ["pkg.a", "pkg.b"] and pa.actions == []
+    added = {**tree, "pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", requires=["pkg.a@1"]),
+             "pkg/c/unit.py": "class Unit:\n    pass\n"}
+    pa = only(Case(tmp_path / "added", base=tree, new=added, artifacts=[artifact]).plan())
+    assert reloaded(pa) == ["pkg.b"] and pa.actions == []
+    with_action = DerivedArtifact(UnitId("pkg.b"), "g", "pkg.rebuild", [], [UnitId("pkg.a")])
+    pa = only(Case(tmp_path / "action", base=tree, new=changed, artifacts=[with_action]).plan())
+    assert reloaded(pa) == ["pkg.a"] and [(a.unit, a.action) for a in pa.actions] == [("pkg.b", "pkg.rebuild")]
 
 
 def with_units(**manifests: str) -> dict[str, str]:
@@ -341,7 +362,7 @@ def test_a_platform_change_restarts_the_role_processes(tmp_path: Path) -> None:
     cuda = replace(eager, roles=[replace(r, platform_options={"cuda": 1}) for r in eager.roles])
     assert [pa.proc for pa in only_restarts(Case(tmp_path / "2", topo=cuda).plan())] == [W0]
     bad = replace(base, roles=[replace(r, platform="tpu") for r in base.roles])
-    assert bad.check() == ["role worker names an unknown platform 'tpu'; known: ['fake', 'torch_eager']"]
+    assert bad.check() == ["role worker names an unknown platform 'tpu'; known: ['fake', 'torch_eager', 'cuda_graph']"]
 
 
 def only_restarts(p: ActionPlan | Failed) -> list[ProcActions]:

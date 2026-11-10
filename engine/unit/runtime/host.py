@@ -97,6 +97,10 @@ def make_platform(spec: ProcSpec) -> Platform:
         from platforms.torch_eager import TorchEagerPlatform
 
         return TorchEagerPlatform(cuda=bool(spec.platform_options.get("cuda", 0)))
+    if spec.platform == "cuda_graph":
+        from platforms.cuda_graph import CudaGraphPlatform
+
+        return CudaGraphPlatform()
     raise ValueError(f"unknown platform {spec.platform!r}")
 
 

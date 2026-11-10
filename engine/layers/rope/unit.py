@@ -24,8 +24,9 @@ def rope_cos_sin_cache(rotary_dim: int, max_position: int, base: float) -> torch
 class Rope:
     """``layers.rope@1``."""
 
-    def __init__(self, catalog: Any) -> None:
+    def __init__(self, catalog: Any, max_context: int | None = None) -> None:
         self.catalog = catalog
+        self.max_context = max_context
         self.caches: dict[tuple[int, float, str], torch.Tensor] = {}
 
     def cos_sin_cache(self, rotary_dim: int, max_position: int, base: float, device: torch.device,
@@ -40,6 +41,7 @@ class Rope:
     def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor, head_size: int,
                 rotary_dim: int, max_position: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
         cache = self.cos_sin_cache(rotary_dim, max_position, base, query.device,
+                                   self.max_context - 1 if self.max_context is not None else
                                    int(positions.max()) if positions.numel() else 0)
         return self.catalog.call("pos.rope@1", {"head_dim": head_size, "rotary_dim": rotary_dim}, positions, query,
                                  key, head_size, rotary_dim, cache)
@@ -47,4 +49,4 @@ class Rope:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        ctx.provide("layers.rope@1", Rope(ctx.use("kernels.catalog@1")))
+        ctx.provide("layers.rope@1", Rope(ctx.use("kernels.catalog@1"), config["batch.max_context_len"]))
