@@ -277,9 +277,12 @@ def test_7_a_config_value_takes_the_cheapest_rung(tmp_path: Path) -> None:
 
 
 @pytest.mark.covers(edges=("call", "state"), ladder=(2,), kinds=("logic", "state"))
-def test_8_new_scheduling_logic_keeps_the_requests_in_flight(tmp_path: Path) -> None:
+def test_8_new_scheduling_logic_leaves_the_request_table_as_it_is(tmp_path: Path) -> None:
     """⑧ apply: the scheduling logic's code changed -> reload it (and the policies registered into
-    it); the request table is a state unit and stays, so in-flight requests carry on."""
+    it); the request table is a state unit the reload does not touch, so what it holds stays. Since
+    doc/specs/empty-apply.md a change applies to an empty engine: this toy table declares no
+    ``drain``, and its counters stand for state that outlives a logic reload, not for requests in
+    flight (tests/scenarios/test_m2a.py has those)."""
 
     async def main() -> None:
         async with scenario(tmp_path) as s:
@@ -331,6 +334,8 @@ def test_a_framework_change_needs_an_engine_restart(tmp_path: Path) -> None:
             r = await s.apply()
             assert r.status == "failed" and r.plan is not None and r.plan.restart_engine
             assert "escalate.restart_engine" in {d.code for d in r.diagnostics}
+            assert any("framework modules changed: ['core.change.queue']" in d.reason for d in r.diagnostics
+                       if d.code == "escalate.restart_engine")
             assert (await s.status()).identity == before and {p: s.pid(p) for p in ALL} == pids
 
     run(main())

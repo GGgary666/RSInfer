@@ -18,6 +18,11 @@ REQUESTS = "frontend.requests@1"
 TOKENS = "sched.tokens@1"
 """Schema of the scheduler -> frontend record."""
 
+ENDED_BY_CHANGE = "ended: the engine is being changed (apply --force)"
+"""The error (``TokenEvents.errors``) of a request a change ended at once: the server's doing, which
+the frontend answers with 503 and ``Retry-After`` (doc/specs/empty-apply.md). Recognised by its text,
+whichever of the scheduler and the frontend saw the change first."""
+
 
 class NewRequest(msgspec.Struct, frozen=True):
     request: int

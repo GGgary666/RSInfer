@@ -8,7 +8,7 @@ entry = "schedfix.worker.unit:Unit"
 services = ["proc.loop@1"]
 
 [requires]
-services = ["proc.streams@1"]
+services = ["proc.streams@1", "proc.control@1"]
 
 [config]
 "schedfix.scheduler" = { type = "dict", default = {}, binding = "startup", doc = "ProcId of the scheduler host." }

@@ -90,7 +90,7 @@ class Row:
 class FixtureWorker:
     def __init__(self, plans: Reader, results: Writer, *, rank: int, capacity: dict[str, int],
                  pages: dict[str, int], max_batch: int, delay_s: float = 0.0, announce_after_s: float = 0.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 identity: Callable[[], str] = lambda: "", clock: Callable[[], float] = time.monotonic) -> None:
         self.plans, self.results, self.rank = plans, results, rank
         self.capacity, self.pages, self.max_batch, self.delay_s, self.clock = capacity, pages, max_batch, delay_s, clock
         self.announce_after_s = announce_after_s
@@ -103,6 +103,9 @@ class FixtureWorker:
         """(kind, slot) -> (request, tokens its state has seen)."""
         self.need_full = True
         self.announced = False
+        self.identity = identity
+        self.announced_as = ""
+        """As ``core.worker``: ``Capacity`` says the identity, and goes out again once it changed."""
         self.due: deque[tuple[float, int, bytes]] = deque()
         self.outbox: deque[tuple[int, bytes]] = deque()
         self.script: dict[int, str] = {}
@@ -123,8 +126,11 @@ class FixtureWorker:
 
     def turn(self, wait: float = 0.0) -> None:
         now = self.clock()
-        if not self.announced and now - self.started >= self.announce_after_s:
-            record = RecordBuilder(STEP_RESULT, 0, self.rank).add(Capacity.SECTION, Capacity(dict(self.capacity))).build()
+        if (not self.announced and now - self.started >= self.announce_after_s) or \
+                (self.announced and self.identity() != self.announced_as):
+            self.announced_as = self.identity()
+            record = RecordBuilder(STEP_RESULT, 0, self.rank).add(
+                Capacity.SECTION, Capacity(dict(self.capacity), identity=self.announced_as)).build()
             self.outbox.append((0, encode_record(record)))  # the plans' answers keep their order
             self.announced = True
         while self.due and self.due[0][0] <= now and not self.held:
@@ -298,12 +304,14 @@ class Unit:
 
     def __init__(self, ctx: Any, config: Any) -> None:
         streams = ctx.use("proc.streams@1")
+        control = ctx.use("proc.control@1")
         scheduler = msgspec.convert(config["schedfix.scheduler"], ProcId)
         rank = ctx.instance.proc.index
         self.worker = FixtureWorker(streams.reader("plans", scheduler.host),
                                     streams.writer(scheduler, f"results.{rank}"), rank=rank,
                                     capacity=dict(config["schedfix.capacity"]), pages=dict(config["schedfix.pages"]),
-                                    max_batch=config["schedfix.max_batch"], delay_s=config["schedfix.delay_s"])
+                                    max_batch=config["schedfix.max_batch"], delay_s=config["schedfix.delay_s"],
+                                    identity=lambda: str(control.identity))
         self.reported = 0
         ctx.provide("proc.loop@1", self)
 

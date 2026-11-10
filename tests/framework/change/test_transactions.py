@@ -166,6 +166,43 @@ def test_drain_waits_then_the_unit_settles_the_rest_at_the_deadline(tmp_path: Pa
     run(main())
 
 
+def test_a_drain_hears_how_the_change_ended_also_when_it_refused_to_start(tmp_path: Path) -> None:
+    """A drain gets ``commit()`` or ``abort()`` (state-changes.md §5.2), so the unit that stopped
+    taking requests for the change takes them again (doc/specs/empty-apply.md). A drain that
+    refuses fails the change with its reason."""
+    async def main() -> None:
+        async with engine(tmp_path) as e:
+            def drain(args: dict[str, object]) -> Script:
+                return lambda inp: ActionPlan(procs=[ProcActions(SCHED, leads_epochs=True, drain=[
+                    UnitAction(UnitId("toyc.tunable"), "toy.op", args)])], drain_timeout_s=5.0)
+
+            e.planner.script = drain({"ticks": 1})
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status == "committed"
+            log = e.c.log_of(SCHED)
+            assert log[-2:] == ["drain start", "op commit"], log
+            e.planner.script = drain({"refuse": True})
+            before = e.coord.identity
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status != "committed" and e.coord.identity == before
+            assert any("the toy holds requests" in d.reason for d in r.diagnostics), r.diagnostics
+            log = e.c.log_of(SCHED)
+            assert log[-2:] == ["drain start", "op abort"], log
+            # a deadline that fails the change is asked once, not again at every safe point until
+            # the coordinator's Abort arrives (Antigravity, #42)
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(SCHED, leads_epochs=True, drain=[
+                UnitAction(UnitId("toyc.tunable"), "toy.op", {"never": True, "deadline_fails": True})])],
+                drain_timeout_s=0.2)
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status != "committed" and any("did not empty in time" in d.reason for d in r.diagnostics)
+            log = e.c.log_of(SCHED)
+            last_start = len(log) - 1 - log[::-1].index("drain start")
+            assert log[last_start:].count("drain timeout") == 1, log
+            assert log[-1] == "op abort", log
+
+    run(main())
+
+
 def test_dry_run_returns_the_plan_that_runs(tmp_path: Path) -> None:
     async def main() -> None:
         async with engine(tmp_path) as e:

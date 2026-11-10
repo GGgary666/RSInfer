@@ -74,11 +74,11 @@
 
 | 路径 | 内容 |
 |---|---|
-| `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、出错不冻结（`loop.py`） |
+| `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、出错不冻结（`loop.py`）；变更前排空（`drain.py`，`doc/specs/empty-apply.md`） |
 | `engine/policies/` | 决策点的策略单元：`fcfs`（`policy.order@1`）、`prefill_first`（`policy.compose@1`），接口在 `core/contracts/policy.py` |
 | `engine/core/state/alloc/` | 联合账本 `core.state.alloc`（`ledger@1`，接口在 `core/contracts/ledger.py`）；`prefix.py` 是账本内部的联合前缀匹配算法 |
 
-阶段 2 的文本前端：`engine/frontend/http/`、`tokenizer/`、`detok/` 是前端的三个单元，`frontend/interfaces.py`（它们之间的本地接口）和 `transport.py`（前端的两条记录流）是它们共用的库；`engine/sched/reqs/` 是调度宿主里的请求表状态单元 `sched.reqs`。来源、行为和运行方法见 `engine/frontend/README.md`。
+阶段 2 的文本前端：`engine/frontend/http/`、`tokenizer/`、`detok/` 是前端的三个单元（`frontend.http` 也是变更时引擎的门：变更期间新请求回 503，`api.py` 的 `Gate`），`frontend/interfaces.py`（它们之间的本地接口）和 `transport.py`（前端的两条记录流）是它们共用的库；`engine/sched/reqs/` 是调度宿主里的请求表状态单元 `sched.reqs`。来源、行为和运行方法见 `engine/frontend/README.md`。
 
 worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 
@@ -140,7 +140,7 @@ worker 里的执行层单元（阶段 2，eager，`stage2-contract.md` §6）：
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、状态单元的变更（`state-changes.md`：排空与版本迁移，只有规格）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
@@ -159,6 +159,7 @@ uv run pytest tests/framework/ipc -q # 只跑某个目录
 PYTHONPATH=engine uv run python -m core.control serve --source <工作区> --topology <topology.json> \
     --state-dir <目录> --host <HostId> --bind <地址> [--config <config.json>] --spawn-agents
 PYTHONPATH=engine uv run python -m core.control.client --control <地址> status|check|apply|introspect|logs
+# apply 只作用于空引擎（doc/specs/empty-apply.md）：有请求时默认被拒；--wait-empty [秒] 等它们跑完，--force 立刻结束它们；--json 打印完整结果
 # formal 全流程：需要 Java 11+；首次 --bootstrap 下载并校验 TLC 1.7.4
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```

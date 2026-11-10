@@ -192,7 +192,10 @@ class Op:
     def start_drain(self, args):
         self.left = args.get("ticks", 0)
         self.never = args.get("never", False)
+        self.deadline_fails = args.get("deadline_fails", False)
         log(self.config, self.ctx, "drain start")
+        if args.get("refuse"):
+            raise RuntimeError("the toy holds requests")
 
     def drained(self):
         self.left -= 1
@@ -200,6 +203,8 @@ class Op:
 
     def drain_deadline(self):
         log(self.config, self.ctx, "drain timeout")
+        if self.deadline_fails:
+            raise RuntimeError("the toy did not empty in time")
         return {"aborted": 3}  # this toy's policy: the requests left end at the deadline
 
 

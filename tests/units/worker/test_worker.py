@@ -107,6 +107,31 @@ def loop(executor: FakeExecutor, pipe: Pipe, **kw: Any) -> WorkerLoop:
     return WorkerLoop(executor, pipe, pipe, rank=0, idle_wait_s=0.0, **kw)
 
 
+def test_a_new_loop_says_its_capacity_at_its_first_step_not_when_it_is_built() -> None:
+    """Built inside a change's Execute, its stores are a candidate the change may undo: a Capacity
+    then would reach the scheduler as the current one (Codex, #42). It goes out at the first step,
+    after the process resumed."""
+    pipe = Pipe()
+    w = loop(FakeExecutor(), pipe)
+    assert pipe.answers() == []
+    w.step()
+    assert pipe.answers() == [(0, Capacity.SECTION)]
+
+
+def test_a_new_identity_sends_capacity_again_under_it() -> None:
+    """After a change the scheduler plans again only once it has each rank's ``Capacity`` under the
+    identity served now (doc/specs/empty-apply.md): the loop sends it at its next step."""
+    served = {"identity": "v1"}
+    pipe = Pipe()
+    w = loop(FakeExecutor(), pipe, identity=lambda: served["identity"])
+    w.step()
+    served["identity"] = "v2"
+    w.step()
+    capacities = [cast(Capacity, read_sections(decode_record(r), {Capacity.SECTION: Capacity}).unwrap()[Capacity.SECTION])
+                  for r in pipe.written]
+    assert [c.identity for c in capacities] == ["v1", "v2"] and capacities[1].items == {"kv.paged": 4}
+
+
 def test_capacity_first_then_answers_in_plan_order() -> None:
     """Step 2 runs on while step 3 is refused: the refusal waits for step 2's answer."""
     slow = Pending(2, done=False)

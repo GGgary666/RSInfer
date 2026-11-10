@@ -110,6 +110,9 @@ class _Change:
     drain_reply: Deferred | None = None
     drain_deadline: float = 0.0
     drain_outcomes: dict[str, int] = field(default_factory=dict[str, int])
+    draining_actions: list[UnitAction] = field(default_factory=list[UnitAction])
+    """``start_drain()`` was called on these (even if it raised): each hears ``commit()`` or
+    ``abort()``, so it takes requests again (state-changes.md §5.2)."""
     pause_reply: Deferred | None = None
     pause_after: int | None = None
 
@@ -134,6 +137,10 @@ class Participant:
         host.safe_point_hooks.append(self.tick)
 
     # ----------------------------------------------------------- helpers
+
+    def _serving_handler(self, a: UnitAction) -> Any:
+        """The handler of the instance serving now, or ``None`` once the change removed the unit."""
+        return self.rt.action_handler(a.unit, a.action)
 
     def _handler(self, a: UnitAction) -> Any:
         h = self.rt.action_handler(a.unit, a.action)
@@ -339,6 +346,14 @@ class Participant:
         if c.staged:
             self.rt.discard_staged()
             c.staged = False
+        for ua in reversed(c.draining_actions):  # last: the instance serving again hears it
+            try:
+                handler = self._serving_handler(ua)
+                if handler is not None:
+                    handler.abort()
+            except Exception as e:  # noqa: BLE001
+                self._abort_failed(ua, e)
+        c.draining_actions.clear()
 
     def _with_fresh_modules(self, undo: _Undo) -> ReloadPlan:
         assert undo.reverse_reload is not None
@@ -365,6 +380,7 @@ class Participant:
             return Ok(Drained(c.id, dict(c.drain_outcomes)))
         try:
             for ua in c.actions.drain:
+                c.draining_actions.append(ua)  # before the call: abort() also ends a drain that raised
                 self._handler(ua).start_drain(ua.args)
         except Exception as e:  # noqa: BLE001
             return self._fail("drain", e)
@@ -385,8 +401,10 @@ class Participant:
                         c.drain_outcomes[outcome] = c.drain_outcomes.get(outcome, 0) + int(n)
                 done = True
         except Exception as e:  # noqa: BLE001
+            c.phase = "prepared"  # still serving; the coordinator aborts (drained() is not asked again)
             if c.drain_reply is not None:
                 c.drain_reply.resolve(self._fail("drain", e))
+                c.drain_reply = None
             return
         if done and c.drain_reply is not None:
             c.phase = "drained"
@@ -544,6 +562,15 @@ class Participant:
             except Exception as e:  # noqa: BLE001 - commit cannot fail any more; report it
                 self.diagnostics.append(diag(COMPONENT, "commit", f"{ua.unit}.{ua.action}: {e}",
                                              code="change.commit_hook_failed"))
+        for ua in c.draining_actions:  # the instance serving now: a reloaded unit's new one
+            try:
+                handler = self._serving_handler(ua)
+                if handler is not None:
+                    handler.commit()
+            except Exception as e:  # noqa: BLE001 - commit cannot fail any more; report it
+                self.diagnostics.append(diag(COMPONENT, "commit", f"{ua.unit}.{ua.action}: {e}",
+                                             code="change.commit_hook_failed"))
+        c.draining_actions.clear()
         self.host.identity = c.identity
         c.phase = "committed"
         c.renew()

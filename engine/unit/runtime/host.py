@@ -123,6 +123,13 @@ class ControlLink:
         """The supervisor's address, for a unit that looks peers up from a thread of its own."""
         return self._host.spec.control
 
+    @property
+    def paused(self) -> bool:
+        """The process is paused: before its first resume, or inside a change, from its epoch
+        boundary until the change committed or was undone. For a unit serving from a thread of
+        its own, which the pause does not stop (doc/specs/empty-apply.md)."""
+        return self._host.paused
+
     def submit(self, cs: ChangeSet) -> Result[int]:
         h = self._host
         r = h.client.call(h.spec.control, SubmitChange(cs), timeout=h.ipc.rpc_timeout_s)

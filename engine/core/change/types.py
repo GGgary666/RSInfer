@@ -13,6 +13,7 @@ from unit.runtime.types import ProcessPlan, ReloadPlan, ReloadReport, UnitSpec
 
 ChangeSource = Literal["apply", "config", "internal", "startup", "operator"]
 ChangeStatus = Literal["committed", "aborted", "failed", "planned", "dropped"]
+WhenBusy = Literal["refuse", "wait", "force"]
 
 EMPTY = Identity("")
 """The identity of the empty system; startup changes start here."""
@@ -25,6 +26,13 @@ class ChangeMeta(msgspec.Struct, frozen=True):
     evidence: list[str] = []
     handles_fault: bool = False
     """Responds to a lost process or machine: goes to the front of the queue."""
+    when_busy: WhenBusy = "refuse"
+    """A change applies to an empty engine (doc/specs/empty-apply.md): what to do when requests
+    are in it. ``refuse``: fail and say how to wait or force; ``wait``: take no new requests and
+    apply once the ones in it ended; ``force``: end them at once with an error. The units that
+    hold requests do it (their ``drain`` action); a change of live config keys only does not wait."""
+    wait_s: float = 3600.0
+    """With ``wait``: how long; then the change fails, nothing is ended and requests come in again."""
 
 
 class StateRequest(msgspec.Struct, frozen=True):

@@ -10,6 +10,9 @@ services = ["frontend.http@1"]
 [requires]
 services = ["frontend.tokenizer@1", "frontend.detok@1", "proc.control@1", "proc.streams@1"]
 
+[capabilities]
+actions = ["drain"]  # the engine's gate for changes (doc/specs/empty-apply.md)
+
 [config]
 "frontend.model" = { type = "str", default = "Qwen3.8-27B", binding = "startup" }
 "frontend.http_bind" = { type = "str", default = "", binding = "startup", doc = "Bind address from deployment configuration." }

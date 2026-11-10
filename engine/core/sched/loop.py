@@ -41,6 +41,9 @@ What is ours (stage2-contract.md §4):
   persistent batch (``batch.max_context_len``), and plans use at most ``batch.max_rows`` rows:
   the worker raises on a plan beyond them (stage2-contract.md §4.3). A frontend that takes nothing for
   ``sched.frontend_timeout_s`` loses its requests (they are cancelled), not the scheduler.
+- **Changes.** A change applies to an empty engine (doc/specs/empty-apply.md, ``drain.py``): this
+  unit says what it holds, ends it all when the change forces it, and once empty takes no
+  requests until the change committed or was undone (``held``).
 """
 
 from __future__ import annotations
@@ -70,12 +73,14 @@ from core.contracts.records import (
     StateOps,
     StepFailure,
 )
-from core.contracts.requests import REQUESTS, TOKENS, Requests, TokenEvents
+from core.contracts.requests import ENDED_BY_CHANGE, REQUESTS, TOKENS, Requests, TokenEvents
 from core.contracts.serving import ReturnRoute
 from core.ipc.records import OpenRecord, RecordBuilder, decode_record, encode_record, read_sections
 from core.ipc.stream import StreamAddress
 
 type Answer = Sampled | Resync | StepFailure
+FORCED = ENDED_BY_CHANGE
+"""The error of a request a change ended at once (doc/specs/empty-apply.md)."""
 type Kind = Literal["waiting", "prefilling", "decoding"]
 
 
@@ -254,6 +259,13 @@ class Scheduler:
         self.expect_plans = [False] * len(plans)
         """One replacement, seen on one stream already: the other stream's change is the same one."""
         self.adopted = False
+        self.drain_mode: str | None = None
+        """A change is emptying the engine (``drain.py``): ``refuse``, ``wait`` or ``force``."""
+        self.held = False
+        """Taking no requests: the engine is empty for a change, until it committed or was undone."""
+        self.capacity_wanted: set[int] = set()
+        """Ranks whose ``Capacity`` under the identity served now has not come since a change committed:
+        their stores may have been rebuilt with another size. No step is planned meanwhile."""
 
     # ------------------------------------------------------------------ the loop
 
@@ -302,6 +314,21 @@ class Scheduler:
     def _epoch(self) -> int | None:
         return self.table.last_retired if self.table.last_retired >= 1 else None
 
+    def occupancy(self) -> tuple[int, int, int]:
+        """Requests running, requests waiting, steps in flight. A request ended (or cancelled)
+        no longer counts, but a step still in flight does: it may write what the request held.
+        A failed worker's steps never come back, so they do not count once the loop failed."""
+        live = [r for r in self.table.entries() if not r.finished()]
+        running = sum(1 for r in live if r.row is not None)
+        return running, len(live) - running, 0 if self.fault is not None else len(self.flights)
+
+    def end_all(self, message: str) -> int:
+        """End every request with ``message`` as its error; how many."""
+        live = [r for r in self.table.entries() if not r.finished()]
+        for r in live:
+            self._error(r, message)
+        return len(live)
+
     def _note(self, text: str) -> None:
         if not self.diagnostics or self.diagnostics[-1] != text:
             self.diagnostics.append(text)
@@ -310,6 +337,9 @@ class Scheduler:
     def _wait(self) -> None:
         if self.flights and self.fault is None:
             self._wait_result(self.settings.idle_wait_s)
+            return
+        if self.held:
+            time.sleep(self.settings.idle_wait_s)
             return
         raw = self.requests.read(timeout=self.settings.idle_wait_s)
         if raw is not None:
@@ -377,7 +407,10 @@ class Scheduler:
             self._note(f"rank {rank}: result dropped: {type(e).__name__}: {e}")
             return
         if Capacity.SECTION in parts:
-            self._capacity(rank, cast(Capacity, parts[Capacity.SECTION]).items)
+            capacity = cast(Capacity, parts[Capacity.SECTION])
+            self._capacity(rank, capacity.items)
+            if capacity.identity == self.identity():
+                self.capacity_wanted.discard(rank)
         answer = cast(Answer | None, parts.get(StepFailure.SECTION) or parts.get(Resync.SECTION)
                       or parts.get(Sampled.SECTION))
         if answer is None:
@@ -586,6 +619,8 @@ class Scheduler:
     # ------------------------------------------------------------------ frontend
 
     def _ingest(self) -> bool:
+        if self.held:  # what comes now waits in the stream: it runs on what the change makes
+            return False
         got = False
         for _ in range(32):
             raw = self.requests.read(timeout=0)
@@ -607,6 +642,9 @@ class Scheduler:
         requests = cast(Requests, parts[Requests.SECTION])
         route = cast(ReturnRoute, parts[ReturnRoute.SECTION]).tokens
         for new in requests.new:
+            if self.drain_mode == "force":
+                self._refuse(route, new.request, FORCED)
+                continue
             if self.fault is not None:
                 self._refuse(route, new.request, f"the engine stopped serving at step {self.fault.step}: "
                                                  f"{self.fault.reason}")
@@ -736,6 +774,8 @@ class Scheduler:
     def _plan(self) -> bool:
         if self.fault is not None or not self.ledger.ready or len(self.flights) >= max(1, self.depth()):
             return False
+        if self.capacity_wanted:
+            return False  # after a change: plan with the workers' capacity of now, not an older one
         if self.full and self.flights:
             return False  # a full delta goes out once every step sent before it is answered
         try:
