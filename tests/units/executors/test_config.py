@@ -12,7 +12,8 @@ import pytest
 import torch
 
 from core.change.types import ProcActions
-from tests.units.support.worker import Driver, Worker, tiny_config
+from core.common.result import Failed
+from tests.units.support.worker import Driver, FailingAlloc, Worker, tiny_config
 
 
 def worker(config: dict[str, Any] | None = None, capsys: pytest.CaptureFixture[str] | None = None,
@@ -158,3 +159,32 @@ def test_a_worker_rebuilt_for_new_state_config_generates_as_one_started_with_it(
     finally:
         rebuilt.close()
         fresh.close()
+
+
+def test_a_kv_rebuild_out_of_memory_rolls_back_to_a_worker_that_generates_as_before() -> None:
+    """``model.dtype`` changes the KV the model declares (``state.kv.dtype`` is ``auto``), while the
+    KV store itself is not reloaded: its running instance rebuilds the buffers. Out of memory there,
+    the reload rolls back, the old model declares the old KV again, and the worker generates as
+    before (#46 review: the store took the old declarations as unchanged, its buffers gone)."""
+    prompt = [5, 17, 3, 44, 9, 2]
+    w, _ = worker()
+    try:
+        d = Driver(w)
+        d.add(0, prompt)
+        d.generate([0], 4)
+        before = list(d.requests[0].outputs)
+        pa = plan_change(w, "model.dtype", "bf16")
+        assert pa.reload is not None and "state.kv_paged" not in [u.id for u in pa.reload.units_to_reload]
+        kv = w.service("state.kv.paged@1")
+        kv.platform = failing = FailingAlloc(kv.platform)
+        failing.arm()
+        r = w.runtime.reload(pa.reload, values=pa.config)
+        assert isinstance(r, Failed) and any("injected" in diag.reason for diag in r.diagnostics), r
+        assert not failing.armed  # the KV store's allocation is what failed
+        d.remove(0)
+        d.rebuilt()
+        d.add(1, prompt)
+        d.generate([1], 4)
+        assert d.requests[1].outputs == before
+    finally:
+        w.close()

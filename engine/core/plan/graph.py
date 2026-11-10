@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from typing import Any
-import time
 
 import torch
 
+from core.contracts.kernels import Solution
 from core.contracts.columns import Column
 from core.contracts.plan import PlanKey
 from core.contracts.records import BatchPlan
@@ -99,21 +99,9 @@ class GraphPlan:
             self.graph.close()
         self.graph, self.output, self.deps = None, None, None
 
-
-def build(plans: dict[int, GraphPlan], model: Any, backends: Sequence[Any], batch: Any,
-          stores: dict[str, Any], recorder: Any, catalog: Any, resolved: dict[str, Any],
-          budget: int, baseline: int, guard: Callable[[], Dependencies]) -> Dependencies:
-    """Warm up, capture, and compare each candidate before the set is published."""
-    torch.cuda.reset_peak_memory_stats()
-    empty = scratch_plan()
-    # Allocate every backend bucket before taking any generation snapshots.
-    for size in plans:
-        for backend in backends:
-            backend.prepare(batch, empty, PlanKey("decode", size))
-    deps = guard()
-    for size, plan in plans.items():
-        started = time.perf_counter()
-
+    def capture(self, model: Any, stores: dict[str, Any], recorder: Any, catalog: Any,
+                solutions: Sequence[Solution]) -> None:
+        """Capture this bucket on scratch state, then compare its outputs and state with eager."""
         def clear() -> None:
             for store in stores.values():
                 store.clear(store.scratch())
@@ -127,39 +115,26 @@ def build(plans: dict[int, GraphPlan], model: Any, backends: Sequence[Any], batc
             return values
 
         with recorder.warmup(), torch.inference_mode():
-            for backend in backends:
-                backend.prepare(batch, empty, PlanKey("decode", size))
             catalog.selected(clear=True)
             for _ in range(3):
                 clear()
-                model.forward(plan.inputs, plan.positions, plan.last_index)
-            descriptions = list(catalog.selected())
-            for choices in resolved["decode"].values():
-                descriptions.extend(catalog.describe(value.removesuffix(" (fallback)"))
-                                    for key, value in choices.items() if key != "backend")
+                model.forward(self.inputs, self.positions, self.last_index)
+            descriptions = [*catalog.selected(), *solutions]
             unsupported = [s.id for s in descriptions if not s.capturable]
             if unsupported:
                 raise ValueError(f"decode kernels are not capturable: {unsupported}")
             clear()
-            expected = model.forward(plan.inputs, plan.positions, plan.last_index).clone()
+            expected = model.forward(self.inputs, self.positions, self.last_index).clone()
             expected_state = scratch_values()
             clear()
         with torch.inference_mode(), recorder.capture() as graph:
-            plan.output = model.forward(plan.inputs, plan.positions, plan.last_index)
-        plan.graph = graph
+            self.output = model.forward(self.inputs, self.positions, self.last_index)
+        self.graph = graph
         with recorder.warmup(), torch.inference_mode():
             clear()
             graph.replay()
-        assert plan.output is not None
-        torch.testing.assert_close(plan.output, expected, rtol=1e-3, atol=1e-3)
+        assert self.output is not None
+        torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3)
         for actual, wanted in zip(scratch_values(), expected_state, strict=True):
             torch.testing.assert_close(actual, wanted, rtol=1e-3, atol=1e-3)
         clear()
-        peak = torch.cuda.max_memory_allocated() - baseline
-        plan.peak_bytes, plan.build_seconds = peak, time.perf_counter() - started
-        if peak > budget:
-            raise MemoryError(f"graph bucket {size} needs {peak} bytes; plan.graph_memory_bytes={budget}")
-    torch.cuda.synchronize()
-    if not deps.valid():
-        raise RuntimeError("graph dependencies changed while building")
-    return deps

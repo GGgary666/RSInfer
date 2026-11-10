@@ -14,6 +14,7 @@
 - scratch 每个 lane 独立，位于账本可分配容量之外；全部 bucket metadata 分配完成后才记录 generation。输出是借用视图，测试 Driver 在下一步之前 clone。
 - kernel 代码/注册来源变更时，`core.deps` 对真实 graph 平台重载 plan，避免 action abort 在旧 kernel 恢复之前录图。运行时优先加载已就绪的非 capture 单元，再加载 capture 单元，确保注册已完成。这是平台接入之外唯一必要的加载顺序修正。
 - replay 前检查提供者撤销、当前 binding generation 和 catalog version；布局全量比较用于调试守卫。`required` 缺图在 executor 写状态之前失败；候选构建失败不降级为 eager。
+- 简化复审：`GraphPlan.capture()` 只负责单桶 capture 和 eager 输出/状态对照；`Unit.rebuild()` 负责选核、全部桶的依赖快照、预算、原子发布和失败清理。启动只选核一次，backend 的固定元数据绑定明确命名为 `GraphBinding`。合入 `master@07442d6` 的状态池释放修复，复用其 generation 与声明清理。
 
 ## 1. 设计依据与范围
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -25,7 +26,7 @@ from core.contracts.plan import Backend, PersistentBatch, Phase, Plan, PlanKey, 
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from core.contracts.tensor import Tensor
-from core.plan.graph import Dependencies, GraphPlan, buckets, build
+from core.plan.graph import Dependencies, GraphPlan, buckets, scratch_plan
 from unit.runtime.proxy import provision_of
 
 
@@ -65,12 +66,12 @@ def resolution(platform: Any, states: Sequence[StateDecl],
 class Plans:
     """``plan@1``."""
 
-    def __init__(self, model: Any, backends: Sequence[Backend], resolved: Mapping[str, Any]) -> None:
+    def __init__(self, model: Any, backends: Sequence[Backend]) -> None:
         self.eager = EagerPlan(model, backends)
-        self.resolved = resolved
+        self.resolved: Mapping[str, Any] = {}
+        """The start-up record (``resolution``)."""
         self.graphs: dict[int, GraphPlan] = {}
         self.required = False
-        """The start-up record (``resolution``)."""
 
     def buckets(self, phase: Phase) -> list[int]:
         return [size for size, graph in self.graphs.items() if graph.valid()] if phase == "decode" else []
@@ -128,15 +129,13 @@ class Unit:
         model = ctx.use("model@1")
         names = list(dict.fromkeys(model.assembly.layers))
         backends: list[Backend] = [ctx.use(name) for name in names]
-        resolved = resolution(ctx.platform, model.assembly.states,
-                              {name: b.resolve(model.assembly.states) for name, b in zip(names, backends, strict=True)})
         self.model, self.names, self.backends = model, names, backends
         self.catalog = ctx.use("kernels.catalog@1")
         self.batch, self.weights = ctx.use("worker.batch@1"), ctx.use("state.weights@1")
         self.stores = {kind: ctx.use(service) for kind, service in
                        (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
                        if any(d.kind == kind for d in model.assembly.states)}
-        self.plans = Plans(model, backends, resolved)
+        self.plans = Plans(model, backends)
         self.plans.required = self.mode == "required"
         ctx.effect(lambda: self.plans.close, label="decode graphs")
         ctx.on_action("rebuild_graphs", Rebuild(self))
@@ -148,8 +147,9 @@ class Unit:
         resolved = resolution(self.ctx.platform, self.model.assembly.states,
                               {name: b.resolve(self.model.assembly.states)
                                for name, b in zip(self.names, self.backends, strict=True)})
-        unsupported = [value for choices in resolved["decode"].values() for key, value in choices.items()
-                       if key != "backend" and not self.catalog.describe(value.removesuffix(" (fallback)")).capturable]
+        solutions = [self.catalog.describe(value.removesuffix(" (fallback)"))
+                     for choices in resolved["decode"].values() for key, value in choices.items() if key != "backend"]
+        unsupported = [s.id for s in solutions if not s.capturable]
         reason = ("disabled" if self.mode == "off" else
                   "platform has no CUDA graph support" if self.ctx.platform.info().name != "cuda_graph" else
                   f"uncapturable decode kernels: {unsupported}" if unsupported else "")
@@ -168,16 +168,31 @@ class Unit:
             bindings.extend(lambda b=b: b.binding for b in self.backends)
             bindings.extend(lambda d=d: self.stores[d.kind].bind(d.layer) for d in self.model.assembly.states)
 
-            def guard() -> Dependencies:
-                return Dependencies([self.model, self.batch, self.weights, self.catalog,
-                                     *self.backends, *self.stores.values()], bindings, self.catalog)
-
             try:
+                recorder = self.ctx.platform.graph()
+                empty = scratch_plan()
+                torch.cuda.reset_peak_memory_stats(device)
+                # Allocate every bucket before snapshotting binding generations.
                 for size in self.sizes:
                     candidates[size] = GraphPlan(size, device, self.backends)
+                    for backend in self.backends:
+                        backend.prepare(self.batch, empty, PlanKey("decode", size))
+                deps = Dependencies([self.model, self.batch, self.weights, self.catalog,
+                                     *self.backends, *self.stores.values()], bindings, self.catalog)
                 with self.ctx.plan_scope("decode_graphs"):
-                    deps = build(candidates, self.model, self.backends, self.batch, self.stores,
-                                 self.ctx.platform.graph(), self.catalog, resolved, self.budget, baseline, guard)
+                    for size, graph in candidates.items():
+                        started = time.perf_counter()
+                        for backend in self.backends:
+                            backend.prepare(self.batch, empty, PlanKey("decode", size))
+                        graph.capture(self.model, self.stores, recorder, self.catalog, solutions)
+                        graph.peak_bytes = torch.cuda.max_memory_allocated(device) - baseline
+                        graph.build_seconds = time.perf_counter() - started
+                        if graph.peak_bytes > self.budget:
+                            raise MemoryError(f"graph bucket {size} needs {graph.peak_bytes} bytes; "
+                                              f"plan.graph_memory_bytes={self.budget}")
+                torch.cuda.synchronize()
+                if not deps.valid():
+                    raise RuntimeError("graph dependencies changed while building")
                 for graph in candidates.values():
                     graph.deps = deps
                 self.plans.graphs = candidates

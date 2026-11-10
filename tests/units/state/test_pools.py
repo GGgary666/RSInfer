@@ -14,7 +14,7 @@ from models.qwen38.unit import states
 from platforms.torch_eager import TorchEagerPlatform
 from state.gdn_slots.unit import MambaPool
 from state.kv_paged.unit import KVPool
-from tests.units.support.worker import tiny_config
+from tests.units.support.worker import FailingAlloc, tiny_config
 from worker.batch.unit import PersistentBatch
 
 CFG = Config.from_hf(tiny_config().to_dict())
@@ -66,6 +66,24 @@ def test_the_scratch_items_are_outside_the_items_the_ledger_hands_out() -> None:
         pool.clear(pool.scratch())
     assert torch.equal(k[:4], k_before[32:]) and torch.equal(k[4:], k_before[4:])
     assert not conv[:, 0].any() and torch.equal(conv[:, 1:], conv_before[:, 1:])
+
+
+@pytest.mark.parametrize("kind", ["kv.paged", "gdn.slots"])
+def test_a_store_whose_new_allocation_failed_allocates_the_old_declarations_again(kind: str) -> None:
+    """A change rebuilding a store's buffers may run out of device memory half-way; the runtime then
+    rolls back, and the old model declares its old states again. Its old buffers are gone already,
+    so the store allocates them again rather than take them as unchanged (#46 review)."""
+    platform = FailingAlloc(TorchEagerPlatform())
+    pool: KVPool | MambaPool = KVPool(platform, 4, 8) if kind == "kv.paged" else MambaPool(platform, 3)
+    old = [s for s in states(CFG, "f32", 4) if s.kind == kind]
+    pool.declare(old)
+    platform.arm()
+    with pytest.raises(torch.OutOfMemoryError):
+        pool.declare([s for s in states(CFG, "bf16", 4, ssm_dtype="bf16") if s.kind == kind])
+    pool.declare(old)
+    for d in old:
+        assert all(t.dtype == torch.float32 for t in pool.bind(d.layer).buffers().values())
+    assert pool.generation > 0  # what was bound before the failed change is stale
 
 
 def plan(rows: list[int], prev: list[int]) -> BatchPlan:

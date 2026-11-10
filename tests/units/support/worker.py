@@ -34,6 +34,26 @@ WORKER_UNITS = ("core.kernels", "kernels.reference", "core.state.weights", "core
 PAGE_SIZE = 4
 
 
+class FailingAlloc:
+    """A platform whose next ``alloc`` after ``arm()`` raises, as a device out of memory would; the
+    rest goes to ``platform``. Put in place of one store's ``platform`` to fail only its allocation."""
+
+    def __init__(self, platform: Any) -> None:
+        self.platform, self.armed = platform, False
+
+    def arm(self) -> None:
+        self.armed = True
+
+    def alloc(self, *args: Any, **kwargs: Any) -> Any:
+        if self.armed:
+            self.armed = False
+            raise torch.OutOfMemoryError("CUDA out of memory (injected)")
+        return self.platform.alloc(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.platform, name)
+
+
 def spec(uid: str) -> UnitSpec:
     return UnitSpec(load_manifest(ENGINE / Path(*uid.split(".")) / "unit.toml").unwrap())
 

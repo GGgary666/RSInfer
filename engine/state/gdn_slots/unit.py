@@ -74,12 +74,15 @@ class MambaPool:
             raise ValueError(f"{KIND} holds one state shape for every GDN layer")
         (conv_shape, conv_dtype), (temporal_shape, ssm_dtype) = decls[0].tensors["conv"], decls[0].tensors["temporal"]
         self.free()
+        # Freed buffers stay in PyTorch's cache, and the next allocation may take part of a freed
+        # block: a new pool a little larger than the old one then fits neither there nor in what the
+        # device has left. Give them back first (doc/framework-bugs/2026-11-10-gdn-ssm-dtype-rebuild-oom.md).
+        torch.cuda.empty_cache()
         n = len(decls)
         conv = self.platform.alloc(0, 0, shape=(n, self.size + self.scratch_items, *conv_shape), dtype=conv_dtype)
         temporal = self.platform.alloc(0, 0, shape=(n, self.size + self.scratch_items, *temporal_shape), dtype=ssm_dtype)
         self.allocated = [conv, temporal]
         self.conv, self.temporal = self.platform.tensor(conv), self.platform.tensor(temporal)
-        self.generation += bool(self.decls)
         self.mamba_layer_ids, self.decls = [d.layer for d in decls], list(decls)
 
     def _tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -122,11 +125,12 @@ class MambaPool:
         """Nothing to do here: a slot is cleared or restored before a request reads it."""
 
     def free(self) -> None:
-        self.generation += bool(self.allocated)
+        """The buffers go, and so do the declarations: declared again (a rollback declares the old
+        ones), the states are allocated again rather than taken as unchanged."""
         for buf in self.allocated:
             self.platform.free(buf)
-        self.allocated, self.conv, self.temporal = [], None, None
-        self.decls = []
+        self.generation += bool(self.allocated)  # their bindings are stale
+        self.allocated, self.conv, self.temporal, self.decls = [], None, None, []
 
 
 class Unit:

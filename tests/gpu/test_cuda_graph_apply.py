@@ -65,7 +65,7 @@ def test_config_changes_recapture_only_graph_dependencies(tmp_path: Path) -> Non
     graph_source = tmp_path / "source/engine/core/plan/graph.py"
     original = graph_source.read_text()
     # Observe completed capture contexts in the test snapshot, without changing production code.
-    target = "        plan.graph = graph\n"
+    target = "        self.graph = graph\n"
     assert original.count(target) == 1
     graph_source.write_text(original.replace(target, target + '        print("TEST_GRAPH_CAPTURE_COMPLETED", flush=True)\n'))
     run = tmp_path / "run"

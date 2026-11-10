@@ -35,14 +35,14 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
-class NoBuffers:
+class GraphBinding:
     """``Binding``: all graph metadata; eager metadata is separate."""
 
-    generation: int = 0
-    tensors: Mapping[str, torch.Tensor] | None = None
+    generation: int
+    tensors: Mapping[str, torch.Tensor]
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return self.tensors or {}
+        return self.tensors
 
 
 @dataclass(frozen=True)
@@ -65,8 +65,8 @@ class GDNAttnBackend:
         self.graph_buffers: dict[str, torch.Tensor] = {}
 
     @property
-    def binding(self) -> NoBuffers:
-        return NoBuffers(self.generation, self.graph_buffers)
+    def binding(self) -> GraphBinding:
+        return GraphBinding(self.generation, self.graph_buffers)
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         _, head_v_dim, head_k_dim = next(d.tensors["temporal"][0] for d in states if d.kind == KIND)
