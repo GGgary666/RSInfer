@@ -142,10 +142,13 @@ def test_kernel_apply_and_failed_graph_build_restore_serving(tmp_path: Path, ove
 
 @pytest.mark.timeout(900)
 def test_repeated_kernel_changes_leave_the_device_as_it_was(tmp_path: Path) -> None:
-    """With the state pools at the default share of the device, every kernel change records the
-    graphs again in what is left. A closed set of graphs gives its pool back, so the tenth change
-    finds the room the first one found, and a change that fails rolls back to graphs that serve."""
-    args, body = deployment(tmp_path, mem_fraction="0.85")
+    """With the state pools at the default share of the device (of a 24 GB one; on a larger card
+    the same 24 GiB of it, since this small model's pages are 1 KiB each and a SM100 of them is a
+    hundred and sixty million), every kernel change records the graphs again in what is left. A
+    closed set of graphs gives its pool back, so the tenth change finds the room the first one
+    found, and a change that fails rolls back to graphs that serve."""
+    fraction = min(0.85, (24 << 30) / torch.cuda.mem_get_info()[1])
+    args, body = deployment(tmp_path, mem_fraction=f"{fraction:.4f}")
     source = tmp_path / "source"
     kernel = source / "engine/kernels/reference/ops.py"
     original = kernel.read_text()
