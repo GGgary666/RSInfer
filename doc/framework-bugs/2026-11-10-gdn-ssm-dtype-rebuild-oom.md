@@ -2,7 +2,7 @@
 
 - 日期：2026-11-10
 - 报告人：Devin（n1 上做热更新耗时对比时碰到，是其中的 B7 这个 case）
-- 状态：未修（用户决定先只报告）
+- 状态：已修（修复和本报告在同一个 PR 里，见文末「修复」）
 - 引擎：
   - 机器：n1（`gpu-node-n1`），SM100 180 GB 单卡（GPU 1），torch 2.11.0+cu130；
   - 代码：master `efce690`；
@@ -56,6 +56,10 @@
     - `MambaPool.declare` 先 `self.free()`，再按新形状 `platform.alloc`：`engine/state/gdn_slots/unit.py` 第 64–78 行；
     - `alloc` 用 `torch.zeros` 一次申请一整块：同一文件第 129 行。
   - 缓存里最大的空闲块放不下这块稍大的新张量。分配器只好向驱动再要一整块 46.27 GiB，可驱动那边只剩 25.87 GiB，于是 OOM。缓存里的空闲加上驱动的空闲一共约 72 GiB，总量其实够。
+  - 再细一层（修的时候确认的）：分配器申请失败时，会先把整块空着的缓存还给驱动再重试，所以光是有缓存还不至于 OOM。出问题的是申请的顺序：
+    - `declare` 先申请 conv。新 conv（48 × 658 × 10240 × 3 × 2 字节 = 1.81 GiB）比旧 conv 那块（0.92 GiB）大，按 best-fit 从旧 temporal 那一大块里切了出来；
+    - 那一大块从此算"在用"，还不回去；
+    - 接着申请 temporal，缓存里没有放得下的，驱动那边又不够。
   - 新池子只要比旧池子大一点就会碰到这个问题。改 `holder.*`、`state.kv.pages`、`state.kv.dtype`（KV 存储的 `declare` 也是先 free 再 alloc，`engine/state/kv_paged/unit.py` 第 84–85 行）也可能碰到，这几个没有单独试。
 - 验证：
   - 同样的引擎，worker 进程带 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 启动（节点代理会把这个变量传给引擎进程，见 `engine/core/nodeagent/agent.py` 的 `child_env`），再做同样的 apply：`committed`，execute 0.56 秒，holder 变成 657 个槽，输出相同。
@@ -65,7 +69,7 @@
   2. `apply --config '{"state.gdn.ssm_dtype": "bf16"}'`，结果是 `aborted`，诊断如上。
   
   能写成 `tests/gpu/` 下的测试：起引擎，apply 这个键，断言 `committed`，输出和冷启动 `--ssm-dtype bf16` 的相同。
-- 修法的方向（还没修）：
+- 修法的方向（写报告时考虑过的）：
   - 重建状态池时，先把缓存还给驱动再申请新的。比如状态单元在 `declare` 里 free 之后调 `torch.cuda.empty_cache()`；或者 `platforms.torch_eager` 的 `alloc` 碰到 OOM 时先 `empty_cache` 再试一次。后者属于框架本体（`engine/framework.toml` 里有 `platforms.torch_eager`）。
   - 或者 worker 进程默认用 `expandable_segments:True`，从根上避免这种碎片。可以放在部署那一层，比如 `deploy/qwen38.py` 给 worker 角色设的环境变量。
 - 另外观察到（没有单独确认会不会出问题）：
@@ -74,3 +78,16 @@
 - 绕过：
   - 冷启动时直接带 `--ssm-dtype bf16`，或者给 worker 设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 后再 apply。
   - 热更新耗时对比里，B7 按"失败、已撤回"记录，没有换成绕过后的结果。
+- 修复（2026-11-10）：
+  - 修在单元一侧，不改框架本体，所以可以热更新上去：
+    - `state.gdn_slots`：`declare` 在 `self.free()` 之后、申请之前调 `torch.cuda.empty_cache()`；
+    - `state.kv_paged`：`declare` 先校验全部声明，把要换的层都 free，并丢掉它们的 `k_buffer` / `v_buffer` 引用，清一次缓存，再统一申请。
+    
+    两个都改，是因为同一次变更两个存储都重建时（比如改 `holder.mem_fraction`、`state.kv.page_size`），模型先给 KV 存储 `declare`，KV 的申请也可能切进 GDN 存储刚释放的大块。
+  - 在 CPU 上、CUDA 没初始化时，`torch.cuda.empty_cache()` 什么都不做。
+  - 测试：`tests/gpu/test_state_rebuild.py`。按 GPU 的空闲显存定大小：旧池约占 55%，新池是 bf16、槽数翻倍再多几个，直接复现切块。
+    - 不修时 OOM（"Tried to allocate 97.78 GiB … 93.94 GiB is reserved by PyTorch but unallocated"）；
+    - 修了以后通过。
+  - n1 上的端到端验证，每次 apply 后输出都和变更前相同：
+    - 用修过的代码冷启动后：B7 改成 bf16 再改回 `auto`，`holder.mem_fraction` 0.85 → 0.80 再改回，四次都 `committed`；
+    - 一台没修的引擎：先 B7，`aborted`，同样的 OOM（第 3 次复现）；再把修复热更新上去（重载 `state.gdn_slots`、`state.kv_paged`），`committed`；之后 B7 `committed`。
