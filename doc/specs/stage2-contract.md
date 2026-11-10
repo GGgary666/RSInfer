@@ -50,6 +50,19 @@
 
 2026-11-09：M2a 的链路跑通了（`tests/scenarios/test_m2a.py`，进 CI）。Qwen3.8-27B 真实结构的前 4 层在 RTX 4090 D 上和 HF 对齐，参照 kernel，fp32 逐字相同（`tests/gpu/`）。用的还是参照 kernel，不是 M2b 要的真 kernel；完整模型在 SM100 上的端到端验证交给 Devin，用同一套 `deploy/qwen38.py` 和 `tests/gpu/test_qwen38_serve.py`。
 
+**2026-11-10：M2a 完成。** 本文给 M2a 的各项都已落实，并有测试：
+- §1.3 主体：前端 → 调度 → worker → 前端整条链路，经 HTTP 的文本和同尺寸 HF 逐字相同，开、不开重叠都测（`tests/scenarios/test_m2a.py`，进 CI）；
+- §4.3 重建持久 batch 以后接着生成，和不重建时逐 token 相同：
+  - executor 层：`tests/units/executors/test_pytorch.py::test_a_rebuilt_batch_answers_resync_until_a_full_delta_then_continues`；
+  - 接真调度器、开重叠：`tests/units/worker/test_worker.py::test_a_rebuilt_persistent_batch_is_resynced_and_generation_goes_on`；
+  - 重建以后隔了几步才再排进 batch 的行：2026-11-10 用临时脚本在本地验证过，两种顺序都相同，晚排进来的那一行由调度器给出输入 token，没有用 `from_previous`。没有加进测试；
+- §5.5.6 页 / 槽寻址、拷贝、清空、padding 条目（`tests/units/state/test_pools.py`、快照恢复的测试）；
+- §5.5.3、§5.5.8 不兼容的显式配置在启动时被拒：显式指定的 backend 没有合适的 solution、阶段 2 不支持的状态 dtype（`tests/units/executors/test_config.py`）、账本和存储的页大小对不上（`tests/units/scheduler/test_ledger.py`）。dtype 和 kernel 之间的约束（如 flashinfer 要 bf16）随 M2b 的真 kernel 一起接入；
+- §3 前端与调度器之间的流：由 [empty-apply.md](empty-apply.md) 落实。除了只改 live 键，每次变更前都先排空前端，apply 时这条流里没有在途记录；
+- §1.4 `core.plan` 的 eager 路径先做（`engine/core/plan/`）。
+
+下一步是 M2b、M2c、M2d。
+
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
 - 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比按下面的口径一致；
@@ -124,7 +137,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 - 新增算法、换 kernel、改调度策略，沿用现有交接方式时直接改实现。
 - 交接内容或语义确实改变时，才更新共享定义；单个 RSI agent 可以同时修改接口及全部使用者。
 - 所有使用者在同一次变更中更新时，可以直接修改定义。需要不同版本并存时再新增分段或版本；不要求每个功能都新增文件、分段或 `@2`。
-- 原地修改还要处理旧格式的在途记录：新接收方必须能正确解码并按原语义处理队列里的旧消息；否则先停止该流的生产并排空，或用新分段/版本区分。调度器与 worker 的计划、结果由 §4.4 的 `quiesce()` 收齐；前端与调度器的流在步循环之外，其暂停入队、排空或兼容解码要在 M2a 单独落实。现有 msgspec 映射结构忽略未知字段、给缺失字段补默认值，只解决编码层面的兼容，仍需检查字段含义。
+- 原地修改还要处理旧格式的在途记录：新接收方必须能正确解码并按原语义处理队列里的旧消息；否则先停止该流的生产并排空，或用新分段/版本区分。调度器与 worker 的计划、结果由 §4.4 的 `quiesce()` 收齐；前端与调度器的流在步循环之外，其暂停入队、排空或兼容解码要在 M2a 单独落实。（2026-11-10：已由 [empty-apply.md](empty-apply.md) 落实：除了只改 live 键，每次变更前都先排空前端，apply 时这条流里没有在途记录。）现有 msgspec 映射结构忽略未知字段、给缺失字段补默认值，只解决编码层面的兼容，仍需检查字段含义。
 - 两位负责人审核是当前团队的 PR 协作流程，不是 RSI 运行时的人类审批条件。`apply` 仍按依赖、暂停和变更协议执行。
 - `__init__.py` 不重新导出各模块。模块按真实交接边界隔离，避免无关重载；`REACHES` 测试记录实际依赖。
 - 修改前后用依赖分析确认影响范围。没有运行实例时可检查 ImportGraph；有实例时用 dry-run。它是工程检查，不是审批。
@@ -202,7 +215,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
   - 2026-11-09 更新（#30 评审）：新建的持久 batch 也算“重建以后”，收到第一份 `full` 之前什么都不跑。调度器启动后的第一份增量本来就是 `full`。
   - 采样不在 worker 里留随机状态：客户端没给 seed 的话，调度器在接纳请求时补一个，worker 按（seed, 位置）取随机数。所以重建前后采到的 token 一样，和 batch 怎么拼也无关。
   - 开投机时，下一步要验证的草稿如果留在显存里，也一起丢掉；重建后每行的第一步不带草稿。
-  - 契约测试（M2a，`torch_eager`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。
+  - 契约测试（M2a，`torch_eager`）：请求 decode 若干步以后重建 batch，再接着生成，和不重建的对照逐 token 一致；要覆盖重建后隔了几步才再排进 batch 的行，以及开重叠的情况。2026-11-10：已完成，见 §1.3 下面的 M2a 记录。
 - **上限**（2026-11-09，#30 评审）：持久 batch 最多 `batch.max_rows` 行，每行最多 `batch.max_context_len` 个 token（按整页留表）。超出上限的增量，`apply` 在改动任何东西之前就报错，不回 `Resync`：再发一份 `full` 也装不下。调度器通过 `[reads]` 读这两个键，接纳时拒绝装不下的请求（#31）。
 
 ### 4.4 一步重叠
