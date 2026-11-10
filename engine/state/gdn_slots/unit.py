@@ -82,7 +82,6 @@ class MambaPool:
         temporal = self.platform.alloc(0, 0, shape=(n, self.size + 1, *temporal_shape), dtype=ssm_dtype)
         self.allocated = [conv, temporal]
         self.conv, self.temporal = self.platform.tensor(conv), self.platform.tensor(temporal)
-        self.generation += bool(self.decls)
         self.mamba_layer_ids, self.decls = [d.layer for d in decls], list(decls)
 
     def _tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,9 +124,12 @@ class MambaPool:
         """Nothing to do here: a slot is cleared or restored before a request reads it."""
 
     def free(self) -> None:
+        """The buffers go, and so do the declarations: declared again (a rollback declares the old
+        ones), the states are allocated again rather than taken as unchanged."""
         for buf in self.allocated:
             self.platform.free(buf)
-        self.allocated, self.conv, self.temporal = [], None, None
+        self.generation += bool(self.allocated)  # their bindings are stale
+        self.allocated, self.conv, self.temporal, self.decls = [], None, None, []
 
 
 class Unit:

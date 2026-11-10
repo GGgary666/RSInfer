@@ -78,10 +78,7 @@ class KVPool:
             if self.decls.get(d.layer) != d:
                 changed.append(d)
         for d in changed:
-            for buf in self.allocated.pop(d.layer, []):
-                self.platform.free(buf)
-            self.k_buffer.pop(d.layer, None)
-            self.v_buffer.pop(d.layer, None)
+            self._free_layer(d.layer)
         if changed:
             # As in state.gdn_slots: give the freed buffers (these, or those of a store the same
             # change rebuilds) back before allocating, or these allocations may split them.
@@ -93,7 +90,6 @@ class KVPool:
             k = self.platform.alloc(0, 0, shape=(total_slots, *k_shape[1:]), dtype=k_dtype)
             v = self.platform.alloc(0, 0, shape=(total_slots, *v_shape[1:]), dtype=v_dtype)
             self.allocated[d.layer] = [k, v]
-            self.generation += d.layer in self.decls
             self.k_buffer[d.layer], self.v_buffer[d.layer] = self.platform.tensor(k), self.platform.tensor(v)
             self.decls[d.layer] = d
 
@@ -125,11 +121,20 @@ class KVPool:
     def invalidate(self) -> None:
         """Nothing to do here: the ledger drops its prefix index, so no request reads old contents."""
 
+    def _free_layer(self, layer: int) -> None:
+        """Its buffers go, and so does its declaration: declared again (a rollback declares the
+        old one), the layer is allocated again rather than taken as unchanged."""
+        bufs = self.allocated.pop(layer, [])
+        for buf in bufs:
+            self.platform.free(buf)
+        self.generation += bool(bufs)  # its bindings are stale
+        self.k_buffer.pop(layer, None)
+        self.v_buffer.pop(layer, None)
+        self.decls.pop(layer, None)
+
     def free(self) -> None:
-        for bufs in self.allocated.values():
-            for buf in bufs:
-                self.platform.free(buf)
-        self.allocated.clear()
+        for layer in list(self.allocated):
+            self._free_layer(layer)
 
 
 class Unit:
