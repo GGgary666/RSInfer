@@ -158,7 +158,8 @@ def test_the_units_that_hold_requests_empty_the_engine_before_a_change(tmp_path:
         # the only process draining: nothing in front of it closes a door, so it is the gate
         assert pa.drain == [UnitAction(UnitId("pkg.d"), "drain", {"mode": when, "gate": True})]
         assert not isinstance(p, Failed) and p.drain_timeout_s == timeout
-        assert any(f"emptied first; with requests in it: {when}" in n for n in p.notes)
+        what = {"refuse": "refuse the change", "wait": "wait until they end", "force": "end them"}[when]
+        assert any(f"must be empty first; if requests are in it: {what}" in n for n in p.notes)
 
 
 def test_a_code_change_empties_the_engine_too(tmp_path: Path) -> None:

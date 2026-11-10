@@ -158,7 +158,8 @@ def summary(result: ChangeResult) -> dict[str, Any]:
             if pa.actions:
                 p["actions"] = [f"{a.unit}.{a.action}" for a in pa.actions]
             if pa.drain:
-                p["drain"] = [f"{a.unit} ({a.args.get('mode', '')})" for a in pa.drain]
+                # what the unit does if requests are in the engine, not what this change met
+                p["drain"] = [f"{a.unit} (if busy: {a.args.get('mode', '')})" for a in pa.drain]
             if p:
                 procs[str(pa.proc)] = p
         if procs:

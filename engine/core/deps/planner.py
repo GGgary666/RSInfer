@@ -119,7 +119,8 @@ def plan(w: World) -> Result[ActionPlan]:
         if any(pa.drain for pa in procs):
             mode = w.cs.meta.when_busy
             drain_timeout = w.cs.meta.wait_s if mode == "wait" else FORCE_DRAIN_S if mode == "force" else None
-            w.notes.append(f"the engine is emptied first; with requests in it: {mode} (doc/specs/empty-apply.md)")
+            what = {"refuse": "refuse the change", "wait": "wait until they end", "force": "end them"}[mode]
+            w.notes.append(f"the engine must be empty first; if requests are in it: {what} (doc/specs/empty-apply.md)")
     return Ok(ActionPlan(procs=procs, control=control, spawn=spawn, stop=stop,
                          topology=topo if w.cs.topology is not None else None, drain_timeout_s=drain_timeout,
                          notes=w.notes))
