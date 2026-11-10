@@ -8,7 +8,9 @@ When it cannot tell, it picks the more expensive action and says so in ``notes``
 A change applies to an empty engine (doc/specs/empty-apply.md): unless it only sets live config
 keys, every unit of a process changed in place that holds requests (it declares the action
 ``drain``) empties its part of the engine first, as the change asks when it finds requests there
-(``ChangeMeta.when_busy``). So a reload may rebuild state units: nothing is in them.
+(``ChangeMeta.when_busy``). So a reload may rebuild state units: nothing is in them. ``gate``
+says whether the units of that process are the only ones draining: then nothing in front of them
+closes a door, and they stop taking requests themselves once empty (a scheduler with no frontend).
 """
 
 from __future__ import annotations
@@ -107,9 +109,13 @@ def plan(w: World) -> Result[ActionPlan]:
             control = c
     drain_timeout: float | None = None
     live_only = not (spawn or stop or control is not None or w.cs.state or w.cs.topology is not None) and all(
-        pa.restart is None and pa.reload is None and not pa.stage and not pa.actions for pa in procs)
+        pa.restart is None and pa.reload is None and not pa.stage and not pa.actions
+        and all(p.binding(k) == "live" for k in pa.config) for pa in procs)
     if not live_only:
         procs = [p.with_drain(pa) for pa in procs]
+        if sum(1 for pa in procs if pa.drain) == 1:  # no unit in front of it closes a door
+            procs = [msgspec.structs.replace(pa, drain=[msgspec.structs.replace(a, args={**a.args, "gate": True})
+                                                        for a in pa.drain]) for pa in procs]
         if any(pa.drain for pa in procs):
             mode = w.cs.meta.when_busy
             drain_timeout = w.cs.meta.wait_s if mode == "wait" else FORCE_DRAIN_S if mode == "force" else None
@@ -165,7 +171,7 @@ class _Planner:
         self.base_graph = ImportGraph(w.base_tree.modules)
         self.owners = _owners(w.new_tree)
 
-    def _binding(self, key: str) -> str:
+    def binding(self, key: str) -> str:
         owner = self.owners.get(key)
         return owner[1].binding if owner is not None else "startup"
 
@@ -248,7 +254,7 @@ class _Planner:
         units = sorted(UnitId(u.unit) for u in self.w.running[pa.proc].units
                        if (s := self.base_tree.units.get(UnitId(u.unit))) is not None
                        and DRAIN in s.manifest.capabilities.actions)
-        args = {"mode": self.w.cs.meta.when_busy}
+        args = {"mode": self.w.cs.meta.when_busy, "gate": False}
         return msgspec.structs.replace(pa, drain=[UnitAction(u, DRAIN, dict(args)) for u in units]) if units else pa
 
     def natives_touch(self, units: list[UnitId]) -> bool:
@@ -307,7 +313,7 @@ class _Planner:
                     reload.add(r.unit)
                 else:
                     rebuild.setdefault((art.owner, art.name), (art.rebuild, set()))[1].add(r.key)
-            elif r.hooked and self._binding(r.key) != "startup":
+            elif r.hooked and self.binding(r.key) != "startup":
                 pass  # rung 1: it takes the new value in place (ctx.on_config)
             else:
                 reload.add(r.unit)  # rung 2: a startup key, or read without a hook

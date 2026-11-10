@@ -401,8 +401,10 @@ class Participant:
                         c.drain_outcomes[outcome] = c.drain_outcomes.get(outcome, 0) + int(n)
                 done = True
         except Exception as e:  # noqa: BLE001
+            c.phase = "prepared"  # still serving; the coordinator aborts (drained() is not asked again)
             if c.drain_reply is not None:
                 c.drain_reply.resolve(self._fail("drain", e))
+                c.drain_reply = None
             return
         if done and c.drain_reply is not None:
             c.phase = "drained"

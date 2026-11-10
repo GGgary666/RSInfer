@@ -76,7 +76,8 @@ class Unit:
         manager = FrontendManager(config["frontend.model"], tokenizer, detok, channel,
                                   lambda: str(control.identity), max_tokens=config["frontend.max_tokens"],
                                   max_requests=config["frontend.max_requests"],
-                                  response_timeout_s=config["frontend.response_timeout_s"])
+                                  response_timeout_s=config["frontend.response_timeout_s"],
+                                  paused=lambda: bool(getattr(control, "paused", False)))
         server = Server(manager, config["frontend.http_bind"], config["frontend.http_port"],
                         config["frontend.start_timeout_s"], config["frontend.shutdown_timeout_s"])
         ctx.effect(server.start, "HTTP server and record streams")

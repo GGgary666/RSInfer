@@ -5,8 +5,9 @@ writes the answer to the scheduler's reader ``results.<rank>``; the rank is this
 (one process per rank). Everything below the loop (persistent batch, backends, model, sampler) is
 the executor's (``core.contracts.execution``).
 
-- At start, and whenever the results go to a new reader (a new scheduler process, whose ledger is
-  empty), it sends ``Capacity``.
+- At start, whenever the results go to a new reader (a new scheduler process, whose ledger is
+  empty), and once the process serves a new identity (a change committed), it sends ``Capacity``
+  with that identity: the scheduler plans again after a change only once it has it.
 - It takes the next plan while a step runs, two at most (one step of overlap, §4.4). Answers go out
   in plan order: ``Sampled`` with ``StepStats``, ``Resync`` (the executor refused the plan before
   doing anything), or ``StepFailure`` (the executor raised: what ran is unknown). After a failure
@@ -68,8 +69,11 @@ class Taken:
 class WorkerLoop:
     def __init__(self, executor: Executor, plans: Reader, results: Writer, *, rank: int,
                  idle_wait_s: float = 0.01, quiesce_timeout_s: float = 30.0, announce_every_s: float = 1.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 identity: Callable[[], str] = lambda: "", clock: Callable[[], float] = time.monotonic) -> None:
         self.executor, self.plans, self.results, self.rank = executor, plans, results, rank
+        self.identity = identity
+        self.announced_as: str | None = None
+        """The identity of the last ``Capacity`` queued."""
         self.idle_wait_s, self.quiesce_timeout_s, self.clock = idle_wait_s, quiesce_timeout_s, clock
         self.announce_every_s = announce_every_s
         self.last_write = clock()
@@ -83,6 +87,12 @@ class WorkerLoop:
         self.announcing = False
         """A ``Capacity`` is queued."""
         self.failures = 0
+        # Now, not on the first step: built inside a change's Execute (its stores rebuilt, maybe
+        # smaller), it writes the new capacity while the scheduler is paused. The scheduler's first
+        # step after it resumes reads results before it admits anything, so it never plans with
+        # the old one (doc/specs/empty-apply.md).
+        self._announce()
+        self._flush()
 
     # ------------------------------------------------------------------ the loop
 
@@ -191,12 +201,14 @@ class WorkerLoop:
             return
         moved = self.announced_on != self.results.generation
         idle = not self.taken and not self.outbox and self.clock() - self.last_write >= self.announce_every_s
-        if not moved and not idle:
+        identity = self.identity()
+        if not moved and not idle and identity == self.announced_as:
             return
         if moved and self.announced_on is not None:
             self._note("results go to a new reader (a new scheduler?): Capacity again")
-        self.outbox.appendleft((0, self._record(0, (Capacity.SECTION, self.executor.capacity()))))
-        self.announcing = True
+        capacity = msgspec.structs.replace(self.executor.capacity(), identity=identity)
+        self.outbox.appendleft((0, self._record(0, (Capacity.SECTION, capacity))))
+        self.announcing, self.announced_as = True, identity
 
     def _flush(self) -> None:
         while self.outbox:
@@ -228,10 +240,12 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         scheduler = msgspec.convert(config["worker.scheduler"], ProcId)
         streams = ctx.use("proc.streams@1")
+        control = ctx.use("proc.control@1")
         rank = ctx.instance.proc.index
         self.loop = WorkerLoop(cast(Executor, ctx.use("executor@1")), streams.reader("plans", scheduler.host),
                                streams.writer(scheduler, f"results.{rank}"), rank=rank,
                                idle_wait_s=config["worker.idle_wait_s"],
                                quiesce_timeout_s=config["worker.quiesce_timeout_s"],
-                               announce_every_s=config["worker.announce_every_s"])
+                               announce_every_s=config["worker.announce_every_s"],
+                               identity=lambda: str(control.identity))
         ctx.provide("proc.loop@1", self.loop)

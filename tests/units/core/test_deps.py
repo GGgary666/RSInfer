@@ -155,7 +155,8 @@ def test_the_units_that_hold_requests_empty_the_engine_before_a_change(tmp_path:
         p = Case(tmp_path / when, new=tree, base=tree, config={"pkg.start": 3}, units=("pkg.a", "pkg.b", "pkg.d"),
                  meta=ChangeMeta(when_busy=when, wait_s=120.0)).plan()
         pa = only(p)
-        assert pa.drain == [UnitAction(UnitId("pkg.d"), "drain", {"mode": when})]
+        # the only process draining: nothing in front of it closes a door, so it is the gate
+        assert pa.drain == [UnitAction(UnitId("pkg.d"), "drain", {"mode": when, "gate": True})]
         assert not isinstance(p, Failed) and p.drain_timeout_s == timeout
         assert any(f"emptied first; with requests in it: {when}" in n for n in p.notes)
 

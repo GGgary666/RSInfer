@@ -89,7 +89,7 @@ class RequestState:
 class FrontendManager:
     def __init__(self, model: str, tokenizer: Tokenizer, detokenizer: Detokenizer, channel: Channel,
                  identity: Callable[[], str], *, max_tokens: int = 4096, max_requests: int = 1024,
-                 response_timeout_s: float = 120.0) -> None:
+                 response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False) -> None:
         self.model, self.tokenizer, self.detokenizer, self.channel = model, tokenizer, detokenizer, channel
         self.identity, self.max_tokens, self.max_requests = identity, max_tokens, max_requests
         self.response_timeout_s = response_timeout_s
@@ -103,11 +103,21 @@ class FrontendManager:
         self.incarnation = 0
         self.gate: str | None = None
         """Closed (the change's mode) while a change empties the engine: new requests are turned away."""
+        self.paused = paused
+        self.built_paused = paused()
+        """Built while its process was paused: by a change's Execute, which reloads this unit (or at
+        start). The drain closed the instance this one replaces; this one stays closed until the
+        process resumes, after the change committed or was undone (Codex, #42)."""
         self.entering = 0
         """Requests between the gate and ``states``: a change that closes the gate waits for them too."""
 
     def open_requests(self) -> int:
         return len(self.states) + self.entering
+
+    def closed(self) -> bool:
+        if self.built_paused and not self.paused():
+            self.built_paused = False  # resumed once: later pauses are of changes that keep it
+        return self.gate is not None or self.built_paused
 
     async def start(self) -> None:
         await self.channel.start()
@@ -175,7 +185,9 @@ class FrontendManager:
                 continue
             if uid in events.errors:
                 state.finished = True
-                self._ack(UserReply(uid, "", True, error=events.errors[uid], error_status=400))
+                # A change forcing the engine empty ended it: the server's doing, retry later (Devin, #42).
+                status = 503 if self.gate == "force" else 400
+                self._ack(UserReply(uid, "", True, error=events.errors[uid], error_status=status))
                 continue
             state.last_epoch = epoch
             if events.identity not in state.identities:
@@ -192,7 +204,7 @@ class FrontendManager:
     async def submit(self, request: OpenAICompletionRequest, *, chat: bool) -> int:
         self.entering += 1  # before the gate: a change closing it now still sees this request
         try:
-            if self.gate is not None:
+            if self.closed():
                 raise HTTPException(503, CLOSED, headers={"Retry-After": str(RETRY_AFTER_S)})
             return await self._submit(request, chat=chat)
         finally:
@@ -373,7 +385,8 @@ def create_app(manager: FrontendManager) -> FastAPI:
             chunks: list[str] = []
             async for ack in manager.wait_for_ack(uid):
                 if ack.error:
-                    raise HTTPException(ack.error_status, ack.error)
+                    raise HTTPException(ack.error_status, ack.error, headers={"Retry-After": str(RETRY_AFTER_S)}
+                                        if ack.error_status == 503 else None)
                 chunks.append(ack.incremental_output)
                 if ack.finished:
                     return "".join(chunks), ack
@@ -428,9 +441,11 @@ class Gate:
 
     def start_drain(self, args: dict[str, Any]) -> None:
         mode = str(args.get("mode", "refuse"))
+        # Closed first, counted after: ``submit`` counts itself before it looks at the gate, so a
+        # request either is counted here or finds the gate closed. ``abort()`` opens it again.
+        self.manager.gate = mode
         if mode == "refuse" and (n := self.manager.open_requests()):
             raise RuntimeError(f"the frontend has {n} open request(s). {HINT}")
-        self.manager.gate = mode
 
     def drained(self) -> bool:
         return self.manager.gate is None or self.manager.open_requests() == 0

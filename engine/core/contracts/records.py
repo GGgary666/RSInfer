@@ -143,6 +143,11 @@ class Capacity(msgspec.Struct, frozen=True):
 
     SECTION: ClassVar[str] = "state.capacity@1"
     items: dict[str, int]
+    identity: str = ""
+    """The identity the worker served when it sent this (``""``: unknown, an older sender). After
+    a change the scheduler plans again only once every rank sent one under the new identity: an
+    older one may be on its way still, with the capacity of stores the change rebuilt
+    (doc/specs/empty-apply.md)."""
 
 
 class Resync(msgspec.Struct, frozen=True):

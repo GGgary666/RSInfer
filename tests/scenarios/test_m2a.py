@@ -156,6 +156,8 @@ def test_a_change_applies_to_an_empty_engine_refused_forced_or_waited_for(model:
         assert code == 0 and forced["status"] == "committed", forced
         long.join(60)
         assert not long.is_alive() and any("apply --force" in f for f in forced_frames), forced_frames[-3:]
+        error = next(json.loads(f)["error"] for f in forced_frames if "apply --force" in f)
+        assert error["code"] == 503 and error["type"] == "server_error"  # the server's doing: retry later
 
         code, plain = apply(4)  # nothing in the engine now
         assert code == 0 and plain["status"] == "committed", plain

@@ -72,3 +72,22 @@ def test_the_change_sees_the_open_requests_refuse_fails_and_wait_waits(front: tu
         g.abort()
         scheduler.hold = False
         assert complete(client).status_code == 200
+
+
+def test_a_frontend_built_while_its_process_is_paused_stays_closed_until_it_resumes() -> None:
+    """A change's Execute that reloads ``frontend.http`` builds a new instance: the drain closed the
+    old one, and the new one must not take requests before the change committed or was undone
+    (Codex, #42). Its HTTP thread serves even though the process is paused."""
+    scheduler = ScriptScheduler()
+    f = Frontend(scheduler, paused=True)
+    try:
+        with httpx.Client(base_url=f.url, timeout=10) as client:
+            r = complete(client)
+            assert r.status_code == 503 and r.headers["retry-after"] == "1"
+            f.control.paused = False  # the change ended: the process resumes
+            assert complete(client).status_code == 200
+            f.control.paused = True  # a later pause, of a change that does not reload it, leaves it open
+            assert complete(client).status_code == 200
+    finally:
+        f.close()
+        scheduler.close()

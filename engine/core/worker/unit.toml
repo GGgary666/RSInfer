@@ -8,7 +8,7 @@ entry = "core.worker.unit:Unit"
 services = ["proc.loop@1"]
 
 [requires]
-services = ["executor@1", "proc.streams@1"]
+services = ["executor@1", "proc.streams@1", "proc.control@1"]
 
 [config]
 "worker.scheduler" = { type = "dict", default = {}, binding = "startup", doc = "ProcId of the scheduler host; this worker's rank is its own process index." }

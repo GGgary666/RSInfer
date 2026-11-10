@@ -188,6 +188,17 @@ def test_a_drain_hears_how_the_change_ended_also_when_it_refused_to_start(tmp_pa
             assert any("the toy holds requests" in d.reason for d in r.diagnostics), r.diagnostics
             log = e.c.log_of(SCHED)
             assert log[-2:] == ["drain start", "op abort"], log
+            # a deadline that fails the change is asked once, not again at every safe point until
+            # the coordinator's Abort arrives (Antigravity, #42)
+            e.planner.script = lambda inp: ActionPlan(procs=[ProcActions(SCHED, leads_epochs=True, drain=[
+                UnitAction(UnitId("toyc.tunable"), "toy.op", {"never": True, "deadline_fails": True})])],
+                drain_timeout_s=0.2)
+            r = await e.coord.submit(ChangeSet(base=e.coord.identity))
+            assert r.status != "committed" and any("did not empty in time" in d.reason for d in r.diagnostics)
+            log = e.c.log_of(SCHED)
+            last_start = len(log) - 1 - log[::-1].index("drain start")
+            assert log[last_start:].count("drain timeout") == 1, log
+            assert log[-1] == "op abort", log
 
     run(main())
 

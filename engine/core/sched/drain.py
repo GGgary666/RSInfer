@@ -9,8 +9,11 @@ takes no new requests while a change runs. Here the scheduler:
 - ``force``: ends every request at once with an error, refuses what arrives, and waits only for
   the steps in flight.
 
-Once empty it takes no requests (``Scheduler.held``) until the change committed or was undone:
-they wait in the stream and run on what the change made.
+With a frontend in front of it (``gate`` false), the scheduler goes on reading: a request the
+frontend took before it closed may still be on its way, and the change waits for the frontend to
+see it end (served, or refused when forcing). Without one (``gate`` true) the scheduler is the
+gate: once empty it takes no requests (``Scheduler.held``) until the change committed or was
+undone; they wait in the stream and run on what the change made.
 """
 
 from __future__ import annotations
@@ -33,15 +36,24 @@ def holds(running: int, waiting: int, steps: int) -> str:
 class Drain:
     def __init__(self, loop: Scheduler) -> None:
         self.loop = loop
+        self.gate = False
+        """No frontend in front of this scheduler drains: it stops taking requests itself once empty."""
 
     def start_drain(self, args: dict[str, Any]) -> None:
         mode = str(args.get("mode", "refuse"))
         if mode not in ("refuse", "wait", "force"):
             raise ValueError(f"drain mode {mode!r}: refuse, wait or force")
         occupied = self.loop.occupancy()
+        fault = self.loop.fault
+        if fault is not None and mode != "force" and any(occupied):
+            # no step goes out any more: what the requests hold never ends by itself (Devin, #42)
+            raise RuntimeError(f"the engine stopped serving at step {fault.step} ({fault.reason}) and "
+                               f"{holds(*occupied)}, which can no longer end: waiting cannot empty it. Run the "
+                               "same apply with --force to end them and apply.")
         if mode == "refuse" and any(occupied):
             raise RuntimeError(f"{holds(*occupied)}. {HINT}")
         self.loop.drain_mode = mode
+        self.gate = bool(args.get("gate", False))
         if mode == "force":
             ended = self.loop.end_all(FORCED)
             print(f"core.sched: a change (apply --force) ended {ended} request(s)", file=sys.stderr, flush=True)
@@ -52,7 +64,7 @@ class Drain:
             return True
         if any(self.loop.occupancy()):
             return False
-        self.loop.held = True
+        self.loop.held = self.gate
         return True
 
     def drain_deadline(self) -> dict[str, int]:
@@ -62,7 +74,10 @@ class Drain:
                            "requests come in again. Retry with a longer --wait-empty, or with --force.")
 
     def commit(self) -> None:
+        """The change may have rebuilt the workers' stores with another size: plan again once each
+        rank sent its ``Capacity`` under the new identity (Codex, Antigravity, #42)."""
         self._open()
+        self.loop.capacity_wanted = set(range(len(self.loop.results)))
 
     def abort(self) -> None:
         self._open()

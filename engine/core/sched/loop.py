@@ -263,6 +263,9 @@ class Scheduler:
         """A change is emptying the engine (``drain.py``): ``refuse``, ``wait`` or ``force``."""
         self.held = False
         """Taking no requests: the engine is empty for a change, until it committed or was undone."""
+        self.capacity_wanted: set[int] = set()
+        """Ranks whose ``Capacity`` under the identity served now has not come since a change committed:
+        their stores may have been rebuilt with another size. No step is planned meanwhile."""
 
     # ------------------------------------------------------------------ the loop
 
@@ -404,7 +407,10 @@ class Scheduler:
             self._note(f"rank {rank}: result dropped: {type(e).__name__}: {e}")
             return
         if Capacity.SECTION in parts:
-            self._capacity(rank, cast(Capacity, parts[Capacity.SECTION]).items)
+            capacity = cast(Capacity, parts[Capacity.SECTION])
+            self._capacity(rank, capacity.items)
+            if capacity.identity == self.identity():
+                self.capacity_wanted.discard(rank)
         answer = cast(Answer | None, parts.get(StepFailure.SECTION) or parts.get(Resync.SECTION)
                       or parts.get(Sampled.SECTION))
         if answer is None:
@@ -768,6 +774,8 @@ class Scheduler:
     def _plan(self) -> bool:
         if self.fault is not None or not self.ledger.ready or len(self.flights) >= max(1, self.depth()):
             return False
+        if self.capacity_wanted:
+            return False  # after a change: plan with the workers' capacity of now, not an older one
         if self.full and self.flights:
             return False  # a full delta goes out once every step sent before it is answered
         try:

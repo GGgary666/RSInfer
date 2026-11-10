@@ -200,7 +200,7 @@ class Frontend:
     """The real frontend units in a unit runtime, with the host services they use."""
 
     def __init__(self, scheduler: ScriptScheduler | None = None, *, supervisor: FakeSupervisor | None = None,
-                 response_timeout_s: float = 120.0, io_timeout_s: float = 2.0) -> None:
+                 response_timeout_s: float = 120.0, io_timeout_s: float = 2.0, paused: bool = False) -> None:
         units = [spec("frontend.tokenizer", "tests.units.frontend.support:TokenizerUnit",
                       provides=["frontend.tokenizer@1"], process=["frontend"]),
                  *(UnitSpec(load_manifest(ENGINE / f"frontend/{name}/unit.toml").unwrap())
@@ -221,8 +221,10 @@ class Frontend:
         self.channels = Channels(self.zctx, local=proc.host, bind=BIND, tun=TUN, allocate=lambda name: name,
                                  lookup=lambda p, name: None, publish=self.published.__setitem__)
         self.runtime = UnitRuntime(proc)
-        self.runtime.provide_host("proc.control@1", SimpleNamespace(
-            identity=Identity("v1"), address=supervisor.address if supervisor is not None else ""))
+        self.control = SimpleNamespace(identity=Identity("v1"), address=supervisor.address if supervisor is not None else "",
+                                       paused=paused)
+        """``proc.control@1``; ``paused``: the process is paused (a change's Execute, or before it started)."""
+        self.runtime.provide_host("proc.control@1", self.control)
         self.runtime.provide_host("proc.streams@1", self.channels)
         self.runtime.load_process_plan(ProcessPlan(proc, Identity("v1"), units, config=config)).unwrap()
         server = cast(Server | None, self.runtime.lookup("frontend.http@1"))

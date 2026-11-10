@@ -78,10 +78,10 @@ class WorkerThread:
     """A fixture worker on a thread, with data channels of its own."""
 
     def __init__(self, directory: Directory, rank: int, *, max_batch: int, capacity: dict[str, int],
-                 delay_s: float, announce_after_s: float = 0.0) -> None:
+                 delay_s: float, announce_after_s: float = 0.0, identity: Callable[[], str] = lambda: "v1") -> None:
         self.directory, self.rank, self.proc = directory, rank, WORKERS[rank]
         self.kw: dict[str, Any] = {"rank": rank, "capacity": capacity, "pages": PAGES, "max_batch": max_batch,
-                                   "delay_s": delay_s, "announce_after_s": announce_after_s}
+                                   "delay_s": delay_s, "announce_after_s": announce_after_s, "identity": identity}
         self.ready, self.stopping = threading.Event(), threading.Event()
         self.error: BaseException | None = None
         self.worker: FixtureWorker | None = None
@@ -245,7 +245,9 @@ class Engine:
         self.zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
         self.channels = directory.channels(self.zctx, SCHED)
         self.runtime = UnitRuntime(SCHED)
-        self.runtime.provide_host("proc.control@1", SimpleNamespace(identity=Identity("v1"), address=""))
+        self.control = SimpleNamespace(identity=Identity("v1"), address="")
+        """``proc.control@1``: the identity the engine serves (the workers serve it too)."""
+        self.runtime.provide_host("proc.control@1", self.control)
         self.runtime.provide_host("proc.streams@1", self.channels)
         self.runtime.load_process_plan(ProcessPlan(SCHED, Identity("v1"), self.units, config=self.config)).unwrap()
 
@@ -308,13 +310,17 @@ class Bed:
     def errors(self) -> list[str]:
         return [e for w in self.workers for e in w.fixture.errors]
 
+    def new_identity(self, identity: str) -> None:
+        """A change committed: the scheduler host and the workers serve ``identity`` now."""
+        self.engine.control.identity = Identity(identity)
+
     def replace_worker(self, rank: int, *, announce_after_s: float = 0.0) -> None:
         """A new worker process for ``rank``: new readers and writers, none of the old state."""
         old = self.workers[rank]
         errors = old.fixture.errors
         old.close()
         assert errors == [], errors
-        self.workers[rank] = WorkerThread(old.directory, rank, max_batch=old.kw["max_batch"],
+        self.workers[rank] = WorkerThread(old.directory, rank, identity=old.kw["identity"], max_batch=old.kw["max_batch"],
                                           capacity=old.kw["capacity"], delay_s=old.kw["delay_s"],
                                           announce_after_s=announce_after_s)
 
@@ -329,7 +335,9 @@ def bed(*, ranks: int = 2, delay_s: float = 0.0, capacity: dict[str, int] | None
     try:
         e = Engine(directory, ranks=ranks, **engine)
         max_batch = e.config["sched.max_batch"].value
-        workers = [WorkerThread(directory, r, max_batch=max_batch, capacity=dict(capacity or CAPACITY),
+        control = e.control
+        workers = [WorkerThread(directory, r, identity=lambda: str(control.identity), max_batch=max_batch,
+                                capacity=dict(capacity or CAPACITY),
                                 delay_s=delay_s) for r in range(ranks)]
         client = Client(directory)
         b = Bed(e, workers, client)
