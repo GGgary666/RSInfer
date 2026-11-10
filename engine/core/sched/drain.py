@@ -44,12 +44,7 @@ class Drain:
         if mode not in ("refuse", "wait", "force"):
             raise ValueError(f"drain mode {mode!r}: refuse, wait or force")
         occupied = self.loop.occupancy()
-        fault = self.loop.fault
-        if fault is not None and mode != "force" and any(occupied):
-            # no step goes out any more: what the requests hold never ends by itself (Devin, #42)
-            raise RuntimeError(f"the engine stopped serving at step {fault.step} ({fault.reason}) and "
-                               f"{holds(*occupied)}, which can no longer end: waiting cannot empty it. Run the "
-                               "same apply with --force to end them and apply.")
+        self._fail_if_stuck(mode)
         if mode == "refuse" and any(occupied):
             raise RuntimeError(f"{holds(*occupied)}. {HINT}")
         self.loop.drain_mode = mode
@@ -62,10 +57,20 @@ class Drain:
     def drained(self) -> bool:
         if self.loop.drain_mode is None:
             return True
+        self._fail_if_stuck(self.loop.drain_mode)  # a worker may fail while the change waits (Devin, #42)
         if any(self.loop.occupancy()):
             return False
         self.loop.held = self.gate
         return True
+
+    def _fail_if_stuck(self, mode: str) -> None:
+        """After a worker failure no step goes out any more: what the requests hold never ends by
+        itself, so only ``force`` can empty the engine (Devin, #42)."""
+        fault, occupied = self.loop.fault, self.loop.occupancy()
+        if fault is not None and mode != "force" and any(occupied):
+            raise RuntimeError(f"the engine stopped serving at step {fault.step} ({fault.reason}) and "
+                               f"{holds(*occupied)}, which can no longer end: waiting cannot empty it. Run the "
+                               "same apply with --force to end them and apply.")
 
     def drain_deadline(self) -> dict[str, int]:
         occupied = self.loop.occupancy()

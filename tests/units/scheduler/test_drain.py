@@ -159,3 +159,19 @@ def test_after_a_worker_failure_only_force_empties_the_engine_and_the_change_say
         h.start_drain({"mode": "force", "gate": True})
         b.run_until(h.drained)
         h.abort()
+
+
+def test_a_worker_failure_while_the_change_waits_fails_it_at_once() -> None:
+    """Waiting began with the engine serving; then a worker fails: the change fails at the next
+    check, pointing to ``--force``, instead of waiting out its limit (Devin, #42)."""
+    with bed() as b:
+        b.client.send([request(1, [1, 2, 3], 200)])
+        b.run_until(lambda: len(b.client.outputs[1].tokens) >= 1)
+        h = drain(b)
+        h.start_drain({"mode": "wait", "gate": False})
+        assert not h.drained()
+        b.workers[0].fixture.script[b.engine.table.last_submitted + 2] = "fail"
+        b.run_until(lambda: b.engine.loop.fault is not None)
+        with pytest.raises(RuntimeError, match=r"stopped serving at step .*waiting cannot empty it.*--force"):
+            h.drained()
+        h.abort()
