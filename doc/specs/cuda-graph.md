@@ -1,20 +1,27 @@
 # CUDA Graph 支持：实现方案
 
 - 日期：2026-11-10
-- 状态：首版实现已通过 SM90-80GB CUDA Graph 专项及真实控制面 apply 验证；已完成 [实现简化与 A/B/C 对抗验证](../evaluations/cuda-graph-abc.md)。早期范围和限制见 [验证记录](../evaluations/cuda-graph.md)。
+- 状态：已实现；按 PR #45 的三份 review 改过一轮，见下面「实现选择」和 [cuda-graph-review-fixes.md](../evaluations/cuda-graph-review-fixes.md)。之前的记录：[A/B/C 对抗验证](../evaluations/cuda-graph-abc.md)、[早期验证记录](../evaluations/cuda-graph.md)。
 - 代码基线：`master@efce690`；开发分支：`gw/dev/cuda-graph`。该基线已记录 M2a 完成，下一步包含 M2b 的真实 kernel 与 M2c 的 graph。
 - 目标：在现有 Qwen3.8 TP1 worker 上运行完整 decode forward 的 CUDA Graph，并在 `apply` 后正确失效、重录和释放。
 - 实现原则：**minimal patch，fail fast**。先完成最小正确闭环，复用已有执行路径和变更协议；配置不兼容和资源不足尽早拒绝，执行失败不能伪装成正常 eager 回退。
 
-### 首版实现选择（2026-11-10）
+### 实现选择（2026-11-10，三份 review 之后）
 
-- 平台名为 `cuda_graph`，放在 `engine/platforms/cuda_graph/`。当前内核使用 PyTorch，远程测试机器实际为 SM90-80GB/SM90；不使用 `cuda_sm100` 命名，也不声称完成 SM100 验收。
-- attention decode 在已有 SGLang PyTorch SDPA 参照上适配固定容量的索引、长度 mask 和批量 GQA；GDN 使用已有 PyTorch recurrent/conv 实现。未引入 FlashInfer/FLA/causal-conv 新依赖。该实现先验证完整 forward 与热更新闭环，不代表优化 kernel 或性能验收。
-- `plan.graph_memory_bytes` 默认 1 GiB，holder 预留该预算；逐 bucket 统计构建峰值，超出就失败。固定容量 attention 的临时内存随 bucket 和 `batch.max_context_len` 增长；大模型不能直接假定默认预算足够，应显式限制行数、上下文和预算。
-- scratch 每个 lane 独立，位于账本可分配容量之外；全部 bucket metadata 分配完成后才记录 generation。输出是借用视图，测试 Driver 在下一步之前 clone。
-- kernel 代码/注册来源变更时，`core.deps` 对真实 graph 平台重载 plan，避免 action abort 在旧 kernel 恢复之前录图。运行时优先加载已就绪的非 capture 单元，再加载 capture 单元，确保注册已完成。这是平台接入之外唯一必要的加载顺序修正。
-- replay 前检查提供者撤销、当前 binding generation 和 catalog version；布局全量比较用于调试守卫。`required` 缺图在 executor 写状态之前失败；候选构建失败不降级为 eager。
-- 简化复审：`GraphPlan.capture()` 只负责单桶 capture 和 eager 输出/状态对照；`Unit.rebuild()` 负责选核、全部桶的依赖快照、预算、原子发布和失败清理。启动只选核一次，backend 的固定元数据绑定明确命名为 `GraphBinding`。合入 `master@07442d6` 的状态池释放修复，复用其 generation 与声明清理。
+PR #45 的三份 review（Gemini、Claude Opus 5.5 在 SM100 上的完整模型、Claude Fable 5.2 在 4090D 上的 4 层模型）之后改成下面这样；测量见 [cuda-graph-review-fixes.md](../evaluations/cuda-graph-review-fixes.md)。**§3–§7 是动手之前的方案，和这里不一致的地方以这里为准**，不一致的条目列在本节末尾。
+
+- **平台**：`cuda_graph`（`engine/platforms/cuda_graph/`），PyTorch 的 CUDA Graph，一个进程一条 capture stream。一个 recorder 录的图共用一个内存池（SGLang、vLLM 的做法），从最大的桶录起；recorder 的图全部关闭后，下一次录制用新的池。
+- **padding**：照 SGLang（`PaddingPolicy.ZERO`）。填充的 lane 是持久 batch 的 padding 行（下标 0）、长度 1，读写的只有 KV 的 padding 页和 GDN 的 padding 槽。状态池和 holder 与不开 graph 时完全一样，不读 plan 的配置。backend 每个桶的固定 buffer 只有一维的 `req_pool_indices`、`seq_lens`、`out_cache_loc`（GDN 是 `mamba_cache_indices`），`req_to_token` 直接用持久 batch 的表。
+- **kernel**：固定容量的 decode attention 在单独的单元 `kernels.torch_graph` 里，声明 `requires=[CAPTURE]`：目录只在 `select(capture=True)`（从 graph 回放的步）时选它，eager 的 decode 仍然用变长的参照实现。它不展开 GQA（q 按 K/V head 分组后直接 matmul）。代价仍然随 `batch.max_context_len` 增长，由 M2b 的 paged decode kernel 取代。backend 的 `resolve` 多返回一张 `graph` 表：decode 的各个 definition 在回放步里用哪个 solution，没有可捕获的就是空串。
+- **哪些情况不录图**：`off`；平台设备能力里没有 `cuda_graph`；backend 的某个 decode kernel 没有可捕获的 solution；forward 经 `catalog.call` 用到的 kernel（norm、linear 等，在一次 eager forward 里用 `catalog.recording()` 记下）有不可捕获的；图留下的显存超过 `plan.graph_memory_bytes` 或录制时 OOM。这些情况下 `auto` 走 eager，原因写进 `core.plan` 日志的 `cuda_graph.reason`；`required` 启动失败。其余的录制错误（capture 报错、回放的 logits 和 eager 不一致）在两种模式下都让启动失败。
+- **录制**：每个桶一次 eager forward（预热，同时是对照）、capture、一次回放，比较 logits；不比较状态。完整模型上的状态对照由 `tests/gpu` 负责。
+- **显存**：`plan.graph_memory_bytes`（默认 1 GiB）是图可以留下的设备显存上限，用录制前后 `memory_reserved` 的差来量（先 `empty_cache()`），所有桶合计；它来自 `holder.mem_fraction` 留给激活的那部分，holder 不为它另外预留。关闭图以后 `empty_cache()`，把池还给设备。
+- **桶**：`plan.graph_buckets` 为空时是不超过 `min(batch.max_rows, 8)` 的 2 的幂；更大的步走 eager。`required` 要求最大的桶等于 `batch.max_rows`，所以行数多于 8 时要显式列出。
+- **依赖守卫**：所有桶共用一份记录（提供者实例、目录版本、每个提供者一个 binding generation），每步在 `PlanService.buckets()` 里检查一次；`required` 进了 `PlanService` 契约，executor 在写状态之前拒绝没有图的 decode 步。
+- **变更**：没有 `rebuild_graphs` 这个 action。`core.plan` 用 `ctx.derived("decode_graphs", rebuild="", units=<登记过 kernel 的单元和目录单元>)` 登记；`core.deps` 对没有 rebuild action 的派生产物一律重载它的 owner（不看平台），在它依赖的单元之后加载（`_next_ready` 把 capture 单元排在后面）；撤回时反向重载，旧的 plan 在恢复后的 kernel 上重新录。新加一个向目录注册的单元也会重载 plan。
+- **部署**：`deploy/qwen38.py` 默认 `--cuda-graph off`（`torch_eager` 平台）；`auto` / `required` 用 `cuda_graph` 平台。
+
+与下文不一致的条目：§3.3「候选构建失败不降级」（显存不够时 `auto` 降级）；§4.2 末尾「capture 与 eager 不能各选一套 kernel」（attention decode 现在就是两套，差别在 kernel 的容差以内）；§5.2 每个 lane 独立 scratch（改为共用 padding 项）；§5.3 每个桶独立的私有池和 holder 预留（改为共用一个池，holder 不预留）；§6 的调试用布局比较（删了）；§7.2 的重建 action（改为重载）。
 
 ## 1. 设计依据与范围
 

@@ -47,17 +47,19 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
 
 ### CUDA Graph 参数（2026-11-10）
 
-CUDA 部署默认 `--cuda-graph auto`，使用 `cuda_graph` 平台；`--cuda-graph off` 使用原 `torch_eager`。CPU 的 auto 保持 eager，CPU 上 required 启动失败。
+默认 `--cuda-graph off`：worker 在 `torch_eager` 平台上，全部步都是 eager。`auto` 和 `required` 让 worker 用 `cuda_graph` 平台，给 decode 步录图；prefill 和 mixed 步仍然是 eager。
 
 ```sh
+uv run python deploy/qwen38.py serve --model /path/to/model --cuda-graph auto
 uv run python deploy/qwen38.py serve --model /path/to/model \
-  --cuda-graph required --max-rows 4 --graph-buckets 1 2 4 \
-  --max-context 512 --graph-memory-bytes 1073741824
+  --cuda-graph required --max-rows 16 --graph-buckets 1 2 4 8 16
 ```
 
-只录每行一个 token 的 decode，prefill/mixed 走 eager。`--graph-buckets` 默认是不超过 `--max-rows` 的 2 的幂；required 必须覆盖最大行数（非 2 的幂需显式列入）。`--graph-memory-bytes` 是 holder 预留和 graph 构建峰值上限，默认 1 GiB。构建、校验或预算失败会终止启动，不会悄悄回退。
-
-首版用 PyTorch 固定容量 SDPA 和 GDN 参照实现；内存/计算随 bucket 与最大上下文增长，大模型应从小容量开始验证。日志 `core.plan` 的 `cuda_graph` 字段给出实际 buckets、回退原因、构建耗时和峰值。完整 27B/SM100 的性能尚未验收，详见 [实现方案](../doc/specs/cuda-graph.md)。启动配置通过空引擎 `apply --config` 重载读取者及其使用者，必要时重建状态池和 plan；修改状态配置不必然要求重启进程，已验证 GDN 槽容量可原地重载并重录。范围以 dry-run 为准。第一次引入平台代码需要重启引擎。
+- `auto`：能录就录；录不了（某个 decode kernel 不可捕获，或者图留下的显存超过 `--graph-memory-bytes`）就走 eager，原因在 worker 日志 `core.plan: {...}` 的 `cuda_graph.reason` 里。`required`：这些情况下启动失败，运行时没有图能装下的 decode 步也被拒绝。CPU 上 `auto` 是 eager，`required` 启动失败。
+- `--graph-buckets`：每张图的行数，默认是不超过 `min(--max-rows, 8)` 的 2 的幂；行数更多的步走 eager。`required` 要求最大的桶等于 `--max-rows`，行数多于 8 时要显式列出。
+- `--graph-memory-bytes`：全部图可以留下的设备显存，默认 1 GiB，来自 `--mem-fraction` 留给激活的那部分；状态池的大小与不开 graph 时相同。实际留下多少在日志的 `cuda_graph.kept_bytes`。
+- 回放的 decode 步用的是固定容量的 attention（`kernels.torch_graph`），代价随 `--max-context` 增长而不是随序列的实际长度；4090 D 上 4 层模型，8 行在 4096 时比 eager 快 1.1–1.2 倍，在 16384 时比 eager 慢。eager 的 decode 步仍然用参照实现。数字见 [cuda-graph-review-fixes.md](../doc/evaluations/cuda-graph-review-fixes.md)，设计见 [cuda-graph.md](../doc/specs/cuda-graph.md)。完整 27B 上改过以后还没有重新验收。
+- 改 `plan.*` 的配置或 kernel 单元的代码会在空引擎上重载 `core.plan` 并重录；范围以 `apply --dry-run` 为准。
 
 ### 原 eager 验证记录
 
