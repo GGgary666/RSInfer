@@ -14,5 +14,5 @@
   - worker 那边于是把调度器当成换了人，重新接上；调度器看到结果流的生产者代数变了（`_results_moved`），把已经发到那条连接上的请求结束掉。
 - 修复：`core.state.alloc` 的空闲项改成一个栈，底下从未发出过的 `0 .. fresh - 1` 只记个数，不列出来（`Free`）；发放的顺序与原来的列表相同。改完以后同样的 CPU 引擎第一个请求 0.1 s 返回。
 - 没有改的：心跳线程依赖 GIL。任何单元在有流的进程里做一次占住 GIL 超过 2 s 的调用（把很大的 Python 容器一次建出来、不释放 GIL 的扩展调用）都会有同样的后果。可能的方向是把心跳放到不需要 GIL 的线程里；这一轮没有做。
-- 复现与回归：`tests/units/scheduler/test_ledger.py::test_a_pool_of_a_billion_items_lists_none_of_them` 和 `test_a_pool_hands_out_the_items_a_listed_stack_would`（进 CI）。端到端的复现要 152 GiB 的虚拟内存，没有放进测试；命令见上面「引擎」。`tests/gpu/test_cuda_graph_apply.py::test_repeated_kernel_changes_leave_the_device_as_it_was` 原来按卡的 85% 分状态池，在 SM100 上就是这 1.59 亿页；现在最多用 24 GiB。
+- 复现与回归：`tests/units/scheduler/test_ledger.py::test_a_pool_of_a_billion_items_lists_none_of_them` 和 `test_a_pool_hands_out_the_items_a_listed_stack_would`（进 CI）。端到端的复现要 152 GiB 的虚拟内存，没有放进测试；命令见上面「引擎」。`tests/gpu/test_cuda_graph_apply.py::test_repeated_kernel_changes_leave_the_device_as_it_was` 按卡的 85% 分状态池，在 SM100 上就是这 1.59 亿页，所以它在大卡上同时是这个问题的端到端回归（Opus 在 SM100 上跑过：改之前 3 次都失败，改之后通过，48.8 s）。
 - 绕过：改之前可以用小一点的 `--mem-fraction`，或者调大 `ipc.peer_timeout_s`。

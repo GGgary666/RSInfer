@@ -98,7 +98,9 @@ class Pool:
         change applies to an empty engine (doc/specs/empty-apply.md), and rebuilding a store there
         can change its size (a new dtype, another holder budget)."""
         if not (self.holdings or self.reservations or self.releases):
-            self.free = Free(items)  # every item is free: none needs listing
+            # Every item is free, so none needs listing. A free item carries nothing while prefix
+            # caching is off (``reusable``); a cache kept in free items would not survive this.
+            self.free = Free(items)
         elif items < self.capacity:
             raise ValueError("a state pool shrinks only while it holds nothing")
         else:
