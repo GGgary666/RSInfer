@@ -133,6 +133,8 @@ class PyTorchExecutor:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
+        self.row_index: torch.Tensor | None = None
+        """``0 .. n - 1`` on the device, as long as the largest decode step so far."""
 
     def capacity(self) -> Capacity:
         return Capacity({kind: store.capacity() for kind, store in self.stores.items()})
@@ -177,9 +179,12 @@ class PyTorchExecutor:
         input_ids = torch.cat(parts)
         pos = on_device(torch.cat([torch.arange(p, p + n) for p, n in zip(positions, num_tokens, strict=True)]),
                         device)
-        # One token per row in a decode step: each row's last token is its only one.
-        last_index = (torch.arange(len(rows), device=device) if plan.phase == "decode" else
-                      on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device))
+        if plan.phase == "decode":  # one token per row: each row's last token is its only one
+            if self.row_index is None or len(self.row_index) < len(rows):
+                self.row_index = torch.arange(len(rows), device=device)
+            last_index = self.row_index[:len(rows)]
+        else:
+            last_index = on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device)
 
         try:
             logits = chosen.run(self.batch, plan, input_ids, pos, last_index)

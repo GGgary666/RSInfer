@@ -13,7 +13,7 @@ second must not move the request forward past the first, which did not run eithe
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 from core.contracts.state import StateDecl
@@ -38,11 +38,39 @@ class Reservation:
     admission: bool = False
 
 
+class Free:
+    """The free items, the stack mini-sglang's free-slot list is, without listing the items never
+    handed out: ``0 .. fresh - 1`` at the bottom is a count, the items given back are on top. A
+    worker reports its whole pool at once, and listing a hundred million pages takes seconds in
+    one call that holds the GIL, longer than the streams' peers wait for a heartbeat
+    (doc/framework-bugs/2026-11-10-a-long-gil-hold-looks-like-a-dead-peer.md)."""
+
+    def __init__(self, fresh: int = 0) -> None:
+        self.fresh = fresh
+        self.returned: list[int] = []
+
+    def __len__(self) -> int:
+        return self.fresh + len(self.returned)
+
+    def __iter__(self) -> Iterator[int]:
+        yield from range(self.fresh)
+        yield from self.returned
+
+    def pop(self) -> int:
+        if self.returned:
+            return self.returned.pop()
+        self.fresh -= 1
+        return self.fresh
+
+    def extend(self, items: Iterable[int]) -> None:
+        self.returned.extend(items)
+
+
 class Pool:
     def __init__(self, declarations: Sequence[StateDecl]) -> None:
         self.declare(declarations)
         self.capacity = 0
-        self.free: list[int] = []
+        self.free = Free()
         self.holdings: dict[int, Holding] = {}
         self.reservations: dict[tuple[int, int], Reservation] = {}
         self.releases: dict[int, int] = {}
@@ -69,10 +97,12 @@ class Pool:
         """The workers' usable items (``Capacity``). It may shrink only while nothing is held: a
         change applies to an empty engine (doc/specs/empty-apply.md), and rebuilding a store there
         can change its size (a new dtype, another holder budget)."""
-        if items < self.capacity:
-            if self.holdings or self.reservations or self.releases:
-                raise ValueError("a state pool shrinks only while it holds nothing")
-            self.free = list(range(items))
+        if not (self.holdings or self.reservations or self.releases):
+            # Every item is free, so none needs listing. A free item carries nothing while prefix
+            # caching is off (``reusable``); a cache kept in free items would not survive this.
+            self.free = Free(items)
+        elif items < self.capacity:
+            raise ValueError("a state pool shrinks only while it holds nothing")
         else:
             self.free.extend(range(self.capacity, items))
         self.capacity = items
@@ -161,5 +191,6 @@ class Pool:
         self._free_ready()
 
     def check(self) -> list[str]:
-        ids = [*self.free, *(item for holding in self.holdings.values() for item in holding.items)]
-        return [] if sorted(ids) == list(range(self.capacity)) else [f"{self.kind}: free/held items disagree"]
+        ids = [*self.free.returned, *(item for holding in self.holdings.values() for item in holding.items)]
+        handed_out = range(self.free.fresh, self.capacity)  # every item that ever left the bottom of the stack
+        return [] if sorted(ids) == list(handed_out) else [f"{self.kind}: free/held items disagree"]
