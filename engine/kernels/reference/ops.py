@@ -256,28 +256,6 @@ def attention_decode(query: torch.Tensor, output: torch.Tensor, k_cache: torch.T
 
 # ------------------------------------------------------------------ GDN: causal conv
 
-def attention_decode_fixed(query: torch.Tensor, output: torch.Tensor, k_cache: torch.Tensor,
-                           v_cache: torch.Tensor, req_to_token: torch.Tensor, req_pool_indices: torch.Tensor,
-                           seq_lens: torch.Tensor, scaling: float | None = None, enable_gqa: bool = False,
-                           causal: bool = False) -> torch.Tensor:
-    """SGLang's decode SDPA with fixed extent and a device-side length mask.
-
-    Unlike the variable-length reference above, lengths and page mappings are read at replay.
-    This intentionally uses bounded dense gathers; it is not a FlashInfer replacement.
-    """
-    if causal:
-        raise ValueError("single-token decode uses a length mask, not a causal triangle")
-    slots = req_to_token[req_pool_indices.long()].long()
-    mask = torch.arange(slots.shape[1], device=slots.device)[None, :] < seq_lens[:, None]
-    # Invalid table entries may contain stale page mappings; never gather them.
-    slots = torch.where(mask, slots, 0)
-    key = k_cache[slots].transpose(1, 2).to(query.dtype)
-    value = v_cache[slots].transpose(1, 2).to(query.dtype)
-    out = scaled_dot_product_attention(query.unsqueeze(2), key, value,
-                                      attn_mask=mask[:, None, None, :], scale=scaling, enable_gqa=enable_gqa)
-    output.copy_(out.squeeze(2))
-    return output
-
 
 def causal_conv1d_ref(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
                       initial_states: torch.Tensor | None = None, return_final_states: bool = False,

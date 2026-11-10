@@ -1,4 +1,8 @@
-"""Real TP1 capture/replay, changing inputs, state, buckets and providers. No GPU skips."""
+"""Real TP1 capture/replay, changing inputs, state, buckets and providers. No GPU skips.
+
+The eager worker these compare with runs the reference attention; a replayed step runs the
+fixed-extent one (``kernels.torch_graph``), so the comparisons also hold that kernel to the
+reference, and ``hf_greedy`` holds both to HF."""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import gc
 import pytest
 import torch
 
+from core.contracts.kernels import Implementation, Solution
 from core.contracts.plan import PlanKey
 from core.contracts.columns import Column
 from core.contracts.records import Resync, StateCopy
@@ -45,7 +50,7 @@ def assert_state(a: Worker, b: Worker) -> None:
 def test_platform_reuses_stream_and_recovers_failed_capture() -> None:
     p = CudaGraphPlatform()
     first, second = p.graph(), p.graph()
-    assert first.stream is second.stream
+    assert first.stream is second.stream and first.pool != second.pool  # a pool per recorder
     x = torch.ones(4, device="cuda")
     with first.warmup():
         x.add_(1)
@@ -114,7 +119,7 @@ def test_hf_guard_refit_and_kernel_reload(checkpoint: Path) -> None:
         old = plans.get(PlanKey("decode", 1))
         gen = weights.bind("").generation
         weights.fill("")
-        assert weights.bind("").generation == gen and old.valid()
+        assert weights.bind("").generation == gen and plans.buckets("decode") == [1, 2, 4]
         # Changed contents must be visible without recapturing or moving the bindings.
         d = Driver(w)
         d.add(0, [5, 17, 3])
@@ -138,8 +143,9 @@ def test_hf_guard_refit_and_kernel_reload(checkpoint: Path) -> None:
             w.service("executor@1").submit(100, delta, plan, ops)
         for x, y in zip(before, state(w), strict=True):
             torch.testing.assert_close(x, y, rtol=0, atol=0)
+        assert plans.buckets("decode") == []
         w.runtime.reload(ReloadPlan(units_to_reload=[spec("kernels.reference"), spec("core.plan")])).unwrap()
-        assert not old.valid()
+        assert old.graph is None  # closed with the plans it belonged to
         assert w.service("plan@1").buckets("decode") == [1, 2, 4]
         assert w.service("plan@1").get(PlanKey("decode", 1)) is not old
     finally:
@@ -153,8 +159,78 @@ def test_required_and_auto_handle_uncapturable_backend(checkpoint: Path) -> None
         assert w.service("plan@1").buckets("decode") == []
     finally:
         w.close()
-    with pytest.raises(Exception, match="uncapturable decode kernels"):
+    with pytest.raises(Exception, match=r"uncapturable decode kernels: \['attn.decode@1'\]"):
         worker(checkpoint, **config)
+
+
+def test_a_kernel_of_another_layer_that_is_not_capturable_means_eager_under_auto(checkpoint: Path) -> None:
+    """The norms and linears a forward calls are eager's choices; a captured step shares them. One
+    that is not capturable leaves ``auto`` without graphs, with the reason, and fails ``required``."""
+    w = worker(checkpoint, "auto")
+    undo: Any = None
+    try:
+        assert w.service("plan@1").buckets("decode") == [1, 2, 4]
+        catalog = w.service("kernels.catalog@1")
+        fn = catalog.resolve(catalog.definition("gemm.linear@1").reference)
+        undo = catalog.register(Implementation(Solution("host.linear@1", "gemm.linear@1", "test:linear"), fn))
+        w.runtime.reload(ReloadPlan(units_to_reload=[spec("core.plan")])).unwrap()
+        plans = w.service("plan@1")
+        assert plans.buckets("decode") == []
+        assert plans.resolved["cuda_graph"]["reason"] == "uncapturable decode kernels: ['host.linear@1']"
+        d = Driver(w)
+        d.add(0, [5, 17, 3])
+        assert d.generate([0], 3)[0]  # and serves eagerly
+    finally:
+        if undo is not None:
+            undo()
+        w.close()
+
+
+def test_graphs_that_keep_more_than_their_memory_mean_eager_under_auto(checkpoint: Path) -> None:
+    """``plan.graph_memory_bytes`` bounds what the graphs keep on the device: over it, ``auto`` runs
+    eagerly and says so, ``required`` fails the start, and either way the graphs' memory is back."""
+    platform = CudaGraphPlatform()
+    warm = worker(checkpoint, platform=platform)  # cuBLAS keeps a workspace per stream, here the capture stream's
+    warm.close()
+    del warm
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_reserved()
+    tight: dict[str, Any] = {"plan.graph_memory_bytes": 4096}
+    w = worker(checkpoint, "auto", platform, **tight)
+    try:
+        plans = w.service("plan@1")
+        assert plans.buckets("decode") == []
+        assert plans.resolved["cuda_graph"]["reason"].startswith("the graphs do not fit: the decode graphs keep")
+        d = Driver(w)
+        d.add(0, [5, 17, 3])
+        assert d.generate([0], 3)[0]
+    finally:
+        w.close()
+    del w, plans, d
+    with pytest.raises(Exception, match="more than plan.graph_memory_bytes = 4096"):
+        worker(checkpoint, "required", platform, **tight)
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    assert torch.cuda.memory_reserved() <= baseline + (1 << 20)
+
+
+def test_the_graphs_take_nothing_from_the_state_pools(checkpoint: Path) -> None:
+    """Padded lanes share the one padding item, so the holder gives the requests what it gives
+    without graphs; and the log says what the graphs keep."""
+    sized: dict[str, Any] = {"state.kv.pages": 0, "state.gdn.slots": 0, "holder.mem_fraction": 0.05}
+    capacities = []
+    for mode in ("off", "required"):
+        w = worker(checkpoint, mode, **sized)
+        try:
+            capacities.append(dict(w.service("executor@1").capacity().items))
+            graph = w.service("plan@1").resolved["cuda_graph"]
+            assert (graph.get("kept_bytes", 0) > 0) == (mode == "required"), graph
+        finally:
+            w.close()
+    assert capacities[0] == capacities[1] and capacities[0]["gdn.slots"] > 0
 
 
 def test_candidate_failure_releases_partial_set(checkpoint: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,7 +240,8 @@ def test_candidate_failure_releases_partial_set(checkpoint: Path, monkeypatch: p
     del warm
     torch.cuda.synchronize()
     gc.collect()
-    baseline = torch.cuda.memory_allocated()
+    torch.cuda.empty_cache()
+    baseline, reserved = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
     capture = Recorder.capture
     calls = 0
 
@@ -183,6 +260,7 @@ def test_candidate_failure_releases_partial_set(checkpoint: Path, monkeypatch: p
     torch.cuda.synchronize()
     gc.collect()
     assert torch.cuda.memory_allocated() <= baseline + (1 << 20)
+    assert torch.cuda.memory_reserved() <= reserved + (1 << 20)
 
 
 def test_overlap_and_repeated_rebuild_keep_outputs_and_memory(checkpoint: Path) -> None:
@@ -211,13 +289,17 @@ def test_overlap_and_repeated_rebuild_keep_outputs_and_memory(checkpoint: Path) 
             return out
 
         assert run(2) == run(1)
-        allocated: list[int] = []
-        for _ in range(4):
+        # A closed graph's pool goes back to the device. Reserved memory and the device's free
+        # memory show it; allocated memory stays flat even when every rebuild leaks its pool.
+        held: list[tuple[int, int, int]] = []
+        for _ in range(10):
             w.service("executor@1").synchronize()
             w.runtime.reload(ReloadPlan(units_to_reload=[spec("kernels.reference"), spec("core.plan")])).unwrap()
             assert w.service("plan@1").buckets("decode") == [1, 2, 4]
             gc.collect()
-            allocated.append(torch.cuda.memory_allocated())
-        assert max(allocated[1:]) - min(allocated[1:]) <= (1 << 20), allocated
+            held.append((torch.cuda.memory_allocated(), torch.cuda.memory_reserved(), torch.cuda.mem_get_info()[0]))
+        for i, name in enumerate(("allocated", "reserved", "free on the device")):
+            values = [h[i] for h in held[1:]]
+            assert max(values) - min(values) <= (2 << 20), (name, values)
     finally:
         w.close()

@@ -1,8 +1,12 @@
-"""Decode throughput with graph on/off, including an identical-kernel control.
+"""Decode throughput with graphs on and off, at several ``batch.max_context_len``.
 
 Run manually with the GPU environment; this is not a pytest timing assertion.
 Model loading, capture, prefill and warm-up are outside the measured interval.
 Each case first primes its entire sequence-length trajectory, then measures repeats.
+
+The context length matters: a replayed step's attention costs by ``max_context`` whatever the
+rows' lengths (``kernels.torch_graph``), an eager step's by the lengths. The two run different
+attention kernels, so in bf16 their greedy tokens may part; the result says whether they did.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from platforms.torch_eager import TorchEagerPlatform
 from tests.gpu.support import REPO, TEXT, free_gpu
 from tests.units.support.worker import Driver, Worker
 
-MODES = ("eager", "eager_same_kernels", "graph")
+MODES = ("eager", "graph")
 
 
 def checkpoint_at(root: Path) -> Path:
@@ -116,11 +120,13 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=16)
     parser.add_argument("--prompt", type=int, default=32)
-    parser.add_argument("--max-context", type=int, default=256)
+    parser.add_argument("--max-context", type=int, nargs="+", default=[256, 4096, 16384],
+                        help="batch.max_context_len of each run; the sequences stay prompt + warmup + steps long")
+    parser.add_argument("--graph-memory-bytes", type=int, default=1 << 30)
     args = parser.parse_args()
     if min(args.repeats, args.steps, args.warmup, args.prompt) < 1 or args.steps < 2:
         parser.error("positive counts and at least two measured steps are required")
-    if args.prompt + args.warmup + args.steps > args.max_context:
+    if args.prompt + args.warmup + args.steps > min(args.max_context):
         parser.error("prompt + warmup + steps exceeds max-context")
     torch.set_num_threads(1)
     checkpoint = checkpoint_at(args.work_dir)
@@ -138,46 +144,47 @@ def main() -> None:
     result["environment"]["nvidia_smi_before"] = subprocess.check_output(["nvidia-smi"], text=True)
     eager_platform, graph_platform = TorchEagerPlatform(cuda=True), CudaGraphPlatform()
     cases = [(b, d) for b in (1, 4, 8) for d in (1, 2)]
-    for repeat in range(args.repeats):
-        # Rotate mode order and reverse case order to reduce warm-cache/order bias.
-        for mode in MODES[repeat % 3:] + MODES[:repeat % 3]:
-            free_gpu()
-            started = time.perf_counter()
-            w = Worker(cfg, platform=(eager_platform if mode == "eager" else graph_platform), **{
-                "weights.path": str(checkpoint), "model.dtype": "bf16", "state.gdn.conv_dtype": "bf16",
-                "state.kv.pages": 2048, "state.kv.page_size": 4, "state.gdn.slots": 8,
-                "batch.max_rows": 8, "batch.max_context_len": args.max_context,
-                "plan.cuda_graph": "required" if mode == "graph" else "off"})
-            plans: Any = None
-            try:
-                plans = w.service("plan@1")
-                assert plans.buckets("decode") == ([1, 2, 4, 8] if mode == "graph" else [])
-                result["builds"].append({"repeat": repeat, "mode": mode, "load_seconds": time.perf_counter() - started,
-                                         "resolution": plans.resolved})
-                for batch, depth in cases if repeat % 2 == 0 else list(reversed(cases)):
-                    if repeat == 0:
-                        prime = {"mode": mode, **decode(w, batch, depth, args.prompt, args.warmup, args.steps)}
-                        result["priming"].append(prime)
-                        print("BENCH_PRIME " + json.dumps(prime), flush=True)
-                    trial = {"repeat": repeat, "mode": mode,
+    runs = [(repeat, context, mode) for repeat in range(args.repeats) for context in args.max_context
+            # Rotate the mode order and reverse the case order to reduce warm-cache and order bias.
+            for mode in MODES[repeat % 2:] + MODES[:repeat % 2]]
+    for repeat, context, mode in runs:
+        free_gpu()
+        started = time.perf_counter()
+        w = Worker(cfg, platform=(eager_platform if mode == "eager" else graph_platform), **{
+            "weights.path": str(checkpoint), "model.dtype": "bf16", "state.gdn.conv_dtype": "bf16",
+            "state.kv.pages": 2048, "state.kv.page_size": 4, "state.gdn.slots": 8,
+            "batch.max_rows": 8, "batch.max_context_len": context,
+            "plan.graph_memory_bytes": args.graph_memory_bytes,
+            "plan.cuda_graph": "required" if mode == "graph" else "off"})
+        plans: Any = None
+        try:
+            plans = w.service("plan@1")
+            assert plans.buckets("decode") == ([1, 2, 4, 8] if mode == "graph" else [])
+            result["builds"].append({"repeat": repeat, "max_context": context, "mode": mode,
+                                     "load_seconds": time.perf_counter() - started, "resolution": plans.resolved})
+            for batch, depth in cases if repeat % 2 == 0 else list(reversed(cases)):
+                if repeat == 0:
+                    prime = {"max_context": context, "mode": mode,
                              **decode(w, batch, depth, args.prompt, args.warmup, args.steps)}
-                    result["trials"].append(trial)
-                    print("BENCH_TRIAL " + json.dumps(trial), flush=True)
-            finally:
-                w.close()
-                del plans, w
-                free_gpu()
-    # The identical-kernel pair must produce identical measured greedy token streams.
-    hashes = {(t["repeat"], t["batch"], t["overlap_depth"], t["mode"]): t["token_sha256"] for t in result["trials"]}
-    result["same_kernel_tokens_equal"] = all(
-        hashes[r, b, d, "graph"] == hashes[r, b, d, "eager_same_kernels"]
-        for r in range(args.repeats) for b, d in cases)
+                    result["priming"].append(prime)
+                    print("BENCH_PRIME " + json.dumps(prime), flush=True)
+                trial = {"repeat": repeat, "max_context": context, "mode": mode,
+                         **decode(w, batch, depth, args.prompt, args.warmup, args.steps)}
+                result["trials"].append(trial)
+                print("BENCH_TRIAL " + json.dumps(trial), flush=True)
+        finally:
+            w.close()
+            del plans, w
+            free_gpu()
+    hashes = {(t["repeat"], t["max_context"], t["batch"], t["overlap_depth"], t["mode"]): t["token_sha256"]
+              for t in result["trials"]}
+    result["tokens_equal"] = {f"ctx{c}/b{b}/depth{d}": all(hashes[r, c, b, d, "graph"] == hashes[r, c, b, d, "eager"]
+                                                           for r in range(args.repeats))
+                              for c in args.max_context for b, d in cases}
     result["environment"]["nvidia_smi_after"] = subprocess.check_output(["nvidia-smi"], text=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
     print("BENCH_RESULT " + json.dumps(result, default=str), flush=True)
-    if not result["same_kernel_tokens_equal"]:
-        raise AssertionError("graph and same-kernel eager produced different tokens; inspect before reporting speedup")
     print("AGXINFER_GRAPH_BENCH_OK", flush=True)
 
 

@@ -1,0 +1,8 @@
+[unit]
+id = "kernels.torch_graph"
+kind = "logic"
+process = ["worker"]
+entry = "kernels.torch_graph.unit:Unit"
+
+[requires]
+services = ["kernels.catalog@1"]

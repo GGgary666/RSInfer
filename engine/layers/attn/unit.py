@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import AttentionBackend, PersistentBatch, PlanKey
+from core.contracts.plan import GRAPH, AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from layers.solutions import Kernels
@@ -36,7 +36,7 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class GraphBinding:
-    """``Binding``: all graph metadata; eager metadata is separate."""
+    """``Binding``: the fixed metadata buffers of the graph buckets; an eager step's are its own."""
 
     generation: int
     tensors: Mapping[str, torch.Tensor]
@@ -54,6 +54,8 @@ class Metadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    graph: bool = False
+    """The metadata of a graph bucket: fixed buffers, filled before each replay."""
 
 
 class TorchNativeAttnBackend:
@@ -87,27 +89,28 @@ class TorchNativeAttnBackend:
         req_to_token = batch.binding.buffers()["req_to_token"]
         device = req_to_token.device
         if key.bucket:
+            # init_forward_metadata_replay_cuda_graph: the bucket's fixed buffers, the rows padded
+            # as SGLang pads them (PaddingPolicy.ZERO): a padded lane is the padding row, index 0,
+            # with one token, so it reads and writes the padding slot only.
             size, n = key.bucket, len(plan.rows)
-            scratch = self.kv.slots(self.kv.scratch()[:size]).view(size, -1)[:, 0]
             m = self.graph_metadata.get(size)
             if m is None:
-                table = torch.empty((size, req_to_token.shape[1]), dtype=torch.int64, device=device)
-                m = Metadata(True, table, torch.arange(size, device=device),
-                             torch.ones(size, dtype=torch.int64, device=device),
-                             torch.zeros(size, dtype=torch.int64, device=device),
-                             torch.ones(size, dtype=torch.int64, device=device), scratch.clone())
+                none = torch.empty(0, dtype=torch.int64, device=device)
+                m = Metadata(True, req_to_token, torch.zeros(size, dtype=torch.int64, device=device),
+                             torch.ones(size, dtype=torch.int64, device=device), none, none,
+                             torch.zeros(size, dtype=torch.int64, device=device), graph=True)
                 self.graph_metadata[size] = m
-                self.graph_buffers.update({f"{size}.{name}": value for name, value in vars(m).items()
-                                           if isinstance(value, torch.Tensor)})
+                self.graph_buffers.update({f"{size}.req_pool_indices": m.req_pool_indices, f"{size}.seq_lens": m.seq_lens,
+                                           f"{size}.out_cache_loc": m.out_cache_loc})
                 self.generation += 1
-            m.req_to_token.copy_(scratch[:, None].expand_as(m.req_to_token))
-            m.seq_lens.fill_(1)
+            m.req_pool_indices[n:].zero_()
+            m.seq_lens[n:].fill_(1)
             if n:
-                rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
-                m.req_to_token[:n].copy_(req_to_token[rows])
+                m.req_pool_indices[:n].copy_(on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1,
+                                                       device))
                 m.seq_lens[:n].copy_(on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64) + 1,
                                               device))
-            m.out_cache_loc.copy_(m.req_to_token.gather(1, (m.seq_lens - 1)[:, None]).flatten())
+            m.out_cache_loc.copy_(req_to_token[m.req_pool_indices, m.seq_lens - 1])
             self.forward_metadata = m
             return
         rows = torch.tensor(list(plan.rows.values()), dtype=torch.int64)
@@ -131,7 +134,7 @@ class TorchNativeAttnBackend:
         o = torch.empty_like(q)
         cache = self.kv.bind(layer).buffers()
         k_cache, v_cache = cache["k"], cache["v"]
-        phase = "decode" if m.decode else "prefill"
+        phase = GRAPH if m.graph else "decode" if m.decode else "prefill"
         self.kernels(phase, "kv.store@1")(k_cache, v_cache, m.out_cache_loc, k.view(-1, num_kv_heads, head_dim),
                                           v.view(-1, num_kv_heads, head_dim))
         use_gqa = num_heads != num_kv_heads

@@ -292,9 +292,11 @@ def main(argv: list[str]) -> int:
         s.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
         s.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")
         s.add_argument("--overlap", action="store_true", help="one step of overlap (sched.overlap)")
-        s.add_argument("--cuda-graph", choices=("auto", "off", "required"), default="auto")
-        s.add_argument("--graph-buckets", type=int, nargs="*", default=[], help="decode row capacities")
-        s.add_argument("--graph-memory-bytes", type=int, default=1 << 30, help="graph construction memory budget")
+        s.add_argument("--cuda-graph", choices=("auto", "off", "required"), default="off",
+                       help="decode graphs (plan.cuda_graph); auto and required run the worker on cuda_graph")
+        s.add_argument("--graph-buckets", type=int, nargs="*", default=[],
+                       help="rows of each decode graph (default: powers of two up to min(--max-rows, 8))")
+        s.add_argument("--graph-memory-bytes", type=int, default=1 << 30, help="device memory the graphs may keep")
         s.add_argument("--name", default="Qwen3.8-27B", help="model name the frontend answers with")
         s.add_argument("--bind", default="127.0.0.1")
         s.add_argument("--port", type=int, default=8000)

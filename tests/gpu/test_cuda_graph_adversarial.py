@@ -116,7 +116,7 @@ def test_catalog_change_rejects_replay_before_state_writes(checkpoint: Path,
         with pytest.raises(StaleGraph):
             w.service("executor@1").submit(2, delta, plan, ops)
         assert replays == [], "rejected graph must not launch GPU work"
-        assert not old.valid()
+        assert plans.buckets("decode") == [] and plans.get(PlanKey("decode", 1)) is old
         for actual, expected in zip(buffers, before, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:

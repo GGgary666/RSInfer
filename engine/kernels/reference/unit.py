@@ -42,6 +42,12 @@ invariant). Batch invariant are the references that loop over sequences or only 
 others run one torch op over the whole batch (ops module docstring)."""
 
 
+HOST_DEPENDENT = frozenset({"attn.extend@1", "attn.decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1",
+                            "sample.seeded@1"})
+"""The references that read lengths or offsets on the host (a loop over sequences, a seed per row):
+a graph would freeze what they read, so these are not capturable; the others are."""
+
+
 def reference_id(definition: str) -> str:
     """Keeps the version: ``gemm.linear@1`` and ``gemm.linear@2`` can be registered side by side."""
     return f"reference.{definition}"
@@ -54,13 +60,6 @@ class Unit:
             ctx.register("kernels.catalog@1", Definition(name, doc, ref, tolerance, batch_invariant),
                          label=f"definition {name}")
             ctx.register("kernels.catalog@1", Implementation(Solution(ref, name, f"{fn.__module__}:{fn.__name__}",
-                                                                      library="torch", capturable=name not in {
-                                                                          "attn.extend@1", "attn.decode@1",
-                                                                          "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1",
-                                                                          "sample.seeded@1"}), fn),
+                                                                      library="torch",
+                                                                      capturable=name not in HOST_DEPENDENT), fn),
                          label=f"solution {ref}")
-        fn = ops.attention_decode_fixed
-        ctx.register("kernels.catalog@1", Implementation(
-            Solution("torch_graph.attn.decode@1", "attn.decode@1", f"{fn.__module__}:{fn.__name__}",
-                     library="torch", capturable=True, requires=["cuda_graph"]), fn),
-                     label="fixed-extent decode SDPA")

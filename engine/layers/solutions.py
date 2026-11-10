@@ -10,9 +10,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from core.contracts.kernels import KernelFn
+from core.contracts.plan import GRAPH
 
 PHASES = ("prefill", "decode")
-
 
 class Kernels:
     """The solutions of one backend, per phase and definition."""
@@ -31,21 +31,25 @@ class Kernels:
 
     def resolve(self, calls: Mapping[str, Mapping[str, Mapping[str, int]]]) -> dict[str, dict[str, str]]:
         """``calls``: phase -> definition -> the shape it is called with. Returns phase -> the backend
-        and each definition's solution, a fallback to the reference marked."""
+        and each definition's solution, a fallback to the reference marked; and under ``GRAPH`` the
+        decode definitions again for a captured step, ``""`` where nothing capturable fits."""
         version = self.catalog.version
         fns: dict[tuple[str, str], KernelFn] = {}
         out: dict[str, dict[str, str]] = {}
-        for phase, definitions in calls.items():
+        for table, phase in (*((phase, phase) for phase in calls), (GRAPH, "decode")):
             backend = self.backends[phase]
             chosen = {"backend": backend}
-            for definition, shape in definitions.items():
+            for definition, shape in calls.get(phase, {}).items():
                 try:
-                    selected = self.catalog.select(definition, shape, backend)
+                    selected = self.catalog.select(definition, shape, backend, capture=table == GRAPH)
                 except LookupError as e:
+                    if table == GRAPH:  # the plan records no graph, and says which kernel is why
+                        chosen[definition] = ""
+                        continue
                     raise ValueError(f"{self.keys[phase]} = {backend!r}: {e}") from None
-                fns[phase, definition] = self.catalog.resolve(selected.solution)
+                fns[table, definition] = self.catalog.resolve(selected.solution)
                 chosen[definition] = selected.solution + (" (fallback)" if selected.fallback else "")
-            out[phase] = chosen
+            out[table] = chosen
         self.fns, self.calls, self.version = fns, calls, version
         return out
 

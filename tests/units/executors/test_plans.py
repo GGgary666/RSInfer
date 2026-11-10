@@ -1,8 +1,8 @@
 """executors.pytorch picks each step's plan from ``plan@1`` (stage2-contract.md §9.1): a decode step
 takes the smallest ready graph bucket that holds its rows, any other step the eager plan, and a
-graph found stale runs eagerly instead. ``core.plan`` has no graphs yet, so a stand-in graph plan
-pads the rows to its bucket, as a graph would, and runs them eagerly: the routing shows, and so
-does what padding may write (only the padding items, §9.1)."""
+graph found stale runs eagerly instead. A stand-in graph plan pads the rows to its bucket, as a
+graph would, and runs them eagerly: the routing shows, and so does what padding may write (only
+the padding items, §9.1). ``core.plan``'s own graph plans are in ``test_cuda_graph.py``."""
 
 from __future__ import annotations
 
@@ -58,6 +58,8 @@ class GraphStandIn:
 
 class StandInPlans:
     """``plan@1``: the real eager plan, and the stand-in decode graph."""
+
+    required = False
 
     def __init__(self, real: Any, bucket: int) -> None:
         self.real = real
@@ -141,7 +143,7 @@ def test_a_stale_graph_runs_eagerly_instead(worker: Worker) -> None:
     assert plans.graph.padded == []
 
 
-def test_core_plan_has_only_the_eager_plan_so_far(worker: Worker) -> None:
+def test_core_plan_has_only_the_eager_plan_where_the_platform_records_no_graphs(worker: Worker) -> None:
     plans = worker.service("plan@1")
     assert plans.buckets("decode") == [] and plans.buckets("prefill") == []
     with pytest.raises(LookupError):

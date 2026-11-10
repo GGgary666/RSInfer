@@ -26,7 +26,7 @@ from tests.framework.support import PROC
 from unit.runtime import ProcessPlan, UnitRuntime, UnitSpec
 
 ENGINE = Path(__file__).resolve().parents[3] / "engine"
-WORKER_UNITS = ("core.kernels", "kernels.reference", "core.state.weights", "core.state.holder", "state.kv_paged",
+WORKER_UNITS = ("core.kernels", "kernels.reference", "kernels.torch_graph", "core.state.weights", "core.state.holder", "state.kv_paged",
                 "state.gdn_slots",
                 "worker.batch", "layers.linear", "layers.embedding", "layers.norm", "layers.rope",
                 "layers.activation", "layers.sampler", "layers.attn", "layers.gdn", "models.qwen38", "core.plan",

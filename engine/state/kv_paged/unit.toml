@@ -14,6 +14,3 @@ services = ["state.kv.paged@1"]
 
 [requires]
 services = ["state.holder@1"]
-
-[reads]
-config = ["plan.cuda_graph", "batch.max_rows"]

@@ -6,12 +6,17 @@ Definition / Solution.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import msgspec
 
 type KernelFn = Callable[..., Any]
+
+CAPTURE = "capture"
+"""In ``Solution.requires``: the solution runs only in a step replayed from a graph. For a kernel
+whose cost follows the captured extent instead of the step's, which an eager step should not pay."""
 
 
 class Tolerance(msgspec.Struct, frozen=True):
@@ -48,7 +53,7 @@ class Solution(msgspec.Struct, frozen=True):
     """Supported values per shape key (head dims, page sizes, ...); empty = any."""
     capturable: bool = False
     requires: list[str] = []
-    """Platform capabilities, e.g. ``sm_100``."""
+    """Platform capabilities, e.g. ``sm_100``; ``CAPTURE`` for a solution of captured steps only."""
     process_init: bool = False
     """Needs once-per-process initialization (a reload cannot redo it: restart the process)."""
     cross_machine: bool = False
@@ -82,12 +87,19 @@ class Catalog(Protocol):
     def register(self, item: Definition | Implementation) -> Callable[[], None]:
         """Add a definition or a solution; the returned undo removes it (a reload re-registers)."""
         ...
-    def select(self, definition: str, shape: Mapping[str, int], backend: str = "auto") -> Selected:
+    def select(self, definition: str, shape: Mapping[str, int], backend: str = "auto", *,
+               capture: bool = False) -> Selected:
         """``auto``: a fitting solution, else the reference (``fallback``). A named backend: one of
-        its solutions that fits, or ``LookupError``; never the reference in its place."""
+        its solutions that fits, or ``LookupError``; never the reference in its place. ``capture``:
+        the choice for a step replayed from a graph, among the capturable solutions only (those
+        that require ``CAPTURE`` fit only here); ``LookupError`` when there is none."""
         ...
     def resolve(self, solution: str) -> KernelFn: ...
-
     def describe(self, solution: str) -> Solution: ...
-    def selected(self, *, clear: bool = False) -> list[Solution]: ...
-    def sources(self) -> list[str]: ...
+    def recording(self) -> AbstractContextManager[set[str]]:
+        """The ids of the solutions ``call`` runs inside the scope: what a forward pass uses besides
+        the solutions its backends fixed (a plan checks that they are capturable)."""
+        ...
+    def sources(self) -> list[str]:
+        """The units that registered something: what a plan built from the catalog was built with."""
+        ...

@@ -177,12 +177,14 @@ class PyTorchExecutor:
         input_ids = torch.cat(parts)
         pos = on_device(torch.cat([torch.arange(p, p + n) for p, n in zip(positions, num_tokens, strict=True)]),
                         device)
-        last_index = on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device)
+        # One token per row in a decode step: each row's last token is its only one.
+        last_index = (torch.arange(len(rows), device=device) if plan.phase == "decode" else
+                      on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device))
 
         try:
             logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
         except StaleGraph:
-            if chosen is eager or getattr(self.plans, "required", False):
+            if chosen is eager or self.plans.required:
                 raise
             logits = eager.run(self.batch, plan, input_ids, pos, last_index)
         next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
@@ -200,13 +202,14 @@ class PyTorchExecutor:
 
     def _plans(self, plan: BatchPlan) -> tuple[Plan, Plan]:
         """The step's plan and the eager one. A decode step takes the smallest ready graph bucket
-        that holds its rows; any other step, or one no graph holds, the eager plan (bucket 0). The
-        scheduler's ``bucket`` is only a hint."""
+        that holds its rows; any other step, or one no graph holds, the eager plan (bucket 0),
+        unless the plans require graphs. The scheduler's ``bucket`` is only a hint."""
         phase = "decode" if plan.phase == "decode" else "prefill"
         eager = self.plans.get(PlanKey(phase, 0))
         fits = [b for b in self.plans.buckets(phase) if b >= len(plan.rows)] if phase == "decode" else []
-        if phase == "decode" and not fits and getattr(self.plans, "required", False):
-            raise StaleGraph("required decode graph is unavailable; no state was changed")
+        if phase == "decode" and not fits and self.plans.required:
+            raise StaleGraph(f"no ready decode graph holds {len(plan.rows)} rows, and graphs are required; "
+                             "no state was changed")
         return (self.plans.get(PlanKey(phase, min(fits))) if fits else eager), eager
 
     def _copies(self, state: StateOps, when: str) -> None:

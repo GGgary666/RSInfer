@@ -16,6 +16,11 @@ from core.contracts.tensor import Binding, Tensor
 
 type Phase = Literal["prefill", "decode"]
 
+GRAPH = "graph"
+"""Beside the phases, in what ``Backend.resolve`` returns: a decode step replayed from a graph. It
+calls the decode definitions with the solutions the kernel catalog picks for a captured step
+(``Catalog.select(capture=True)``), which may differ from an eager decode step's."""
+
 
 class PlanKey(msgspec.Struct, frozen=True):
     phase: Phase
@@ -38,8 +43,8 @@ class Plan(Protocol):
         itself. ``input_ids`` and ``positions`` ``[tokens]`` are the step's tokens in row order,
         ``last_index`` ``[rows]`` each row's last one. Returns the logits ``[rows, vocab]`` of the
         real rows, valid until the next run of any plan of the service; the work may still be
-        running on the step stream. A graph whose dependencies changed raises
-        ``platforms.base.StaleGraph`` before it writes anything (§9.3)."""
+        running on the step stream. A graph that was closed raises ``platforms.base.StaleGraph``;
+        one whose dependencies changed is no longer among ``PlanService.buckets`` (§9.3)."""
         ...
 
 
@@ -48,9 +53,18 @@ class PlanService(Protocol):
     The only unit that may record graphs (``captures_graph``). The worker picks the plan of each
     step itself, before it changes any state (§9.1)."""
 
+    @property
+    def required(self) -> bool:
+        """Decode steps must replay a graph (``plan.cuda_graph = required``): the worker refuses a
+        decode step no listed bucket holds, before it changes any state, instead of running it
+        eagerly."""
+        ...
+
     def buckets(self, phase: Phase) -> list[int]:
         """The graph buckets that are ready and whose dependencies hold, from the bucketing policy
-        (powers of 2 by default). The eager plan, bucket 0, is always there and not listed."""
+        (powers of 2 by default). The eager plan, bucket 0, is always there and not listed. This is
+        the dependency check of a step: the worker asks once, before it changes any state, and runs
+        the plan it then gets."""
         ...
 
     def get(self, key: PlanKey) -> Plan:
@@ -75,7 +89,8 @@ class Backend(Protocol):
     selected solutions are by-value ones (§8.5, §9.3)."""
 
     def release_graphs(self) -> None:
-        """Release metadata after all graph work and consumers have finished."""
+        """Drop the fixed buffers of the graph buckets (``binding`` moves on). The plan calls it once
+        the graphs recorded over them are closed."""
         ...
 
     @property
@@ -86,7 +101,9 @@ class Backend(Protocol):
         from the backend configured for that phase and the shapes in ``states`` (every layer's
         declarations); ``forward`` then calls only those. A backend named explicitly that has no
         fitting solution for one of them fails the start; ``auto`` may fall back to the reference.
-        Returns, per phase, the backend asked for and each definition's solution, for the log."""
+        Returns, per phase, the backend asked for and each definition's solution, for the log; and
+        under ``GRAPH`` the decode definitions' solutions in a captured step, ``""`` for one that
+        has no capturable solution (the plan then records no graph)."""
         ...
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None: ...
@@ -147,7 +164,8 @@ class PersistentBatch(Protocol):
     def binding(self) -> Binding: ...
 
     def prepare(self, kinds: Sequence[str]) -> None:
-        """Allocate all model state tables before capturing any graph."""
+        """Allocate the ``slots.<kind>`` tables of ``kinds`` now rather than at the first item of
+        each: a graph records the tables' addresses."""
         ...
 
     def check(self, delta: RowDelta, plan: BatchPlan) -> str:

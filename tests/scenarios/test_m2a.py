@@ -174,6 +174,57 @@ def test_a_change_applies_to_an_empty_engine_refused_forced_or_waited_for(model:
         assert got["choices"][0]["text"] is not None
 
 
+def test_a_kernel_change_that_cannot_run_rolls_back_and_the_engine_keeps_serving(model: Path, tokenizer: Path,
+                                                                                tmp_path: Path) -> None:
+    """``core.plan`` is built from the kernel units (``ctx.derived``, no rebuild action), so a kernel
+    change reloads it after them, on every platform. A kernel unit that no longer registers a
+    definition decode calls fails that reload, at apply rather than at the first request; the reload
+    rolls back, nothing is left to recover, and the next change applies."""
+    args = ["--model", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype", "f32",
+            "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8", "--cpu-bytes", str(4 << 20),
+            "--timeout", "120"]
+    workspace = tmp_path / "workspace"
+    shutil.copytree(REPO / "engine", workspace / "engine", ignore=shutil.ignore_patterns("__pycache__"))
+    ops, unit = (workspace / "engine" / "kernels" / "reference" / name for name in ("ops.py", "unit.py"))
+    registrations = unit.read_text()
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "max_tokens": 8, "temperature": 0.0, "ignore_eos": True}
+    with served(tmp_path / "run", *args) as url:
+        control = json.loads((tmp_path / "run" / "control" / "control.json").read_text())["control"]
+
+        def client(*arguments: str) -> tuple[int, dict[str, Any]]:
+            out = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, *arguments],
+                                 env=ENV, capture_output=True, text=True, timeout=600)
+            return out.returncode, json.loads(out.stdout)
+
+        def text() -> str:
+            return post(url + "/v1/completions", body)["choices"][0]["text"]
+
+        baseline = text()
+        assert baseline
+        ops.write_text(ops.read_text() + "\n# version 2\n")
+        code, applied = client("apply", "--source", str(workspace))
+        assert code == 0 and applied["status"] == "committed", applied
+        worker = applied["processes"]["host-a/worker/0"]
+        assert worker["reload"] == ["core.plan", "kernels.reference"] and "actions" not in worker, worker
+        assert text() == baseline
+
+        unit.write_text(registrations.replace('("gdn.recurrent_update@1"', '("gdn.recurrent_update_gone@1"'))
+        assert unit.read_text() != registrations
+        code, failed = client("apply", "--source", str(workspace))
+        assert code == 1 and failed["status"] == "aborted", failed
+        reasons = " ".join(d["reason"] for d in failed["diagnostics"])
+        assert "no kernel definition 'gdn.recurrent_update@1'" in reasons and "rolled back" in reasons, reasons
+        code, status = client("status")
+        assert code == 0 and status["recovery_required"] is False, status
+        assert text() == baseline
+
+        unit.write_text(registrations)
+        ops.write_text(ops.read_text() + "\n# version 3\n")
+        code, applied = client("apply", "--source", str(workspace))
+        assert code == 0 and applied["status"] == "committed", applied
+        assert text() == baseline
+
+
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a

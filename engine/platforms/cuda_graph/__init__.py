@@ -6,7 +6,7 @@ Warm-up and capture must run while the worker is paused.
 
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 
 import torch
@@ -16,9 +16,10 @@ from platforms.torch_eager import TorchEagerPlatform
 
 
 class CudaGraph:
-    def __init__(self) -> None:
+    def __init__(self, closed: Callable[[], None]) -> None:
         self.raw = torch.cuda.CUDAGraph()
         self.ready = False
+        self._closed: Callable[[], None] | None = closed
 
     def check(self) -> list[str]:
         return [] if self.ready else ["graph is not ready"]
@@ -30,12 +31,23 @@ class CudaGraph:
 
     def close(self) -> None:
         self.ready = False
-        self.raw.reset()
+        if self._closed is not None:
+            closed, self._closed = self._closed, None
+            self.raw.reset()
+            closed()
 
 
 class Recorder:
+    """The graphs of one recorder share a memory pool, as SGLang's and vLLM's do: record the
+    largest first and the others fit in what it took. They must not replay concurrently, and only
+    a graph's outputs outlive the replay of another. PyTorch drops a pool with its last graph, so
+    a recorder whose graphs are all closed starts a new one."""
+
     def __init__(self, stream: torch.cuda.Stream) -> None:
         self.stream = stream
+        self.pool = torch.cuda.graph_pool_handle()
+        self.open = 0
+        """Graphs of this recorder not closed yet: those hold ``pool``."""
 
     @contextmanager
     def warmup(self) -> Generator[None]:
@@ -48,12 +60,18 @@ class Recorder:
             self.stream.synchronize()
             current.wait_stream(self.stream)
 
+    def _closed(self) -> None:
+        self.open -= 1
+        if not self.open:
+            self.pool = torch.cuda.graph_pool_handle()
+
     @contextmanager
     def capture(self) -> Generator[CudaGraph]:
-        graph = CudaGraph()
+        graph = CudaGraph(self._closed)
+        self.open += 1
         with self.warmup():
             try:
-                graph.raw.capture_begin()
+                graph.raw.capture_begin(pool=self.pool)
                 try:
                     yield graph
                 finally:

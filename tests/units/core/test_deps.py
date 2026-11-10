@@ -64,12 +64,11 @@ class Case:
     units: tuple[str, ...] = ("pkg.a", "pkg.b")
     meta: ChangeMeta = field(default_factory=ChangeMeta)
     artifacts: list[DerivedArtifact] | None = None
-    base_topo: Topology | None = None
 
     def plan(self) -> ActionPlan | Failed:
         base_root = write_tree(self.tmp / "base" / "engine", self.base)
         new_root = write_tree(self.tmp / "new" / "engine", self.new)
-        base = IdentityManifest(files=_hashes(base_root), topology=self.base_topo or topology())
+        base = IdentityManifest(files=_hashes(base_root), topology=topology())
         new = IdentityManifest(files=_hashes(new_root), config=self.config, topology=self.topo)
         cs = ChangeSet(base=Identity("b"), config=self.config, topology=self.topo if self.topo != topology() else None,
                        state=self.state, meta=self.meta)
@@ -122,20 +121,23 @@ def test_a_startup_key_reloads_only_its_readers(tmp_path: Path) -> None:
     assert reloaded(pa) == ["pkg.a"] and pa.actions == []
 
 
-def test_graph_owner_reloads_for_changed_or_new_registry_users(tmp_path: Path) -> None:
-    """Rollback must restore providers before reconstructing a graph, including new auto choices."""
-    tree = {**BASE, "pkg/b/unit.toml": manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"],
-                                                    capabilities="captures_graph = true")}
-    artifact = DerivedArtifact(UnitId("pkg.b"), "g", "rebuild", [], [UnitId("pkg.a")])
-    topo = topology()
-    gpu = replace(topo, roles=[replace(r, platform="cuda_graph") for r in topo.roles])
+def test_an_artifact_without_a_rebuild_action_reloads_its_owner(tmp_path: Path) -> None:
+    """``ctx.derived(rebuild="")``: nothing rebuilds the artifact in place, so a change to a unit it
+    was built from reloads its owner too, after that unit; and so does a unit added that registers
+    with one of them (a new kernel unit may change what the artifact is built from). A rollback
+    then reloads the old owner over the restored units, which an action's abort could not wait for."""
+    tree = {**BASE, "pkg/b/unit.toml": manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"])}
+    artifact = DerivedArtifact(UnitId("pkg.b"), "g", "", [], [UnitId("pkg.a")])
     changed = {**tree, "pkg/a/unit.py": "class Unit:\n    changed = True\n"}
-    pa = only(Case(tmp_path / "changed", base=tree, new=changed, artifacts=[artifact], topo=gpu, base_topo=gpu).plan())
+    pa = only(Case(tmp_path / "changed", base=tree, new=changed, artifacts=[artifact]).plan())
     assert reloaded(pa) == ["pkg.a", "pkg.b"] and pa.actions == []
     added = {**tree, "pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit", requires=["pkg.a@1"]),
              "pkg/c/unit.py": "class Unit:\n    pass\n"}
-    pa = only(Case(tmp_path / "added", base=tree, new=added, artifacts=[artifact], topo=gpu, base_topo=gpu).plan())
+    pa = only(Case(tmp_path / "added", base=tree, new=added, artifacts=[artifact]).plan())
     assert reloaded(pa) == ["pkg.b"] and pa.actions == []
+    with_action = DerivedArtifact(UnitId("pkg.b"), "g", "pkg.rebuild", [], [UnitId("pkg.a")])
+    pa = only(Case(tmp_path / "action", base=tree, new=changed, artifacts=[with_action]).plan())
+    assert reloaded(pa) == ["pkg.a"] and [(a.unit, a.action) for a in pa.actions] == [("pkg.b", "pkg.rebuild")]
 
 
 def with_units(**manifests: str) -> dict[str, str]:

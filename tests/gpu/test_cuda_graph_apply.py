@@ -1,4 +1,5 @@
-"""Real apply: config recapture/reuse, kernel changes and failed-build recovery."""
+"""Real apply: config recapture/reuse, kernel changes, failed-build recovery, and what repeated
+changes leave on the device."""
 
 from __future__ import annotations
 
@@ -10,13 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 
 from tests.scenarios.deploy import ENV, REPO, cli, post, served
 from tests.units.support.tokenizer import save_tokenizer
 from tests.units.support.worker import tiny_config
 
 
-def deployment(tmp_path: Path, overlap: bool = False) -> tuple[list[str], dict[str, Any]]:
+def deployment(tmp_path: Path, overlap: bool = False, mem_fraction: str = "0.1") -> tuple[list[str], dict[str, Any]]:
     config = tmp_path / "config"
     config.mkdir()
     (config / "config.json").write_text(json.dumps({
@@ -31,7 +33,7 @@ def deployment(tmp_path: Path, overlap: bool = False) -> tuple[list[str], dict[s
     args = ["--model", str(checkpoint), "--tokenizer", str(tokenizer), "--source", str(source),
             "--device", "cuda", "--cuda-graph", "required", "--max-rows", "4", "--max-context", "64",
             "--dtype", "f32", "--conv-dtype", "f32", "--page-size", "4", "--max-slots", "8",
-            "--mem-fraction", "0.1", "--timeout", "120", *(["--overlap"] if overlap else [])]
+            "--mem-fraction", mem_fraction, "--timeout", "120", *(["--overlap"] if overlap else [])]
     body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "temperature": 0.0,
             "max_tokens": 8, "ignore_eos": True}
     return args, body
@@ -55,7 +57,7 @@ def graph_state(run: Path) -> tuple[int, int, list[int]]:
     records = [json.loads(line.split("core.plan: ", 1)[1]) for line in logs.splitlines() if "core.plan: " in line]
     graph = records[-1]["cuda_graph"]
     assert graph["mode"] == "required" and not graph["reason"], graph
-    assert set(graph["build"]) == {str(b) for b in graph["buckets"]}, graph
+    assert set(graph["seconds"]) == {str(b) for b in graph["buckets"]} and graph["kept_bytes"] > 0, graph
     return plan["generation"], logs.count("TEST_GRAPH_CAPTURE_COMPLETED"), graph["buckets"]
 
 
@@ -99,6 +101,10 @@ def test_config_changes_recapture_only_graph_dependencies(tmp_path: Path) -> Non
                   "plan_generation": [before[0], after[0]], "new_captures": after[1] - before[1],
                   "buckets": after[2], "serving_matches": True}), flush=True)
             before = after
+        # The plan's own keys are the plan's: the state pools stay where they are.
+        for values in ({"plan.cuda_graph": "auto"}, {"plan.graph_memory_bytes": 1 << 31}):
+            code, dry = client(run, "apply", "--config", json.dumps(values), "--dry-run")
+            assert code == 0 and dry["processes"]["host-a/worker/0"]["reload"] == ["core.plan"], (values, dry)
 
 
 @pytest.mark.timeout(600)
@@ -132,3 +138,35 @@ def test_kernel_apply_and_failed_graph_build_restore_serving(tmp_path: Path, ove
         assert logs.count('"buckets": [1, 2, 4]') >= 3, logs[-5000:]
     with served(tmp_path / "cold", *args, ready_s=180) as url:
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+
+
+@pytest.mark.timeout(900)
+def test_repeated_kernel_changes_leave_the_device_as_it_was(tmp_path: Path) -> None:
+    """With the state pools at the default share of the device, every kernel change records the
+    graphs again in what is left. A closed set of graphs gives its pool back, so the tenth change
+    finds the room the first one found, and a change that fails rolls back to graphs that serve."""
+    args, body = deployment(tmp_path, mem_fraction="0.85")
+    source = tmp_path / "source"
+    kernel = source / "engine/kernels/reference/ops.py"
+    original = kernel.read_text()
+    run = tmp_path / "run"
+    free: list[int] = []
+    with served(run, *args, ready_s=300) as url:
+        baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
+        assert baseline
+        for i in range(10):
+            kernel.write_text(original + f"\n# change {i}\n")
+            code, applied = client(run, "apply", "--source", str(source))
+            assert code == 0 and applied["status"] == "committed", (i, applied)
+            assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline, i
+            free.append(torch.cuda.mem_get_info()[0])
+            if i == 4:  # a kernel that breaks the capture: the old graphs come back
+                kernel.write_text(original.replace("return F.linear(x, weight, bias)",
+                                                   "return F.linear(x, weight, bias) * float(x.sum().item() * 0 + 1)"))
+                code, failed = client(run, "apply", "--source", str(source))
+                assert code != 0 and failed["status"] != "committed", failed
+                code, status = client(run, "status")
+                assert code == 0 and status["recovery_required"] is False, status
+                assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+        assert graph_state(run)[2] == [1, 2, 4]
+    assert max(free[1:]) - min(free[1:]) <= (64 << 20), [f >> 20 for f in free]

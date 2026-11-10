@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from core.contracts.plan import GDNBackend, PersistentBatch, PlanKey
+from core.contracts.plan import GRAPH, GDNBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from layers.solutions import Kernels
@@ -36,7 +36,7 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class GraphBinding:
-    """``Binding``: all graph metadata; eager metadata is separate."""
+    """``Binding``: the fixed metadata buffers of the graph buckets; an eager step's are its own."""
 
     generation: int
     tensors: Mapping[str, torch.Tensor]
@@ -51,6 +51,8 @@ class Metadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
+    graph: bool = False
+    """The metadata of a graph bucket: fixed buffers, filled before each replay."""
 
 
 class GDNAttnBackend:
@@ -79,17 +81,19 @@ class GDNAttnBackend:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
         device = mapping.device
         if key.bucket:
+            # The bucket's fixed buffers; a padded lane takes the padding row's slot, index 0, as
+            # SGLang's padded rows do (get_mamba_indices of req_pool_indices padded with zeros).
             size, n = key.bucket, len(plan.rows)
-            scratch = self.states.indices(self.states.scratch()[:size])
             m = self.graph_metadata.get(size)
             if m is None:
-                m = Metadata(True, torch.arange(size + 1, dtype=torch.int32, device=device), scratch.clone(),
-                             torch.zeros(size, dtype=torch.bool, device=device))
+                m = Metadata(True, torch.arange(size + 1, dtype=torch.int32, device=device),
+                             torch.zeros(size, dtype=mapping.dtype, device=device),
+                             torch.zeros(size, dtype=torch.bool, device=device), graph=True)
                 self.graph_metadata[size] = m
-                self.graph_buffers.update({f"{size}.{name}": value for name, value in vars(m).items()
-                                           if isinstance(value, torch.Tensor)})
+                self.graph_buffers.update({f"{size}.query_start_loc": m.query_start_loc,
+                                           f"{size}.mamba_cache_indices": m.mamba_cache_indices})
                 self.generation += 1
-            m.mamba_cache_indices.copy_(scratch)
+            m.mamba_cache_indices[n:].zero_()
             if n:
                 rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
                 m.mamba_cache_indices[:n].copy_(mapping[rows])
@@ -129,15 +133,16 @@ class GDNAttnBackend:
         v_dim = num_v_heads * head_v_dim
         cache_indices = m.mamba_cache_indices
         if m.decode:
-            mixed_qkv = self.kernels("decode", "gdn.conv1d_update@1")(mixed_qkv, conv_states, conv_weights, bias,
-                                                                     activation, cache_indices)
+            phase = GRAPH if m.graph else "decode"
+            mixed_qkv = self.kernels(phase, "gdn.conv1d_update@1")(mixed_qkv, conv_states, conv_weights, bias,
+                                                                  activation, cache_indices)
             bs = mixed_qkv.shape[0]
             query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
             query = query.view(1, bs, num_k_heads, head_k_dim)
             key = key.view(1, bs, num_k_heads, head_k_dim)
             value = value.view(1, bs, num_v_heads, head_v_dim)
-            return self.kernels("decode", "gdn.recurrent_update@1")(A_log, dt_bias, query, key, value, a, b,
-                                                                   ssm_states, cache_indices, m.query_start_loc)
+            return self.kernels(phase, "gdn.recurrent_update@1")(A_log, dt_bias, query, key, value, a, b,
+                                                                ssm_states, cache_indices, m.query_start_loc)
 
         mixed_qkv = self.kernels("prefill", "gdn.conv1d_fn@1")(  # _convolve_prefill
             mixed_qkv.transpose(0, 1), conv_weights, bias, activation, conv_states,

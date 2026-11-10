@@ -56,7 +56,6 @@ class KVPool:
     v_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
     allocated: dict[int, list[Any]] = field(default_factory=dict[int, list[Any]])
     generation: int = 0
-    scratch_items: int = 1
     sized_from: dict[str, Any] = field(default_factory=dict[str, Any])
     """The dtype key the model declares the KV in. Read here so that changing it reloads this
     unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
@@ -87,7 +86,7 @@ class KVPool:
         for d in changed:
             (k_shape, k_dtype), (v_shape, v_dtype) = d.tensors["k"], d.tensors["v"]
             # The padded page (slot 0's page) absorbs dummy padded-token writes.
-            total_slots = self.size + self.scratch_items * self.page_size
+            total_slots = self.size + self.page_size
             k = self.platform.alloc(0, 0, shape=(total_slots, *k_shape[1:]), dtype=k_dtype)
             v = self.platform.alloc(0, 0, shape=(total_slots, *v_shape[1:]), dtype=v_dtype)
             self.allocated[d.layer] = [k, v]
@@ -101,7 +100,7 @@ class KVPool:
         return self.pages
 
     def scratch(self) -> Sequence[int]:
-        return [-1, *range(self.pages, self.pages + self.scratch_items - 1)]
+        return [-1]
 
     def slots(self, items: Sequence[int]) -> torch.Tensor:
         """The token slots of ``items``, in order, on the device of the buffers."""
@@ -142,7 +141,5 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         self.pool = KVPool(ctx.platform, config["state.kv.page_size"], config["state.kv.pages"],
                            ctx.use("state.holder@1"), sized_from={"state.kv.dtype": config["state.kv.dtype"]})
-        if ctx.platform.info().name == "cuda_graph" and config["plan.cuda_graph"] != "off":
-            self.pool.scratch_items = config["batch.max_rows"]
         ctx.effect(lambda: self.pool.free, label="kv buffers")
         ctx.provide("state.kv.paged@1", self.pool)

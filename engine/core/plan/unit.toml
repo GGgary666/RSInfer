@@ -12,12 +12,11 @@ services = ["model@1", "layers.attn@1", "layers.gdn@1", "worker.batch@1", "state
 
 [capabilities]
 captures_graph = true
-actions = ["rebuild_graphs"]
 
 [config]
-"plan.cuda_graph" = { type = "str", default = "auto", binding = "startup", doc = "auto, off, or required; capture only on the cuda_graph platform." }
-"plan.graph_buckets" = { type = "list", default = [], binding = "startup", doc = "Positive decode row capacities; empty means powers of two up to batch.max_rows." }
-"plan.graph_memory_bytes" = { type = "int", default = 1073741824, binding = "startup", doc = "Device memory reserved for graph construction, metadata and private pools." }
+"plan.cuda_graph" = { type = "str", default = "auto", binding = "startup", doc = "Decode graphs: auto (where the platform records them and the kernels are capturable), off, or required (the start fails without them)." }
+"plan.graph_buckets" = { type = "list", default = [], binding = "startup", doc = "Rows of each decode graph; empty: powers of two up to min(batch.max_rows, 8). A step no bucket holds runs eagerly." }
+"plan.graph_memory_bytes" = { type = "int", default = 1073741824, binding = "startup", doc = "Device memory the decode graphs may keep (one pool for all buckets), out of what holder.mem_fraction leaves free." }
 
 [reads]
-config = ["batch.max_rows", "batch.max_context_len"]
+config = ["batch.max_rows"]
