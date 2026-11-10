@@ -87,6 +87,10 @@ class Stream(Protocol):
 
 
 class Graph(Protocol):
+    def close(self) -> None:
+        """Release a graph after its stream and output consumers have finished."""
+        ...
+
     def replay(self) -> None:
         """Raises ``StaleGraph`` when a recorded dependency changed."""
         ...
@@ -97,6 +101,10 @@ class Graph(Protocol):
 
 
 class GraphRecorder(Protocol):
+    def warmup(self) -> AbstractContextManager[None]:
+        """Use the capture stream before capture; join its work on exit. Worker must be paused."""
+        ...
+
     def capture(self) -> AbstractContextManager[Graph]: ...
 
 

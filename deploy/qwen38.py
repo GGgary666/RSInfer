@@ -90,7 +90,8 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
         hosts=[HostSpec(host, args.bind, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
         placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
-               RoleSpec("worker", [], per_rank=True, platform="torch_eager",
+               RoleSpec("worker", [], per_rank=True,
+                        platform="cuda_graph" if cuda and args.cuda_graph != "off" else "torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
     decls = states(Qwen3_5TextConfig.from_hf(cfg), args.dtype, args.page_size)
     config: dict[str, Any] = {
@@ -109,6 +110,8 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float]]:
         "state.gdn.conv_dtype": args.conv_dtype, "batch.max_rows": args.max_rows,
         "batch.max_context_len": args.max_context, "holder.mem_fraction": args.mem_fraction,
         "holder.max_slots": args.max_slots, "holder.cpu_bytes": args.cpu_bytes,
+        "plan.cuda_graph": args.cuda_graph, "plan.graph_buckets": args.graph_buckets,
+        "plan.graph_memory_bytes": args.graph_memory_bytes,
         **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)}),
     }
     topo_file, config_file = run / "topology.json", run / "config.json"
@@ -136,7 +139,8 @@ def worker_gpu(requested: int | None) -> int:
 def serve_command(args: argparse.Namespace, topo: Path, config: Path, tunables: dict[str, float]) -> list[str]:
     return [sys.executable, "-m", "core.control", "serve", "--source", str(args.source.resolve()), "--topology", str(topo),
             "--state-dir", str(args.run.resolve() / "control"), "--host", HOST, "--bind", args.bind,
-            "--config", str(config), "--spawn-agents", "--platform", json.dumps({"name": "torch_eager"}),
+            "--config", str(config), "--spawn-agents", "--platform",
+            json.dumps({"name": "cuda_graph" if args.device == "cuda" and args.cuda_graph != "off" else "torch_eager"}),
             "--tunables", json.dumps(tunables)]
 
 
@@ -288,6 +292,9 @@ def main(argv: list[str]) -> int:
         s.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
         s.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")
         s.add_argument("--overlap", action="store_true", help="one step of overlap (sched.overlap)")
+        s.add_argument("--cuda-graph", choices=("auto", "off", "required"), default="auto")
+        s.add_argument("--graph-buckets", type=int, nargs="*", default=[], help="decode row capacities")
+        s.add_argument("--graph-memory-bytes", type=int, default=1 << 30, help="graph construction memory budget")
         s.add_argument("--name", default="Qwen3.8-27B", help="model name the frontend answers with")
         s.add_argument("--bind", default="127.0.0.1")
         s.add_argument("--port", type=int, default=8000)

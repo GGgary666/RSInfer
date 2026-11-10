@@ -45,6 +45,22 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
 
 ## 跑过的（2026-11-09）
 
+### CUDA Graph 参数（2026-11-10）
+
+CUDA 部署默认 `--cuda-graph auto`，使用 `cuda_graph` 平台；`--cuda-graph off` 使用原 `torch_eager`。CPU 的 auto 保持 eager，CPU 上 required 启动失败。
+
+```sh
+uv run python deploy/qwen38.py serve --model /path/to/model \
+  --cuda-graph required --max-rows 4 --graph-buckets 1 2 4 \
+  --max-context 512 --graph-memory-bytes 1073741824
+```
+
+只录每行一个 token 的 decode，prefill/mixed 走 eager。`--graph-buckets` 默认是不超过 `--max-rows` 的 2 的幂；required 必须覆盖最大行数（非 2 的幂需显式列入）。`--graph-memory-bytes` 是 holder 预留和 graph 构建峰值上限，默认 1 GiB。构建、校验或预算失败会终止启动，不会悄悄回退。
+
+首版用 PyTorch 固定容量 SDPA 和 GDN 参照实现；内存/计算随 bucket 与最大上下文增长，大模型应从小容量开始验证。日志 `core.plan` 的 `cuda_graph` 字段给出实际 buckets、回退原因、构建耗时和峰值。完整 27B/SM100 的性能尚未验收，详见 [实现方案](../doc/specs/cuda-graph.md)。bucket 配置通过空引擎 `apply --config` 重载 plan；改变 mode、预留量等若影响状态池，则遵循已有状态单元重启规则，以 dry-run 为准。第一次引入平台代码需要重启引擎。
+
+### 原 eager 验证记录
+
 - **CPU**（`tests/scenarios/test_m2a.py`，进 CI）：
   - 小随机模型，用 `checkpoint` 写成多模态布局；tokenizer 是 `tests/units/support/tokenizer.py` 生成的真 HF tokenizer。
   - `serve` 起整个引擎，completions、chat 和 `chat` 命令的流式输出，文本都和 HF 的贪心生成逐字相同，开、不开重叠都一样。

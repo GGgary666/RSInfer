@@ -36,12 +36,13 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class NoBuffers:
-    """``Binding``: eager attention keeps no fixed buffers."""
+    """``Binding``: all graph metadata; eager metadata is separate."""
 
     generation: int = 0
+    tensors: Mapping[str, torch.Tensor] | None = None
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {}
+        return self.tensors or {}
 
 
 @dataclass(frozen=True)
@@ -62,10 +63,13 @@ class TorchNativeAttnBackend:
         self.kernels = kernels
         self.kv = kv
         self.forward_metadata: Metadata | None = None
+        self.graph_metadata: dict[int, Metadata] = {}
+        self.generation = 0
+        self.graph_buffers: dict[str, torch.Tensor] = {}
 
     @property
     def binding(self) -> NoBuffers:
-        return NoBuffers()
+        return NoBuffers(self.generation, self.graph_buffers)
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         head_dim = next(d.tensors["k"][0][-1] for d in states if d.kind == KIND)
@@ -73,9 +77,39 @@ class TorchNativeAttnBackend:
         return self.kernels.resolve({"prefill": {"kv.store@1": {}, "attn.extend@1": shape},
                                      "decode": {"kv.store@1": {}, "attn.decode@1": shape}})
 
+    def release_graphs(self) -> None:
+        self.graph_metadata.clear()
+        self.graph_buffers.clear()
+        self.forward_metadata = None
+        self.generation += 1
+
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         req_to_token = batch.binding.buffers()["req_to_token"]
         device = req_to_token.device
+        if key.bucket:
+            size, n = key.bucket, len(plan.rows)
+            scratch = self.kv.slots(self.kv.scratch()[:size]).view(size, -1)[:, 0]
+            m = self.graph_metadata.get(size)
+            if m is None:
+                table = torch.empty((size, req_to_token.shape[1]), dtype=torch.int64, device=device)
+                m = Metadata(True, table, torch.arange(size, device=device),
+                             torch.ones(size, dtype=torch.int64, device=device),
+                             torch.zeros(size, dtype=torch.int64, device=device),
+                             torch.ones(size, dtype=torch.int64, device=device), scratch.clone())
+                self.graph_metadata[size] = m
+                self.graph_buffers.update({f"{size}.{name}": value for name, value in vars(m).items()
+                                           if isinstance(value, torch.Tensor)})
+                self.generation += 1
+            m.req_to_token.copy_(scratch[:, None].expand_as(m.req_to_token))
+            m.seq_lens.fill_(1)
+            if n:
+                rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
+                m.req_to_token[:n].copy_(req_to_token[rows])
+                m.seq_lens[:n].copy_(on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64) + 1,
+                                              device))
+            m.out_cache_loc.copy_(m.req_to_token.gather(1, (m.seq_lens - 1)[:, None]).flatten())
+            self.forward_metadata = m
+            return
         rows = torch.tensor(list(plan.rows.values()), dtype=torch.int64)
         prefix = torch.tensor(list(plan.positions.values()), dtype=torch.int64)
         extend = torch.tensor(list(plan.num_tokens.values()), dtype=torch.int64)

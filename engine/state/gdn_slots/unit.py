@@ -56,6 +56,7 @@ class MambaPool:
     temporal: torch.Tensor | None = None
     allocated: list[Any] = field(default_factory=list[Any])
     generation: int = 0
+    scratch_items: int = 1
     sized_from: dict[str, Any] = field(default_factory=dict[str, Any])
     """The dtype keys the model declares the states in. Read here so that changing one reloads this
     unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
@@ -74,8 +75,8 @@ class MambaPool:
         (conv_shape, conv_dtype), (temporal_shape, ssm_dtype) = decls[0].tensors["conv"], decls[0].tensors["temporal"]
         self.free()
         n = len(decls)
-        conv = self.platform.alloc(0, 0, shape=(n, self.size + 1, *conv_shape), dtype=conv_dtype)
-        temporal = self.platform.alloc(0, 0, shape=(n, self.size + 1, *temporal_shape), dtype=ssm_dtype)
+        conv = self.platform.alloc(0, 0, shape=(n, self.size + self.scratch_items, *conv_shape), dtype=conv_dtype)
+        temporal = self.platform.alloc(0, 0, shape=(n, self.size + self.scratch_items, *temporal_shape), dtype=ssm_dtype)
         self.allocated = [conv, temporal]
         self.conv, self.temporal = self.platform.tensor(conv), self.platform.tensor(temporal)
         self.generation += bool(self.decls)
@@ -95,7 +96,7 @@ class MambaPool:
         return self.size
 
     def scratch(self) -> Sequence[int]:
-        return [-1]
+        return [-1, *range(self.size, self.size + self.scratch_items - 1)]
 
     def indices(self, items: Sequence[int]) -> torch.Tensor:
         """The slots of ``items``, on the device of the states (``index_fill_`` wants them there)."""
@@ -121,14 +122,18 @@ class MambaPool:
         """Nothing to do here: a slot is cleared or restored before a request reads it."""
 
     def free(self) -> None:
+        self.generation += bool(self.allocated)
         for buf in self.allocated:
             self.platform.free(buf)
         self.allocated, self.conv, self.temporal = [], None, None
+        self.decls = []
 
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         self.pool = MambaPool(ctx.platform, config["state.gdn.slots"], holder=ctx.use("state.holder@1"), sized_from={
             "state.gdn.ssm_dtype": config["state.gdn.ssm_dtype"], "state.gdn.conv_dtype": config["state.gdn.conv_dtype"]})
+        if ctx.platform.info().name == "cuda_graph" and config["plan.cuda_graph"] != "off":
+            self.pool.scratch_items = config["batch.max_rows"]
         ctx.effect(lambda: self.pool.free, label="gdn states")
         ctx.provide("state.gdn.slots@1", self.pool)

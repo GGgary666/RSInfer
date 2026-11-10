@@ -74,6 +74,10 @@ class Backend(Protocol):
     The fixed buffers are the graph's by-address dependencies (``binding``); the bucket and the
     selected solutions are by-value ones (§8.5, §9.3)."""
 
+    def release_graphs(self) -> None:
+        """Release metadata after all graph work and consumers have finished."""
+        ...
+
     @property
     def binding(self) -> Binding: ...
 
@@ -141,6 +145,10 @@ class PersistentBatch(Protocol):
 
     @property
     def binding(self) -> Binding: ...
+
+    def prepare(self, kinds: Sequence[str]) -> None:
+        """Allocate all model state tables before capturing any graph."""
+        ...
 
     def check(self, delta: RowDelta, plan: BatchPlan) -> str:
         """Why the plan cannot run on the batch the delta leaves (built or rebuilt and not yet

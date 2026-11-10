@@ -10,6 +10,9 @@ services = ["state.holder@1"]
 [state]
 drain_on_reload = false
 
+[reads]
+config = ["plan.cuda_graph", "plan.graph_memory_bytes", "batch.max_rows"]
+
 [config]
 "holder.mem_fraction" = { type = "float", default = 0.85, binding = "startup", doc = "Share of the device for the weights and the state pools (SGLang's mem_fraction_static); the rest is for activations and the runtime." }
 "holder.state_ratio" = { type = "float", default = 0.9, binding = "startup", doc = "GDN state memory to KV memory (SGLang's mamba_full_memory_ratio)." }

@@ -543,7 +543,9 @@ class UnitRuntime:
 
     def _next_ready(self) -> _Slot | None:
         pending = sorted((s for s in self._slots.values() if s.state is InstanceState.PENDING),
-                         key=lambda s: s.id)
+                         # Capture sees registrations as well as services. Let ready providers
+                         # finish first, including on reload when their services already exist.
+                         key=lambda s: (s.manifest.capabilities.captures_graph, s.id))
         fallback: _Slot | None = None
         for s in pending:
             if any(n not in self._services for n in s.manifest.requires.services):

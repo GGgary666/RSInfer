@@ -37,12 +37,15 @@ class Holder:
     """``state.holder@1``."""
 
     def __init__(self, device_bytes: int, *, cpu: bool, mem_fraction: float, state_ratio: float,
-                 max_slots: int, cpu_bytes: int) -> None:
+                 max_slots: int, cpu_bytes: int, graph_bytes: int = 0, scratch_items: int = 1) -> None:
         if not 0 < mem_fraction <= 1 or state_ratio < 0 or max_slots < 0:
             raise ValueError("holder.mem_fraction must be in (0, 1], state_ratio and max_slots >= 0")
         self.device_bytes, self.cpu = device_bytes, cpu
         self.mem_fraction, self.state_ratio, self.max_slots, self.cpu_bytes = mem_fraction, state_ratio, max_slots, cpu_bytes
         self.sizes: dict[str, int] = {}
+        if graph_bytes < 0 or scratch_items < 1:
+            raise ValueError("graph reserve must be nonnegative and scratch count positive")
+        self.graph_bytes, self.scratch_items = graph_bytes, scratch_items
 
     def size(self, states: Sequence[StateDecl], weights_bytes: int) -> Mapping[str, int]:
         kinds: dict[str, list[StateDecl]] = {}
@@ -52,7 +55,7 @@ class Holder:
         slot_kinds = [k for k, ds in kinds.items() if ds[0].lifetime == "slot"]
         paged_kinds = [k for k in kinds if k not in slot_kinds]
         budget = self.cpu_bytes if self.cpu else int(self.device_bytes * self.mem_fraction) - weights_bytes
-        budget -= sum(per_item.values())  # the padding item of every kind
+        budget -= self.graph_bytes + self.scratch_items * sum(per_item.values())
         slot_bytes = sum(per_item[k] for k in slot_kinds)
         page_bytes = sum(per_item[k] for k in paged_kinds)
         slots = 0
@@ -77,7 +80,10 @@ class Holder:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         device = ctx.platform.devices()[0]
+        graph = ctx.platform.info().name == "cuda_graph" and config["plan.cuda_graph"] != "off"
         ctx.provide("state.holder@1", Holder(device.total_bytes, cpu="cpu" in device.capabilities,
                                              mem_fraction=config["holder.mem_fraction"],
                                              state_ratio=config["holder.state_ratio"],
-                                             max_slots=config["holder.max_slots"], cpu_bytes=config["holder.cpu_bytes"]))
+                                             max_slots=config["holder.max_slots"], cpu_bytes=config["holder.cpu_bytes"],
+                                             graph_bytes=config["plan.graph_memory_bytes"] if graph else 0,
+                                             scratch_items=config["batch.max_rows"] if graph else 1))

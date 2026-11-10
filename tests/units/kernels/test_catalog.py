@@ -84,7 +84,8 @@ def test_a_reloaded_kernel_unit_registers_again_and_an_unloaded_one_leaves_nothi
     assert cat.select("norm.gemma_rms@1", {}).fallback
     rt.reload(ReloadPlan(units_to_reload=[spec(REFERENCE)])).unwrap()
     assert [d.name for d in cat.definitions()] == sorted(names)
-    assert all(cat.solutions(n) == [f"reference.{n}"] for n in names)
+    assert all(cat.solutions(n) == [f"reference.{n}", *(["torch_graph.attn.decode@1"] if n == "attn.decode@1" else [])]
+               for n in names)
     assert {d.name for d in cat.definitions() if d.batch_invariant} == {n for n, *_, inv in DEFINITIONS if inv}
     rt.unload_all().unwrap()
     assert cat.definitions() == [] and cat.solutions("norm.gemma_rms@1") == []

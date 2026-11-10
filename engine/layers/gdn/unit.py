@@ -36,12 +36,13 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class NoBuffers:
-    """``Binding``: eager GDN keeps no fixed buffers."""
+    """``Binding``: all graph metadata; eager metadata is separate."""
 
     generation: int = 0
+    tensors: Mapping[str, torch.Tensor] | None = None
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {}
+        return self.tensors or {}
 
 
 @dataclass(frozen=True)
@@ -59,10 +60,13 @@ class GDNAttnBackend:
         self.kernels = kernels
         self.states = states
         self.forward_metadata: Metadata | None = None
+        self.graph_metadata: dict[int, Metadata] = {}
+        self.generation = 0
+        self.graph_buffers: dict[str, torch.Tensor] = {}
 
     @property
     def binding(self) -> NoBuffers:
-        return NoBuffers()
+        return NoBuffers(self.generation, self.graph_buffers)
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         _, head_v_dim, head_k_dim = next(d.tensors["temporal"][0] for d in states if d.kind == KIND)
@@ -74,6 +78,23 @@ class GDNAttnBackend:
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
         device = mapping.device
+        if key.bucket:
+            size, n = key.bucket, len(plan.rows)
+            scratch = self.states.indices(self.states.scratch()[:size])
+            m = self.graph_metadata.get(size)
+            if m is None:
+                m = Metadata(True, torch.arange(size + 1, dtype=torch.int32, device=device), scratch.clone(),
+                             torch.zeros(size, dtype=torch.bool, device=device))
+                self.graph_metadata[size] = m
+                self.graph_buffers.update({f"{size}.{name}": value for name, value in vars(m).items()
+                                           if isinstance(value, torch.Tensor)})
+                self.generation += 1
+            m.mamba_cache_indices.copy_(scratch)
+            if n:
+                rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
+                m.mamba_cache_indices[:n].copy_(mapping[rows])
+            self.forward_metadata = m
+            return
         rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64), device)
         extend = on_device(torch.tensor(list(plan.num_tokens.values()), dtype=torch.int32), device)
         prefix = on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64), device)
@@ -86,6 +107,12 @@ class GDNAttnBackend:
                                          torch.cumsum(extend, dim=0, dtype=torch.int32)])
         # get_mamba_indices: req_index_to_mamba_index_mapping[req_pool_indices]
         self.forward_metadata = Metadata(decode, query_start_loc, mapping[rows + 1], prefix > 0)
+
+    def release_graphs(self) -> None:
+        self.graph_metadata.clear()
+        self.graph_buffers.clear()
+        self.forward_metadata = None
+        self.generation += 1
 
     def forward(self, layer: int, mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
                 conv_weights: torch.Tensor, bias: torch.Tensor | None, activation: str, A_log: torch.Tensor,

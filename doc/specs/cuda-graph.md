@@ -1,10 +1,19 @@
 # CUDA Graph 支持：实现方案
 
 - 日期：2026-11-10
-- 状态：实现前设计，待评审；本文不表示功能已经实现或通过 GPU 验收。
+- 状态：首版实现已通过 SM90-80GB CUDA Graph 专项及真实控制面 apply 验证；范围和限制见 [验证记录](../evaluations/cuda-graph.md)。
 - 代码基线：`master@efce690`；开发分支：`gw/dev/cuda-graph`。该基线已记录 M2a 完成，下一步包含 M2b 的真实 kernel 与 M2c 的 graph。
 - 目标：在现有 Qwen3.8 TP1 worker 上运行完整 decode forward 的 CUDA Graph，并在 `apply` 后正确失效、重录和释放。
 - 实现原则：**minimal patch，fail fast**。先完成最小正确闭环，复用已有执行路径和变更协议；配置不兼容和资源不足尽早拒绝，执行失败不能伪装成正常 eager 回退。
+
+### 首版实现选择（2026-11-10）
+
+- 平台名为 `cuda_graph`，放在 `engine/platforms/cuda_graph/`。当前内核使用 PyTorch，远程测试机器实际为 SM90-80GB/SM90；不使用 `cuda_sm100` 命名，也不声称完成 SM100 验收。
+- attention decode 在已有 SGLang PyTorch SDPA 参照上适配固定容量的索引、长度 mask 和批量 GQA；GDN 使用已有 PyTorch recurrent/conv 实现。未引入 FlashInfer/FLA/causal-conv 新依赖。该实现先验证完整 forward 与热更新闭环，不代表优化 kernel 或性能验收。
+- `plan.graph_memory_bytes` 默认 1 GiB，holder 预留该预算；逐 bucket 统计构建峰值，超出就失败。固定容量 attention 的临时内存随 bucket 和 `batch.max_context_len` 增长；大模型不能直接假定默认预算足够，应显式限制行数、上下文和预算。
+- scratch 每个 lane 独立，位于账本可分配容量之外；全部 bucket metadata 分配完成后才记录 generation。输出是借用视图，测试 Driver 在下一步之前 clone。
+- kernel 代码/注册来源变更时，`core.deps` 对真实 graph 平台重载 plan，避免 action abort 在旧 kernel 恢复之前录图。运行时优先加载已就绪的非 capture 单元，再加载 capture 单元，确保注册已完成。这是平台接入之外唯一必要的加载顺序修正。
+- replay 前检查提供者撤销、当前 binding generation 和 catalog version；布局全量比较用于调试守卫。`required` 缺图在 executor 写状态之前失败；候选构建失败不降级为 eager。
 
 ## 1. 设计依据与范围
 
@@ -66,16 +75,17 @@
 
 ### 3.2 分桶与配置
 
-配置声明放在 `core.plan/unit.toml`，以下键名为本方案提议：
+配置声明放在 `core.plan/unit.toml`：
 
 | 配置 | 语义 |
 |---|---|
 | `plan.cuda_graph` | `auto`（默认）、`off`、`required`。`auto` 在支持且配置合法的 CUDA 路径启用；`off` 使用 eager；`required` 要求配置的 decode bucket 全部就绪 |
 | `plan.graph_buckets` | 显式正整数列表；空列表按有效行数上限生成 2 的幂。不超过上限的非幂尾部可走 eager；需要覆盖尾部时显式配置该容量 |
+| `plan.graph_memory_bytes` | 正整数，默认 1073741824；holder 为 graph 保留的字节数，也是构建峰值的上限 |
 
 首版这些键使用 `startup` 绑定，在单元初始化阶段读取，通过现有排空、暂停和单元重载生效，不新增 live 开关或在线分桶策略。构建使用该配置快照；不能只在 `plan_scope` 内读取这些键，因为现有规划器可能据 `plan_build` 记录派发重建 action，而不是重载。用 `dry-run` 测试确认实际计划。校验重复值、非正值、超出 `batch.max_rows` 的值；`required` 还需覆盖配置允许的 decode 行数。暂不增加自动调参、按负载补录或 LRU 驱逐。
 
-`auto` 在 CPU / `torch_eager` 或尚不支持 capture 的合法 backend 组合上走 eager，并在启动日志记录具体原因；在验收通过的 `cuda_sm100` 组合上默认录 graph。显式指定的 backend 不可用、布局不兼容等配置错误，在任何模式下都失败，不能借 `auto` 偷换 backend。
+`auto` 在 CPU / `torch_eager` 或尚不支持 capture 的合法 backend 组合上走 eager，并在启动日志记录具体原因；在 `cuda_graph` 平台的可捕获组合上默认录 graph。显式指定的 backend 不可用、布局不兼容等配置错误，在任何模式下都失败，不能借 `auto` 偷换 backend。
 
 `required` 在启动或变更中就检查平台、所有捕获路径和资源，不等第一条请求触发失败。它要求普通 decode 使用 graph，prefill/mixed 仍按定义走 eager。
 
@@ -96,7 +106,7 @@
 
 ### 4.1 CUDA 平台
 
-按现有规划增加 `engine/platforms/cuda_sm100/`，复用 torch 平台已有的张量分配能力，保留 `torch_eager` 的 eager 定位。首个目标为 SM100/SM100；不把其他架构未经验证的路径标成已支持。
+增加 `engine/platforms/cuda_graph/`，复用 torch 平台已有的张量分配能力，保留 `torch_eager` 的 eager 定位。首版使用通用 PyTorch CUDA 路径，按实际 GPU 记录验收结果；架构专用 kernel 留待后续。
 
 必要接入点为 `platforms.PLATFORMS`、`unit.runtime.host.make_platform`、`engine/framework.toml` 和部署拓扑/平台身份的生成。平台实现及其构造入口属于框架边界，首次接入需要重启引擎；之后 plan、backend、kernel 的开发继续用 `apply`。
 
@@ -239,11 +249,10 @@ holder 当前只预算权重和状态池，需为 graph 私有池、metadata、w
 
 提交前执行 `uv run pyright`、`uv run pytest -n 8`。实现修改 `unit.runtime.host` 或仓库规定的其他关键框架组件时，另跑 formal 全流程。GPU 用例放 `tests/gpu/`，通过显式路径运行。性能记录包含首次 capture、重录暂停、host/device step 时间、TPOT、峰值 allocated/reserved 显存及重复更新后的趋势；不预设加速倍数，也不将探针耗时当成整引擎结果。
 
-## 10. 实现前必须收敛的事项
+## 10. 后续优化与未验证范围
 
-- 锁定 FlashInfer/FLA/causal-conv 版本及目标 shape/dtype/layout 组合，证明完整 forward 可捕获。
-- 确定各 kernel 的 padding mask 语义与 scratch 数量，测出其显存成本。
-- 验证平台直接 capture API 的失败恢复，确定 graph 预留显存与默认 bucket 上限。
-- 明确 kernel 注册来源到 `ctx.derived(units=...)` 的最小交接，以及重建 action 对状态动作的执行顺序。
+- 优化 kernel 接入时锁定 FlashInfer/FLA/causal-conv 版本，重新验证完整 forward、padding 和 scratch。
+- 完整 27B 真权重、SM100、长上下文和默认大 bucket 的显存与性能尚需专门验收。
+- 首版没有共享 graph 池，未设定加速倍数或 TPOT 承诺。
 
-上述事项各自阻塞对应实现步骤，不通过扩大框架抽象或吞掉运行错误来绕过。第一个可交付里程碑是：**TP1 Qwen3.8 decode graph 与同配置 eager 对齐，并通过一次 kernel 热更新完成失效、重录和恢复服务。**
+第一个可交付里程碑仍是：**TP1 Qwen3.8 decode graph 与同配置 eager 对齐，并通过一次 kernel 热更新完成失效、重录和恢复服务。** 优化和完整模型性能验收不由小模型专项测试代替。

@@ -56,6 +56,35 @@ def test_pending_until_dependency_appears(generic: Callable[..., UnitSpec]) -> N
     assert report.loaded == [provider.id, user.id]
 
 
+def test_capture_waits_for_registrations_on_load_and_reload(pkg: str, snapshot: Snapshot) -> None:
+    root = snapshot("v1", {f"{pkg}/units.py": '''
+        from unit.runtime import Registry
+
+        class Catalog:
+            def __init__(self, ctx, config):
+                ctx.provide("cat@1", Registry("catalog"))
+
+        class Kernel:
+            def __init__(self, ctx, config):
+                ctx.register("cat@1", "kernel")
+
+        class Capture:
+            def __init__(self, ctx, config):
+                assert list(ctx.use("cat@1")) == ["kernel"]
+    '''})
+    cat = spec(f"{pkg}.catalog", f"{pkg}.units:Catalog", provides=["cat@1"])
+    kernel = spec(f"{pkg}.z_kernel", f"{pkg}.units:Kernel", requires=["cat@1"])
+    capture = spec(f"{pkg}.a_capture", f"{pkg}.units:Capture", requires=["cat@1"],
+                   capabilities="captures_graph = true")
+    rt = UnitRuntime(PROC)
+    try:
+        rt.load_process_plan(plan([cat, capture, kernel], root)).unwrap()
+        report = rt.reload(ReloadPlan(units_to_reload=[capture, kernel])).unwrap()
+        assert report.loaded == [kernel.id, capture.id]
+    finally:
+        rt.unload_all().unwrap()
+
+
 def test_failed_init_leaves_nothing(pkg: str, snapshot: Snapshot) -> None:
     root = snapshot("v1", {f"{pkg}/bad.py": '''
         from unit.runtime import Registry

@@ -323,6 +323,17 @@ class _Planner:
                 continue
             keys = set(a.config) & set(changed_keys)
             built_from = set(a.units) & (reload | removed)
+            captures = (w.new_tree.units[a.owner].manifest.capabilities.captures_graph
+                        and w.new.topology is not None
+                        and any(r.name == intro.proc.role and r.platform == "cuda_graph" for r in w.new.topology.roles))
+            added_services = {s for u in added for s in w.new_tree.units[u].manifest.requires.services}
+            added_user = any(added_services & set(w.new_tree.units[u].manifest.provides.services)
+                             for u in a.units if u in w.new_tree.units)
+            if captures and (built_from or added_user):
+                # Graph actions abort before reverse reload. Recreate their owner instead so
+                # rollback captures against restored providers, never the failed candidate.
+                reload.add(a.owner)
+                continue
             if keys or built_from:
                 rebuild.setdefault((a.owner, a.name), (a.rebuild, set()))[1].update(keys)
         for (owner, name), (action, keys) in sorted(rebuild.items()):

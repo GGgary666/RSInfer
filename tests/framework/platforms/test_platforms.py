@@ -19,13 +19,14 @@ from unit.runtime.host import make_platform
 MAKERS = {"fake": FakePlatform, "torch_eager": TorchEagerPlatform}
 
 
-@pytest.fixture(params=PLATFORMS)
+@pytest.fixture(params=MAKERS)
 def platform(request: pytest.FixtureRequest) -> Platform:
     return MAKERS[request.param]()
 
 
 def test_every_platform_name_has_a_maker() -> None:
-    assert set(MAKERS) == set(PLATFORMS)
+    # The real CUDA platform is exercised explicitly in tests/gpu/test_cuda_graph.py.
+    assert set(MAKERS) | {"cuda_graph"} == set(PLATFORMS)
 
 
 def test_a_buffer_has_the_shape_dtype_and_size_asked_for(platform: Platform) -> None:

@@ -116,6 +116,10 @@ def check_plan(plan: BatchPlan) -> None:
         raise ValueError("a row runs twice in one plan")
     if any(n < 1 for n in num_tokens) or any(p < 0 for p in positions):
         raise ValueError("every row runs at least one token from a position >= 0")
+    if not rows or plan.phase not in ("prefill", "mixed", "decode"):
+        raise ValueError("a plan needs rows and a valid phase")
+    if plan.phase == "decode" and any(n != 1 for n in num_tokens):
+        raise ValueError("decode requires exactly one token per row")
     if any(f and n != 1 for f, n in zip(prev, num_tokens, strict=True)):
         raise ValueError("a from_previous row runs exactly one token")
     if sum(n for f, n in zip(prev, num_tokens, strict=True) if not f) != len(plan.tokens):
@@ -178,7 +182,7 @@ class PyTorchExecutor:
         try:
             logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
         except StaleGraph:
-            if chosen is eager:
+            if chosen is eager or getattr(self.plans, "required", False):
                 raise
             logits = eager.run(self.batch, plan, input_ids, pos, last_index)
         next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
@@ -201,6 +205,8 @@ class PyTorchExecutor:
         phase = "decode" if plan.phase == "decode" else "prefill"
         eager = self.plans.get(PlanKey(phase, 0))
         fits = [b for b in self.plans.buckets(phase) if b >= len(plan.rows)] if phase == "decode" else []
+        if phase == "decode" and not fits and getattr(self.plans, "required", False):
+            raise StaleGraph("required decode graph is unavailable; no state was changed")
         return (self.plans.get(PlanKey(phase, min(fits))) if fits else eager), eager
 
     def _copies(self, state: StateOps, when: str) -> None:

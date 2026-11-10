@@ -101,9 +101,11 @@ class WeightStore:
 
     def declare(self, decls: Sequence[WeightDecl]) -> None:
         moved = False
+        existing = bool(self.decls)
         for d in decls:
             if self.decls.get(d.name) == d:
                 continue
+            moved |= existing
             if d.name in self.buffers_:
                 self.platform.free(self.buffers_.pop(d.name))
                 moved = True
@@ -143,6 +145,7 @@ class WeightStore:
         return Views(self, prefix)
 
     def free(self) -> None:
+        self.generation += 1
         for buf in self.buffers_.values():
             self.platform.free(buf)
         self.buffers_.clear()

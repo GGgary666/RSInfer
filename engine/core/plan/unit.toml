@@ -8,7 +8,16 @@ entry = "core.plan.unit:Unit"
 services = ["plan@1"]
 
 [requires]
-services = ["model@1", "layers.attn@1", "layers.gdn@1"]
+services = ["model@1", "layers.attn@1", "layers.gdn@1", "worker.batch@1", "state.weights@1", "state.kv.paged@1", "state.gdn.slots@1", "kernels.catalog@1"]
 
 [capabilities]
 captures_graph = true
+actions = ["rebuild_graphs"]
+
+[config]
+"plan.cuda_graph" = { type = "str", default = "auto", binding = "startup", doc = "auto, off, or required; capture only on the cuda_graph platform." }
+"plan.graph_buckets" = { type = "list", default = [], binding = "startup", doc = "Positive decode row capacities; empty means powers of two up to batch.max_rows." }
+"plan.graph_memory_bytes" = { type = "int", default = 1073741824, binding = "startup", doc = "Device memory reserved for graph construction, metadata and private pools." }
+
+[reads]
+config = ["batch.max_rows", "batch.max_context_len"]

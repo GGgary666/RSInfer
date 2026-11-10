@@ -131,8 +131,16 @@ class FakeGraph:
     steps: list[_Step] = field(default_factory=list[_Step])
     values: list[ValueDep] = field(default_factory=list[ValueDep])
     replays: int = 0
+    closed: bool = False
+
+    def close(self) -> None:
+        self.closed = True
+        self.steps.clear()
+        self.values.clear()
 
     def check(self) -> list[str]:
+        if self.closed:
+            return ["graph is closed"]
         problems: list[str] = []
         for step in self.steps:
             for b in step.buffers:
@@ -163,6 +171,10 @@ class FakeGraph:
 class FakeGraphRecorder:
     def __init__(self, platform: FakePlatform) -> None:
         self._platform = platform
+
+    @contextmanager
+    def warmup(self) -> Generator[None]:
+        yield
 
     @contextmanager
     def capture(self) -> Generator[FakeGraph]:

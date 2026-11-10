@@ -9,3 +9,6 @@ services = ["layers.rope@1"]
 
 [requires]
 services = ["kernels.catalog@1"]
+
+[reads]
+config = ["batch.max_context_len"]

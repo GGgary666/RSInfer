@@ -16,6 +16,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from core.common.ids import Identity, UnitId
 from core.common.manifest import load_manifest
+from core.common.result import Failed
 from core.context.config import ConfigEntry
 from core.contracts.columns import Column, ragged
 from core.contracts.records import AddedRow, BatchPlan, RowDelta, StateAssign, StateCopy, StateOps
@@ -96,8 +97,11 @@ class Worker:
         entries = {key: ConfigEntry(s.id, decl, overrides.get(key, decl.default))
                    for s in self.specs for key, decl in s.manifest.config.items()}
         self.runtime = UnitRuntime(PROC, platform=platform or TorchEagerPlatform())
-        self.runtime.load_process_plan(ProcessPlan(PROC, Identity("w"), self.specs, config=entries,
-                                                   code_root=str(ENGINE))).unwrap()
+        loaded = self.runtime.load_process_plan(ProcessPlan(PROC, Identity("w"), self.specs, config=entries,
+                                                            code_root=str(ENGINE)))
+        if isinstance(loaded, Failed):
+            self.runtime.unload_all().unwrap()
+        loaded.unwrap()
 
     def service(self, name: str) -> Any:
         found = self.runtime.lookup(name)
@@ -235,5 +239,5 @@ class Driver:
             result = self.step(chunks)
             for i, row in enumerate(chunks):
                 if self.requests[row].previous:
-                    out[row].append(result.logits[i])
+                    out[row].append(result.logits[i].clone())
         return out

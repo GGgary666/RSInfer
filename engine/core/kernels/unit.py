@@ -18,8 +18,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from core.contracts.kernels import Definition, Implementation, KernelFn, Selected
-from unit.runtime.registry import Registry
+from core.contracts.kernels import Definition, Implementation, KernelFn, Selected, Solution
+from unit.runtime.registry import Registry, current_instance
 
 
 class KernelCatalog:
@@ -31,6 +31,8 @@ class KernelCatalog:
         self._implementations: Registry[Implementation] = Registry("kernels.implementations")
         self.version = 0
         self._kept: dict[tuple[str, tuple[tuple[str, int], ...]], KernelFn] = {}
+        self._selected: set[str] = set()
+        self._sources: dict[str, str] = {}
 
     def register(self, item: Definition | Implementation) -> Callable[[], None]:
         """Names and ids are unique, so a lookup never depends on the order of registration. A
@@ -44,15 +46,38 @@ class KernelCatalog:
                 raise ValueError(f"kernel solution {item.solution.id!r} is already registered")
             undo = self._implementations.register(item)
         self._changed()
+        owner = current_instance()
+        name = item.name if isinstance(item, Definition) else item.solution.id
+        if owner is not None:
+            self._sources[name] = str(owner.unit)
 
         def undo_and_note() -> None:
             undo()
+            self._sources.pop(name, None)
             self._changed()
         return undo_and_note
 
     def _changed(self) -> None:
         self.version += 1
         self._kept.clear()
+        self._selected.clear()
+
+    def sources(self) -> list[str]:
+        """Actual registration owners, including alternatives that may affect auto selection."""
+        return sorted(set(self._sources.values()))
+
+    def describe(self, solution: str) -> Solution:
+        for i in self._implementations:
+            if i.solution.id == solution:
+                return i.solution
+        raise LookupError(f"no kernel solution {solution!r} is registered")
+
+    def selected(self, *, clear: bool = False) -> list[Solution]:
+        """Solutions used through call(), including the non-attention layers."""
+        if clear:
+            self._selected.clear()
+            self._kept.clear()
+        return [self.describe(s) for s in sorted(self._selected)]
 
     def definition(self, name: str) -> Definition:
         for d in self._definitions:
@@ -97,7 +122,9 @@ class KernelCatalog:
         key = (definition, tuple(sorted(shape.items())))
         fn = self._kept.get(key)
         if fn is None:
-            fn = self._kept[key] = self.resolve(self.select(definition, shape).solution)
+            solution = self.select(definition, shape).solution
+            self._selected.add(solution)
+            fn = self._kept[key] = self.resolve(solution)
         return fn(*args, **kwargs)
 
 
