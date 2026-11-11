@@ -101,7 +101,8 @@ def test_the_graph_kernel_unit_serves_captured_decode_steps_only() -> None:
         # What a captured decode step needs besides: the references that keep nothing on the host.
         capturable = {d.name for d in cat.definitions() if cat.describe(d.reference).capturable}
         assert {d.name for d in cat.definitions()} - capturable == {
-            "attn.extend@1", "attn.decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1", "sample.seeded@1"}
+            "attn.extend@1", "attn.decode@1", "attn.paged_extend@1", "attn.paged_decode@1", "gdn.conv1d_fn@1",
+            "gdn.chunk_delta_rule@1", "sample.seeded@1"}
     finally:
         rt.unload_all().unwrap()
 

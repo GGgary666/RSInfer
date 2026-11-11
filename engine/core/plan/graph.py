@@ -15,29 +15,64 @@ from core.contracts.records import BatchPlan
 from core.contracts.tensor import Tensor
 from unit.runtime.proxy import provision_of
 
-DEFAULT_MAX_BUCKET = 8
-"""Without ``plan.graph_buckets``: powers of two up to this many rows. The decode attention of a
-captured step costs by ``batch.max_context_len`` (``kernels.torch_graph``), which more rows than
-this did not win back (doc/evaluations/cuda-graph-review-fixes.md); larger steps run eagerly."""
+DEFAULT_MAX_BUCKET = 64
+"""Without ``plan.graph_buckets``, the largest bucket; larger steps run eagerly. On a SM100 with
+the 64-layer model, steps of 16 to 64 rows that ran eagerly were 2.7 to 3.3 times slower than
+replayed ones, and the buckets up to 64 kept 140 MiB more than those up to 8 (review of #51,
+doc/evaluations/real-kernels-fused.md)."""
+
+FIXED_EXTENT_MAX_BUCKET = 8
+"""The same while a captured step runs a solution made for captured steps only (``CAPTURE``): a
+stand-in over fixed extents for a kernel that reads the host, as the decode attention of
+``kernels.torch_graph``. Its cost follows ``batch.max_context_len`` per lane, which more rows
+than this did not win back (doc/evaluations/cuda-graph-review-fixes.md)."""
 
 
-def buckets(mode: str, values: Sequence[int], rows: int, budget: int) -> list[int]:
+def default_buckets(rows: int, fixed_extent: bool) -> list[int]:
+    """The buckets when none are configured. As SGLang's default decode sizes (1, 2, 4, 8, 12, then
+    every 8th; ``generate_cuda_graph_batch_sizes``, e838360), up to ``batch.max_rows`` or
+    ``DEFAULT_MAX_BUCKET`` and with that size itself, so that up to there a step of any size is
+    replayed; over fixed extents, the powers of two."""
+    if fixed_extent:
+        return [1 << i for i in range(min(rows, FIXED_EXTENT_MAX_BUCKET).bit_length())]
+    limit = min(rows, DEFAULT_MAX_BUCKET)
+    return sorted({b for b in (1, 2, 4, 8, 12, *range(16, limit + 1, 8)) if b <= limit} | {limit})
+
+
+def buckets(mode: str, values: Sequence[int], rows: int, budget: int, fixed_extent: bool) -> list[int]:
     if mode not in ("auto", "off", "required"):
         raise ValueError("plan.cuda_graph must be auto, off or required")
     if rows < 1 or budget <= 0:
         raise ValueError("batch.max_rows and plan.graph_memory_bytes must be positive")
     if any(type(b) is not int or not 0 < b <= rows for b in values) or len(set(values)) != len(values):
         raise ValueError("plan.graph_buckets must be distinct positive integers <= batch.max_rows")
-    chosen = sorted(values) if values else [1 << i for i in range(min(rows, DEFAULT_MAX_BUCKET).bit_length())]
+    chosen = sorted(values) if values else default_buckets(rows, fixed_extent)
     if mode == "required" and chosen[-1] != rows:
         raise ValueError("required graphs must cover batch.max_rows; list its exact capacity in plan.graph_buckets")
     return chosen
 
 
-def no_rows() -> BatchPlan:
-    """A decode step without rows: every lane of a bucket is padding."""
-    return BatchPlan(Column.of("i32", []), Column.of("i32", []), Column.of("i32", []),
-                     Column.of("i64", []), Column.of("u8", []), "decode", 0)
+def padding_row() -> BatchPlan:
+    """A decode step of the padding row alone (row -1, on the stores' scratch items): a lane with
+    a defined result while there are no requests. A bucket's other lanes are padding: what a
+    kernel computes for a padded lane is undefined, and they all write the padding items."""
+    return BatchPlan(Column.of("i32", [-1]), Column.of("i32", [1]), Column.of("i32", [0]),
+                     Column.of("i64", [0]), Column.of("u8", [0]), "decode", 0)
+
+
+def eager_padding_step(batch: PersistentBatch, model: Any, backends: Sequence[Backend], stores: Sequence[Any],
+                       device: torch.device) -> None:
+    """One eager decode step of the padding row, on the scratch items. What a kernel library
+    allocates for all its steps (a workspace, a compiled module) is allocated here."""
+    for store in stores:
+        store.clear(store.scratch())
+    for backend in backends:
+        backend.prepare(batch, padding_row(), PlanKey("decode", 0))
+    token = torch.zeros(1, dtype=torch.int64, device=device)
+    with torch.inference_mode():
+        model.forward(token, torch.zeros_like(token), torch.arange(1, device=device))
+    for store in stores:
+        store.clear(store.scratch())
 
 
 class Dependencies:
@@ -94,19 +129,20 @@ class GraphPlan:
         self.graph, self.output = None, None
 
     def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> torch.Tensor:
-        """An eager forward of a bucket of padding lanes, from a cleared padding item. The backends
-        allocate the bucket's fixed buffers here the first time, outside inference mode: every
-        later step updates them in place."""
+        """An eager forward of the bucket with the padding row in its first lane, from a cleared
+        padding item. The backends allocate the bucket's fixed buffers here the first time,
+        outside inference mode: every later step updates them in place."""
         for store in stores:
             store.clear(store.scratch())
         for backend in self.backends:
-            backend.prepare(batch, no_rows(), PlanKey("decode", self.size))
+            backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
         with torch.inference_mode():
             return model.forward(self.inputs, self.positions, self.last_index)
 
     def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
-        """Record the forward of a bucket of padding lanes; the replay must give the logits the
-        same kernels gave eagerly. That eager forward is the warm-up too."""
+        """Record the bucket's forward, after an eager one as the warm-up. A graph of one lane has
+        no padded lane beside the padding row, so what it replays is defined: it must be the
+        logits the same kernels gave eagerly."""
         with recorder.warmup():
             expected = self.padded(batch, model, stores).clone()
             for store in stores:
@@ -117,5 +153,6 @@ class GraphPlan:
         with recorder.warmup():
             graph.replay()
         assert self.output is not None
-        torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
-            f"decode graph of {self.size} rows replays other logits than the eager forward it recorded: {m}"))
+        if self.size == 1:
+            torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
+                f"a decode graph replays other logits than the eager forward it recorded: {m}"))

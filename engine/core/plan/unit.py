@@ -29,11 +29,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from core.contracts.kernels import CAPTURE
 from core.contracts.plan import GRAPH, Backend, PersistentBatch, Phase, Plan, PlanKey, PlanService
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from core.contracts.tensor import Tensor
-from core.plan.graph import Dependencies, GraphPlan, buckets
+from core.plan.graph import Dependencies, GraphPlan, buckets, eager_padding_step
 from unit.runtime.proxy import provision_of
 
 
@@ -114,7 +115,6 @@ class Plans:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         mode, budget = config["plan.cuda_graph"], config["plan.graph_memory_bytes"]
-        sizes = buckets(mode, config["plan.graph_buckets"], config["batch.max_rows"], budget)
         model = ctx.use("model@1")
         names = list(dict.fromkeys(model.assembly.layers))
         backends: list[Backend] = [ctx.use(name) for name in names]
@@ -130,6 +130,10 @@ class Unit:
                               {name: b.resolve(model.assembly.states) for name, b in zip(names, backends, strict=True)})
         uncapturable = sorted({definition for chosen in resolved[GRAPH].values()
                                for definition, solution in chosen.items() if not solution})
+        captured = [solution.removesuffix(" (fallback)") for chosen in resolved[GRAPH].values()
+                    for definition, solution in chosen.items() if definition != "backend" and solution]
+        sizes = buckets(mode, config["plan.graph_buckets"], config["batch.max_rows"], budget,
+                        fixed_extent=any(CAPTURE in self.catalog.describe(s).requires for s in captured))
         reason = ("disabled" if mode == "off" else
                   "platform has no CUDA graph support" if "cuda_graph" not in resolved["device"] else
                   f"uncapturable decode kernels: {uncapturable}" if uncapturable else "")
@@ -159,21 +163,34 @@ class Unit:
         self.batch.prepare(list(self.stores))
         device = self.batch.binding.buffers()["last_token"].device
         stores = list(self.stores.values())
-        torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()  # count what the graphs keep, not what a cached block happened to hold
-        before = torch.cuda.memory_reserved(device)
+        # An eager step of the padding row first. It shows what the forward runs besides the
+        # backends' kernels (norms, linears, ...): eager's choices, which a captured step shares, so
+        # they have to be capturable too. And the kernel libraries allocate in it what all their
+        # steps share, eager ones included: that is not the graphs', stays when they are closed,
+        # and is there before their memory is counted, on a cold start as after a reload.
+        with recorder.warmup(), self.catalog.recording() as used:
+            eager_padding_step(self.batch, self.model, self.backends, stores, device)
+        uncapturable = sorted(s for s in used if not self.catalog.describe(s).capturable)
+        if uncapturable:
+            return f"uncapturable decode kernels: {uncapturable}", {}
         graphs = {size: GraphPlan(size, device, self.backends) for size in sorted(sizes, reverse=True)}
         seconds: dict[str, float] = {}
+        before = 0
         try:
-            # What the forward runs besides the backends' kernels (norms, linears, ...): eager's
-            # choices, which a captured step shares, so they have to be capturable too.
-            with recorder.warmup(), self.catalog.recording() as used:
-                next(iter(graphs.values())).padded(self.batch, self.model, stores)
-            uncapturable = sorted(s for s in used if not self.catalog.describe(s).capturable)
-            if uncapturable:
-                for backend in self.backends:
-                    backend.release_graphs()
-                return f"uncapturable decode kernels: {uncapturable}", {}
+            if 1 not in graphs:
+                # Only a graph of one lane can be held to the eager logits (GraphPlan.capture):
+                # with no such bucket, record one for the check alone, and have the backends
+                # drop what they keep for it (they hold no other bucket yet).
+                probe = GraphPlan(1, device, self.backends)
+                try:
+                    probe.capture(self.batch, self.model, stores, recorder)
+                finally:
+                    probe.close()
+                    for backend in self.backends:
+                        backend.release_graphs()
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()  # count what the graphs keep, not what a cached block happened to hold
+            before = torch.cuda.memory_reserved(device)
             # The largest first, into one pool: the smaller ones fit in what it took.
             for size, graph in graphs.items():
                 started = time.perf_counter()

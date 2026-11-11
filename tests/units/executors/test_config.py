@@ -38,8 +38,9 @@ def test_the_start_up_log_says_what_runs_in_each_phase(capsys: pytest.CaptureFix
             "backend": "auto", "kv.store@1": "reference.kv.store@1 (fallback)",
             "attn.extend@1": "reference.attn.extend@1 (fallback)"}
         assert logged["decode"]["layers.gdn@1"] == {
-            "backend": "auto", "gdn.conv1d_update@1": "reference.gdn.conv1d_update@1 (fallback)",
-            "gdn.recurrent_update@1": "reference.gdn.recurrent_update@1 (fallback)"}
+            "backend": "auto",
+            "gdn.qkvzba_conv1d_update@1": "reference.gdn.qkvzba_conv1d_update@1 (fallback)",
+            "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)"}
     finally:
         w.close()
 
@@ -59,6 +60,18 @@ def test_a_backend_named_per_phase_is_used_for_that_phase(capsys: pytest.Capture
 def test_a_named_backend_without_a_fitting_solution_fails_the_start(key: str) -> None:
     with pytest.raises(Exception, match=rf"{key} = 'flashinfer': backend 'flashinfer' has no solution"):
         Worker(tiny_config().to_dict(), **{key: "flashinfer"})
+
+
+def test_the_attention_kernels_are_asked_for_with_the_dtypes_of_queries_and_cache() -> None:
+    """A kernel library may take bf16 / fp16 only, or read the cache as the queries' type: the shape
+    the attention kernels are selected by says whether the model is fp32 and whether the cache has
+    the model's dtype. A library named for a combination it does not take fails the start."""
+    for config, shape in (({}, "'fp32': 1, 'kv_as_q': 1"),
+                          ({"model.dtype": "bf16", "state.gdn.conv_dtype": "bf16"}, "'fp32': 0, 'kv_as_q': 1"),
+                          ({"model.dtype": "bf16", "state.gdn.conv_dtype": "bf16", "state.kv.dtype": "f16"},
+                           "'fp32': 0, 'kv_as_q': 0")):
+        with pytest.raises(Exception, match=rf"attn.backend = 'flashinfer': .* for \{{'head_dim': 16, {shape}\}}"):
+            Worker(tiny_config().to_dict(), **{"attn.backend": "flashinfer", **config})
 
 
 def test_state_dtypes_follow_sglang_defaults() -> None:

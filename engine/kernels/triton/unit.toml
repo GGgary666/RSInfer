@@ -1,0 +1,8 @@
+[unit]
+id = "kernels.triton"
+kind = "logic"
+process = ["worker"]
+entry = "kernels.triton.unit:Unit"
+
+[requires]
+services = ["kernels.catalog@1"]

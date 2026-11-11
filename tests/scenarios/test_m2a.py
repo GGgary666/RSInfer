@@ -208,12 +208,12 @@ def test_a_kernel_change_that_cannot_run_rolls_back_and_the_engine_keeps_serving
         assert worker["reload"] == ["core.plan", "kernels.reference"] and "actions" not in worker, worker
         assert text() == baseline
 
-        unit.write_text(registrations.replace('("gdn.recurrent_update@1"', '("gdn.recurrent_update_gone@1"'))
+        unit.write_text(registrations.replace('("gdn.packed_decode@1"', '("gdn.packed_decode_gone@1"'))
         assert unit.read_text() != registrations
         code, failed = client("apply", "--source", str(workspace))
         assert code == 1 and failed["status"] == "aborted", failed
         reasons = " ".join(d["reason"] for d in failed["diagnostics"])
-        assert "no kernel definition 'gdn.recurrent_update@1'" in reasons and "rolled back" in reasons, reasons
+        assert "no kernel definition 'gdn.packed_decode@1'" in reasons and "rolled back" in reasons, reasons
         code, status = client("status")
         assert code == 0 and status["recovery_required"] is False, status
         assert text() == baseline

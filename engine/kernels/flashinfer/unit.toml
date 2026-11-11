@@ -1,0 +1,8 @@
+[unit]
+id = "kernels.flashinfer"
+kind = "logic"
+process = ["worker"]
+entry = "kernels.flashinfer.unit:Unit"
+
+[requires]
+services = ["kernels.catalog@1"]

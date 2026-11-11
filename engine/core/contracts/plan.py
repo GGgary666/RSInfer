@@ -125,17 +125,19 @@ class AttentionBackend(Backend, Protocol):
 class GDNBackend(Backend, Protocol):
     """``layers.gdn@1``: gated delta net (SGLang's ``RadixLinearAttention`` and ``GDNAttnBackend``)."""
 
-    def forward(self, layer: int, mixed_qkv: Tensor, a: Tensor, b: Tensor, conv_weights: Tensor,
+    def forward(self, layer: int, projected_qkvz: Tensor, projected_ba: Tensor, conv_weights: Tensor,
                 bias: Tensor | None, activation: str, A_log: Tensor, dt_bias: Tensor, num_k_heads: int,
-                num_v_heads: int, head_k_dim: int, head_v_dim: int) -> Tensor:
-        """``mixed_qkv`` ``[tokens, conv_dim]`` is the input projection before the convolution, ``a``
-        and ``b`` ``[tokens, num_v_heads]`` the gate inputs. The backend runs everything of the GDN
-        in between, once each: the causal conv and its activation, the per-head L2 norm of q and k
-        (it may be fused into the kernel), the gating of ``a`` and ``b`` into the decay and the
-        update rate, the gated delta rule, and both state updates, conv and recurrent. The weights
-        come from the weight store; the backend only reads them. Returns the core output
-        ``[1, tokens, num_v_heads, head_v_dim]``; the gated RMSNorm with ``z`` and the output
-        projection are the model's."""
+                num_v_heads: int, head_k_dim: int, head_v_dim: int) -> tuple[Tensor, Tensor]:
+        """``projected_qkvz`` ``[tokens, conv_dim + num_v_heads * head_v_dim]`` and ``projected_ba``
+        ``[tokens, 2 * num_v_heads]`` are the layer's two input projections as the GEMMs leave them:
+        ``[q | k | v | z]`` and the gate inputs ``[b | a]``. The backend runs everything of the GDN
+        in between, once each: taking the projections apart (in a kernel, or as views), the causal
+        conv of ``[q | k | v]`` and its activation, the per-head L2 norm of q and k (it may be fused
+        into the kernel), the gating of ``a`` and ``b`` into the decay and the update rate, the gated
+        delta rule, and both state updates, conv and recurrent. The weights come from the weight
+        store; the backend only reads them. Returns the core output ``[1, tokens, num_v_heads,
+        head_v_dim]`` and ``z`` ``[tokens, num_v_heads, head_v_dim]``, which may be a view of
+        ``projected_qkvz``; the gated RMSNorm with ``z`` and the output projection are the model's."""
         ...
 
 

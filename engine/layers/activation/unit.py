@@ -1,4 +1,5 @@
-"""``layers.activation``: SGLang's ``SiluAndMul``."""
+"""``layers.activation``: SGLang's ``SiluAndMul``, and the output gate of its attention layers
+(``fused_sigmoid_mul``)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,13 @@ class Activation:
         self.catalog = catalog
 
     def silu_and_mul(self, x: torch.Tensor) -> torch.Tensor:
-        return self.catalog.call("act.silu_and_mul@1", {"hidden": x.shape[-1] // 2}, x)
+        shape = {"hidden": x.shape[-1] // 2, "fp32": int(x.dtype == torch.float32)}
+        return self.catalog.call("act.silu_and_mul@1", shape, x)
+
+    def sigmoid_mul(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """``x * sigmoid(gate)``. The kernel may work in place, as SGLang's does: ``x`` is not to be
+        used afterwards."""
+        return self.catalog.call("act.sigmoid_mul@1", {"hidden": x.shape[-1]}, x, gate)
 
 
 class Unit:

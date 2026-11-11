@@ -16,7 +16,8 @@ class Norm:
 
     def gemma_rms(self, x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
                   ) -> Any:
-        """``normed``, or ``(normed, x + residual)`` with a residual."""
+        """``normed``, or ``(normed, x + residual)`` with a residual. With a residual the kernel may
+        work in place, as SGLang's does: ``x`` and ``residual`` are not to be used afterwards."""
         return self.catalog.call("norm.gemma_rms@1", {"hidden": x.shape[-1]}, x, weight, eps, residual)
 
     def rms_gated(self, x: torch.Tensor, weight: torch.Tensor, z: torch.Tensor, eps: float) -> torch.Tensor:

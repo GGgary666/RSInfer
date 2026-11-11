@@ -1,18 +1,30 @@
 # Copyright 2023-2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""``layers.attn``: the full-attention shell with its backend (``layers.attn@1``). Adapted from
-SGLang's ``RadixAttention`` and ``TorchNativeAttnBackend`` (srt/layers/attention/
-torch_native_backend.py, e838360; LICENSE.sglang). ``prepare`` derives the ``ForwardBatch`` fields
-the backend reads (``req_pool_indices``, ``seq_lens``, ``extend_prefix_lens``, ``extend_seq_lens``,
-``out_cache_loc``) from the persistent batch and the plan; ``forward`` stores K/V and runs
-``attn.extend@1`` (prefill and mixed steps, as SGLang's MIXED mode) or ``attn.decode@1``, with the
-solutions ``resolve`` fixed at start from ``attn.backend`` and its per-phase overrides.
+"""``layers.attn``: the full-attention shell with its backends (``layers.attn@1``). Adapted from
+SGLang's ``RadixAttention``, ``TorchNativeAttnBackend`` (srt/layers/attention/
+torch_native_backend.py, e838360; LICENSE.sglang) and, in ``paged``, ``FlashInferAttnBackend``.
+
+The kernels come in two families, which differ in the metadata a step has to prepare for them,
+so each has its backend, as each attention backend of SGLang has its ``init_forward_metadata``:
+
+- ``attn.extend@1`` / ``attn.decode@1`` read ``req_to_token`` themselves (``TorchNativeAttnBackend``
+  here): ``prepare`` derives the ``ForwardBatch`` fields they read (``req_pool_indices``,
+  ``seq_lens``, ``extend_prefix_lens``, ``extend_seq_lens``, ``out_cache_loc``) from the persistent
+  batch and the plan;
+- ``attn.paged_extend@1`` / ``attn.paged_decode@1`` are planned per step over lists of token slots
+  (``paged.PagedAttnBackend``).
+
+``resolve`` fixes at start, per phase, the family and its solutions from ``attn.backend`` and its
+per-phase overrides (SGLang's ``HybridAttnBackend`` over a prefill and a decode backend). ``auto``
+is SGLang's default: the paged kernels where a library provides them (FlashInfer), else the
+native ones. A mixed step runs as an extend, as SGLang's MIXED mode.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -20,9 +32,12 @@ import torch
 from core.contracts.plan import GRAPH, AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
-from layers.solutions import Kernels
+from layers.attn.paged import DEFINITIONS as PAGED
+from layers.attn.paged import KV_INDICES, PagedAttnBackend
+from layers.solutions import PHASES, Kernels
 
 KIND = "kv.paged"
+NATIVE = MappingProxyType({"prefill": "attn.extend@1", "decode": "attn.decode@1"})
 
 
 def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -59,7 +74,7 @@ class Metadata:
 
 
 class TorchNativeAttnBackend:
-    """``layers.attn@1``."""
+    """One of the backends behind ``layers.attn@1``: the kernels that read ``req_to_token``."""
 
     def __init__(self, kernels: Kernels, kv: Any) -> None:
         self.kernels = kernels
@@ -68,16 +83,6 @@ class TorchNativeAttnBackend:
         self.graph_metadata: dict[int, Metadata] = {}
         self.generation = 0
         self.graph_buffers: dict[str, torch.Tensor] = {}
-
-    @property
-    def binding(self) -> GraphBinding:
-        return GraphBinding(self.generation, self.graph_buffers)
-
-    def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
-        head_dim = next(d.tensors["k"][0][-1] for d in states if d.kind == KIND)
-        shape = {"head_dim": head_dim}
-        return self.kernels.resolve({"prefill": {"kv.store@1": {}, "attn.extend@1": shape},
-                                     "decode": {"kv.store@1": {}, "attn.decode@1": shape}})
 
     def release_graphs(self) -> None:
         self.graph_metadata.clear()
@@ -150,11 +155,69 @@ class TorchNativeAttnBackend:
         return o
 
 
+class AttnBackend:
+    """``layers.attn@1``: each phase's backend."""
+
+    def __init__(self, kernels: Kernels, kv: Any, dtype: str) -> None:
+        self.kernels = kernels
+        self.dtype = dtype
+        """The activations' dtype (``model.dtype``): some kernels take bf16 / fp16 only, and some
+        read the cache as if it had the queries' dtype."""
+        self.native, self.paged = TorchNativeAttnBackend(kernels, kv), PagedAttnBackend(kernels, kv)
+        self.backends: dict[str, TorchNativeAttnBackend | PagedAttnBackend] = {phase: self.native for phase in PHASES}
+        self.active: TorchNativeAttnBackend | PagedAttnBackend = self.native
+        """The backend of the last ``prepare``: the step's ``forward`` is its."""
+
+    @property
+    def binding(self) -> GraphBinding:
+        return GraphBinding(self.native.generation + self.paged.generation,
+                            {**self.native.graph_buffers, **self.paged.graph_buffers})
+
+    def release_graphs(self) -> None:
+        self.native.release_graphs()
+        self.paged.release_graphs()
+
+    def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
+        shape_k, dtype_k = next(d.tensors["k"] for d in states if d.kind == KIND)
+        # kv_as_q: FlashInfer's 16-bit paths load the cache's bits as the queries' type, so a
+        # cache of another dtype than the model's is not theirs (the native kernels convert).
+        shape = {"head_dim": shape_k[-1], "fp32": int("f32" in (self.dtype, dtype_k)),
+                 "kv_as_q": int(dtype_k == self.dtype)}
+        calls: dict[str, dict[str, dict[str, int]]] = {}
+        for phase in PHASES:
+            paged = self._paged(phase, shape)
+            self.backends[phase] = self.paged if paged else self.native
+            calls[phase] = {"kv.store@1": {}, (PAGED if paged else NATIVE)[phase]: shape}
+            if paged:
+                calls[phase][KV_INDICES] = {}
+        return self.kernels.resolve(calls, shared=frozenset({"kv.store@1", KV_INDICES}))
+
+    def _paged(self, phase: str, shape: Mapping[str, int]) -> bool:
+        """Whether ``phase`` runs the paged kernels. A named backend that has neither family fails in
+        ``Kernels.resolve``, on the paged definition."""
+        catalog, backend = self.kernels.catalog, self.kernels.backends[phase]
+        if backend == "auto":
+            return not catalog.select(PAGED[phase], shape).fallback
+        try:
+            catalog.select(NATIVE[phase], shape, backend)
+        except LookupError:
+            return True
+        return False
+
+    def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
+        self.active = self.backends["decode" if key.bucket or plan.phase == "decode" else "prefill"]
+        self.active.prepare(batch, plan, key)
+
+    def forward(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int,
+                num_kv_heads: int, head_dim: int, scaling: float) -> torch.Tensor:
+        return self.active.forward(layer, q, k, v, num_heads, num_kv_heads, head_dim, scaling)
+
+
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "attn")
-        ctx.provide("layers.attn@1", TorchNativeAttnBackend(kernels, ctx.use("state.kv.paged@1")))
+        ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"]))
 
 
 if TYPE_CHECKING:
-    _: type[AttentionBackend] = TorchNativeAttnBackend
+    _: type[AttentionBackend] = AttnBackend

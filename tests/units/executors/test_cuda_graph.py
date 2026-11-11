@@ -30,19 +30,27 @@ from unit.runtime.proxy import Provision, ServiceProxy
 @pytest.mark.parametrize("values", [[0], [-1], [2, 2], [9], [True], [1.5]])
 def test_bad_buckets_fail(values: list[int]) -> None:
     with pytest.raises(ValueError, match="graph_buckets"):
-        buckets("auto", values, 8, 1024)
+        buckets("auto", values, 8, 1024, fixed_extent=False)
 
 
 def test_default_buckets_and_required_coverage() -> None:
-    assert buckets("auto", [], 6, 1024) == [1, 2, 4]
-    assert buckets("auto", [], 64, 1024) == [1, 2, 4, 8]  # larger steps run eagerly unless listed
-    assert buckets("auto", [64, 16], 64, 1024) == [16, 64]
-    assert buckets("required", [6, 1, 4], 6, 1024) == [1, 4, 6]
-    for rows in (6, 64):
+    """Over fixed extents (a captured step runs a stand-in that costs by the context length): powers
+    of two up to 8, larger steps run eagerly unless listed. Otherwise SGLang's default sizes up to
+    ``batch.max_rows`` or 64, and that size itself, so that ``required`` is covered up to 64 rows."""
+    assert buckets("auto", [], 6, 1024, fixed_extent=True) == [1, 2, 4]
+    assert buckets("auto", [], 64, 1024, fixed_extent=True) == [1, 2, 4, 8]
+    assert buckets("auto", [], 6, 1024, fixed_extent=False) == [1, 2, 4, 6]
+    assert buckets("auto", [], 64, 1024, fixed_extent=False) == [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
+    assert buckets("auto", [], 100, 1024, fixed_extent=False)[-3:] == [48, 56, 64]
+    assert buckets("required", [], 6, 1024, fixed_extent=False) == [1, 2, 4, 6]
+    for fixed_extent in (True, False):
+        assert buckets("auto", [64, 16], 64, 1024, fixed_extent=fixed_extent) == [16, 64]
+        assert buckets("required", [6, 1, 4], 6, 1024, fixed_extent=fixed_extent) == [1, 4, 6]
+        with pytest.raises(ValueError, match="cuda_graph"):
+            buckets("silent_fallback", [], 4, 1024, fixed_extent=fixed_extent)
+    for rows, fixed_extent in ((6, True), (64, True), (100, False)):
         with pytest.raises(ValueError, match="cover"):
-            buckets("required", [], rows, 1024)
-    with pytest.raises(ValueError, match="cuda_graph"):
-        buckets("silent_fallback", [], 4, 1024)
+            buckets("required", [], rows, 1024, fixed_extent=fixed_extent)
 
 
 def test_decode_length_is_validated_before_state_changes() -> None:
@@ -113,8 +121,9 @@ def test_auto_without_a_graph_platform_runs_eagerly_and_says_why() -> None:
         assert plans.resolved["graph"] == {
             "layers.attn@1": {"backend": "auto", "kv.store@1": "reference.kv.store@1 (fallback)",
                               "attn.decode@1": "torch_graph.attn.decode@1"},
-            "layers.gdn@1": {"backend": "auto", "gdn.conv1d_update@1": "reference.gdn.conv1d_update@1 (fallback)",
-                             "gdn.recurrent_update@1": "reference.gdn.recurrent_update@1 (fallback)"}}
+            "layers.gdn@1": {"backend": "auto",
+                             "gdn.qkvzba_conv1d_update@1": "reference.gdn.qkvzba_conv1d_update@1 (fallback)",
+                             "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)"}}
         assert not plans.required and plans.buckets("decode") == []
     finally:
         w.close()

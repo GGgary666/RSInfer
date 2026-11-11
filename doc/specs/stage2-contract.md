@@ -63,6 +63,8 @@
 
 下一步是 M2b、M2c、M2d。
 
+**2026-11-11：M2b 在 RTX 4090 D 上的部分。** SGLang `e838360` 的 GDN Triton kernel（`kernels.triton`）和 FlashInfer 的 paged attention（`kernels.flashinfer`）接进了 kernel 目录，eager 和 decode graph 都用；前 4 层在 fp32 下和 HF 逐 token 相同，bf16 按下面的口径。SM100 上才有的 kernel（FlashInfer 的 GDN、CuTe DSL、`trtllm_mha`）、完整模型和融合路径还没做。做法、数字和没做的见 [../evaluations/real-kernels-4090d.md](../evaluations/real-kernels-4090d.md)。
+
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
 - 快速测试层里，“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比按下面的口径一致；
@@ -122,7 +124,7 @@ Qwen3.8、TP1 时的进程和单元如下。目录按单元 id 放在 `engine/` 
 | 控制面 | 已有的四个单元 | | | | |
 
 - 2026-11-09 补：已经实现的单元，“提供”“需要”两列按它们 `unit.toml` 的 `[provides]`、`[requires]` 改过；还没实现的几行（`core.worker`、`core.state.holder` 等）没动。
-- 2026-11-09 注：表里 `attn.backend.flashinfer`、`gdn.backend.fla` 这一行和已经实现的做法不一样。现在 attention 和 GDN 的 backend 外壳是 `layers.attn`、`layers.gdn`（`Backend`，§7），由它们按 §5.5.3 的 `attn.backend`、`gdn.backend` 等键，在 kernel 目录里选这个名字下的那组 solution（§6），没有单独的 `attn.backend.*@1`、`gdn.backend.*@1` 服务。flashinfer、fla 是照这种方式接（每步元数据的准备，即 SGLang 各 backend 的 `init_forward_metadata`，怎样随 backend 换），还是做成单独的 backend 单元，接入时再定。
+- 2026-11-09 注：表里 `attn.backend.flashinfer`、`gdn.backend.fla` 这一行和已经实现的做法不一样。现在 attention 和 GDN 的 backend 外壳是 `layers.attn`、`layers.gdn`（`Backend`，§7），由它们按 §5.5.3 的 `attn.backend`、`gdn.backend` 等键，在 kernel 目录里选这个名字下的那组 solution（§6），没有单独的 `attn.backend.*@1`、`gdn.backend.*@1` 服务。flashinfer、fla 是照这种方式接（每步元数据的准备，即 SGLang 各 backend 的 `init_forward_metadata`，怎样随 backend 换），还是做成单独的 backend 单元，接入时再定。2026-11-11 定：照这种方式接。GDN 的 Triton kernel 签名和参照一致，直接登记（`kernels.triton`）。FlashInfer 的 attention 每步要先 plan，元数据和原来不同，所以 `layers.attn` 里多了一个 backend（`layers/attn/paged.py`），它调的是新 definition `attn.paged_extend@1` / `attn.paged_decode@1`，其 solution 是每步先 plan 再 run 的 operator，由 `kernels.flashinfer` 登记；`layers.attn` 按阶段选一族。
 - 控制面单元要加的规则：
   - `core.deps`：重录 graph 的推导（graph 的依赖登记成派生产物，依赖变了就重录：能分片的在准备阶段，不能的在暂停期内，§9.4），以及容量变更的影响；dry-run 报出重录造成的停顿；
   - `core.manifest`：单元不许自己建 stream（§10.4）。
@@ -490,6 +492,11 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - 选择：编 plan 时按 definition 加 shape 选定，eager 路径每次调用都查。选不到合适的就退回参照实现，并在 plan 和结果里标出来。选中的 solution 是 plan 的按值依赖。
 - 2026-11-09 补充：attention 和 GDN 的 definition 在 worker 启动时按 §5.5.3 的 backend 配置固定一次，不再每次调用现选。solution id 的第一段就是它所属的 backend 名（`reference.attn.extend@1` 属于 `reference`）；按名字选（`select(..., backend=...)`）时只在这个 backend 的 solution 里选，选不到就报错，不退回参照实现。其余 definition（norm、linear 等）按 `auto` 在第一次以某个 shape 调用时选定，之后按（definition，shape）一直用这一个，不再每次现选（2026-11-09 改）。目录的每次登记和撤销（比如 kernel 单元重载）都让 `Catalog.version` 加一：固定下来的选择在下一次调用时重新解析，所以热重载以后跑的是新代码。graph 对 solution 的依赖另按 §9.3 检查。已知缺口（2026-11-09，#35 评审）：如果一个 kernel 单元被删掉，而 `attn.backend` 之类的键还显式点着它的名字，重新解析会在前向里失败，表现为 `StepFailure`，而不是在变更时就被拒绝；第 5 步做变更计划时一起补。
 - kernel 单元通过 `ctx.register` 登记到目录里，层只按 definition 调用，不直接调具体的 kernel。
+- 2026-11-11 补充（真 kernel 接入时定的，细节见 [../evaluations/real-kernels-4090d.md](../evaluations/real-kernels-4090d.md)）：
+  - solution 可以不是函数：paged attention 的两个 definition，solution 是造 operator 的东西，operator 每步在 graph 外 `plan`、在 graph 内 `run`（§8.4 的 `prepare` / `forward` 分工）。约定写在 `kernels/reference/paged.py`。
+  - shape 里多了 `fp32`（0 或 1）：不收 fp32 激活的 kernel（FlashInfer、Triton 的 chunk）声明 `shapes={"fp32": [0]}`。`auto` 在 fp32 下退回参照实现，点名则启动失败。
+  - 显式指定的 backend 必须覆盖的是它自己的 kernel；写 KV 池（`kv.store@1`）在 SGLang 里是池的操作，点名的 backend 没有时按 `auto` 选。
+  - graph 桶里 GDN 的 padding 行槽号是 -1（SGLang 的 `pad_slot_id`），kernel 不为它读写状态，它的输出没有定义。
 - **实现（2026-11-08）**：
   - `core.kernels`（`engine/core/kernels/`）提供 `kernels.catalog@1`。kernel 单元登记 `Definition` 和 `Implementation`（solution 加函数本身）；重载时登记随撤销表撤掉，新实例再登记。
   - 选择：符合 shape 和平台能力的非参照 solution 里按 id 取第一个；没有就用参照实现，`Selected.fallback` 为真。`Definition.reference` 是参照 solution 的 id。

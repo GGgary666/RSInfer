@@ -2,7 +2,7 @@
 
 - 日期：2026-11-11
 - 状态：描述已经实现的行为，不是提案。
-- 对应的代码：PR #51（分支 `real-kernels`）加 PR #53（分支 `exp/sm100-kv-store-indices`，提交 `f543495`）。**这两个 PR 合进 master 之前，本文提到的一部分文件在 master 上还不存在**，所以下面的路径只写成代码路径，不做链接。
+- 对应的代码：PR #51，包括合进它的 PR #53（KV 写入和槽列表的两个 kernel）。本文先随 #50 进了 master，那时这些代码还在 #51 的分支上；#51 合并以后，下面的路径在 master 上都存在。
 - 范围：Qwen3.8、TP1 的 full attention 层。GDN、调度、状态分配不在这里。
 
 本文最初是一份接入 FlashInfer 的设计提案（提交 `502f5ce`）。后来 #51 用另一种做法实现了，这里按实现重写；两者的差别列在最后一节。
@@ -184,7 +184,10 @@ prefill 步一行不止一个新 token，`out_cache_loc` 直接从 `req_to_token
 - padding lane 算出来的东西没有定义，采样结果被丢掉。
 - GDN 层里 padding lane 的状态槽号是 -1，kernel 不为它读写状态。
 
-因此 **padding 槽里的 K、V 可以是任何值**，包括非有限值。FlashInfer 只读每行列表里的槽，不受影响。`torch_graph` 的 attention 会读到 padding 槽（长度之外的位置都指向它），见 §9 的已知问题。
+因此 **padding 槽里的 K、V 可以是任何值**，包括非有限值。读得到 padding 槽的 kernel 必须能容忍这一点：
+
+- FlashInfer 只读每行列表里的槽，读不到它。
+- `torch_graph` 的 attention 会读到它（长度之外的位置都指向 padding 槽）。它把这些位置的分数 mask 掉，并且在取出 V 以后把这些位置清零。后一步是必须的：0 × NaN 还是 NaN，只 mask 分数的话，padding 槽里一个非有限值就会把所有真实行的输出变成 NaN（见 §9）。
 
 ### 7.4 录制
 
@@ -207,11 +210,11 @@ graph 关掉时（`core.plan` 卸载、预算超了、录制出错），backend 
 
 ## 9. 已知问题和没做的
 
-- **`torch_graph` 的 attention 会被 padding 槽里的非有限值污染。** 它把长度之外的位置指向 padding 槽，只把分数 mask 掉，而 0 × NaN 还是 NaN，真实行的输出就坏了。本 PR 的历史里有一个两行的修复和 6 个回归测试（提交 `5e14f65`），后来随代码一起从这个 PR 里去掉了，**现在不在 master、#51、#53 的任何一个里**。细节见 [serving-flashinfer-gdn-ablation.md](../evaluations/serving-flashinfer-gdn-ablation.md)。
+- **已修：`torch_graph` 的 attention 曾经会被 padding 槽里的非有限值污染。** 它原来只把长度之外的位置的分数 mask 掉，没有清掉对应的 V，真实行的输出会变成 NaN，表现是一直输出 token 0。gaow 的两行修复和六项回归测试（原提交 `5e14f65`）在 #51 合并前带了进来（提交 `ba7a07d`）。发现的经过、修复和验证见 [serving-flashinfer-gdn-ablation.md](../evaluations/serving-flashinfer-gdn-ablation.md)。
 - extend 没有用 SGLang 默认的 ragged wrapper。
 - prefill 不走 graph（SGLang 给 prefill 也录）。短 prompt 的首 token 时间因此压在 host 上。
 - SGLang 在录 graph 时把 GDN 的一个小 GEMM 放到第二个 stream 上并行，这里没有。
-- `cuda.kv.store@1` 里带 PDL 的那一支只在 SM90 以上的机器上编译，4090 D（SM89）上没跑过。
+- `cuda.kv.store@1` 里带 PDL 的那一支只在 SM90 以上的机器上编译。4090 D（SM89）上走不到它；SM100（SM100）上跑过，见 [real-kernels-kv-store-indices.md](../evaluations/real-kernels-kv-store-indices.md)。
 - FlashInfer 的 GDN kernel 和 `trtllm_mha` 没有接。
 
 ## 10. 测试在哪
