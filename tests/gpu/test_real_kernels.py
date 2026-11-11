@@ -280,6 +280,55 @@ def test_flashinfer_silu_and_mul_stays_within_its_definition(dtype: torch.dtype)
         close("act.silu_and_mul@1", got, ref.silu_and_mul(x))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_cuda_kv_store_stays_within_its_definition(dtype: torch.dtype) -> None:
+    """``cuda.kv.store@1``: both contiguous K/V and strided slices of a combined QKV projection,
+    with int64 and int32 slot indices, and fallback conversion when the cache dtype differs."""
+    from kernels.cuda import ops
+
+    module = ops.build()
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    slots = 512
+    for tokens in (1, 13, 256):
+        qkv = torch.randn(tokens, 2 * HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM, device=DEVICE,
+                          generator=gen).to(dtype)
+        _, k, v = qkv.split([2 * HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM], dim=-1)
+        kv_views = k.view(tokens, KV_HEADS, HEAD_DIM), v.view(tokens, KV_HEADS, HEAD_DIM)
+        assert not kv_views[0].is_contiguous()
+        for loc_dtype in (torch.int64, torch.int32):
+            loc = (torch.randperm(slots - 1, device=DEVICE, generator=gen)[:tokens] + 1).to(loc_dtype)
+            got_k = torch.zeros(slots, KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+            got_v = torch.zeros_like(got_k)
+            want_k, want_v = got_k.clone(), got_v.clone()
+            ops.kv_store(module, got_k, got_v, loc, *kv_views)
+            ref.kv_store(want_k, want_v, loc, *kv_views)
+            assert torch.equal(got_k, want_k) and torch.equal(got_v, want_v)
+
+
+def test_triton_kv_indices_stays_within_its_definition(triton: Any) -> None:
+    """``triton.attn.kv_indices@1``: slot lists and optional per-row last slot, keeping the tail of
+    a padded graph bucket buffer untouched."""
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    req_to_token = torch.randint(1, 50000, (16, 1024), device=DEVICE, generator=gen, dtype=torch.int32)
+    rows = torch.tensor([5, 1, 9, 0, 12], device=DEVICE, dtype=torch.int64)
+    lengths = [1, 513, 64, 1, 700]  # spans multiple 512-token Triton blocks and 1-token padded rows
+    lens = torch.tensor(lengths, device=DEVICE, dtype=torch.int64)
+    kv_indptr = indptr_of(lengths).to(DEVICE)
+    buf_len = sum(lengths) + 37
+    got_idx = torch.full((buf_len,), -7, device=DEVICE, dtype=torch.int32)
+    want_idx = got_idx.clone()
+    got_last = torch.full((len(lengths),), -1, device=DEVICE, dtype=torch.int64)
+    want_last = got_last.clone()
+    triton.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, got_idx, got_last)
+    ref.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, want_idx, want_last)
+    assert torch.equal(got_idx, want_idx) and torch.equal(got_last, want_last)
+    got_idx2 = torch.full((buf_len,), -3, device=DEVICE, dtype=torch.int32)
+    want_idx2 = got_idx2.clone()
+    triton.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, got_idx2)
+    ref.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, want_idx2)
+    assert torch.equal(got_idx2, want_idx2)
+
+
 # ------------------------------------------------------------------ the worker stack, 4 layers in bf16
 
 
@@ -313,6 +362,8 @@ def real_kernels(w: Worker, graphs: bool) -> None:
     assert {resolved[t]["layers.attn@1"][d] for t, d in zip(tables, (
         "attn.paged_extend@1", "attn.paged_decode@1", "attn.paged_decode@1"), strict=False)} == {
         "flashinfer.attn.paged_extend@1", "flashinfer.attn.paged_decode@1"}
+    assert {resolved[t]["layers.attn@1"]["kv.store@1"] for t in tables} == {"cuda.kv.store@1"}
+    assert {resolved[t]["layers.attn@1"]["attn.kv_indices@1"] for t in tables} == {"triton.attn.kv_indices@1"}
     gdn = {s for t in tables for d, s in resolved[t]["layers.gdn@1"].items() if d != "backend"}
     assert gdn and all(s.startswith("triton.gdn.") for s in gdn), gdn
     assert resolved["decode"]["layers.gdn@1"] == {
@@ -489,7 +540,8 @@ def test_the_kernel_units_reload_under_running_requests(checkpoint: Path) -> Non
         version = reloaded.service("kernels.catalog@1").version
         for _ in range(2):
             reloaded.runtime.reload(ReloadPlan(units_to_reload=[
-                spec("kernels.triton"), spec("kernels.flashinfer"), spec("core.plan")])).unwrap()
+                spec("kernels.triton"), spec("kernels.flashinfer"), spec("kernels.cuda"),
+                spec("core.plan")])).unwrap()
         assert reloaded.service("kernels.catalog@1").version > version
         assert reloaded.service("plan@1").buckets("decode") == [1, 2, 4]
         for _ in range(4):
@@ -513,7 +565,8 @@ def test_the_backends_start_when_named_as_sglang_names_them(checkpoint: Path) ->
         for table, definition in (("prefill", "attn.paged_extend@1"), ("decode", "attn.paged_decode@1"),
                                   ("graph", "attn.paged_decode@1")):
             assert resolved[table]["layers.attn@1"] == {
-                "backend": "flashinfer", "kv.store@1": "reference.kv.store@1 (fallback)",
+                "backend": "flashinfer", "kv.store@1": "cuda.kv.store@1",
+                "attn.kv_indices@1": "triton.attn.kv_indices@1",
                 definition: f"flashinfer.{definition}"}
             assert resolved[table]["layers.gdn@1"]["backend"] == "triton"
         d = Driver(w)
