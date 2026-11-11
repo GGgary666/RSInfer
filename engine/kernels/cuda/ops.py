@@ -7,10 +7,11 @@ Python module lets ``core.deps``'s import graph detect C++ kernel edits during h
 compiled module is named after a digest of the source: a changed source builds and loads a fresh
 module beside the old one (native code cannot be unloaded); an unchanged one loads from cache.
 
-A build takes about a minute. At start, and when a change adds this unit, that is before anything
-waits for it. A change that edits the source of the running unit reloads it while the worker is
-paused, where a build outlasts the change's time limit and the change is rolled back: build first,
-in the worker's environment, then apply (the reload then loads from cache):
+A build takes about a minute. ``build`` is also the unit's build step (``[unit] build`` in
+``unit.toml``): a change that edits the source runs it while the engine serves, in a process of its
+own, and the reload at the pause loads from cache. Before build steps (2026-11-11) the reload built
+it while the worker was paused, outlasted the change's time limit, and the change was rolled back.
+Building by hand ahead of a change still works, in the worker's environment:
 
     PYTHONPATH=engine uv run python -m kernels.cuda.ops
 """
@@ -30,7 +31,11 @@ from kernels.cuda.kv_store_cu import CUDA_SOURCE
 
 
 def build() -> Any:
+    """The compiled module; ``None`` without a CUDA device (a build step runs on every worker)."""
     from torch.utils.cpp_extension import _get_build_directory, load
+
+    if not torch.cuda.is_available():
+        return None
 
     raw = CUDA_SOURCE.encode("utf-8")
     digest = hashlib.sha256(raw).hexdigest()[:16]
@@ -45,8 +50,7 @@ def build() -> Any:
             tmp.write(raw)
         Path(tmp.name).replace(cu_path)
     if not any(build_dir.glob(f"{name}*.so")):
-        print(f"kernels.cuda: building {name}, about a minute (ahead of an apply: python -m kernels.cuda.ops)",
-              file=sys.stderr, flush=True)
+        print(f"kernels.cuda: building {name}, about a minute", file=sys.stderr, flush=True)
     started = time.perf_counter()
     module = load(name=name, sources=[str(cu_path)], build_directory=str(build_dir), extra_cuda_cflags=["-O3"],
                   verbose=False)

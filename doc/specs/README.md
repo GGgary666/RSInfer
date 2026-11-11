@@ -53,6 +53,7 @@ id = "policies.chunk_fcfs"
 kind = "logic"                      # logic | state；框架本体不是单元，没有清单
 process = ["scheduler"]             # 装在哪些进程角色里
 entry = "policies.chunk_fcfs:Unit"  # 模块:类
+build = "kernels.cuda.ops:build"    # 可选（2026-11-11）：模块:函数，慢的构建（编译原生扩展进缓存）。变更重载这个单元、或者把它加进已在服务的进程时，参与者在准备阶段用新代码另起一个进程跑它（change.md 4.6），失败就让变更在暂停之前失败
 
 [provides]
 services = ["sched.chunk_policy@1"] # 服务名@接口版本

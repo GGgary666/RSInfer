@@ -97,7 +97,7 @@ $A serve /path/to/model \
 - `--graph-memory-bytes`：全部图可以留下的设备显存，默认 1 GiB，来自 `--mem-fraction` 留给激活的那部分；状态池的大小与不开 graph 时相同。实际留下多少在日志的 `cuda_graph.kept_bytes`。
 - 回放的 decode 步用的是固定容量的 attention（`kernels.torch_graph`），代价随 `--max-context` 增长而不是随序列的实际长度；4090 D 上 4 层模型，8 行在 4096 时比 eager 快 1.1–1.2 倍，在 16384 时比 eager 慢。eager 的 decode 步仍然用参照实现。数字见 [cuda-graph-review-fixes.md](../doc/evaluations/cuda-graph-review-fixes.md)，设计见 [cuda-graph.md](../doc/specs/cuda-graph.md)。完整 27B 上改过以后还没有重新验收。
 - 2026-11-11：bf16 模型在装了 `gpu` extra 的机器上，attention 和 GDN 默认用真 kernel（FlashInfer、Triton），eager 和回放的步是同一套，回放的代价不再随 `--max-context` 增长；上一条只适用于 fp32 或没有 FlashInfer 的情况。FlashInfer 第一次 plan 要编译，`PATH` 上要有 `ninja` 和 CUDA 编译器：用 `uv run` 起，或者把环境的 `bin` 加进 `PATH`。见 [real-kernels-4090d.md](../doc/evaluations/real-kernels-4090d.md)。
-- 2026-11-11：有 CUDA 设备时 worker 还会加载 `kernels.cuda`，它在加载时编译一个 C++/CUDA kernel（KV 写入）。一台机器上第一次启动因此多等约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），之后从 `~/.cache/torch_extensions` 加载；和 FlashInfer 一样要求 `PATH` 上有 `ninja` 和 CUDA 编译器。
+- 2026-11-11：有 CUDA 设备时 worker 还会加载 `kernels.cuda`，它在加载时编译一个 C++/CUDA kernel（KV 写入）。一台机器上第一次启动因此多等约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），之后从 `~/.cache/torch_extensions` 加载；和 FlashInfer 一样要求 `PATH` 上有 `ninja` 和 CUDA 编译器。改了它的 C++ 源码以后直接 `control apply` 就行：编译在变更的准备阶段另起进程做，引擎照常服务（2026-11-11 起）。
 - 改 `plan.*` 的配置或 kernel 单元的代码会在空引擎上重载 `core.plan` 并重录；范围以 `apply --dry-run` 为准。
 
 ### 原 eager 验证记录

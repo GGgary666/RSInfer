@@ -38,6 +38,22 @@ ENGINE = REPO / "engine"
 ADDRESS = "127.0.0.1"  # test data: every fake host lives on this machine
 
 TOY = {
+    "toyc/builder.py": '''
+"""A build step (``[unit] build``): after ``TOYC_BUILD_S`` seconds, appends a line to the file
+``TOYC_BUILD_LOG`` names (the step's process does not know the toy log); exits 3 when
+``TOYC_BUILD_FAIL`` is set."""
+import os
+import sys
+import time
+
+
+def make():
+    time.sleep(float(os.environ.get("TOYC_BUILD_S", "0")))
+    with open(os.environ["TOYC_BUILD_LOG"], "a") as f:
+        f.write(f"built {sys.path[0] if sys.path else ''}\\n")
+    if os.environ.get("TOYC_BUILD_FAIL"):
+        sys.exit(3)
+''',
     "toyc/__init__.py": "",
     "toyc/units.py": '''
 import time
@@ -359,6 +375,11 @@ class Cluster:
     def log_of(self, p: ProcId) -> list[str]:
         f = self.logs / f"{p.host}-{p.role}-{p.index}.log"
         return f.read_text().splitlines() if f.exists() else []
+
+    def output_of(self, p: ProcId) -> list[str]:
+        """What the process (every incarnation of it) wrote to its stdout and stderr."""
+        runs = sorted((self.tmp / str(p.host) / "snapshots" / ".run").glob(f"{p.role}-{p.index}-*/log"))
+        return [line for f in runs for line in f.read_text(errors="replace").splitlines()]
 
     async def wait_loss(self, kind: str, timeout: float = 10.0) -> Loss:
         loss = await asyncio.wait_for(self.sup.losses.get(), timeout)

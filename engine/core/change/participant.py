@@ -9,6 +9,11 @@ iterator, and every safe point advances each unfinished one by one ``next()``,
 so the old version keeps serving in between. A ``prepare`` that returns
 ``None`` was done in one shot; how long serving stopped for it is reported.
 
+A unit may declare a build step (``UnitSection.build``): what is slow to make for it, made ahead of
+its load. A change that reloads the unit, or adds it to a process that already serves, runs the
+step first, in a process of its own from the change's code, polled once per slice: the old version
+keeps serving while it runs, and the load at the pause finds what it made.
+
 Any coordinator message renews the participant's lease (§4.7). When the lease
 runs out while still preparing, the participant withdraws by itself: it has
 promised nothing yet. After ``Prepared`` it must not decide alone: it asks the
@@ -19,6 +24,9 @@ pause after the coordinator has confirmed every participant.
 
 from __future__ import annotations
 
+import itertools
+import os
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -63,6 +71,11 @@ if TYPE_CHECKING:
     from unit.runtime.runtime import UnitRuntime
 
 COMPONENT = "change.participant"
+
+_BUILD = ("import importlib, sys\n"
+          "module, _, function = sys.argv[1].partition(':')\n"
+          "getattr(importlib.import_module(module), function)()\n")
+"""A unit's build step, in a process of its own (``-c``: ``sys.argv[1]`` is the step)."""
 
 Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone",
                 "committed"]
@@ -197,6 +210,7 @@ class Participant:
             return fail(COMPONENT, "prepare", "change already finished", code="change.finished")
         c = _Change(msg.change_id, msg.identity, msg.actions, 0.0, msg.coordinator_timeout_s)
         a = msg.actions
+        builds = self._builds(a, self._code_root_for(msg.identity))
         removed = set(a.reload.units_to_remove) if a.reload else set[UnitId]()
         orphans = sorted({ua.unit for ua in a.actions if ua.unit in removed})
         if orphans:
@@ -221,8 +235,11 @@ class Participant:
                                                   changed_modules=changed,
                                                   config={k: e for k, e in for_new.items() if e.owner in staged_ids})
                 c.staged = True  # an undo discards whatever it built
+                then = self._staging_then(c, staging, list(a.actions))
                 c.slicing.append((f"staging {len(a.stage)} new unit(s)",
-                                  self._staging_then(c, staging, list(a.actions))))
+                                  itertools.chain(builds, then) if builds is not None else then))
+            elif builds is not None:  # the builds first: preparing an action may load what they make
+                c.slicing.append(("build steps", self._builds_then(c, builds, list(a.actions))))
             else:
                 self._prepare_or_defer(c, a.actions)
         except Exception as e:  # noqa: BLE001 - a failing unit fails the change, not the process
@@ -246,6 +263,45 @@ class Participant:
                 hint="return an iterator from prepare() to prepare in slices between steps"))
         else:
             c.slicing.append((f"{ua.unit}.{ua.action}", iter(out)))
+
+    def _builds(self, a: ProcActions, code_root: str | None) -> Iterator[None] | None:
+        """The ``build`` steps (``UnitSection.build``) of the units this change loads here: those it
+        reloads, and those it adds to a process that already serves. At a process's start nothing is
+        served yet, and the load itself builds."""
+        specs = [*(a.reload.units_to_reload if a.reload else []), *(a.reload.units_to_add if a.reload else [])]
+        if self.rt.snapshot().units:
+            specs += a.stage
+        steps = dict.fromkeys((s.id, s.manifest.unit.build) for s in specs if s.manifest.unit.build)
+        if not steps or code_root is None:
+            return None
+        return self._run_builds(list(steps), code_root)
+
+    def _run_builds(self, steps: list[tuple[UnitId, str]], code_root: str) -> Iterator[None]:
+        """Each step in a process of its own, from the change's code (``code_root``), one after
+        another, polled once per slice: this process keeps serving, and holds no lock and no GIL
+        the build needs. Its output goes where this process's goes. A step that exits non-zero
+        fails the change before anything paused; an undo (``close``) kills the one running."""
+        env = {**os.environ, "PYTHONPATH": code_root}
+        for unit, entry in steps:
+            t0 = time.monotonic()
+            proc = subprocess.Popen([sys.executable, "-P", "-s", "-c", _BUILD, entry], env=env, stdin=subprocess.DEVNULL)
+            try:
+                while proc.poll() is None:
+                    yield
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            took = time.monotonic() - t0
+            if proc.returncode != 0:
+                raise StagingFailed(fail(COMPONENT, "prepare", f"{unit}: its build step {entry} exited with "
+                                         f"{proc.returncode} after {took:.1f}s; its output is in this process's log",
+                                         subject=str(unit), code="change.build_failed"))
+            print(f"core.change: {unit}: build step {entry} done in {took:.1f}s", file=sys.stderr, flush=True)
+
+    def _builds_then(self, c: _Change, builds: Iterator[None], actions: list[UnitAction]) -> Iterator[None]:
+        yield from builds
+        self._prepare_or_defer(c, actions)
 
     def _staging_then(self, c: _Change, staging: Iterator[None], actions: list[UnitAction]) -> Iterator[None]:
         """The staging slices; then the preparations start, each in its own slices: they may use
