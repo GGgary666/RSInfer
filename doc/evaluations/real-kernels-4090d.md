@@ -1,5 +1,11 @@
 # 真 kernel 第一批：Triton GDN 和 FlashInfer attention（2026-11-11，RTX 4090 D，4 层）
 
+> **后续（同一天）：[real-kernels-fused.md](real-kernels-fused.md)。** 那一批换上了融合路径并修了 #51 review 提的问题，本文以下几处已经被它取代：
+> - "只换 RMSNorm"的实验代码现在是正式的 solution；"没做的"里的融合路径、RMSNorm、SiLU·mul、RoPE 都做了，默认的 graph 桶上限也改了；
+> - decode 的 GDN definition 换成了 `gdn.qkvzba_conv1d_update@1` 和 `gdn.packed_decode@1`，`pos.rope@1` 换成了 `attn.qk_norm_rope_gate@1`，`fused_sigmoid_gating_recurrent.py` 删掉了；
+> - 第一次录 graph 时 `kept_bytes` 把 FlashInfer 的 workspace 算进去的问题修了；自检用的 1 行 graph 不再在 backend 里留东西；
+> - 和 SGLang 的对比、launch 数、和 HF 相同的步数都有新的数字。
+
 M2b（[../specs/stage2-contract.md](../specs/stage2-contract.md) §1.3）在这台机器上能做的部分：把 SGLang `e838360` 的 GDN Triton kernel 和 FlashInfer 的 paged attention 接进 kernel 目录，eager 和 decode graph 都用它们。只在 Qwen3.8-27B 真实结构的前 4 层（3 层 GDN + 1 层 full attention，随机 bf16 权重，checkpoint 7.57 GiB）上验证过；完整模型和只有 SM90 / SM100 才有的 kernel 留给 SM100。
 
 ## 结论
