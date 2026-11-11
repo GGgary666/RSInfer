@@ -28,6 +28,8 @@ def attention_decode(query: torch.Tensor, output: torch.Tensor, k_cache: torch.T
     slots = torch.where(mask, slots, 0)
     key = k_cache[slots].to(query.dtype)    # [rows, width, kv_heads, dim]
     value = v_cache[slots].to(query.dtype)
+    # Inactive lanes may leave non-finite padding values; zero weight times NaN is still NaN.
+    value.masked_fill_(~mask[:, :, None, None], 0)
     q = query.reshape(rows, kv_heads, heads // kv_heads, dim) * (dim ** -0.5 if scaling is None else scaling)
     scores = torch.einsum("rhgd,rwhd->rhgw", q, key).masked_fill(~mask[:, None, None, :], float("-inf"))
     output.copy_(torch.einsum("rhgw,rwhd->rhgd", torch.softmax(scores, dim=-1), value).reshape(rows, heads, dim))
