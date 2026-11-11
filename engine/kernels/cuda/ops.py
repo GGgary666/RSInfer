@@ -6,13 +6,20 @@ the CUDA compiler on ``PATH``, as FlashInfer's JIT needs) into its cache directo
 Python module lets ``core.deps``'s import graph detect C++ kernel edits during hot ``apply``. The
 compiled module is named after a digest of the source: a changed source builds and loads a fresh
 module beside the old one (native code cannot be unloaded); an unchanged one loads from cache.
+
+A build takes about a minute. At start, and when a change adds this unit, that is before anything
+waits for it. A change that edits the source of the running unit reloads it while the worker is
+paused, where a build outlasts the change's time limit and the change is rolled back: build first,
+in the worker's environment, then apply (the reload then loads from cache):
+
+    PYTHONPATH=engine uv run python -m kernels.cuda.ops
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -32,9 +39,14 @@ def build() -> Any:
     build_dir.mkdir(parents=True, exist_ok=True)
     cu_path = build_dir / "kv_store.cu"
     if not cu_path.exists() or cu_path.read_bytes() != raw:
-        tmp = build_dir / f"kv_store.{os.getpid()}.cu"
-        tmp.write_bytes(raw)
-        tmp.replace(cu_path)
+        # Written beside and moved into place: another process building the same source sees the
+        # whole file or none of it.
+        with tempfile.NamedTemporaryFile(dir=build_dir, suffix=".cu", delete=False) as tmp:
+            tmp.write(raw)
+        Path(tmp.name).replace(cu_path)
+    if not any(build_dir.glob(f"{name}*.so")):
+        print(f"kernels.cuda: building {name}, about a minute (ahead of an apply: python -m kernels.cuda.ops)",
+              file=sys.stderr, flush=True)
     started = time.perf_counter()
     module = load(name=name, sources=[str(cu_path)], build_directory=str(build_dir), extra_cuda_cflags=["-O3"],
                   verbose=False)
@@ -53,3 +65,7 @@ def kv_store(module: Any, k_cache: torch.Tensor, v_cache: torch.Tensor, loc: tor
     if not module.store(k_cache, v_cache, loc, cache_k, cache_v):
         k_cache[loc] = cache_k
         v_cache[loc] = cache_v
+
+
+if __name__ == "__main__":
+    build()

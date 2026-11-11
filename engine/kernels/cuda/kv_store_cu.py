@@ -1,3 +1,9 @@
+# Copyright 2023-2026 SGLang Team
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from SGLang e838360 (kernels/jit/csrc/elementwise/kvcache.cuh; LICENSE.sglang): its
+# store_kvcache kernel (the split of a row over warps, 16-byte loads and stores, where it waits for
+# and releases its neighbours under programmatic dependent launch), written against PyTorch's
+# extension headers in place of SGLang's own JIT headers.
 """CUDA C++ source of ``kv.store@1``, kept in a Python module so ``core.deps``'s import graph sees
 every edit to the C++/CUDA kernel and reloads ``kernels.cuda`` + ``core.plan`` in place."""
 

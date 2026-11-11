@@ -50,21 +50,6 @@ def indptr_of(lengths: list[int]) -> torch.Tensor:
     return out
 
 
-def gather_kv_indices(req_to_token: torch.Tensor, req_pool_indices: torch.Tensor, kv_indptr: torch.Tensor,
-                      total: int, out: torch.Tensor | None = None) -> torch.Tensor:
-    """Each row's first tokens' slots, row after row: what SGLang's
-    ``create_flashinfer_kv_indices_triton`` writes, here with torch on the device. ``total`` is
-    ``kv_indptr[-1]``, known on the host."""
-    j = torch.arange(total, device=req_to_token.device)
-    starts = kv_indptr.long()
-    row = torch.searchsorted(starts[1:], j, right=True)
-    slots = req_to_token[req_pool_indices[row], j - starts[row]]
-    if out is None:
-        return slots.to(torch.int32)
-    out[:total].copy_(slots)
-    return out
-
-
 @dataclass
 class Metadata:
     table: str

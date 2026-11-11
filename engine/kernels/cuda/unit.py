@@ -2,7 +2,9 @@
 as SGLang JIT-compiles its own (python/sglang/kernels/jit/). For now one solution:
 ``kv.store@1``, the store into the KV pool that SGLang runs as its ``store_kvcache`` under every
 attention backend. It needs a CUDA device: in a process without one the unit registers nothing,
-and compiles nothing."""
+and compiles nothing. With one, loading the unit builds the kernel if its source was not built
+before (about a minute, with ``ninja`` and the CUDA compiler on ``PATH``, as FlashInfer needs
+them); ``ops`` says how to build ahead of a change to the source."""
 
 from __future__ import annotations
 

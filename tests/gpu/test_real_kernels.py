@@ -33,7 +33,7 @@ from core.contracts.kernels import Tolerance
 from kernels.reference import ops as ref
 from kernels.reference import paged as ref_paged
 from kernels.reference.unit import DEFINITIONS
-from layers.attn.paged import gather_kv_indices, indptr_of
+from layers.attn.paged import indptr_of
 from platforms.cuda_graph import CudaGraphPlatform
 from platforms.torch_eager import TorchEagerPlatform
 from tests.gpu.support import free_gpu, make_checkpoint
@@ -206,8 +206,11 @@ def test_flashinfer_paged_attention_stays_within_its_definitions() -> None:
     def layout(rows: list[int], lengths: list[int], out: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
         kv_indptr_cpu = indptr_of(lengths)
         kv_indptr = kv_indptr_cpu.to(DEVICE)
-        return kv_indptr_cpu, kv_indptr, gather_kv_indices(req_to_token, torch.tensor(rows, device=DEVICE), kv_indptr,
-                                                           int(kv_indptr_cpu[-1]), out)
+        if out is None:
+            out = torch.empty(int(kv_indptr_cpu[-1]), dtype=torch.int32, device=DEVICE)
+        ref.create_flashinfer_kv_indices(req_to_token, torch.tensor(rows, device=DEVICE),
+                                         torch.tensor(lengths, device=DEVICE), kv_indptr, out)
+        return kv_indptr_cpu, kv_indptr, out
 
     eager, want = ops.PagedDecode(workspace, *shape), ref_paged.PagedDecode(*shape)
     for rows, lengths in (([3, 1, 7, 2, 5], [200, 1, 77, 300, 33]), ([4, 8], [300, 150]), ([6], [9])):
@@ -282,27 +285,51 @@ def test_flashinfer_silu_and_mul_stays_within_its_definition(dtype: torch.dtype)
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_cuda_kv_store_stays_within_its_definition(dtype: torch.dtype) -> None:
-    """``cuda.kv.store@1``: both contiguous K/V and strided slices of a combined QKV projection,
-    with int64 and int32 slot indices, and fallback conversion when the cache dtype differs."""
+    """``cuda.kv.store@1`` against the reference, bit for bit: K and V as the attention layer hands
+    them over (K its own tensor, V a strided slice of the QKV projection), one token, a decode
+    batch and a prefill step, int64 and int32 slots; the slots it was not given stay as they were.
+    Where the kernel does not take the tensors (another dtype than the pool's, a row that is not
+    whole 16-byte vectors) the solution still stores what the reference stores."""
     from kernels.cuda import ops
 
     module = ops.build()
     gen = torch.Generator(device="cuda").manual_seed(7)
-    slots = 512
-    for tokens in (1, 13, 256):
-        qkv = torch.randn(tokens, 2 * HEADS * HEAD_DIM + 2 * KV_HEADS * HEAD_DIM, device=DEVICE,
-                          generator=gen).to(dtype)
-        _, k, v = qkv.split([2 * HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM], dim=-1)
-        kv_views = k.view(tokens, KV_HEADS, HEAD_DIM), v.view(tokens, KV_HEADS, HEAD_DIM)
-        assert not kv_views[0].is_contiguous()
+    slots = 4096
+    q_width = 2 * HEADS * HEAD_DIM
+
+    def pools(kv_heads: int = KV_HEADS, head_dim: int = HEAD_DIM) -> tuple[torch.Tensor, ...]:
+        k = torch.randn(slots, kv_heads, head_dim, device=DEVICE, generator=gen).to(dtype)
+        v = torch.randn(slots, kv_heads, head_dim, device=DEVICE, generator=gen).to(dtype)
+        return k, v, k.clone(), v.clone()
+
+    for tokens in (1, 13, 2000):
+        qkv = torch.randn(tokens, q_width + 2 * KV_HEADS * HEAD_DIM, device=DEVICE, generator=gen).to(dtype)
+        k = torch.randn(tokens, KV_HEADS, HEAD_DIM, device=DEVICE, generator=gen).to(dtype)
+        v = qkv[:, q_width + KV_HEADS * HEAD_DIM:].view(tokens, KV_HEADS, HEAD_DIM)
+        assert tokens == 1 or not v.is_contiguous()
         for loc_dtype in (torch.int64, torch.int32):
             loc = (torch.randperm(slots - 1, device=DEVICE, generator=gen)[:tokens] + 1).to(loc_dtype)
-            got_k = torch.zeros(slots, KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
-            got_v = torch.zeros_like(got_k)
-            want_k, want_v = got_k.clone(), got_v.clone()
-            ops.kv_store(module, got_k, got_v, loc, *kv_views)
-            ref.kv_store(want_k, want_v, loc, *kv_views)
+            got_k, got_v, want_k, want_v = pools()
+            assert module.store(got_k.clone(), got_v.clone(), loc, k, v)  # the kernel takes these: no fallback below
+            ops.kv_store(module, got_k, got_v, loc, k, v)
+            ref.kv_store(want_k, want_v, loc.long(), k, v)
             assert torch.equal(got_k, want_k) and torch.equal(got_v, want_v)
+
+    # The fallbacks: the model's K/V in another dtype than the pool, and rows of 12 bytes.
+    loc = torch.tensor([5, 9, 2], device=DEVICE)
+    other = torch.float32 if dtype != torch.float32 else torch.bfloat16
+    k, v = (torch.randn(3, KV_HEADS, HEAD_DIM, device=DEVICE, generator=gen).to(other) for _ in range(2))
+    got_k, got_v, want_k, want_v = pools()
+    ops.kv_store(module, got_k, got_v, loc, k, v)
+    ref.kv_store(want_k, want_v, loc, k, v)
+    assert torch.equal(got_k, want_k) and torch.equal(got_v, want_v)
+    width = 12 // torch.empty(0, dtype=dtype).element_size()
+    k, v = (torch.randn(3, 1, width, device=DEVICE, generator=gen).to(dtype) for _ in range(2))
+    got_k, got_v, want_k, want_v = pools(1, width)
+    assert not module.store(got_k.clone(), got_v.clone(), loc, k, v)
+    ops.kv_store(module, got_k, got_v, loc, k, v)
+    ref.kv_store(want_k, want_v, loc, k, v)
+    assert torch.equal(got_k, want_k) and torch.equal(got_v, want_v)
 
 
 def test_triton_kv_indices_stays_within_its_definition(triton: Any) -> None:

@@ -15,7 +15,7 @@ import torch
 
 from kernels.reference import ops as reference
 from kernels.reference.paged import PagedDecode
-from layers.attn.paged import gather_kv_indices, indptr_of
+from layers.attn.paged import indptr_of
 from tests.units.support.worker import Driver, Worker, hf_model, save_checkpoint, tiny_config
 
 PROMPTS = {0: [5, 17, 3, 44, 9, 61, 2], 1: [8, 30, 30, 1, 77, 12, 40, 3, 19, 6, 55], 2: [4]}
@@ -84,25 +84,14 @@ def test_a_planned_operator_is_made_again_after_the_kernel_catalog_changed(worke
     assert attn.active.operators["decode", 0][0] is not before
 
 
-def test_the_token_lists_are_each_rows_first_slots_in_row_order() -> None:
-    req_to_token = torch.arange(40, dtype=torch.int32).reshape(4, 10) + 100
-    rows = torch.tensor([3, 1, 2])
-    kv_indptr = indptr_of([2, 5, 1])
-    assert kv_indptr.tolist() == [0, 2, 7, 8] and kv_indptr.dtype == torch.int32
-    got = gather_kv_indices(req_to_token, rows, kv_indptr, 8)
-    assert got.tolist() == [130, 131, 110, 111, 112, 113, 114, 120] and got.dtype == torch.int32
-    buffer = torch.full((12,), -1, dtype=torch.int32)  # a graph bucket's: filled in place, the rest untouched
-    assert gather_kv_indices(req_to_token, rows, kv_indptr, 8, buffer) is buffer
-    assert buffer.tolist() == [130, 131, 110, 111, 112, 113, 114, 120, -1, -1, -1, -1]
-
-
 def test_the_kv_indices_reference_lays_out_the_same_lists_and_each_rows_last_slot() -> None:
-    """``attn.kv_indices@1`` (what ``prepare`` calls now) against the lists above; it reads nothing
-    on the host, so a graph bucket's buffer past the lists keeps what it held, and a row alone gets
-    what it gets among others."""
+    """``attn.kv_indices@1`` (what ``prepare`` lays the lists out with): each row's first slots, row
+    after row, and each row's last slot. It reads nothing on the host, so a graph bucket's buffer
+    past the lists keeps what it held, and a row alone gets what it gets among others."""
     req_to_token = torch.arange(40, dtype=torch.int32).reshape(4, 10) + 100
     rows, lens = torch.tensor([3, 1, 2]), torch.tensor([2, 5, 1])
     kv_indptr = indptr_of([2, 5, 1])
+    assert kv_indptr.tolist() == [0, 2, 7, 8] and kv_indptr.dtype == torch.int32
     buffer = torch.full((12,), -1, dtype=torch.int32)
     last = torch.zeros(3, dtype=torch.int64)
     reference.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, buffer, last)
