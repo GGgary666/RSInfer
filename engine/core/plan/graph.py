@@ -30,8 +30,9 @@ than this did not win back (doc/evaluations/cuda-graph-review-fixes.md)."""
 
 def default_buckets(rows: int, fixed_extent: bool) -> list[int]:
     """The buckets when none are configured. As SGLang's default decode sizes (1, 2, 4, 8, 12, then
-    every 8th; ``generate_cuda_graph_batch_sizes``, e838360), up to ``batch.max_rows`` and with it,
-    so that a step of any size is replayed; over fixed extents, the powers of two."""
+    every 8th; ``generate_cuda_graph_batch_sizes``, e838360), up to ``batch.max_rows`` or
+    ``DEFAULT_MAX_BUCKET`` and with that size itself, so that up to there a step of any size is
+    replayed; over fixed extents, the powers of two."""
     if fixed_extent:
         return [1 << i for i in range(min(rows, FIXED_EXTENT_MAX_BUCKET).bit_length())]
     limit = min(rows, DEFAULT_MAX_BUCKET)

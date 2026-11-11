@@ -38,7 +38,7 @@
 
 没配 `plan.graph_buckets` 时：
 
-- **graph 里的 attention 按行的长度算代价时**（paged decode）：用 SGLang 的默认档位 1、2、4、8、12，然后每 8 行一档，到 `min(batch.max_rows, 64)`，并且把这个上限本身也录上。这样任何行数的 decode 步都有 graph，`required` 在默认配置下也满足"覆盖 `batch.max_rows`"。`max_rows` 32 时是 1、2、4、8、12、16、24、32，和 SGLang 录的一样，`kept_bytes` 128 MiB。
+- **graph 里的 attention 按行的长度算代价时**（paged decode）：用 SGLang 的默认档位 1、2、4、8、12，然后每 8 行一档，到 `min(batch.max_rows, 64)`，并且把这个上限本身也录上。这样 `max_rows` 不超过 64 时任何行数的 decode 步都有 graph，`required` 在默认配置下也满足"覆盖 `batch.max_rows`"；超过 64 时更多行的步走 eager，`required` 仍要显式列桶。`max_rows` 32 时是 1、2、4、8、12、16、24、32，和 SGLang 录的一样，`kept_bytes` 128 MiB。
 - **graph 里的 attention 是固定容量的那个时**（`kernels.torch_graph`：fp32、KV 和模型 dtype 不同、或没有 FlashInfer）：仍是 2 的幂到 8。它每行要搬 `max_context` 那么长的 K/V，fp32 下 64 行 × 4096 时光是 K 的 gather 就是 1.07 GB，超过 1 GiB 的默认预算；而预算是"全录或全不录"，放开上限会让小桶也录不成。
 - `core.plan` 怎么知道是哪一种：录进 graph 的 solution 里有没有只给 graph 用的（`requires` 含 `CAPTURE`）。
 
@@ -225,6 +225,8 @@ prefill（prompt 2000 token，生成 8 个，每个客户端 8 个请求）：
 留给 SM100 的不变：FlashInfer 的 GDN（SM90 / SM100）、CuTe DSL 的 GDN、`trtllm_mha`。另外 Gemini 的报告里提到，SGLang 在 SM100 加 head dim 256 时默认选的 attention 是 `triton` 而不是 `flashinfer`（两者吞吐差不到 2%）；这里的 `auto` 在有 FlashInfer 时选 FlashInfer。
 
 ## 对 SM100 的预期（没有验证）
+
+> 后来 Gemini 在 SM100 上重测了，结果在 [real-kernels-sm100.md](real-kernels-sm100.md)：64 层的 decode 是 SGLang 的 92.7–100.9%，prefill 是 97.7–100.2%。下面是重测之前写的推算。
 
 - Gemini 的归因：64 层时每步比 SGLang 多约 4.07 ms，对应每层约 63 µs 的未融合小算子和 launch 间隙。
 - 按这里 4 层的计数换算到 64 层（48 层 GDN + 16 层 attention）：第一批每步比 SGLang 多 2000 多次 launch（每个 GDN 层约 25 次，每个 attention 层约 68 次）。现在 GDN 层不多，每个 attention 层多 1 次，加上每步一次的 6 次，合计约 22 次。

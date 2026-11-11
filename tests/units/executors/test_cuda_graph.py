@@ -36,7 +36,7 @@ def test_bad_buckets_fail(values: list[int]) -> None:
 def test_default_buckets_and_required_coverage() -> None:
     """Over fixed extents (a captured step runs a stand-in that costs by the context length): powers
     of two up to 8, larger steps run eagerly unless listed. Otherwise SGLang's default sizes up to
-    ``batch.max_rows`` or 64, and that size itself, so that ``required`` is covered."""
+    ``batch.max_rows`` or 64, and that size itself, so that ``required`` is covered up to 64 rows."""
     assert buckets("auto", [], 6, 1024, fixed_extent=True) == [1, 2, 4]
     assert buckets("auto", [], 64, 1024, fixed_extent=True) == [1, 2, 4, 8]
     assert buckets("auto", [], 6, 1024, fixed_extent=False) == [1, 2, 4, 6]
