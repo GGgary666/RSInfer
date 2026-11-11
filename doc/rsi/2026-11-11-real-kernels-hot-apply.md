@@ -1,11 +1,12 @@
-# 真 kernel 迁移里热更新用了多少，和补做的一次整批热改（2026-11-11，RTX 4090 D）
+# 真 kernel 迁移里热更新用了多少，和补做的两次试验（2026-11-11，RTX 4090 D）
 
 记录人：Claude Fable 5.2（Claude Code）。对应的工作是 #51 的两批真 kernel（[../evaluations/real-kernels-4090d.md](../evaluations/real-kernels-4090d.md)、[../evaluations/real-kernels-fused.md](../evaluations/real-kernels-fused.md)）。
 
-这份记录回答两件事：
+这份记录回答三件事：
 
 - 这次工作里，我有没有照 AGENTS.md 说的"在跑着的引擎上热改"来开发；
-- 这次最大的一个改动能不能热改，热改出来的引擎和冷启动的是不是一样。
+- 这次最大的一个改动能不能热改，热改出来的引擎和冷启动的是不是一样；
+- 我原来放在 pytest 里做的那些检查，能不能临时写进跑着的引擎里做。
 
 ## 结论
 
@@ -13,7 +14,9 @@
 2. **用到的部分没有出过问题。** 试验之前 14 次 apply 全部提交；7 次起引擎里没有一次是热更新失败逼出来的。
 3. **补做的试验：整个第二批可以热改，结果和冷启动一样。** 从第一批的树冷启动引擎，把第二批的树整个 apply 上去：3.1 秒提交，不重启任何进程，worker 重载 11 个单元。选的 kernel、graph 桶、输出的 token、吞吐、身份都和用新树冷启动的相同。
 4. **带在途请求的三种情况都对**（拒绝、`--wait-empty`、`--force`），来回 9 次没有报错，显存不涨。
-5. **我没一直用热更新，主要是习惯，不是做不到。** 我当时归了两个原因：这张 24 GB 的卡放不下引擎和测试同时跑；大部分验证要看 worker 进程里的张量。第二个原因站不住：把检查临时写进单元、apply、看 worker 的日志，同样看得到（见"为什么没一直用"）。这个办法我这次没有用过。
+5. **我没一直用热更新，主要是习惯，不是做不到。** 我当时归了两个原因：这张 24 GB 的卡放不下引擎和测试同时跑；大部分验证要看 worker 进程里的张量。第二个原因站不住：把检查临时写进单元、apply、看 worker 的日志，同样看得到。
+6. **补做的第二个试验：这样做是通的。** kernel 对照参照实现、graph 对 eager 的 logits、profiler 的 trace，三样都在跑着的引擎上做成了，每轮 apply 两秒多。做法和注意点已经写进 skill（「在引擎里做检查」）。
+7. **试验里发现一个 bug**：检查代码在处理请求时抛了异常，引擎停止服务；把代码改好再 apply，引擎仍然拒绝请求，要重载调度器才恢复。报告在 [../framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md](../framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md)。
 
 ## 这次工作里实际用了多少
 
@@ -135,7 +138,7 @@
     - 读张量的值要等设备，只适合查对错，不适合量时间。量时间要把 `torch.profiler` 同样临时包进去，把 trace 写到文件；
     - 查完要把临时代码 apply 回去。
   - 最后留下来的回归测试仍然得是 pytest。但摸索和排查的那部分（这次占了大半）本来可以在引擎上这样做，引擎也就不用为了让出显卡而停掉。
-  - **我这次没有这样做过。上面这些是按机制推的，没有试。**
+  - 上面几条写下来的时候还没试。后来试了，见下一节；试出来的和这里列的一致，另外多出两条（检查代码抛异常的后果、实例上的状态会清零）。
 - **我自己的习惯。** 换 RMSNorm 实验代码和换融合 kernel 那两次，引擎刚好停着，我就顺手冷启动了。按上面的试验，起来以后一直留着、改完 apply，是可以的。
 
 下次这样做：
@@ -145,10 +148,54 @@
 - 排查问题时，先把检查临时写进单元、apply、看 worker 的日志，而不是先去写 pytest；
 - 只有要用整张卡的时候才停。
 
+## 补做的第二个试验：把检查临时写进引擎里
+
+用户的问题是："在里面加一个 print，apply，然后看日志不行吗？"下面是实际试的结果。
+
+### 做法
+
+- 工作区是一个 git worktree（`02d5c30`），在里面起引擎：4 层、bf16、`--cuda-graph auto --overlap --max-rows 8 --max-context 4096`。临时代码只写在这个工作区里，不进提交。
+- 每次：改文件，`apply --source <工作区>`，发请求，读 worker 的日志；查完 `git checkout -- <文件>` 再 apply。
+- 检查的输出用 `print(..., file=sys.stderr, flush=True)`，它进 worker 的日志文件 `<run>/host-a/snapshots/.run/worker-0-2/log`（`core.plan: {...}` 也在这个文件里）。worker 进程的当前目录就是这个文件所在的目录，张量和 trace 用相对路径存就落在那里。
+
+### 四次尝试
+
+| 临时加了什么 | 加在哪 | 计划 | 结果 |
+|---|---|---|---|
+| GDN decode 的两个 kernel 对照参照实现，不分 eager 还是录 graph | `layers/gdn/unit.py` | 重载 `layers.gdn` | **apply 被撤回**（2.3 秒）。在被录进 graph 的前向里读张量的值，capture 失效：`AcceleratorError: CUDA error: operation failed due to a previous error during capture`，接着 `reload rolled back; the previous units are serving`。引擎照常服务，身份没变 |
+| 同上，只在 eager 步里做 | 同上 | 同上 | 提交（2 秒）。带 graph 时一个请求打出 0 行（decode 是回放的）；`apply --config '{"plan.cuda_graph": "off"}'` 以后同一个请求打出 69 行（3 层 × 23 步） |
+| 每个 decode 步把 logits 存成文件 | `executors/pytorch/unit.py` 的 `submit`，`chosen.run(...)` 之后 | 重载 `executors.pytorch` | 提交。同一个请求在 `plan.cuda_graph` 为 `off` 和 `auto` 时各跑一遍，各存 23 步 |
+| 第 40 到 59 个 decode 步包在 `torch.profiler` 里，trace 写文件 | `submit` 开头 | 同上 | 提交。8 个并发请求，trace 11 MB |
+
+读出来的结果：
+
+- **kernel 对照参照实现（真实请求的激活，69 次调用里最大的差）**：conv 输出 9.8e-4（0.125–0.25 之间的值的一个 bf16 舍入单位；值最大 0.27）；core 输出 3.1e-5（值最大 0.0025）；conv 状态 0；SSM 状态 5.2e-4（值最大 0.077）。都在 definition 的容差之内。
+- **graph 对 eager**：23 个 decode 步的 logits（每步 248320 个数）逐元素相同，最大差 0。
+- **profiler**：每步 85.0 次 launch，设备上的 kernel 6.141 ms，其中 GEMM 5.923 ms。和之前在 pytest 进程里量的一致（6.15 ms）。launch 数那里回放的一步是 89 次，这里是 85 次：这里走的是真的调度器，我猜是测试夹具每步多几次拷贝，没有细查。
+- 前两次检查期间，同一个 prompt 的输出一直和基线相同。
+
+### 检查代码自己有 bug 时
+
+故意加了一个在第 3 个 decode 步抛异常的"检查"：
+
+- apply 提交了（只在处理请求时才出错的改动，apply 发现不了）；
+- 请求一来 worker 出错，引擎停止服务。之后的请求马上回 400，错误信息里带着异常的文字；出错那一刻在途的非流式请求一直不返回，我的客户端等到 120 秒超时；
+- **把代码改回去再 apply，提交了，但引擎仍然拒绝请求。** `apply --force`、重载 `core.plan` 的配置变更都不行。只有重载 `core.sched` 的变更之后才恢复。这是 bug，报告见上面的链接；
+- 绕过：在 `engine/core/sched/loop.py` 末尾加一行注释，apply；去掉，再 apply。之后身份回到 `622273f995128992`，输出回到基线，没有重启引擎。
+
+### 其他观察
+
+- 这个引擎上一共 17 次提交、1 次撤回、2 次 dry-run，每次 apply 两秒多。
+- **实例上的状态会清零**：我在 executor 的实例上放了一个步数计数器，改 `plan.cuda_graph`（只重载 `core.plan`）以后它从 1 重新数。executor 依赖 `plan@1`，plan 重载时它也被重建。
+- 静态检查照常管着临时代码：从 `layers.gdn` 里 `from kernels.reference import ops` 会被 `check` 拒掉（`manifest.cross_unit_import`）。参照实现要从 kernel 目录里取：`catalog.resolve("reference.<definition>")`。
+- 试验做完时 worker 比刚起来时多占 248 MiB 显存（21482 → 21730 MiB）。再抓一次 trace 没有再涨。是哪一步留下的我没有分段量，猜是 profiler 第一次初始化。
+- 停引擎时我自己出了个错：`ps | grep` 先匹配到的是启动它的那个进程，`serve` 本身和它的子进程还在，占着显卡。发完 SIGTERM 要看一眼 `unit.runtime.host` 进程是不是都退了。
+
 ## 没覆盖的
 
 - 改框架本体（应该要求重启引擎）、改权重存储、改拓扑或平台；
 - 多 rank、多机；
 - SM100 和完整的 64 层模型；
 - 引擎里有很多请求时的 `--wait-empty` 和 `--force`（这里只有 1 个）；
-- 第一批的改动（新增两个 kernel 单元和它们的依赖库）没有这样试过。
+- 第一批的改动（新增两个 kernel 单元和它们的依赖库）没有这样试过；
+- 在引擎里做检查，只试了 worker 里的单元（层、executor），没有试前端和调度宿主里的。

@@ -183,10 +183,64 @@ $C status                               # 也可以是 introspect（单元、配
   - `--force`：立刻结束里面的请求（客户端收到 503），再 apply。
 - 改完用请求验证：`deploy/qwen38.py chat ...`，或直接对前端发 HTTP；需要时对照冷启动的结果。
 
+### 在引擎里做检查（排查和验证）
+
+2026-11-11 在 4090 D 上实际试过，记录见 `doc/rsi/2026-11-11-real-kernels-hot-apply.md`。
+
+**推荐的路径**：要排查一个问题，或者验证一个改动算得对不对、跑得快不快，先把检查临时写进单元的代码里，apply，发请求，读 worker 的日志；查完把临时代码去掉再 apply。不要一上来就去写 pytest、在测试进程里另搭一套 worker 栈。最后要留下来的回归测试再写成 pytest。
+
+一轮是这样的：
+
+1. 在工作区里改单元的代码，临时的几行前面加一行 `# PROBE` 注释（方便 `git diff` 和 `grep` 找出来）。工作区用 worktree 更干净，临时代码不会混进提交。
+2. `apply --dry-run` 看计划，`apply`。
+3. 发请求（`deploy/qwen38.py chat`，或直接发 HTTP）。
+4. 读结果：
+   - `print(..., file=sys.stderr, flush=True)` 的输出在 worker 的日志里：`<run>/host-a/snapshots/.run/worker-<i>-<n>/log`，`core.plan: {...}` 也在这个文件里。日志只追加，先记下行数或用 `grep -c` 取增量。
+   - 大的东西（张量、profiler 的 trace）存成文件。worker 进程的当前目录就是日志所在的目录，`os.getcwd()` 下的文件落在那里。
+5. `git checkout -- <文件>`，apply；改过的配置也改回去。用 `status` 确认身份回到了原值。
+
+试过的三种检查：
+
+| 要看什么 | 加在哪 | 怎么做 |
+|---|---|---|
+| 一个 kernel 和参照实现在真实激活上差多少 | 调这个 kernel 的层（`layers/*/unit.py`） | 参照实现从目录里取：`catalog.resolve("reference.<definition>")`。有状态的 kernel 先把这几行的状态拷出来（`pool[idx].clone()`），参照实现在拷贝上按 0..n-1 的下标跑，再比输出和状态 |
+| graph 回放和 eager 的 logits 是否相同 | `executors/pytorch/unit.py` 的 `submit`，`chosen.run(...)` 之后 | 每步把 logits 存文件。同一个请求在 `plan.cuda_graph` 为 `off` 和 `auto` 时各跑一遍（`apply --config`），离线比 |
+| 每步发了哪些 kernel、各花多少时间 | `submit` 开头 | 在实例上数步数，第 N 步进 `torch.profiler.profile(...)`，第 N+20 步 `torch.cuda.synchronize()`、退出、`export_chrome_trace` 到文件。Kineto 看得到 graph 回放里的 kernel |
+
+**好处**：
+
+- **快**。一轮 apply 两三秒；冷启动光启动那次变更就要 10 秒左右，还要重读权重。
+- **看到的是真的**：真实请求的激活、真实的调度路径。单测里的随机张量和测试夹具都只是近似。
+- **引擎不用停**。一张卡放不下引擎和 GPU 测试同时跑时，在 pytest 里查就得先停引擎，回来又是冷启动。
+- **顺带测了热更新机制**，这是 AGENTS.md 要的。
+- **多数写错的情况是安全的**：加载时或录 graph 时出错的改动会被撤回，引擎照常服务旧代码。例外见下面第 3 条。
+
+**问题和注意点**：
+
+1. **回放的 graph 里不跑 Python。** 检查只在 eager 步和录 graph 时执行，回放的 decode 步里什么都不会打出来。要看 decode 步，先 `apply --config '{"plan.cuda_graph": "off"}'`，查完改回 `auto`。
+2. **被录进 graph 的前向里不能在 host 上读张量的值**（`.item()`、`float(t)`、`.cpu()`、打印张量）。capture 会失效，apply 被撤回，诊断是 `AcceleratorError ... during capture`。
+   - 在层里做检查时按 backend 的元数据跳过 graph 桶（`layers.attn`、`layers.gdn` 里是 `m.graph`）；
+   - 或者把检查放在 graph 之外：executor 的 `submit` 里、`chosen.run(...)` 之后；
+   - 也别把参照实现的计算留在被录的前向里，它会被录进 graph。
+3. **检查代码在处理请求时抛异常，引擎就停止服务，而且把代码改好再 apply 并不恢复**（`doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md`，未修）。
+   - 之后的请求回 400，错误信息里有异常的文字；出错时在途的非流式请求一直不返回。
+   - 恢复：让 `core.sched` 重载一次（在 `engine/core/sched/` 的某个文件末尾加一行注释，apply；去掉，再 apply），或者重启引擎。
+   - 预防：可能失败的部分包在 `try/except` 里，只打印不抛。检查写在层或模型里时，录 graph 的引擎（`auto` / `required`）在 apply 时会重录 graph，先跑一步 eager 的 padding 行，检查的输出这时就会出现在日志里，可以先看它对不对，再发请求。写在 executor 里的检查要等第一个请求才会跑到。
+4. **读张量的值要等设备**，重叠（`sched.overlap`）就没用了，吞吐会掉。带着这种检查量出来的时间不能用；量时间用 profiler，或者用不带检查的引擎。
+5. **静态检查照常管着临时代码**：
+   - 单元之间不能互相 import（`manifest.cross_unit_import`）。别的单元的东西通过服务拿，参照 kernel 通过 `kernels.catalog@1`；
+   - 模块级不能放可变对象（`manifest.mutable_global`）。计数器、profiler 对象放在实例上（`self._probe_n`）。
+6. **实例上的状态会清零**：单元被重载时清，它依赖的单元被重载时也清。例如重载 `core.plan` 会连带重建 `executors.pytorch`。
+7. **有状态的 kernel 原地改状态池**，对照时别在真的池上再跑一遍，用拷贝。
+8. **每次 apply 都要求引擎是空的**。临时代码和临时配置会改变引擎的身份，查完要改回去。提交前 `grep -rn PROBE engine` 确认没有留下。
+9. **这条路径不代替测试。** 能复现的问题最后写成 pytest（`tests/gpu/` 或 `tests/units/`），提交前照常跑 pyright 和 pytest。
+10. 只试过 worker 里的单元（层、executor）。前端和调度宿主里没有这样试过。
+
 ### 哪些是正常的，哪些可能是 bug
 
 正常，按提示做就行：
 - 引擎里有请求时被拒；worker 出错以后只有 `--force` 能清空；
+  - 清空并把 worker 改好以后引擎仍然拒绝请求，这是已知的 bug（`doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md`）：再让 `core.sched` 重载一次，或者重启引擎；
 - 改了框架本体（`engine/framework.toml` 列的模块）或控制面单元的原生扩展：`escalate.restart_engine`，只能重启引擎（AGENTS.md「框架改动」）；
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
@@ -203,5 +257,6 @@ $C status                               # 也可以是 introspect（单元、配
 ### 踩过的坑
 
 - 停引擎要按 `serve` 进程的精确 PID 发 SIGTERM（`deploy/qwen38.py` 起的子进程在命令行退出时会跟着收到 SIGTERM）；别用 `pkill -f` 之类按命令行匹配，它会匹配到发命令的 shell 自己。
+- 停完确认 `unit.runtime.host` 进程都退了、显存放了（`ps`、`nvidia-smi`）。`ps | grep` 可能先匹配到启动 `serve` 的那个进程，杀了它，`serve` 和它的子进程还在。
 - GPU 上的第一步可能很慢；超时都按 `--timeout` 放长了。
 - `deploy/qwen38.py checkpoint` 生成的 checkpoint 很大（27B 结构的 4 层约 7.6 GiB），用完删掉；快照目录是只读的，删之前先 `chmod -R u+w`。
