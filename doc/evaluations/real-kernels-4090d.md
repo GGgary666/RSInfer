@@ -133,7 +133,7 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 - **让 SGLang 加载这个 checkpoint 要两处调整**：
   - `Qwen3_5ForConditionalGeneration` 是多模态结构，SGLang 会去找图像处理器的文件。在 config.json 里加 `"language_model_only": true`（SGLang 认 checkpoint 自己的这个声明）；`--language-model-only` 这个命令行开关在 `e838360` 不支持这个结构。
   - tokenizer 用 HF 缓存里 `Qwen/Qwen3.6-27B` 的（本机已有，词表 248044）。测试里的词级 tokenizer 不行：SGLang 会"修正"它的组件，结果 prompt 变成 0 个 token，启动预热就挂。
-- **agxinfer**：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --graph-buckets 1 2 4 8 16 32 --token-budget 16384 --mem-fraction 0.75`。后三项是为了和 SGLang 对齐：graph 录到 32 行，prefill 每步的预算和它的 `max_prefill_tokens` 一样，留给激活的显存和它差不多（见下面的 OOM）。
+- **agxinfer**：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --graph-buckets 1 2 4 8 16 32`，graph 录到 32 行是为了和 SGLang 对齐。prefill 那一组再加 `--token-budget 4096`：SGLang 一步 prefill 的上限是 `chunked_prefill_size`，这张卡上是 4096（见"prefill 每步多少 token"）。decode 那一组是带着 `--token-budget 16384 --mem-fraction 0.75` 测的，prompt 只有 32 个 token，这两项不影响结果（不带它们时是 164.9 / 627.3 / 1230.8 / 2334.5 / 4021.9 token/s）。
 - **负载**：`tests/gpu/bench_serving.py`（新）。每档并发有那么多个客户端，各自一个接一个地发 `/v1/completions`（流式、贪心、`ignore_eos`）。每个请求的 prompt 全程唯一。
   - decode：prompt 32 个 token，生成 256 个；每个客户端 4 个请求。
   - prefill：prompt 2000 个 token，生成 8 个；每个客户端 8 个请求。
@@ -155,18 +155,43 @@ prefill（输入 token/s；首 token 时间取中位数）：
 
 | 并发 | SGLang token/s | agxinfer token/s | 比例 | SGLang 首 token | agxinfer 首 token |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 19166 | 17987 | 93.8% | 63 ms | 64 ms |
-| 4 | 30801 | 29083 | 94.4% | 162 ms | 222 ms |
-| 8 | 35506 | 33196 | 93.5% | 258 ms | 427 ms |
+| 1 | 19166 | 17926 | 93.5% | 63 ms | 65 ms |
+| 4 | 30801 | 29120 | 94.5% | 162 ms | 181 ms |
+| 8 | 35506 | 33325 | 93.9% | 258 ms | 289 ms |
 
-- 首 token 时间在 4、8 并发下差得多，是调度不同：SGLang 一步最多 4096 个 token（`chunked_prefill_size`），先到的请求先出结果；agxinfer 把预算内的请求放在一步里，一起出结果。吞吐是可比的。
+- SGLang 重复跑一次是 19992 / 31685 / 36098 token/s，首 token 59 / 159 / 251 ms：两次之间差 4% 以内。
 - decode 的首 token 时间：SGLang 17–81 ms，agxinfer 24–93 ms。
+
+### prefill 每步多少 token
+
+两边的调度策略是同一个：先来先服务，能组 prefill 就先跑 prefill，不混合，按一步的 token 预算装请求，最后一个装不下的请求切块（`policies.fcfs`、`policies.prefill_first` 就是照 SGLang 和 mini-sglang 搬的）。不同的只是预算的值：
+
+| | 每步 prefill 的上限 | 这张卡上的值 |
+|---|---|---|
+| SGLang | `chunked_prefill_size`，没指定时按显存大小定 | 4096 |
+| agxinfer | `sched.token_budget`，固定默认值 | 2048 |
+
+SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时先碰到的是 4096：它的日志里一步最多 `#new-token: 4096`。
+
+同一个 prefill 负载、8 并发，agxinfer 在三种预算下（吞吐都是 3.3 万 token/s 左右，受 GEMM 限制）：
+
+| `--token-budget` | 首 token 中位数 | 说明 |
+|---:|---:|---|
+| 2048（默认） | 259 ms | |
+| 4096 | 289 ms | 和 SGLang 的每步上限相同；SGLang 是 251–258 ms |
+| 16384 | 427 ms | 8 个请求全放进一步，一起出结果；要 `--mem-fraction 0.75`，否则 OOM |
+
+**我第一次对比时把 `--token-budget` 设成了 16384，以为这是在对齐 SGLang 的 `max_prefill_tokens`，其实是它实际每步上限的 4 倍。** 当时首 token 427 对 258 ms 的差距和下面的 OOM 都是这个设置造成的，不是调度策略不同。
 - **agxinfer 的默认配置**（graph 桶到 8 行，`--token-budget 2048`，`--mem-fraction 0.85`）下 decode 是 164.8 / 624.0 / 1225.8 / 2199.2 / 3947.7 token/s：16 并发是 SGLang 的 93%，32 并发是 95%。超过 8 行的步走 eager，开重叠时差得不多。
 
 ### 测的过程里碰到的
 
 - **第一版脚本不同并发档位之间有重复的 prompt，SGLang 的前缀缓存命中了**（它的日志里 `#cached-token: 3968`），8 并发的 prefill 看起来是我们的 1.7 倍。改成全程唯一以后是上表的 94%。agxinfer 现在没有前缀复用（M2d），真实负载里有重复前缀时这个差距会回来。
-- **`--token-budget 16384` 加默认的 `--mem-fraction 0.85` 会让 worker OOM。** 默认分给状态池 12.41 GiB，权重 7.6 GiB，graph 和 FlashInfer 的 workspace 约 0.6 GiB，剩下不到 3 GiB；一步 16000 个 token 的 prefill 的激活放不下，worker 报 `OutOfMemoryError`，引擎停止服务，只能重启。SGLang 自动定的 `mem_fraction_static` 是 0.705，建完池、录完 graph 以后还留着 5.3 GB。默认的 2048 没有这个问题。holder 分池时没有把 prefill 预算算进去。
+- **`--token-budget 16384` 加默认的 `--mem-fraction 0.85` 会让 worker OOM**，引擎停止服务，只能重启。原因是这两个配置之间没有联系，而不是 prefill 本身费显存：
+  - 一步 prefill 的瞬时显存和 token 数成正比，进程内量到每个 token 约 200 KiB（峰值已分配量）：2000 个 token 395 MiB，4000 个 781 MiB，16000 个 3121 MiB。PyTorch 的分配器为这个峰值保留的更多，16000 个 token 那一步之后保留量涨了 5.7 GiB。
+  - 默认的 0.85 分给状态池 12.41 GiB，权重 7.6 GiB，graph 和 FlashInfer 的 workspace 约 0.6 GiB，剩下不到 3 GiB。4096 个 token 的步放得下（实测，没有 OOM），16000 个的放不下。
+  - SGLang 是从每步上限反推池的大小：留 `512 MB + 1.5 MB × chunked_prefill_size`，再加 graph 的份，剩下的才给权重和池。这张卡上是 0.705，状态池 8.65 GB（KV 4.56，GDN 4.09），建完池、录完 graph 以后还空着 5.3 GB。按同一个公式，每步 2048 个 token 对应的是 0.83 左右，和我们的 0.85 接近，所以我们的两个默认值彼此大致一致；只是把 `sched.token_budget` 调大时，`holder.mem_fraction` 不会跟着降。
+  - **同样大小的步，我们用的显存和 SGLang 是一个量级。** 都是每步最多 4096 个 token、同一个 8 并发 prefill 负载，`nvidia-smi` 的占用：agxinfer 从 21532 涨到 23062 MiB（+1.5 GiB），SGLang 从 18692 涨到 19430 MiB（+0.7 GiB），另外它启动时已经给 prefill graph 留了 0.9 GB。空闲时我们多占的 2.8 GiB 是状态池更大（KV 171 万 token 对 119 万，GDN 槽 656 对 455）。
 - SGLang 冷缓存的第一次启动约 95 秒，其中录 prefill graph 56–64 秒（50 个长度档位，含 Triton 的编译和 autotune）；缓存热了以后录 prefill graph 4.3 秒。
 
 ## 在跑着的引擎上热改
@@ -211,4 +236,4 @@ prefill（输入 token/s；首 token 时间取中位数）：
 - prefill kernel 的启动 warm-up。
 - 默认的 graph 桶只到 8 行（`core/plan/graph.py` 的 `DEFAULT_MAX_BUCKET`），理由是当时 graph 里的 attention 按 `max_context` 算。换成 FlashInfer 以后这个理由不成立了，更大的桶没有重新量。
 - 每步 plan 在 host 上多出的 0.3 ms。
-- holder 分池时给大的 prefill 预算留激活的显存（见上面的 OOM）。
+- `holder.mem_fraction` 没指定时按 `sched.token_budget` 来定（SGLang 的做法），以及按显存大小定默认的预算；现在把预算调大而不降 `--mem-fraction` 会 OOM。
