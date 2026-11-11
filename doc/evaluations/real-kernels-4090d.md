@@ -11,12 +11,12 @@ M2b（[../specs/stage2-contract.md](../specs/stage2-contract.md) §1.3）在这�
 2. **这个模型在这张卡上的 decode 已经压在 GEMM 上，再换 kernel 收益很小。** 换完 kernel 以后的 profile（eager，8 行，`torch.profiler`，只算设备上的 kernel）：每步 6.41 ms，其中 GEMM 5.94 ms，其余全部加起来 0.47 ms。
    - LM head 一项 2.63 ms：248320 × 5120 的 bf16 权重 2.5 GB，每步读一遍，是显存带宽；
    - 另外 19 个 GEMM 共 3.31 ms，同样是读权重；
-   - 3 个 GDN recurrent kernel 共 0.11 ms，其余每种 kernel 不到 0.05 ms。
+   - 3 个 GDN recurrent kernel 共 0.11 ms，其余每种 kernel 不到 0.05 ms。但"每种不到 0.05 ms"按 kernel 的名字看不出一件事：参照实现的 RMSNorm 每次调用拆成九、十个小 kernel，11 次调用合计 0.185 ms，是 GEMM 之外最大的一项（见"差距在哪"）。
 
    benchmark 里开重叠的 graph 每步 6.0–6.4 ms，已经等于这个设备时间。换 kernel 之前，Triton GDN 让 graph 每步快了 0.3–1.0 ms，FlashInfer 再快 0–0.8 ms（见下表）。只有 4 层时 LM head 占了约四成；完整 64 层时它被摊薄，但每层的 GEMM（0.83 ms）仍是非 GEMM 部分（0.12 ms）的 7 倍。带宽高得多的 SM100 上占比会不同，要在那里重新 profile。
 3. **FlashInfer 的意义在于 graph 步的代价不再跟 `batch.max_context_len` 走。** 之前 graph 里的 attention 按表宽算，`max_context` 从 256 调到 4096，8 行的每步时间从 7.39 涨到 8.15 ms；现在两档都是 6.40 ms。
 4. **热更新没发现问题。** 在跑着的引擎上改 `kernels.triton`、`kernels.flashinfer` 的代码和 backend 配置，计划、生效、撤回、显存都符合预期（见下）。没有需要写进 `doc/framework-bugs/` 的。
-5. **和原生 SGLang 对比（同一天补测，见"和原生 SGLang 对比"一节）：经 HTTP 的吞吐，decode 是它的 95.5–98.9%，prefill 是 94%。** 同一个 checkpoint、同一个 tokenizer、同样的请求，SGLang 是 `e838360` 的默认配置。每个 token 的间隔，agxinfer 比它多 0.2–0.3 ms（1 并发 6.00 对 5.80 ms，32 并发 7.55 对 7.35 ms）。这个差距没有逐项归因；SGLang 在这条路径上比我们多的是 GDN decode 的融合 kernel、QK norm + RoPE 的融合和 `sgl_kernel` 的小算子。
+5. **和原生 SGLang 对比（同一天补测，见"和原生 SGLang 对比"一节）：经 HTTP 的吞吐，decode 是它的 95.5–98.9%，prefill 是 94%。** 同一个 checkpoint、同一个 tokenizer、同样的请求，SGLang 是 `e838360` 的默认配置。每个 token 的间隔，agxinfer 比它多 0.2–0.3 ms（1 并发 6.00 对 5.80 ms，32 并发 7.55 对 7.35 ms）。**差距主要来自 RMSNorm 还在用参照实现**（见"差距在哪"）：实验里只把它换成 FlashInfer 的融合 kernel，decode 就到了 SGLang 的 97–101%，prefill 到了 93–99%。
 
 ## 环境
 
@@ -194,6 +194,60 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
   - **同样大小的步，我们用的显存和 SGLang 是一个量级。** 都是每步最多 4096 个 token、同一个 8 并发 prefill 负载，`nvidia-smi` 的占用：agxinfer 从 21532 涨到 23062 MiB（+1.5 GiB），SGLang 从 18692 涨到 19430 MiB（+0.7 GiB），另外它启动时已经给 prefill graph 留了 0.9 GB。空闲时我们多占 2.8 GiB，主要是状态池更大（12.41 GiB 对它日志里的 8.65 GB：KV 171 万 token 对 119 万，GDN 槽 656 对 455）；SGLang 那边另有 prefill graph 的占用。
 - SGLang 冷缓存的启动约 90 秒，其中录 prefill graph 56–64 秒（50 个长度档位，含 Triton 的编译和 autotune）；缓存热了以后录 prefill graph 4.3 秒。
 
+## 差距在哪
+
+对两边各抓了 `torch.profiler` 的 trace，用同一个脚本按 kernel 归类。GEMM 不是原因：同样的 cuBLAS kernel、同样的次数；单独测 GEMM，torch 2.11 和 2.14.1 两个环境的结果相同（decode 一步 20 个 GEMM，1 / 8 / 32 行是 5.48 / 5.71 / 6.13 ms）。
+
+### decode（8 行，每步；两边都是 graph 回放里的 kernel）
+
+| | SGLang | agxinfer |
+|---|---:|---:|
+| kernel launch 次数 | 82 | 238 |
+| 设备上 kernel 时间合计 | 6.22 ms | 6.37 ms |
+| GEMM（各 20 次） | 5.98 | 5.94 |
+| RMSNorm（11 次调用） | 0.022（9 个 kernel，FlashInfer 的融合 norm） | 0.185（约 100 个 kernel，参照实现） |
+| GDN recurrent（3 层） | 0.090（packed decode） | 0.103 |
+| RoPE | 0.002（和 Q/K norm、gate 融合成一个 kernel） | 0.033 |
+| SiLU·mul（4 次） | 0.007 | 0.023 |
+| 采样 | 0.011 | 0.011 |
+| GDN conv、gated norm | 0.012 | 0.012 |
+
+- agxinfer 一栏里按 definition 分的数字是在 eager 下给每个 definition 的调用打标签量的（合计 6.40 ms），graph 回放的合计是 6.37 ms。attention 两边都在 0.01–0.02 ms，抓 trace 时两边的上下文长度不同，不比。
+- 不带 profiler 时每步是 6.40 对 6.15 ms，差 0.25 ms。kernel 时间差 0.15–0.18 ms，其中 RMSNorm 一项 0.16 ms。剩下的 0.07–0.10 ms 我归到每步多出的 156 次 launch 上（每个 kernel 之间的间隙），这一项是推出来的，没有直接量。
+- 参照实现的 RMSNorm 慢，是因为它照 `forward_native` 一步一步算：升到 fp32、平方、求均值、rsqrt、乘两次、降回 bf16，带 residual 时再加一次，每一步是一个 kernel。同样 `[8, 5120]` 带 residual 的一次调用，参照实现 93 µs，FlashInfer 的 `gemma_fused_add_rmsnorm` 9 µs。
+
+### prefill（一步 2000 个 token）
+
+| | SGLang | agxinfer |
+|---|---:|---:|
+| kernel launch 次数 | 257 | 311 |
+| 设备上 kernel 时间合计 | 47.2 ms | 51.3–51.5 ms（3 次） |
+| GEMM（各 20 次，同一批 kernel） | 43.2 | 43.4–44.2 |
+| RMSNorm | 0.32 | 2.53 |
+| SiLU·mul | 0.83 | 1.49 |
+| GDN 层里 kernel 之外的 torch 操作（split、cat、拷贝） | 0.6 以内 | 1.64 |
+| GDN 的 chunk kernel | 1.21 | 1.26 |
+| attention | 0.48（ragged） | 0.49（paged） |
+| Q/K norm + RoPE | 0.084（融合） | 0.124，另有 2 次 norm 调用算在上面 |
+
+- GEMM 那一行的差在 agxinfer 自己几次测量的波动之内，不算差距。
+- SGLang 的 prefill 是从它的 prefill graph 回放的，agxinfer 的是 eager。host 一侧的差别这里看不到。
+
+### 验证：只换 RMSNorm
+
+在 `kernels.flashinfer` 里临时登记了一个 `norm.gemma_rms@1` 的 solution（FlashInfer 的 `gemma_rmsnorm` 和 `gemma_fused_add_rmsnorm`，就是 SGLang 的 `GemmaRMSNorm` 在 CUDA 上调的那两个；bf16 下和参照实现差在一个舍入单位以内，fp32 差 1e-6）。**这段代码没有提交**，只用来验证归因：
+
+| | 换之前 | 换之后 | SGLang |
+|---|---:|---:|---:|
+| 进程内 graph 每步，1 / 4 / 8 行 | 6.00 / 6.32 / 6.40 ms | 5.90 / 6.19 / 6.25 ms | |
+| HTTP decode 每 token，1 / 4 / 8 / 16 / 32 并发 | 6.00 / 6.31 / 6.40 / 6.66 / 7.55 ms | 5.89 / 6.18 / 6.25 / 6.51 / 7.39 ms | 5.80 / 6.01 / 6.15 / 6.44 / 7.35 ms |
+| HTTP decode 吞吐相对 SGLang | 96.4 / 95.5 / 96.1 / 98.9 / 96.9% | 98.2 / 97.2 / 98.6 / 101.2 / 98.9% | |
+| HTTP prefill 吞吐相对 SGLang，1 / 4 / 8 并发 | 93.5 / 94.5 / 93.9% | 92.8 / 99.0 / 97.3% | |
+
+- decode 的差距去掉了一半以上：每 token 多出的时间从 0.20–0.30 ms 降到 0.04–0.17 ms。
+- 换之后剩下的 decode 差距，按上表是 RoPE 和 Q/K norm 的融合、SiLU·mul、packed decode，以及仍然多出的 launch。
+- **1 并发的 prefill 没有变（93%）**，首 token 71 对 63 ms。这一档每个请求只有一步 prefill 加 7 步 decode，设备上的 kernel 时间解释不了这 8 ms；我没有再往下查，可能在 host 一侧（agxinfer 的 prefill 是 eager，每步 300 多次 launch 从 Python 发出）。
+
 ## 在跑着的引擎上热改
 
 `deploy/qwen38.py serve`（4 层、bf16、`--cuda-graph auto`、`--max-rows 8`），前端发 completions 请求，每次变更前后用同一个 prompt 取 24 个贪心 token：
@@ -230,8 +284,8 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 - 完整模型上和原生 SGLang 的对比（`tests/gpu/bench_serving.py` 两边通用），以及那里的 profile。
 
 这台机器上还能做、这次没做的：
-- **融合路径**：QK norm + RoPE + gate、`fused_sigmoid_mul`、GDN decode 的 packed decode 和投影解包 + conv、两个输入投影合成一次 GEMM。都要加 definition 并改 `models.qwen38` 的前向。按上面的 profile，除了合并 GEMM，其余在这张卡上每层最多省 0.1 ms 量级；和 SGLang 的差距（4 层每步 0.2–0.3 ms）也在这个量级。
-- **小算子**：norm、silu、RoPE、采样（`sgl_kernel` / FlashInfer）。profile 里它们每个不到 0.05 ms。
+- **融合路径**：QK norm + RoPE + gate、`fused_sigmoid_mul`、GDN decode 的 packed decode 和投影解包 + conv、两个输入投影合成一次 GEMM。都要加 definition 并改 `models.qwen38` 的前向。和 SGLang 的 trace 对比，这些在 decode 一步里合计 0.05 ms 左右（RoPE 0.03，packed decode 0.013），排在 RMSNorm 之后。SGLang 在这张卡上也没有合并两个输入投影的 GEMM（它的 trace 里同样是 20 个）。
+- **小算子**，按"差距在哪"的顺序：RMSNorm（FlashInfer 的融合 norm，实验里已经验证过效果；要正式做还得把 `norm.gemma_rms@1` 的容差从逐位改成有容差，并写明带 residual 时可以原地改）、SiLU·mul、RoPE、采样。我之前在这里写"profile 里它们每个不到 0.05 ms"，那是按 kernel 名字看的，漏掉了参照 RMSNorm 合计 0.185 ms 这一项。
 - extend 的 ragged wrapper。
 - prefill kernel 的启动 warm-up。
 - 默认的 graph 桶只到 8 行（`core/plan/graph.py` 的 `DEFAULT_MAX_BUCKET`），理由是当时 graph 里的 attention 按 `max_context` 算。换成 FlashInfer 以后这个理由不成立了，更大的桶没有重新量。
