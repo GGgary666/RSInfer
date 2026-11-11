@@ -1,6 +1,6 @@
-# 接入 FlashInfer 前的 serving 基线（2026-11-11，SM90-80GB，4 层）
+# 接入真 kernel 之前的 serving 基线：master 的引擎（2026-11-11，SM90-80GB，4 层）
 
-按用户确认的范围，只测试 `dev/gw/attn-kernel` 当前服务。引擎固定为 `03579e36a81900d8506f43f75041cc328985db56`；从 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 `2f3ac834ba3e009d0f394f8a600e075eb2bdde67` 复用 `tests/gpu/bench_serving.py` 的 HTTP 负载和计时逻辑。没有合入或运行该 PR 的 FlashInfer、Triton GDN 实现。
+测的是 `dev/gw/attn-kernel` 分支当时的服务，引擎固定为 `03579e36a81900d8506f43f75041cc328985db56`。这个提交相对 master `ffa7254` 只多了文档和一个微基准脚本，`engine/` 完全相同，所以**这就是 master（接入 FlashInfer 和 Triton GDN 之前）在 SM90-80GB 上的基线**。从 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 `2f3ac834ba3e009d0f394f8a600e075eb2bdde67` 复用 `tests/gpu/bench_serving.py` 的 HTTP 负载和计时逻辑。没有合入或运行该 PR 的 FlashInfer、Triton GDN 实现。
 
 这份记录补充 [attention 算子微基准](attn-kernel-benchmark.md)：这里测的是完整 HTTP 服务链路，但模型只有 Qwen3.8-27B 结构的前 4 层，使用 seed 1 的随机 BF16 权重（约 7.57 GiB），不代表完整 27B 或真实权重的回答质量。
 
@@ -31,16 +31,16 @@ BF16 的 greedy token 与 HF 开始分歧的位置为第 0、2、2 步（eager �
 
 两次启动分别使用 `--cuda-graph off` 和 `--cuda-graph auto`。每个服务保持运行，通过控制面 `apply` 切换 `sched.overlap`，在没有请求时执行 dry-run 和 apply，并检查没有进程重启。其余参数固定：BF16、KV page size 16、`max_rows=64`、`max_context=4096`、`token_budget=2048`、`mem_fraction=0.85`、graph 默认桶 1/2/4/8、默认预算 1 GiB。没有使用 PR #51 报告中扩大 graph 桶、prefill 预算和调低显存比例的配置。
 
-`auto` 下只覆盖到 8 行的图。并发 16/32 时，不能放进这些桶的步走 eager，因此这里叫 graph auto，不宣称高并发全程都在 replay。
+`auto` 下只覆盖到 8 行的图（master 的默认；#51 之后用 paged attention 时默认到 64 行）。并发 16/32 时，不能放进这些桶的步走 eager，因此这里叫 graph auto，不宣称高并发全程都在 replay。
 
 - decode：32 个词的 prompt，生成 256 token；并发 1/4/8/16/32，每客户端 4 个计时请求。
 - prefill：2000 个词的 prompt，生成 8 token；并发 1/4/8，每客户端 2 个计时请求。词数不当作实际输入 token 数，实际数量读取 usage。
 - 每档每个客户端先发 1 个不计入统计的 warm-up 请求；客户端随后串行发送自己的请求，客户端之间并发。
 - 每配置测量 2 次，overlap 顺序为关→开、开→关。相同配置间使用相同 seed 和 prompt，decode 与 prefill 使用不同 seed 区间。当前服务没有 prefix cache。
-- 吞吐是整档总实际输出/输入 token 数除以整档 wall time；TTFT 是第一个非空文本片段的到达时间；TPOT 是首尾非空文本片段之间的时间除以实际输出 token 数减一。该指标包含 detokenizer 和流式分块行为，不能当成纯 GPU token 时间。
+- 吞吐是整档总实际输出/输入 token 数除以整档 wall time；TTFT 是第一个非空文本片段的到达时间；TPOT 是首尾非空文本片段之间的时间除以实际输出 token 数减一。该指标包含 detokenizer 和流式分块行为，不能当成纯 GPU token 时间。这是 `2f3ac83` 那一版脚本的口径；#51 后来把它改成按每个 token 的事件计时（不管带不带文本）。
 - 原脚本的 p99 只是本档少量请求的经验分位数；没有把它当作经过充分采样的服务 SLO。
 
-原脚本遇到缺失 usage 时会采用请求中的 `max_tokens`。本轮在其 `one` 函数内添加严格检查，保留原计时位置和负载：每个请求必须收到 `[DONE]`、`finish_reason=length`、明确 usage，实际输出 token 数必须等于请求数，输入数必须为正、total 必须等于输入与输出之和；缺失信息直接失败。没有按 SSE chunk 数猜 token 数。
+原脚本遇到缺失 usage 时会采用请求中的 `max_tokens`。本轮在其 `one` 函数内添加严格检查（改过的脚本没有提交，在本地的 `.ossrun-artifacts/` 里），保留原计时位置和负载：每个请求必须收到 `[DONE]`、`finish_reason=length`、明确 usage，实际输出 token 数必须等于请求数，输入数必须为正、total 必须等于输入与输出之和；缺失信息直接失败。没有按 SSE chunk 数猜 token 数。
 
 另外，对每个服务模式和 overlap 设置分别发送英文、代码、中文输入，检查流式拼接文本等于非流式文本、再次请求结果不变，并用 tokenizer 独立核对输入 token 计数。没有把不同 batch 或不同 kernel 的 BF16 文本一致作为性能测量的前提。
 
@@ -84,7 +84,7 @@ BF16 的 greedy token 与 HF 开始分歧的位置为第 0、2、2 步（eager �
 
 graph auto + overlap 的 TTFT 中位数在并发 1/4/8 分别为 **60.8 / 210.4 / 344.1 ms**。吞吐更高不意味着每档 TTFT 都更低：例如并发 8 的默认 eager TTFT 为 296.1 ms。
 
-原始 JSON 保存每次运行的 median 和经验 p99。只有两次重复及少量请求，不作显著性检验或稳定尾延迟承诺。以上均为接入 FlashInfer 前的基线，不能和另一张卡上的 PR #51 数字直接相除归因于 kernel。
+原始 JSON 保存每次运行的 median 和经验 p99。只有两次重复及少量请求，不作显著性检验或稳定尾延迟承诺。以上均为接入之前的基线，不能和另一张卡上的 PR #51 数字直接相除归因于 kernel；同一张卡、同一份源码上的配对比较见 [serving-flashinfer-gdn-ablation.md](serving-flashinfer-gdn-ablation.md)。
 
 ## 复现与原始记录
 
@@ -106,7 +106,7 @@ uv run python /tmp/bench_serving-pr51.py --url http://127.0.0.1:8000 --name base
 
 性能 command：`cmd_20261111T100619Z_serving-baseline-benchmark_04cf7b97`。本地 `.ossrun-artifacts/` 保存验证日志、性能日志、原 benchmark、orchestration 脚本、tokenizer manifest 和 `serving-baseline-provenance.json`。生成物不提交。
 
-提交评估记录前，本地 `uv run pyright` 为 0 errors / warnings；`uv run pytest -n 8 -x` 在当前 macOS 上为 116 passed、5 failed，首错即停（并行 worker 已在途的失败仍会回收），未完成全量。堆栈包含只读快照 materialize/rename 和进程组清理的 PermissionError，沿用此前记录的本机验证限制；没有改动框架或测试来绕过失败。远程 GPU/HTTP 验证结果与这项本机框架测试分别记录。
+本地（macOS）当时 `uv run pyright` 为 0 错误；全量 `uv run pytest -n 8 -x` 没有跑完（116 passed、5 failed 后首错即停，堆栈里是只读快照和进程组清理的 PermissionError）。这是本机的限制，和上面的远程 GPU 结果无关。
 
 性能任务的最终标记已写出，末次 GPU 采样时间为 2026-11-11 10:19:57 UTC；原 command 的完成状态回写滞后，未把 `running` 当作成功证据。通过独立只读回收任务 `cmd_20261111T101951Z_probe_serving-baseline-fetch_b3745bdd`（`done / exit 0`、`AGXINFER_BASELINE_ARTIFACT_FETCH_OK`）取得完整结果，核对 `complete=true`、64 个唯一测量组合、12 项协议检查、2752 个审计请求、引擎/benchmark/orchestration SHA256 和原任务最终成功标记。原始回收日志为 `.ossrun-artifacts/serving-baseline-fetch.log`，提取结果为 `serving-baseline-result.json`。
 

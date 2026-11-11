@@ -70,23 +70,3 @@ def test_a_padded_lane_reads_the_padding_slot_and_leaves_the_rows_alone() -> Non
     assert torch.isfinite(got).all()
     with pytest.raises(ValueError, match="length mask"):
         ops.attention_decode(q, torch.empty_like(q), p["k"], p["v"], p["table"], rows, lens, 32 ** -0.5, True, True)
-
-
-@pytest.mark.covers(edges=["call"], ladder=[], kinds=["logic"])
-@pytest.mark.parametrize("poison", [float("nan"), float("inf"), float("-inf")])
-@pytest.mark.parametrize(("dtype", "tolerance"), [(torch.float32, 1e-5), (torch.bfloat16, 2e-2)])
-def test_undefined_padding_values_do_not_contaminate_real_rows(poison: float, dtype: torch.dtype,
-                                                             tolerance: float) -> None:
-    """Upstream kernels may leave inactive lanes undefined, including the shared padding KV slot."""
-    p = paged(3, dtype, torch.Generator().manual_seed(8), heads=4, kv_heads=2, stale=10 ** 6)
-    p["k"][0].fill_(poison)
-    p["v"][0].fill_(poison)
-    want, _ = both(p, True)
-    assert torch.isfinite(want).all()
-    q = torch.cat([p["q"], torch.full((5, 4, 32), poison, dtype=dtype)])
-    rows = torch.cat([p["rows"], torch.zeros(5, dtype=torch.int64)])
-    lens = torch.cat([p["lens"], torch.ones(5, dtype=torch.int64)])
-    got = ops.attention_decode(q, torch.empty_like(q), p["k"], p["v"], p["table"], rows, lens, 32 ** -0.5, True)
-    assert torch.isfinite(got[:3]).all()
-    torch.testing.assert_close(got[:3].float(), want.float(), rtol=tolerance, atol=tolerance)
-    assert not torch.isfinite(p["v"][0]).any()

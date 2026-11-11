@@ -1,8 +1,20 @@
 # FlashInfer 与现有 attention 的算子对比（2026-11-11）
 
-配套设计：[attn-kernel.md](../specs/attn-kernel.md)。脚本：[tests/gpu/bench_attn.py](../../tests/gpu/bench_attn.py)。
+> **读之前先看这三点**（2026-11-11 审查后补的）
+>
+> 1. **这是接入之前做的单层微基准，测的接法不是后来引擎里用的那一种。** 所以这些数字回答的是"把按容量算的 attention 换成 paged kernel 值不值"，不能当成引擎里那条路径的数字。
+>
+>    | | 这里测的 | 引擎里实际用的（#51） |
+>    |---|---|---|
+>    | FlashInfer 版本 | 0.6.14 | 0.7.2 |
+>    | 页表 | 页大小 16，列表里是页号 | 页大小 1，列表里是 token 槽号 |
+>    | workspace | 每个实例 128 MiB | 每个设备 384 MiB，共用 |
+>
+>    引擎实际的做法见 [attn-kernel.md](../specs/attn-kernel.md)，端到端的数字见 [serving-flashinfer-gdn-ablation.md](serving-flashinfer-gdn-ablation.md)。
+> 2. **脚本 `tests/gpu/bench_attn.py` 已经不在仓库里。** 它在本 PR 分支历史的提交 `03579e3` 里，要复现先取出来：`git show 03579e3:tests/gpu/bench_attn.py > tests/gpu/bench_attn.py`。
+> 3. 文中说的"设计"指当时的提案（提交 `502f5ce` 里的 `doc/specs/attn-kernel.md`），不是现在那份文档。
 
-本次通过 **ossrun** 把 `dev/gw/attn-kernel` 独立 worktree 的源码快照发布到远程，在 NVIDIA SM90-80GB 上测量单层 full-attention decode。引擎尚未接入 FlashInfer；这里没有完整模型、HTTP 吞吐或 SM100 的结果。
+本次通过 **ossrun** 把 `dev/gw/attn-kernel` 独立 worktree 的源码快照发布到远程，在 NVIDIA SM90-80GB 上测量单层 full-attention decode。测量时引擎还没有接入 FlashInfer；这里没有完整模型、HTTP 吞吐或 SM100 的结果。
 
 ## 环境和可追溯性
 
@@ -39,7 +51,7 @@ FlashInfer 及补充依赖安装在独立 target 目录，未修改远程原有 
 
 graph 模式分别捕获计算和 KV store + 计算两张图，两图顺序运行并共享内存池。prepared 和含 prepare 的两组测量分开执行，二者之差不是独立测得的 planning 时间。CUDA event 的 `stream_elapsed` 包含 host 提交间隙，也不能当成纯 kernel profiler 时间。JSON 中的 p90 是 7 个组平均值的分位数，不是请求尾延迟。
 
-这是固定长度、重复访问同一份 KV 的热缓存微基准。未计入 CPU 构造页表、QKV projection、RoPE、调度、采样、GDN、HTTP，也没有真实请求连续增长。设计中同规格的多个 attention 层共享每步 planning，不能把本次 `prepare_store_run` 直接乘以层数预测模型性能。
+这是固定长度、重复访问同一份 KV 的热缓存微基准。未计入 CPU 构造页表、QKV projection、RoPE、调度、采样、GDN、HTTP，也没有真实请求连续增长。引擎里每步只 plan 一次，各 attention 层共用，所以不能把本次 `prepare_store_run` 直接乘以层数预测模型性能。
 
 ## 结果
 
@@ -98,7 +110,7 @@ batch 8/32 下，FlashInfer graph 相对现有 torch graph 为 **5.83–14.58×*
 
 FlashInfer graph 相对 torch graph 为 **6.37×**。本次只在 capture 前设置该分布，没有验证同一张图从等长切换为变长。
 
-对设计的直接影响：继续推进 paged decode；将每步 planning 放在各层共享的 prepare 阶段；保留小 batch 的实测验收与显式 backend 选择。尚不足以打开默认自动选择，也不足以预测完整模型加速比。
+当时由此得出的结论：继续推进 paged decode；把每步的 planning 放在各层共用的 prepare 阶段；小 batch 要单独实测；这些数字还不足以预测完整模型的加速比。当时还认为不足以打开默认的自动选择；后来 #51 的做法是 `auto` 在合适的配置下直接选 FlashInfer，依据是它自己的整模型和 HTTP 测试，不是这份微基准。
 
 ## 正确性与覆盖范围
 
@@ -106,13 +118,13 @@ FlashInfer graph 相对 torch graph 为 **6.37×**。本次只在 capture 前设
 
 覆盖 36 个主矩阵配置（batch 1/8/32 × 实际长度 32/256/4096 × 四模式），8 个容量配置（batch 8，实际长度 256/4096，`max_context=16384`），4 个变长配置（batch 8，长度 `[4096,3584,3072,2560]` 重复两次，`max_context=4096`）。
 
-本次长度都为整页；未验证部分页、padding lane、真实跨页增长、capture 后改变长度或页数、split 调度边界、prefill、overlap、apply/撤回、完整模型及 SM100。它是设计阶段的性能证据，不能据此认定 P0–P5 已验收。
+本次长度都为整页；未验证部分页、padding lane、真实跨页增长、capture 后改变长度或页数、split 调度边界、prefill、overlap、apply/撤回、完整模型及 SM100。它是接入之前的性能证据，不是对引擎里实现的验收。
 
 ## 复现
 
 本地 ossrun 指定 source root 为本分支 worktree，发布时检查分支名；执行命令固定 release ID。远程运行的是该 release 内的源码，既不依赖远程 git 当前分支，也不会自动取得发布后本地的新修改。
 
-远程命令使用独立依赖目录，完整执行脚本保存在本地 `.ossrun-artifacts/attn-matrix-command.sh`：
+脚本要先从提交 `03579e3` 取出来（见文首）。远程命令使用独立依赖目录（FlashInfer 0.6.14 单独装，不是仓库 `gpu` extra 里的 0.7.2），完整执行脚本保存在本地 `.ossrun-artifacts/attn-matrix-command.sh`：
 
 ```sh
 export ATTN_DEPS=/checkpoint/binary/agxinfer_cuda_graph/attn-bench-deps/flashinfer-0.6.14
@@ -141,6 +153,4 @@ bench --batches 8 --lengths 4096 --varlen --max-context 4096 --iterations 20 --r
 - `attn-matrix-command.sh`、`attn-install-command.sh`、`attn-extra-deps-command.sh`：执行和依赖安装记录。
 - `attn-probe.log`、`attn-extra-deps.log`、`attn-readonly-diag.log`：环境、依赖和任务诊断。
 
-本地 `uv run pyright` 为 0 error；`uv run pytest tests/units/kernels -q` 为 24 passed。补充在 CPU 上用三组长度分布核对 FP32 oracle 与两条现有实现。没有改动引擎代码，也没有触发引擎 apply 或 formal。
-
-提交到 PR 前再次运行 `uv run pyright`：0 errors / warnings。`uv run pytest -n 8` 在当前 macOS 上反复失败并长时间没有新进展后人工中止，退出码 2；最终统计 **481 passed、73 failed、9 warnings，未完成 589 项全量测试**。日志中有只读快照目录 rename 的 `PermissionError: [Errno 13]`，也有进程/通信超时；设计 PR 的此前验证已出现类似现象，但未逐项证明本次所有失败的根因。没有修改框架或测试来绕过失败。日志保存在 `.ossrun-artifacts/pr-50-pyright.log` 和 `.ossrun-artifacts/pr-50-pytest.log`。
+当时带着脚本的提交在本地过了 `uv run pyright`（0 错误）和 `uv run pytest tests/units/kernels -q`（24 passed）；macOS 上的全量 `pytest -n 8` 没有跑完（481 passed、73 failed 后人工中止，日志里有只读快照 rename 的 PermissionError 和超时）。脚本去掉以后，本 PR 不含代码，这些记录只说明当时的情况。

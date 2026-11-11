@@ -1,6 +1,14 @@
 # FlashInfer 与 Triton GDN 的 serving 消融比较（2026-11-11，SM90-80GB）
 
-上一轮 [serving 基线](serving-baseline-before-flashinfer.md) 只测了尚未接入 FlashInfer 的 `dev/gw/attn-kernel`。本轮实际运行 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 FlashInfer attention 和 Triton GDN 实现，拆开比较各自及组合后的 HTTP 服务性能。
+上一轮 [serving 基线](serving-baseline-before-flashinfer.md) 测的是接入之前的引擎（master 的代码）。本轮实际运行 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 FlashInfer attention 和 Triton GDN 实现，拆开比较各自及组合后的 HTTP 服务性能。
+
+> **读之前先看这两点**（2026-11-11 审查后补的）
+>
+> 1. **测的是 #51 的第一批（`2f3ac83`），不是 #51 现在的样子。** 之后 #51 又做了两件会改变这里数字的事，#53 再加了一件，本文都不包含：
+>    - 每层的小算子换成了融合 kernel（Gemma RMSNorm、SiLU·mul、Q/K norm + RoPE、GDN decode 的两个 kernel）；
+>    - 用 paged attention 时，默认的 graph 桶从"到 8 行"改成"到 64 行"，所以下文"16/32 并发包含 eager fallback"对现在的默认配置不成立；
+>    - #53 把 KV 写入和 KV 槽列表各合成了一个 kernel。
+> 2. **文中的 padding 修复现在不在任何分支上。** 它当时在本 PR 里（提交 `5e14f65`），后来随代码一起从 PR 里去掉了；master、#51、#53 都没有它。修复的内容和现状见"测量前发现并修复的 padding 数值问题"一节。
 
 ## 比较边界
 
@@ -13,16 +21,16 @@
 | Triton GDN | 不注册 | 注册 | reference | torch_graph | Triton |
 | 两者 | 注册 | 注册 | FlashInfer paged | FlashInfer paged | Triton |
 
-Triton 因子包含 `norm.rms_gated@1`，不只包含 recurrent update；Gemma RMSNorm 保持 reference。不能只设 `gdn.backend=reference` 就称为无 Triton，因为 gated RMSNorm 通过 catalog 独立选择。也不能强制 `attn.backend=reference` 代替本表的 native，因为那会排除 `torch_graph`，改变 graph 可用性。
+Triton 因子包含 `norm.rms_gated@1`，不只包含 recurrent update；Gemma RMSNorm 在这个快照里还是 reference（#51 后来给它接了 FlashInfer 的 kernel）。不能只设 `gdn.backend=reference` 就称为无 Triton，因为 gated RMSNorm 通过 catalog 独立选择。也不能强制 `attn.backend=reference` 代替本表的 native，因为那会排除 `torch_graph`，改变 graph 可用性。
 
-本轮 native 是 PR #51 的配对对照，保留 native attention 路径，但包含该 PR 的 padding、metadata 和 graph 初始化变化，不与上一轮引擎 `03579e3` 字节相同。性能归因以本轮同源码、同参数的配对结果为准；没有将两个 PR 合并；FlashInfer/Triton 实现仍来自 PR #51 的隔离快照，设计分支只提交此次必要的 padding 修复、回归测试和评估记录。
+本轮 native 是 PR #51 的配对对照：两个真 kernel 单元都不登记，attention 走原有的 PyTorch 路径，但引擎其余部分是 #51 的（GDN 的 padding 槽号、元数据和 graph 初始化都和 master 不同），所以它和上一轮的引擎 `03579e3` 不是同一份代码。性能归因以本轮同源码、同参数的配对结果为准。没有把两个 PR 合并：FlashInfer 和 Triton 的实现来自 PR #51 的隔离快照，只额外打了下文的 padding 修复。
 
 ## 固定环境与负载
 
 - 通过 ossrun，在同一 SM90-80GB 物理 GPU 1 上串行运行；SM90，81559 MiB。PyTorch 2.11.0+cu130、CUDA runtime 13.0、FlashInfer 0.7.2、Triton 3.6.0、Transformers 5.22.1。
 - 依赖环境按 PR #51 的锁文件独立创建：`794d8b37f9daf2ff0bf85e6db71aae250a02dfe6e38b19185b0cf18ae082468c`。local package mirror安装仍核验锁文件 SHA256；复用已校验的 CUDA 13.0 PyTorch wheel，不改原基线环境。
 - 与上一轮相同的 Qwen3.8-27B 结构前 4 层（3 GDN、1 full attention），seed 1 随机 BF16 权重；相同真实 tokenizer。权重与 tokenizer 哈希见上一轮记录。这不是完整 27B 或语言质量评估。
-- 每组分别测 `--cuda-graph off` / `auto`，固定开启 overlap。BF16、conv BF16、page size 16、max rows 64、max context 4096、token budget 2048、mem fraction 0.85、graph budget 1 GiB；graph 默认桶 1/2/4/8。并发 16/32 包含 eager fallback。
+- 每组分别测 `--cuda-graph off` / `auto`，固定开启 overlap。BF16、conv BF16、page size 16、max rows 64、max context 4096、token budget 2048、mem fraction 0.85、graph budget 1 GiB；graph 桶是这个快照的默认值 1/2/4/8，所以并发 16/32 包含 eager fallback。
 - decode：32 输入 token、256 输出 token，并发 1/4/8/16/32，每客户端 4 个计时请求。
 - prefill：2000 输入 token、8 输出 token，并发 1/4/8，每客户端 2 个计时请求；整请求吞吐包含短 decode。
 - 每档先预热每客户端 1 个请求，再计时；每组两次重复，相同 prompt 和 seed。TTFT 按第一个非空文本片段；TPOT 按首尾非空片段间隔除以实际输出 token 数减一。
@@ -51,7 +59,24 @@ Triton 因子包含 `norm.rms_gated@1`，不只包含 recurrent update；Gemma R
 
 独立 CPU 回归确认 `kernels.torch_graph` 的问题：长度外的 KV 地址替换为 slot 0，但只 mask attention score，没有清理对应的 V。若上游 padded lane 留下 NaN/Inf，`0 × NaN/Inf` 在加权求和时仍会污染有效行。Triton 的 padded lane 输出允许未定义；FlashInfer paged attention 不走这条固定长度求和路径。
 
-最小修复在 gather 后对长度外的临时 V 填 0，保留原 score mask 和有效 token 的原始数值，不修改 cache、不对有效数据使用 `nan_to_num`。FP32/BF16 × NaN/+Inf/−Inf 六项回归在修复前全部失败；修复后 attention 单元测试 14 passed，整个 kernel 测试目录 30 passed。四组测量均使用该修复；不能将修复前的异常 graph 输出算成加速收益。
+最小修复在 gather 后对长度外的临时 V 填 0，保留原 score mask 和有效 token 的原始数值，不修改 cache、不对有效数据使用 `nan_to_num`。就是 `engine/kernels/torch_graph/ops.py` 的 `attention_decode` 里加两行：
+
+```diff
+     key = k_cache[slots].to(query.dtype)    # [rows, width, kv_heads, dim]
+     value = v_cache[slots].to(query.dtype)
++    # Inactive lanes may leave non-finite padding values; zero weight times NaN is still NaN.
++    value.masked_fill_(~mask[:, :, None, None], 0)
+     q = query.reshape(rows, kv_heads, heads // kv_heads, dim) * (dim ** -0.5 if scaling is None else scaling)
+```
+
+FP32/BF16 × NaN/+Inf/−Inf 六项回归在修复前全部失败；修复后 attention 单元测试 14 passed，整个 kernel 测试目录 30 passed。四组测量均使用该修复；不能将修复前的异常 graph 输出算成加速收益。
+
+**这个修复的现状**（2026-11-11 审查时核对的）：
+
+- 修复和六项回归测试在提交 `5e14f65` 里（`tests/units/kernels/test_torch_graph.py` 的 `test_undefined_padding_values_do_not_contaminate_real_rows`）。代码后来从本 PR 去掉了，master、#51、#53 都不含它。
+- 把这六项测试放到 #53 的 head（`f543495`）上跑，六项仍然全部失败；打上这两行以后 14 项全过。也就是说 `kernels.torch_graph` 的这个弱点还在。
+- 当时触发它的条件大概已经没有了：#51 第二批把 GDN 的 decode 换成了 packed decode，它给 padding lane 写的是 0，不再是未初始化的内存。这是按代码推的，没有实际再跑"只开 Triton"这一组来确认。
+- 什么时候会走到 `torch_graph`：fp32、KV 和模型的 dtype 不同、或者没有 FlashInfer 时的 decode graph。
 
 修复后的 `engine/kernels/torch_graph/ops.py` SHA256：`3a6e7c7fa409d2bd4f2a91f5f973c0d91a501ad4a76a56e5e46af71ce67cb124`。这是 kernel 数值修复，没有修改框架本体。
 
@@ -121,11 +146,11 @@ Triton 因子包含 `norm.rms_gated@1`，不只包含 recurrent update；Gemma R
 
 单请求 decode 的 FlashInfer 收益很小：eager 为 1.02×，graph auto 为 0.98×。两次测量不足以把这种小差异视为稳定改善或退化；native graph auto 的该档两次吞吐相差约 5.1%。全部测量中最大的两次速率差为 13.6%，出现在 eager、两者、prefill 并发 4。原始 JSON 保留每次速率、median 和经验 p99，不作稳定尾延迟或显著性承诺。
 
-graph auto 默认只录到 8 行，16/32 并发包含 eager fallback，因此不保证比 eager 更快。这里只改变 kernel 组合，没有扩大桶、增加 prefill token budget 或改显存比例；没有完整模型、真实权重质量、SM100 或原生 SGLang 的配对比较。
+graph auto 在这个快照里默认只录到 8 行，16/32 并发包含 eager fallback，因此不保证比 eager 更快。这里只改变 kernel 组合，没有扩大桶、增加 prefill token budget 或改显存比例；没有完整模型、真实权重质量、SM100 或原生 SGLang 的配对比较。
 
 ## 复现口径
 
-先检出 PR #51 的上述固定提交，再应用 `5e14f65` 中对 `engine/kernels/torch_graph/ops.py` 的两行修复。四份临时源码只省略下列 manifest，保留所有 Python 实现：native 省略 `kernels/flashinfer/unit.toml` 和 `kernels/triton/unit.toml`；FlashInfer 只省略 Triton；Triton GDN 只省略 FlashInfer；两者都启用时不省略。路径相对于 `engine/`。所有份使用同一修复文件，不能用未修复的 native 对照。
+先检出 PR #51 的上述固定提交，再打上前面那两行对 `engine/kernels/torch_graph/ops.py` 的修复（也可以从本 PR 分支历史的 `5e14f65` 里取）。四份临时源码只省略下列 manifest，保留所有 Python 实现：native 省略 `kernels/flashinfer/unit.toml` 和 `kernels/triton/unit.toml`；FlashInfer 只省略 Triton；Triton GDN 只省略 FlashInfer；两者都启用时不省略。路径相对于 `engine/`。所有份使用同一修复文件，不能用未修复的 native 对照。
 
 在同一 GPU 环境中，每份源码分别运行以下两种 `MODE`（`off` / `auto`）。`SOURCE` 为该份源码的父目录，`MODEL` 与 `TOKENIZER` 指向前述同一份缓存；不要把完整模型、另一组权重或其他 tokenizer 混进比较。
 
@@ -162,6 +187,6 @@ uv run python tests/gpu/bench_serving.py --url http://127.0.0.1:8000 --name "$NA
 | `serving-ablation-benchmark-fixed-command.sh` | `d99d5110bfc9c0bb587b897e17dd0c181c80b97a84d94aadf1b45dc0b49a77c6` |
 | `serving-ablation-model-fixed-command.sh` | `29dfa30e3eef7c25bebdec1c9e3907943935b9edd79ef6754132e67c6d6ec0a7` |
 
-## 本地提交验证
+## 本地验证（当时）
 
-修复后 `uv run pyright`：0 errors / warnings。`uv run pytest tests/units/kernels -q`：30 passed。`uv run pytest -n 8 -x`：116 passed、5 failed 后提前停止（22.34 秒），没有完成全量；失败堆栈含 macOS 上的只读快照和进程组 PermissionError。未修改框架或测试以绕过失败，未触发 formal 范围。
+当时带着修复的提交在本地过了 `uv run pyright`（0 错误）和 `uv run pytest tests/units/kernels -q`（30 passed）；macOS 上的全量 `uv run pytest -n 8 -x` 没有跑完（116 passed、5 failed 后停止，堆栈里是只读快照和进程组的 PermissionError）。修复和测试去掉以后，本 PR 不含代码。

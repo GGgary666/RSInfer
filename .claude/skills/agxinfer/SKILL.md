@@ -102,7 +102,6 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/qwen38.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
-  - `bench_attn.py`：独立的 full-attention decode 微基准，对比 reference eager、torch graph 和 FlashInfer eager/graph；固定 BF16 输入、页表和序列长度，分别报告已准备计算与 prepare + KV store + 计算。需要另行安装 FlashInfer，不代表引擎已接入或端到端吞吐。
   - `test_cuda_graph_adversarial.py`：A/B/C 共用的 GPU 验收，检查数值、实际 CUDA replay，以及 catalog 变更后在写状态之前拒绝旧图；实验分支、结果与复现命令见 `doc/evaluations/cuda-graph-abc.md`。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
   - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/qwen38.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
@@ -125,7 +124,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
