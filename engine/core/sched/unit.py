@@ -32,7 +32,7 @@ class Unit:
                             step_timeout_s=config["sched.step_timeout_s"],
                             quiesce_timeout_s=config["sched.quiesce_timeout_s"],
                             frontend_timeout_s=config["sched.frontend_timeout_s"],
-                            idle_wait_s=config["sched.idle_wait_s"])
+                            idle_wait_s=config["sched.idle_wait_s"], asleep=config["holder.sleep"])
         self.loop = Scheduler(
             table=cast(Table, ctx.use("sched.reqs@1")), ledger=cast(Ledger, ctx.use("ledger@1")),
             order=cast(OrderPolicy, ctx.use(ORDER)), compose=cast(ComposePolicy, ctx.use(COMPOSE)),

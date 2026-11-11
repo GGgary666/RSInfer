@@ -20,11 +20,14 @@ What is ours (stage2-contract.md §4):
   delta. Ranks that disagree (one ran it, one did not) cannot be put back together: that is a
   failure.
 - **Failures.** ``StepFailure``, a step without an answer for ``sched.step_timeout_s``, or ranks
-  that disagree: the worker's state is unknown. Then no more steps go out, new requests get an
-  error, the requests it holds stay as they are, and ``report()`` says what happened. Nothing is
-  frozen: control requests, reloads and config keep working. Until changes can choose how to deal
-  with such a state (stage 2's step 5), a new instance of this unit (a reload) ends the requests
-  of steps that never came back with an error and carries on with the rest.
+  that disagree: the worker's state is unknown. Then no more steps go out and every request in
+  the engine ends with an error at once (its client is not left waiting, and the engine is empty
+  for the change that repairs it); new requests get an error, and ``report()`` says what
+  happened. Nothing is frozen: control requests, reloads and config keep working. Once a change
+  committed (the identity served is no longer the one that failed), the loop starts over as a
+  new instance of this unit would: the steps that never came back are given up, the next plan
+  resets the workers' persistent batch, and serving goes on. If the change did not repair it, the
+  next step fails the same way. A new instance (a reload of this unit) does the same at once.
 - **A replaced worker.** Plans or results of a rank going over a new connection mean a new
   worker process (or a broken connection): what the requests had there is gone. Those requests
   end with an error at once, the steps sent there and not answered are given up, and serving
@@ -41,6 +44,8 @@ What is ours (stage2-contract.md §4):
   persistent batch (``batch.max_context_len``), and plans use at most ``batch.max_rows`` rows:
   the worker raises on a plan beyond them (stage2-contract.md §4.3). A frontend that takes nothing for
   ``sched.frontend_timeout_s`` loses its requests (they are cancelled), not the scheduler.
+- **Asleep** (``holder.sleep``): the workers hold no weights or states; every request is refused
+  at once, and no step is planned.
 - **Changes.** A change applies to an empty engine (doc/specs/empty-apply.md, ``drain.py``): this
   unit says what it holds, ends it all when the change forces it, and once empty takes no
   requests until the change committed or was undone (``held``).
@@ -149,6 +154,12 @@ class Settings:
     quiesce_timeout_s: float = 30.0
     frontend_timeout_s: float = 5.0
     idle_wait_s: float = 0.01
+    asleep: bool = False
+    """``holder.sleep``: the workers gave their memory back; every request is refused."""
+
+
+ASLEEP = ("the engine is asleep (holder.sleep): it holds no weights or states. Wake it first "
+          "(agxinfer wake, or apply holder.sleep false)")
 
 
 class Fault(msgspec.Struct, frozen=True):
@@ -247,6 +258,8 @@ class Scheduler:
         self.removed: list[int] = []
         self.capacity: dict[int, dict[str, int]] = {}
         self.fault: Fault | None = None
+        self.fault_identity = ""
+        """The identity served when the loop failed: a change that commits replaces it (``_recover``)."""
         self.policy_error: str | None = None
         self.diagnostics: deque[str] = deque(maxlen=64)
         self.routes: dict[StreamAddress, Outbox] = {}
@@ -271,6 +284,8 @@ class Scheduler:
 
     def step(self) -> int | None:
         before = self.table.last_retired
+        if self.fault is not None and self.identity() != self.fault_identity:
+            self._recover()
         if not self.adopted:
             self._adopt()
         busy = self._collect()
@@ -608,13 +623,36 @@ class Scheduler:
         if self.fault is not None:
             return
         self.fault = Fault(step, rank, reason)
+        self.fault_identity = self.identity()
         for outbox in self.plans:
             outbox.queue.clear()  # nothing more goes to a worker in an unknown state
-        self._note(f"stopped at step {step}: {reason}. New requests get an error; the requests "
-                   "held stay until the engine is changed")
-        for request in list(self.table.entries()):
-            if request.row is None and not request.finished():
-                self._error(request, f"the engine stopped serving at step {step}: {reason}")
+        # No step goes out any more, so a request in the engine could never end by itself: end it
+        # now. What it holds is given back once its steps are given up (``_recover``).
+        ended = self.end_all(f"the engine stopped serving at step {step}: {reason}")
+        self._note(f"stopped at step {step}: {reason}. {ended} request(s) ended with it; new requests get "
+                   "an error until a change commits")
+
+    def _recover(self) -> None:
+        """A change committed since the failure: start over as a new instance of this unit would.
+        Every request ended with the failure, so the steps still in flight (the failed one, and
+        those sent with it) are given up by ``_adopt``, which gives their items back; the next
+        plan is a full delta, which drops whatever rows the workers still have. Answers to the
+        given-up steps that arrive later are dropped (``_take_result``)."""
+        fault = self.fault
+        assert fault is not None
+        self.fault, self.fault_identity = None, ""
+        self.flights.clear()
+        for outbox in self.plans:
+            outbox.queue.clear()
+        self.full = True
+        self.removed.clear()
+        self.home.clear()
+        self.result_gens = [r.generation for r in self.results]
+        self.plan_gens = [o.writer.generation for o in self.plans]
+        self.expect_results = [False] * len(self.plans)
+        self.expect_plans = [False] * len(self.plans)
+        self.adopted = False
+        self._note(f"serving again: a change committed after the failure at step {fault.step} ({fault.reason})")
 
     # ------------------------------------------------------------------ frontend
 
@@ -644,6 +682,9 @@ class Scheduler:
         for new in requests.new:
             if self.drain_mode == "force":
                 self._refuse(route, new.request, FORCED)
+                continue
+            if self.settings.asleep:
+                self._refuse(route, new.request, ASLEEP)
                 continue
             if self.fault is not None:
                 self._refuse(route, new.request, f"the engine stopped serving at step {self.fault.step}: "
@@ -772,7 +813,8 @@ class Scheduler:
         self._flush_routes()
 
     def _plan(self) -> bool:
-        if self.fault is not None or not self.ledger.ready or len(self.flights) >= max(1, self.depth()):
+        if self.fault is not None or self.settings.asleep or not self.ledger.ready or \
+                len(self.flights) >= max(1, self.depth()):
             return False
         if self.capacity_wanted:
             return False  # after a change: plan with the workers' capacity of now, not an older one

@@ -67,6 +67,8 @@ class KVPool:
         return self.pages * self.page_size
 
     def declare(self, decls: Sequence[StateDecl]) -> None:
+        if decls and self.holder is not None and self.holder.asleep:
+            self.pages = 1  # asleep (holder.sleep): whatever state.kv.pages says
         if not self.pages and decls:
             self.pages = self.holder.items(KIND) if self.holder is not None else 0
             if not self.pages:

@@ -49,7 +49,7 @@ def checkpoint_at(root: Path) -> Path:
     checkpoint = root / "checkpoint"
     marker = root / "checkpoint-ready.json"
     if not marker.exists():
-        subprocess.run([sys.executable, str(REPO / "deploy/qwen38.py"), "checkpoint", "--config", str(config),
+        subprocess.run([sys.executable, str(REPO / "deploy/agxinfer.py"), "checkpoint", "--config", str(config),
                         "--layers", "4", "--out", str(checkpoint), "--dtype", "bf16", "--seed", "1"], check=True)
         marker.write_text(json.dumps({"layers": 4, "seed": 1, "dtype": "bf16"}))
     return checkpoint

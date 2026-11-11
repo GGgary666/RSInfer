@@ -1,5 +1,5 @@
 """Stage 2's M2a (stage2-contract.md §1.3): the whole engine on the CPU, started the way an operator
-starts it (``deploy/qwen38.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
+starts it (``deploy/agxinfer.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
 layout and a real HF tokenizer. Text through HTTP, out of the frontend, the scheduler host and a
 worker process, equals what HF's model computes, greedy, token by token."""
 
@@ -21,7 +21,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
-from tests.scenarios.deploy import ENV, REPO, cli, post, served
+from tests.scenarios.deploy import CLI, ENV, REPO, cli, free_port, post, served
 from tests.units.support.tokenizer import save_tokenizer
 from tests.units.support.worker import hf_greedy, tiny_config
 
@@ -225,11 +225,56 @@ def test_a_kernel_change_that_cannot_run_rolls_back_and_the_engine_keeps_serving
         assert text() == baseline
 
 
+def test_the_cli_runs_an_engine_in_the_background_puts_it_to_sleep_and_stops_it(model: Path, tokenizer: Path,
+                                                                              tmp_path: Path) -> None:
+    """``agxinfer serve --detach`` returns once the engine is up. ``status``, ``control`` and the
+    rest find it through its run directory. ``sleep`` gives its memory back and requests are refused;
+    ``wake`` loads the weights again and serves what it served before. ``stop`` leaves no process of it."""
+    run, port = tmp_path / "run", free_port()
+    serve = ["serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype", "f32",
+             "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8",
+             "--cpu-bytes", str(4 << 20), "--timeout", "120", "--port", str(port), "--run", str(run)]
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "max_tokens": 8, "temperature": 0.0, "ignore_eos": True}
+
+    def status() -> tuple[int, dict[str, Any]]:
+        out = subprocess.run([sys.executable, str(CLI), "status", "--run", str(run)], env=ENV, capture_output=True,
+                             text=True, timeout=60)
+        return out.returncode, json.loads(out.stdout)
+
+    try:
+        cli(*serve, "--detach", timeout=180)
+        code, now = status()
+        assert code == 0 and now["running"] and now["health"] == "ok", now
+        assert now["url"] == f"http://127.0.0.1:{port}" and set(now["procs"].values()) == {"RUNNING"}, now
+        again = subprocess.run([sys.executable, str(CLI), *serve, "--detach"], env=ENV, capture_output=True, text=True,
+                               timeout=60)
+        assert again.returncode != 0 and "already runs" in again.stderr, again.stderr  # one engine per run directory
+        url = now["url"]
+        baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
+        assert baseline
+
+        assert json.loads(cli("sleep", "--run", str(run)))["status"] == "committed"
+        with pytest.raises(AssertionError, match="asleep"):
+            post(url + "/v1/completions", body)
+        assert json.loads(cli("wake", "--run", str(run)))["status"] == "committed"
+        assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+        # The client's options, with the engine's after them.
+        checked = json.loads(cli("control", "check", "--source", str(REPO), "--run", str(run)))
+        assert checked["diagnostics"] == [], checked
+        assert cli("complete", "w1 w2 w3 w4 w5", "--run", str(run), "--max-tokens", "8")
+    finally:
+        cli("stop", "--run", str(run), timeout=120)
+    code, now = status()
+    assert code == 1 and not now["running"] and now["processes"] == 0, now
+    assert "no engine runs" in subprocess.run([sys.executable, str(CLI), "stop", "--run", str(run)], env=ENV,
+                                              capture_output=True, text=True, timeout=60).stderr
+
+
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a
     machine landed on GPU 0."""
-    from deploy.qwen38 import worker_gpu
+    from deploy.agxinfer import worker_gpu
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert worker_gpu(None) == 0

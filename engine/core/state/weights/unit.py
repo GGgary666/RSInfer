@@ -8,6 +8,11 @@ model; here they live in this state unit, so a reload of the model keeps them. T
 its parameters and registers its ``load_weights`` (the stacked-parameter mapping); ``load`` feeds
 it ``safetensors_weights_iterator`` over the checkpoint, or fills dummy weights
 (``initialize_dummy_weights``). ``refit`` loads a checkpoint again into the same tensors.
+
+Asleep (``holder.sleep``), the declared tensors are on the meta device: they have shapes and no
+memory, nothing is loaded, and nothing may run on them (the scheduler refuses requests, and
+``core.plan`` records no graph). Waking reloads this unit, which loads the checkpoint again, as
+vLLM's level-2 sleep does; contents a ``refit`` put there are gone then.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import glob
 import os
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 import safetensors
@@ -23,6 +29,10 @@ import torch
 
 from core.contracts.model import WeightDecl, WeightLoader
 from unit.runtime.registry import Registry
+
+
+META_DTYPES = MappingProxyType({"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32, "f64": torch.float64,
+                                "i8": torch.int8, "u8": torch.uint8, "i32": torch.int32, "i64": torch.int64})
 
 
 def safetensors_files(path: str) -> list[str]:
@@ -93,6 +103,8 @@ class WeightStore:
     loaded_from: str = ""
     source: str = ""
     """What ``fill`` last read: a checkpoint path, or ``""`` for the dummy weights."""
+    asleep: bool = False
+    """``holder.sleep``: declared tensors take no memory (the meta device), and nothing is loaded."""
 
     @property
     def version(self) -> str:
@@ -109,8 +121,11 @@ class WeightStore:
             if d.name in self.buffers_:
                 self.platform.free(self.buffers_.pop(d.name))
                 moved = True
-            buf = self.platform.alloc(0, 0, shape=d.shape, dtype=d.format)
-            self.buffers_[d.name], self.tensors[d.name] = buf, self.platform.tensor(buf)
+            if self.asleep:
+                self.tensors[d.name] = torch.empty(d.shape, dtype=META_DTYPES[d.format], device="meta")
+            else:
+                buf = self.platform.alloc(0, 0, shape=d.shape, dtype=d.format)
+                self.buffers_[d.name], self.tensors[d.name] = buf, self.platform.tensor(buf)
             self.decls[d.name] = d
             self.filled.discard(d.name)
         self.generation += moved
@@ -119,12 +134,14 @@ class WeightStore:
         return self.loaders.register(loader)
 
     def load(self) -> None:
-        if set(self.decls) <= self.filled:
+        if self.asleep or set(self.decls) <= self.filled:
             return
         self.fill(self.path)
 
     def fill(self, path: str) -> None:
         """Every declared tensor from the checkpoint at ``path``, or dummy weights for ``""``."""
+        if self.asleep:
+            raise RuntimeError("the weights are asleep (holder.sleep): wake the engine first")
         if path:
             loaders = self.loaders.items()
             if len(loaders) != 1:
@@ -167,6 +184,8 @@ class Refit:
 
     def prepare(self, args: dict[str, Any]) -> None:
         self.path = str(args.get("path", self.store.path))
+        if self.store.asleep:
+            raise RuntimeError("the weights are asleep (holder.sleep): wake the engine first")
         safetensors_files(self.path)
 
     def execute(self, args: dict[str, Any]) -> None:
@@ -187,7 +206,8 @@ class Refit:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        self.store = WeightStore(ctx.platform, config["weights.path"], config["weights.dummy_seed"])
+        self.store = WeightStore(ctx.platform, config["weights.path"], config["weights.dummy_seed"],
+                                 asleep=config["holder.sleep"])
         self.model = {"model.path": config["model.path"], "model.hf_config": config["model.hf_config"],
                       "model.dtype": config["model.dtype"]}
         """The model config the parameters are declared from (and the state dtypes' ``auto``). Read here

@@ -19,4 +19,4 @@ captures_graph = true
 "plan.graph_memory_bytes" = { type = "int", default = 1073741824, binding = "startup", doc = "Device memory the decode graphs may keep (one pool for all buckets), out of what holder.mem_fraction leaves free." }
 
 [reads]
-config = ["batch.max_rows"]
+config = ["batch.max_rows", "holder.sleep"]

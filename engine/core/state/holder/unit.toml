@@ -15,3 +15,4 @@ drain_on_reload = false
 "holder.state_ratio" = { type = "float", default = 0.9, binding = "startup", doc = "GDN state memory to KV memory (SGLang's mamba_full_memory_ratio)." }
 "holder.max_slots" = { type = "int", default = 0, binding = "startup", doc = "GDN slots, if set (SGLang's max_mamba_cache_size); 0: by state_ratio." }
 "holder.cpu_bytes" = { type = "int", default = 1073741824, binding = "startup", doc = "Memory for the state pools on a CPU device." }
+"holder.sleep" = { type = "bool", default = false, binding = "startup", doc = "Asleep: the worker gives its device memory back (weights, state pools, decode graphs) and the scheduler refuses requests; false again loads the weights from the checkpoint. Like vLLM's sleep mode and SGLang's release_memory_occupation." }

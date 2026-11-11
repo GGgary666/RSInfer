@@ -16,7 +16,7 @@ actions = ["drain"]  # a change applies to an empty engine (doc/specs/empty-appl
 
 [reads]
 # What one row of the workers' persistent batch holds (worker.batch; stage2-contract.md §4.3).
-config = ["batch.max_rows", "batch.max_context_len"]
+config = ["batch.max_rows", "batch.max_context_len", "holder.sleep"]
 
 [config]
 "sched.workers" = { type = "list", default = [], binding = "startup", doc = "The workers' ProcIds, rank 0 first; one per rank." }

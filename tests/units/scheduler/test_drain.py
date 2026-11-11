@@ -143,27 +143,28 @@ def test_after_a_change_no_step_until_every_rank_says_its_capacity_under_the_new
         assert not b.engine.loop.capacity_wanted and b.client.outputs[1].error is None
 
 
-def test_after_a_worker_failure_only_force_empties_the_engine_and_the_change_says_so() -> None:
-    """No step goes out after a failure, so what the requests hold never ends by itself: refusing
-    or waiting fails at once and points to ``--force`` (Devin, #42)."""
+def test_after_a_worker_failure_the_engine_is_empty_and_any_change_applies() -> None:
+    """A failure ends every request at once (no step goes out, so none could end by itself):
+    refusing, waiting and forcing all find the engine empty (#42 needed --force here)."""
     with bed() as b:
         b.client.send([request(1, [1, 2, 3], 200)])
         b.run_until(lambda: len(b.client.outputs[1].tokens) >= 1)
         b.workers[1].fixture.script[b.engine.table.last_submitted + 2] = "fail"
         b.run_until(lambda: b.engine.loop.fault is not None)
-        for mode in ("refuse", "wait"):
-            with pytest.raises(RuntimeError, match=r"stopped serving at step .*waiting cannot empty it.*--force"):
-                drain(b).start_drain({"mode": mode, "gate": True})
-            drain(b).abort()
-        h = drain(b)
-        h.start_drain({"mode": "force", "gate": True})
-        b.run_until(h.drained)
-        h.abort()
+        b.run_until(b.finished(1))
+        assert "stopped serving" in (b.client.outputs[1].error or "")
+        for mode in ("refuse", "wait", "force"):
+            h = drain(b)
+            h.start_drain({"mode": mode, "gate": True})
+            assert h.drained()
+            h.abort()
+        assert b.engine.loop.fault is not None  # undone changes leave it: the identity is the same
 
 
-def test_a_worker_failure_while_the_change_waits_fails_it_at_once() -> None:
-    """Waiting began with the engine serving; then a worker fails: the change fails at the next
-    check, pointing to ``--force``, instead of waiting out its limit (Devin, #42)."""
+def test_a_worker_failure_while_the_change_waits_empties_the_engine_and_the_change_goes_on() -> None:
+    """Waiting began with the engine serving; then a worker fails. The failure ends the requests,
+    so the change finds the engine empty at its next check instead of waiting out its limit
+    (Devin, #42); the change may be what repairs the worker."""
     with bed() as b:
         b.client.send([request(1, [1, 2, 3], 200)])
         b.run_until(lambda: len(b.client.outputs[1].tokens) >= 1)
@@ -172,6 +173,10 @@ def test_a_worker_failure_while_the_change_waits_fails_it_at_once() -> None:
         assert not h.drained()
         b.workers[0].fixture.script[b.engine.table.last_submitted + 2] = "fail"
         b.run_until(lambda: b.engine.loop.fault is not None)
-        with pytest.raises(RuntimeError, match=r"stopped serving at step .*waiting cannot empty it.*--force"):
-            h.drained()
-        h.abort()
+        assert h.drained()
+        h.commit()
+        b.new_identity("v2")
+        fresh = request(2, [4, 5, 6], 4)
+        b.client.send([fresh])
+        b.run_until(b.finished(2))
+        assert b.client.outputs[2].error is None and b.engine.loop.fault is None

@@ -1,4 +1,4 @@
-"""The engine as an operator starts it, ``deploy/qwen38.py serve``, for the end-to-end tests
+"""The engine as an operator starts it, ``deploy/agxinfer.py serve``, for the end-to-end tests
 (``test_m2a.py`` on the CPU, ``tests/gpu/test_qwen38_serve.py`` on a GPU)."""
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
-CLI = REPO / "deploy" / "qwen38.py"
+CLI = REPO / "deploy" / "agxinfer.py"
 ENV = {**os.environ, "PYTHONPATH": str(REPO / "engine")}
 
 
