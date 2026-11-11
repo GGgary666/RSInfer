@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import torch
 
+from kernels.reference import ops as reference
 from kernels.reference.paged import PagedDecode
 from layers.attn.paged import gather_kv_indices, indptr_of
 from tests.units.support.worker import Driver, Worker, hf_model, save_checkpoint, tiny_config
@@ -93,3 +94,23 @@ def test_the_token_lists_are_each_rows_first_slots_in_row_order() -> None:
     buffer = torch.full((12,), -1, dtype=torch.int32)  # a graph bucket's: filled in place, the rest untouched
     assert gather_kv_indices(req_to_token, rows, kv_indptr, 8, buffer) is buffer
     assert buffer.tolist() == [130, 131, 110, 111, 112, 113, 114, 120, -1, -1, -1, -1]
+
+
+def test_the_kv_indices_reference_lays_out_the_same_lists_and_each_rows_last_slot() -> None:
+    """``attn.kv_indices@1`` (what ``prepare`` calls now) against the lists above; it reads nothing
+    on the host, so a graph bucket's buffer past the lists keeps what it held, and a row alone gets
+    what it gets among others."""
+    req_to_token = torch.arange(40, dtype=torch.int32).reshape(4, 10) + 100
+    rows, lens = torch.tensor([3, 1, 2]), torch.tensor([2, 5, 1])
+    kv_indptr = indptr_of([2, 5, 1])
+    buffer = torch.full((12,), -1, dtype=torch.int32)
+    last = torch.zeros(3, dtype=torch.int64)
+    reference.create_flashinfer_kv_indices(req_to_token, rows, lens, kv_indptr, buffer, last)
+    assert buffer.tolist() == [130, 131, 110, 111, 112, 113, 114, 120, -1, -1, -1, -1]
+    assert last.tolist() == [131, 114, 120]
+    for r in range(3):
+        alone, one = torch.full((5,), -1, dtype=torch.int32), torch.zeros(1, dtype=torch.int64)
+        reference.create_flashinfer_kv_indices(req_to_token, rows[r:r + 1], lens[r:r + 1], indptr_of([int(lens[r])]),
+                                               alone, one)
+        s, e = int(kv_indptr[r]), int(kv_indptr[r + 1])
+        assert alone[:e - s].tolist() == buffer[s:e].tolist() and int(one) == int(last[r])

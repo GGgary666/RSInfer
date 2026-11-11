@@ -32,6 +32,8 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("gemm.linear@1", "x @ weight.T + bias", ops.linear, LOOSE, False),
     ("embed.lookup@1", "embedding rows by token id", ops.embedding, Tolerance(), True),
     ("kv.store@1", "set_kv_buffer: keys and values at their token slots", ops.kv_store, Tolerance(), True),
+    ("attn.kv_indices@1", "each row's token slots as one list (create_flashinfer_kv_indices_triton), and "
+     "optionally each row's last slot", ops.create_flashinfer_kv_indices, Tolerance(), True),
     ("attn.extend@1", "causal attention of each sequence's new tokens over req_to_token", ops.attention_extend,
      LOOSE, True),
     ("attn.decode@1", "attention of one token per sequence over req_to_token", ops.attention_decode, LOOSE, True),

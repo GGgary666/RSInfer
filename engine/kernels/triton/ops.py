@@ -22,7 +22,7 @@ from typing import Any
 import torch
 
 from kernels.triton import causal_conv1d, elementwise, fused_gdn_gating as gdn_gating, fused_qk_rmsnorm_rope_gate
-from kernels.triton import triton_gdn_fused_proj
+from kernels.triton import kv_indices, triton_gdn_fused_proj
 from kernels.triton.fla import chunk, fused_recurrent, layernorm_gated
 
 # The ported kernels are untyped: their launchers are called as SGLang calls them.
@@ -34,6 +34,7 @@ _fused_qkvzba_causal_conv1d_update_contiguous: Any = triton_gdn_fused_proj.fused
 _packed_decode: Any = fused_recurrent.fused_recurrent_gated_delta_rule_packed_decode
 _fused_qk_gemma_rmsnorm_rope_gate: Any = fused_qk_rmsnorm_rope_gate.fused_qk_gemma_rmsnorm_rope_gate
 _fused_sigmoid_mul: Any = elementwise.fused_sigmoid_mul
+_create_flashinfer_kv_indices: Any = kv_indices.create_flashinfer_kv_indices_triton
 
 
 def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, activation: str | None,
@@ -114,3 +115,15 @@ def fused_sigmoid_mul(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Te
     """``act.sigmoid_mul@1``: ``fused_sigmoid_mul(..., inplace=True)``, as the attention layer calls
     it."""
     return _fused_sigmoid_mul(attn_output, gate, inplace=True)
+
+
+def create_flashinfer_kv_indices(req_to_token: torch.Tensor, req_pool_indices: torch.Tensor,
+                                 page_kernel_lens: torch.Tensor, kv_indptr: torch.Tensor, kv_indices: torch.Tensor,
+                                 out_cache_loc: torch.Tensor | None = None) -> None:
+    """``attn.kv_indices@1``: ``create_flashinfer_kv_indices_triton[(rows,)]``, as
+    ``FlashInferIndicesUpdaterDecode.call_begin_forward`` launches it, one program per row; with
+    ``out_cache_loc``, the same programs write each row's last slot."""
+    rows = req_pool_indices.numel()
+    if rows:
+        _create_flashinfer_kv_indices[(rows,)](req_to_token, req_pool_indices, page_kernel_lens, kv_indptr, None,
+                                               kv_indices, req_to_token.stride(0), out_cache_loc)

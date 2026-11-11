@@ -216,6 +216,27 @@ def kv_store(k_cache: torch.Tensor, v_cache: torch.Tensor, loc: torch.Tensor, ca
     v_cache[loc] = cache_v
 
 
+def create_flashinfer_kv_indices(req_to_token: torch.Tensor, req_pool_indices: torch.Tensor,
+                                 page_kernel_lens: torch.Tensor, kv_indptr: torch.Tensor, kv_indices: torch.Tensor,
+                                 out_cache_loc: torch.Tensor | None = None) -> None:
+    """``attn.kv_indices@1``: what ``create_flashinfer_kv_indices_triton`` writes
+    (kernels/ops/attention/kv_indices.py): row ``r``'s first ``page_kernel_lens[r]`` slots of
+    ``req_to_token[req_pool_indices[r]]`` at ``kv_indices[kv_indptr[r]:]``; with ``out_cache_loc``,
+    also row ``r``'s last slot at ``out_cache_loc[r]`` (where a decode step stores). Reads nothing
+    on the host: ``kv_indices`` past ``kv_indptr[rows]`` keeps what it held."""
+    rows = req_pool_indices.numel()
+    if not rows:
+        return
+    width = req_to_token.shape[1]
+    j = torch.arange(kv_indices.numel(), device=kv_indices.device)
+    starts = kv_indptr[:rows + 1].long()
+    row = torch.searchsorted(starts[1:], j, right=True).clamp_(max=rows - 1)
+    slots = req_to_token[req_pool_indices[row], (j - starts[row]).clamp_(0, width - 1)]
+    kv_indices.copy_(torch.where(j < starts[rows], slots.to(kv_indices.dtype), kv_indices))
+    if out_cache_loc is not None:
+        out_cache_loc.copy_(req_to_token[req_pool_indices, page_kernel_lens.long() - 1])
+
+
 def attention_extend(query: torch.Tensor, output: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                      req_to_token: torch.Tensor, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor,
                      extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, scaling: float | None = None,

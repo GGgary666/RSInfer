@@ -33,7 +33,7 @@ from core.contracts.plan import GRAPH, AttentionBackend, PersistentBatch, PlanKe
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from layers.attn.paged import DEFINITIONS as PAGED
-from layers.attn.paged import PagedAttnBackend
+from layers.attn.paged import KV_INDICES, PagedAttnBackend
 from layers.solutions import PHASES, Kernels
 
 KIND = "kv.paged"
@@ -188,7 +188,9 @@ class AttnBackend:
             paged = self._paged(phase, shape)
             self.backends[phase] = self.paged if paged else self.native
             calls[phase] = {"kv.store@1": {}, (PAGED if paged else NATIVE)[phase]: shape}
-        return self.kernels.resolve(calls, shared=frozenset({"kv.store@1"}))
+            if paged:
+                calls[phase][KV_INDICES] = {}
+        return self.kernels.resolve(calls, shared=frozenset({"kv.store@1", KV_INDICES}))
 
     def _paged(self, phase: str, shape: Mapping[str, int]) -> bool:
         """Whether ``phase`` runs the paged kernels. A named backend that has neither family fails in

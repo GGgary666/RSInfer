@@ -18,8 +18,8 @@ from layers.rope.unit import rope_cos_sin_cache
 
 torch.manual_seed(0)
 
-INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.extend@1", "attn.decode@1", "attn.paged_extend@1",
-             "attn.paged_decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1"}
+INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.kv_indices@1", "attn.extend@1", "attn.decode@1",
+             "attn.paged_extend@1", "attn.paged_decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1"}
 """Loop over sequences or only move data; checked bit for bit below (the paged attention through
 the native one, whose bits it gives).""" 
 

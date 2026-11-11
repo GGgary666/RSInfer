@@ -31,6 +31,9 @@ from core.contracts.records import BatchPlan
 from layers.solutions import Kernels
 
 DEFINITIONS = MappingProxyType({"prefill": "attn.paged_extend@1", "decode": "attn.paged_decode@1"})
+KV_INDICES = "attn.kv_indices@1"
+"""What ``prepare`` lays the slot lists out with, outside the step's graph (``unit`` resolves it
+with the paged definitions)."""
 
 
 def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -126,19 +129,29 @@ class PagedAttnBackend:
             m.kv_indptr_cpu = indptr_of(lengths)
             m.kv_indptr.copy_(on_device(m.kv_indptr_cpu, device))
             m.seq_lens.copy_(on_device(torch.tensor(lengths, dtype=torch.int64), device))
-            gather_kv_indices(req_to_token, m.req_pool_indices, m.kv_indptr, int(m.kv_indptr_cpu[-1]), m.kv_indices)
-            m.out_cache_loc.copy_(req_to_token[m.req_pool_indices, m.seq_lens - 1])
+            # The slot lists and each lane's slot to store at, one kernel (SGLang's
+            # create_flashinfer_kv_indices_triton, with the last slot of each row added).
+            self.kernels(m.table, KV_INDICES)(req_to_token, m.req_pool_indices, m.seq_lens, m.kv_indptr, m.kv_indices,
+                                              m.out_cache_loc)
         else:
             decode = plan.phase == "decode"
             prefix = [int(p) for p in plan.positions.values()]
             extend = [int(n) for n in plan.num_tokens.values()]
+            lengths = [p + n for p, n in zip(prefix, extend, strict=True)]
+            table = "decode" if decode else "prefill"
             req_pool_indices = on_device(torch.tensor(rows, dtype=torch.int64), device)
-            kv_indptr_cpu = indptr_of([p + n for p, n in zip(prefix, extend, strict=True)])
+            kv_indptr_cpu = indptr_of(lengths)
             kv_indptr = on_device(kv_indptr_cpu, device)
-            out_cache_loc = torch.cat([req_to_token[r, p:p + n] for r, p, n in zip(rows, prefix, extend, strict=True)])
-            m = Metadata("decode" if decode else "prefill", 0, indptr_of(extend), kv_indptr_cpu, kv_indptr,
-                         gather_kv_indices(req_to_token, req_pool_indices, kv_indptr, int(kv_indptr_cpu[-1])),
-                         out_cache_loc.to(torch.int64))
+            kv_indices = torch.empty(int(kv_indptr_cpu[-1]), dtype=torch.int32, device=device)
+            one_each = all(n == 1 for n in extend)
+            out_cache_loc = torch.empty(len(rows), dtype=torch.int64, device=device) if one_each else None
+            self.kernels(table, KV_INDICES)(req_to_token, req_pool_indices,
+                                            on_device(torch.tensor(lengths, dtype=torch.int64), device), kv_indptr,
+                                            kv_indices, out_cache_loc)
+            if out_cache_loc is None:
+                out_cache_loc = torch.cat([req_to_token[r, p:p + n]
+                                           for r, p, n in zip(rows, prefix, extend, strict=True)]).to(torch.int64)
+            m = Metadata(table, 0, indptr_of(extend), kv_indptr_cpu, kv_indptr, kv_indices, out_cache_loc)
         m.planned = False
         self.forward_metadata = m
         made = self.operator(m)
