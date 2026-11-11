@@ -12,8 +12,9 @@ under test get the same prompts.
         --output run/bench/agxinfer.json
 
 Reported per level: output tokens per second over the whole level (all requests, wall clock),
-and per request the time to the first token, the time per output token after the first, and
-the latency. One request per client is sent before each level and not counted (kernels compiled
+and per request the time to the first token, the time per output token after the first (from
+the first streamed event to the last, over the tokens the server counted less one), and the
+latency. One request per client is sent before each level and not counted (kernels compiled
 on first use, graphs of a batch size replayed for the first time).
 """
 
@@ -45,7 +46,9 @@ def prompt(seed: int, words: int) -> str:
 
 
 async def one(client: httpx.AsyncClient, url: str, model: str, text: str, max_tokens: int) -> dict[str, Any]:
-    """One streamed completion: when it started, when the first text arrived and when the last."""
+    """One streamed completion: when it started, and when its first and its last token arrived. A
+    token's event counts whether or not it carries text: a server holds back the bytes of an
+    incomplete character, and the text of a stop token."""
     body = {"model": model, "prompt": text, "max_tokens": max_tokens, "temperature": 0.0, "ignore_eos": True,
             "stream": True, "stream_options": {"include_usage": True}}
     start = time.perf_counter()
@@ -61,8 +64,7 @@ async def one(client: httpx.AsyncClient, url: str, model: str, text: str, max_to
                 raise RuntimeError(f"the server answered {event['error']}")
             if event.get("usage"):
                 usage = event["usage"]
-            choices = event.get("choices") or []
-            if choices and choices[0].get("text"):
+            if event.get("choices"):
                 last = time.perf_counter()
                 first = first or last
     end = time.perf_counter()
@@ -74,7 +76,8 @@ async def one(client: httpx.AsyncClient, url: str, model: str, text: str, max_to
 
 async def level(url: str, model: str, clients: int, requests: int, words: int, max_tokens: int, seed: int,
                 timeout: float) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=clients)) as client:
+    limits = httpx.Limits(max_connections=clients, max_keepalive_connections=clients)
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
         async def run(index: int, count: int, base: int) -> list[dict[str, Any]]:
             return [await one(client, url, model, prompt(base + 1000 * index + i, words), max_tokens)
                     for i in range(count)]

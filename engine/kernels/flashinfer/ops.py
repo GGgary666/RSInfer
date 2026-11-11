@@ -4,8 +4,9 @@
 ``FlashInferAttnBackend`` drives them (srt/layers/attention/flashinfer_backend.py, e838360;
 LICENSE.sglang): its plain paths, without speculation, sliding windows, cross attention,
 multi-item scoring or quantized caches. The operators' interface is the reference's
-(``kernels.reference.paged``). Importing this module imports FlashInfer, so only a process with
-a CUDA device does (``unit``).
+(``kernels.reference.paged``). And FlashInfer's Gemma RMSNorm, which SGLang's ``GemmaRMSNorm``
+runs on CUDA. Importing this module imports FlashInfer, so only a process with a CUDA device
+does (``unit``).
 
 FlashInfer plans on the host. Every operator is planned from the host layout the caller gives
 it, so a plan waits for nothing on the device: the first plan of a wrapper is FlashInfer's own
@@ -27,6 +28,8 @@ _flashinfer: Any = import_module("flashinfer")
 BatchDecodeWithPagedKVCacheWrapper: Any = _flashinfer.BatchDecodeWithPagedKVCacheWrapper
 BatchPrefillWithPagedKVCacheWrapper: Any = _flashinfer.BatchPrefillWithPagedKVCacheWrapper
 fast_decode_plan: Any = import_module("flashinfer.decode").fast_decode_plan
+_norm: Any = import_module("flashinfer.norm")
+_activation: Any = import_module("flashinfer.activation")
 
 WORKSPACE_BYTES = 384 * 1024 * 1024
 """SGLang's ``SGLANG_FLASHINFER_WORKSPACE_SIZE``."""
@@ -126,3 +129,20 @@ class PagedExtend:
 
     def run(self, q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, scaling: float) -> torch.Tensor:
         return self.wrapper.forward(q.contiguous(), (k_cache, v_cache), causal=True, sm_scale=scaling)
+
+
+def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
+                   residual: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """``norm.gemma_rms@1``: ``GemmaRMSNorm._forward_impl`` (srt/layers/layernorm.py), one kernel
+    per call where the reference runs about ten. With ``residual`` it works in place, as SGLang's
+    does: ``residual`` becomes the sum and ``x`` its norm. Takes fp32 as well as bf16."""
+    if residual is not None:
+        _norm.gemma_fused_add_rmsnorm(x, residual, weight, eps)
+        return x, residual
+    return _norm.gemma_rmsnorm(x, weight, eps)
+
+
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """``act.silu_and_mul@1``: ``SiluAndMul.forward_cuda``, one kernel (SGLang's own is this one,
+    built by its JIT). bf16 and fp16 only."""
+    return _activation.silu_and_mul(x)

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``layers.rope``: SGLang's ``RotaryEmbedding`` (srt/layers/rotary_embedding/base.py, e838360;
 LICENSE.sglang): an fp32 cos/sin cache per (rotary dim, base, device), grown past
-``max_position_embeddings`` as ``_ensure_cos_sin_cache_length`` does, and ``pos.rope@1``."""
+``max_position_embeddings`` as ``_ensure_cos_sin_cache_length`` does. An attention layer applies
+it with the Q/K norm and the split of its output gate, in one call (``attn.qk_norm_rope_gate@1``,
+``Qwen3_5AttentionDecoderLayer.forward_prepare_cuda_fused``)."""
 
 from __future__ import annotations
 
@@ -38,13 +40,18 @@ class Rope:
             cache = self.caches[key] = rope_cos_sin_cache(rotary_dim, length, base).to(device)
         return cache
 
-    def forward(self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor, head_size: int,
-                rotary_dim: int, max_position: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
-        cache = self.cos_sin_cache(rotary_dim, max_position, base, query.device,
+    def qk_norm_rope_gate(self, positions: torch.Tensor, q_gate: torch.Tensor, k: torch.Tensor,
+                          q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float, num_q_heads: int,
+                          num_kv_heads: int, head_dim: int, rotary_dim: int, max_position: int, base: float,
+                          has_gate: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``q_gate`` holds per head the query, then (``has_gate``) its output gate. Returns the
+        normed and rotated q and k, and the gate in q's shape."""
+        cache = self.cos_sin_cache(rotary_dim, max_position, base, q_gate.device,
                                    self.max_context - 1 if self.max_context is not None else
                                    int(positions.max()) if positions.numel() else 0)
-        return self.catalog.call("pos.rope@1", {"head_dim": head_size, "rotary_dim": rotary_dim}, positions, query,
-                                 key, head_size, rotary_dim, cache)
+        shape = {"head_dim": head_dim, "rotary_dim": rotary_dim, "fp32": int(q_gate.dtype == torch.float32)}
+        return self.catalog.call("attn.qk_norm_rope_gate@1", shape, q_gate, k, q_weight, k_weight, cache, positions,
+                                 eps, num_q_heads, num_kv_heads, head_dim, rotary_dim, has_gate)
 
 
 class Unit:

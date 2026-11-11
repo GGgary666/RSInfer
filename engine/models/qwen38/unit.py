@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``models.qwen38``: Qwen3.8 dense text, ``model@1``. Adapted from SGLang's
 ``Qwen3_5ForCausalLM`` (srt/models/qwen3_5.py, e838360; LICENSE.sglang) for TP1, without
-speculation, LoRA, quantization or fused kernels.
+speculation, LoRA or quantization, with the calls of its CUDA path: the fused Q/K norm, RoPE and
+gate split of an attention layer, its fused output gate, and a GDN layer's projections handed to
+the backend as they are.
 
 What moved: the parameters are declared to ``state.weights@1`` (``params``, SGLang's names, with
 its fused ``qkv_proj``, ``gate_up_proj``, ``in_proj_qkvz``, ``in_proj_ba``) instead of living in
@@ -245,62 +247,46 @@ class Qwen3_5ForCausalLM:
 
     def self_attention(self, layer_id: int, positions: torch.Tensor, hidden_states: torch.Tensor,
                        w: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """``Qwen3_5AttentionDecoderLayer.self_attention`` with ``forward_prepare_native``."""
+        """``Qwen3_5AttentionDecoderLayer.self_attention`` with ``forward_prepare_cuda_fused``."""
         cfg, d = self.cfg, self.dims
         head_dim, num_heads = cfg.head_dim, cfg.num_attention_heads
+        has_gate = bool(cfg.attn_output_gate)
         qkv = self.linear.forward(hidden_states, w["qkv_proj.weight"])
-        gate: torch.Tensor | None = None
-        if cfg.attn_output_gate:
-            q_gate, k, v = qkv.split([d.q_size * 2, d.kv_size, d.kv_size], dim=-1)
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-        else:
-            q, k, v = qkv.split([d.q_size, d.kv_size, d.kv_size], dim=-1)
-
-        q_by_head = self.norm.gemma_rms(q.reshape(-1, head_dim), w["q_norm.weight"], cfg.rms_norm_eps)
-        k_by_head = self.norm.gemma_rms(k.reshape(-1, head_dim), w["k_norm.weight"], cfg.rms_norm_eps)
-        q, k = q_by_head.view(q.shape), k_by_head.view(k.shape)
-        q, k = self.rope.forward(positions, q, k, head_dim, d.rotary_dim, cfg.max_position_embeddings,
-                                 cfg.rope_theta)
+        q_gate, k, v = qkv.split([d.q_size * (1 + has_gate), d.kv_size, d.kv_size], dim=-1)
+        q, k, gate = self.rope.qk_norm_rope_gate(
+            positions, q_gate, k, w["q_norm.weight"], w["k_norm.weight"], cfg.rms_norm_eps, num_heads,
+            cfg.num_key_value_heads, head_dim, d.rotary_dim, cfg.max_position_embeddings, cfg.rope_theta, has_gate)
 
         attn_output = self.attn.forward(layer_id, q, k, v, num_heads, cfg.num_key_value_heads, head_dim,
                                         head_dim ** -0.5)
-        if gate is not None:  # fused_sigmoid_mul
-            attn_output = attn_output * torch.sigmoid(gate.reshape(attn_output.shape))
+        if gate is not None:
+            attn_output = self.act.sigmoid_mul(attn_output, gate)
         return self.linear.forward(attn_output, w["o_proj.weight"])
 
     def linear_attention(self, layer_id: int, hidden_states: torch.Tensor, w: Mapping[str, torch.Tensor]
                          ) -> torch.Tensor:
-        """``Qwen3_5GatedDeltaNet.forward``: input projections, ``fix_query_key_value_ordering``,
-        the core attention (``RadixLinearAttention``), gated norm, output projection."""
-        cfg, d = self.cfg, self.dims
-        head_v_dim, nv = cfg.linear_value_head_dim, cfg.linear_num_value_heads
+        """``Qwen3_5GatedDeltaNet.forward``: input projections, the core attention
+        (``RadixLinearAttention``, which takes the projections apart), gated norm, output
+        projection."""
+        cfg = self.cfg
         projected_states_qkvz = self.linear.forward(hidden_states, w["linear_attn.in_proj_qkvz.weight"])
         projected_states_ba = self.linear.forward(hidden_states, w["linear_attn.in_proj_ba.weight"])
 
-        query, key, value, z = projected_states_qkvz.split([d.key_dim, d.key_dim, d.value_dim, d.value_dim], dim=-1)
-        b, a = projected_states_ba.split([nv, nv], dim=-1)
-        value = value.reshape(value.size(0), -1, head_v_dim)
-        z = z.reshape(z.size(0), -1, head_v_dim)
-        b = b.contiguous()
-        a = a.contiguous()
-        query, key, value = (x.reshape(x.shape[0], -1) for x in (query, key, value))
-        mixed_qkv = torch.cat((query, key, value), dim=-1)
-
         conv_weight = w["linear_attn.conv1d.weight"]
-        core_attn_out = self.gdn.forward(
-            layer_id, mixed_qkv, a, b, conv_weight.view(conv_weight.size(0), conv_weight.size(2)), None,
-            cfg.hidden_act, w["linear_attn.A_log"], w["linear_attn.dt_bias"], cfg.linear_num_key_heads, nv,
-            cfg.linear_key_head_dim, head_v_dim)
+        core_attn_out, z = self.gdn.forward(
+            layer_id, projected_states_qkvz, projected_states_ba,
+            conv_weight.view(conv_weight.size(0), conv_weight.size(2)), None, cfg.hidden_act, w["linear_attn.A_log"],
+            w["linear_attn.dt_bias"], cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        if z.is_contiguous():  # a view of the projection (use_strided_prefill_z) goes to the norm as it is
+            z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm.rms_gated(core_attn_out, w["linear_attn.norm.weight"], z, cfg.rms_norm_eps)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], core_attn_out.shape[-2] * core_attn_out.shape[-1])
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2],
+                                              core_attn_out.shape[-2] * core_attn_out.shape[-1])
         return self.linear.forward(core_attn_out, w["linear_attn.out_proj.weight"])
 
 

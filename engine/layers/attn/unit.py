@@ -158,10 +158,11 @@ class TorchNativeAttnBackend:
 class AttnBackend:
     """``layers.attn@1``: each phase's backend."""
 
-    def __init__(self, kernels: Kernels, kv: Any, fp32: bool) -> None:
+    def __init__(self, kernels: Kernels, kv: Any, dtype: str) -> None:
         self.kernels = kernels
-        self.fp32 = fp32
-        """The activations are fp32: some kernels take bf16 / fp16 only."""
+        self.dtype = dtype
+        """The activations' dtype (``model.dtype``): some kernels take bf16 / fp16 only, and some
+        read the cache as if it had the queries' dtype."""
         self.native, self.paged = TorchNativeAttnBackend(kernels, kv), PagedAttnBackend(kernels, kv)
         self.backends: dict[str, TorchNativeAttnBackend | PagedAttnBackend] = {phase: self.native for phase in PHASES}
         self.active: TorchNativeAttnBackend | PagedAttnBackend = self.native
@@ -178,7 +179,10 @@ class AttnBackend:
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         shape_k, dtype_k = next(d.tensors["k"] for d in states if d.kind == KIND)
-        shape = {"head_dim": shape_k[-1], "fp32": int(self.fp32 or dtype_k == "f32")}
+        # kv_as_q: FlashInfer's 16-bit paths load the cache's bits as the queries' type, so a
+        # cache of another dtype than the model's is not theirs (the native kernels convert).
+        shape = {"head_dim": shape_k[-1], "fp32": int("f32" in (self.dtype, dtype_k)),
+                 "kv_as_q": int(dtype_k == self.dtype)}
         calls: dict[str, dict[str, dict[str, int]]] = {}
         for phase in PHASES:
             paged = self._paged(phase, shape)
@@ -210,7 +214,7 @@ class AttnBackend:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "attn")
-        ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"] == "f32"))
+        ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"]))
 
 
 if TYPE_CHECKING:

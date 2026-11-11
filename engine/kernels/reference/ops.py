@@ -9,15 +9,19 @@ the CUDA / CPU-extension dispatch is gone:
 - ``rms_norm_gated``: ``rms_norm_ref`` (kernels/ops/attention/fla/layernorm_gated.py);
 - ``rope``: ``RotaryEmbedding.forward_native`` and ``apply_rotary_emb``
   (srt/layers/rotary_embedding/base.py, utils.py);
-- ``silu_and_mul``: ``SiluAndMul.forward_native``; ``linear``: ``UnquantizedLinearMethod``;
-  ``embedding``: ``UnquantizedEmbeddingMethod``;
+- ``fused_qk_gemma_rmsnorm_rope_gate``: ``Qwen3_5AttentionDecoderLayer.forward_prepare_native``
+  (srt/models/qwen3_5.py), behind the signature of the kernel its CUDA path calls;
+- ``silu_and_mul``: ``SiluAndMul.forward_native``; ``fused_sigmoid_mul``: the attention output
+  gate; ``linear``: ``UnquantizedLinearMethod``; ``embedding``: ``UnquantizedEmbeddingMethod``;
 - ``kv_store``: the fallback of ``_set_kv_buffer_impl`` (srt/mem_cache/memory_pool.py);
 - ``attention_extend`` / ``attention_decode``: ``TorchNativeAttnBackend._run_sdpa_forward_*``;
 - GDN: the torch references that SGLang checks its CPU kernels against
   (test/registered/cpu/test_mamba.py, test/registered/layers/mamba/test_causal_conv1d.py),
   behind the pool-indexed signatures of the kernels ``GDNAttnBackend`` calls
-  (``causal_conv1d_fn``, ``causal_conv1d_update``, ``fused_gdn_gating``,
-  ``chunk_gated_delta_rule``, ``fused_sigmoid_gating_delta_rule_update``);
+  (``causal_conv1d_fn``, ``fused_gdn_gating``, ``chunk_gated_delta_rule``, and for a decode step
+  ``fused_qkvzba_causal_conv1d_update`` and ``fused_recurrent_gated_delta_rule_packed_decode``,
+  which unpack the projections around ``causal_conv1d_update`` and
+  ``fused_sigmoid_gating_delta_rule_update``);
 - ``sample``: the native path of ``Sampler.forward`` with ``multinomial_with_seed``
   (srt/layers/sampler.py); ``murmur_hash32`` is the Triton kernel of
   kernels/ops/sampling/murmur_hash.py written in torch.
@@ -60,7 +64,10 @@ def _on_device(values: Sequence[float] | Sequence[int], dtype: torch.dtype, devi
 def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
                    residual: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """``norm.gemma_rms@1``: ``GemmaRMSNorm.forward_native``. With ``residual``, adds it first and
-    returns ``(normed, x + residual)``."""
+    returns ``(normed, x + residual)``. SGLang's CUDA path computes the two in place
+    (``gemma_fused_add_rmsnorm``: ``residual`` becomes the sum, ``x`` its norm), so the definition
+    lets a solution overwrite ``x`` and ``residual``: a caller uses what is returned, not what it
+    passed. The reference returns new tensors."""
     orig_dtype = x.dtype
     if residual is not None:
         x = x + residual
@@ -77,8 +84,12 @@ def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
 def rms_norm_gated(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, z: torch.Tensor | None = None,
                    eps: float = 1e-6, group_size: int | None = None, norm_before_gate: bool = True,
                    upcast: bool = True) -> torch.Tensor:
-    """``norm.rms_gated@1``: ``rms_norm_ref``; ``"... (g d) -> ... g d"`` is a ``view``."""
+    """``norm.rms_gated@1``: ``rms_norm_ref``; ``"... (g d) -> ... g d"`` is a ``view``. ``z`` has
+    ``x``'s shape, or is ``[tokens, heads, dim]`` for an ``x`` of ``[tokens * heads, dim]``, as
+    ``rms_norm_gated`` takes the view of the projection a prefill step hands it."""
     dtype = x.dtype
+    if z is not None and z.shape != x.shape:
+        z = z.reshape(x.shape)
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:
@@ -120,7 +131,7 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_
 
 def rope(positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor, head_size: int, rotary_dim: int,
          cos_sin_cache: torch.Tensor, is_neox_style: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-    """``pos.rope@1``: ``RotaryEmbedding.forward_native`` on the first ``rotary_dim`` of each head;
+    """``RotaryEmbedding.forward_native`` on the first ``rotary_dim`` of each head;
     ``cos_sin_cache`` ``[positions, rotary_dim]``, cos then sin (``layers.rope`` builds it). Text
     positions are the same in every mrope section, so Qwen3.8's mrope is this."""
     positions = positions.flatten()
@@ -140,6 +151,31 @@ def rope(positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor, head_s
     return query, key
 
 
+def fused_qk_gemma_rmsnorm_rope_gate(q_gate: torch.Tensor, k: torch.Tensor, q_weight: torch.Tensor,
+                                     k_weight: torch.Tensor, cos_sin_cache: torch.Tensor, positions: torch.Tensor,
+                                     eps: float, num_q_heads: int, num_kv_heads: int, head_dim: int,
+                                     rotary_dim: int, has_gate: bool = True
+                                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """``attn.qk_norm_rope_gate@1``: what an attention layer does to its projection before it
+    attends (``forward_prepare_native``). ``q_gate`` ``[tokens, num_q_heads * (1 + has_gate) *
+    head_dim]`` holds per head the query, then its output gate; ``k`` ``[tokens, num_kv_heads *
+    head_dim]``. GemmaRMSNorm of q and k per head, RoPE on the first ``rotary_dim`` of each head
+    (``cos_sin_cache`` as ``rope`` takes it), and the gate taken apart from the queries. Returns q
+    ``[tokens, num_q_heads * head_dim]``, k, and the gate in q's shape (``None`` without one)."""
+    num_tokens = q_gate.shape[0]
+    gate: torch.Tensor | None = None
+    if has_gate:
+        q, gate = torch.chunk(q_gate.view(num_tokens, num_q_heads, -1), 2, dim=-1)
+        q, gate = q.reshape(num_tokens, -1), gate.reshape(num_tokens, -1)
+    else:
+        q = q_gate
+    q_by_head = gemma_rms_norm(q.reshape(-1, head_dim), q_weight, eps)
+    k_by_head = gemma_rms_norm(k.reshape(-1, head_dim), k_weight, eps)
+    assert isinstance(q_by_head, torch.Tensor) and isinstance(k_by_head, torch.Tensor)
+    q, k = rope(positions, q_by_head.view(q.shape), k_by_head.view(k.shape), head_dim, rotary_dim, cos_sin_cache)
+    return q, k, gate
+
+
 # ------------------------------------------------------------------ dense
 
 
@@ -147,6 +183,14 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     """``act.silu_and_mul@1``: ``SiluAndMul.forward_native``."""
     d = x.shape[-1] // 2
     return F.silu(x[..., :d]) * x[..., d:]
+
+
+def fused_sigmoid_mul(attn_output: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """``act.sigmoid_mul@1``: the attention output gate, ``attn_output * sigmoid(gate)``, both
+    ``[tokens, hidden]``. SGLang's kernel writes the result over ``attn_output``, so the
+    definition lets a solution do that: a caller uses what is returned. The reference returns a
+    new tensor."""
+    return attn_output * torch.sigmoid(gate)
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -332,7 +376,7 @@ def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
 
 def causal_conv1d_update(x: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
                          activation: str | None, conv_state_indices: torch.Tensor) -> torch.Tensor:
-    """``gdn.conv1d_update@1``, the decode conv: ``x`` ``(batch, dim)``, row ``i`` steps
+    """The decode conv: ``x`` ``(batch, dim)``, row ``i`` steps
     ``conv_state[conv_state_indices[i]]`` in place. A negative index is a padded lane (SGLang's
     ``pad_slot_id``), whose result is undefined: the reference runs it on the padding slot."""
     idx = conv_state_indices.to(torch.long).clamp_min(0)
@@ -340,6 +384,24 @@ def causal_conv1d_update(x: torch.Tensor, conv_state: torch.Tensor, weight: torc
     out = causal_conv1d_update_ref(x, states, weight, bias, activation)
     conv_state[idx] = states
     return out
+
+
+def fused_qkvzba_causal_conv1d_update(mixed_qkvz: torch.Tensor, mixed_ba: torch.Tensor, conv_state: torch.Tensor,
+                                      conv_weight: torch.Tensor, conv_bias: torch.Tensor | None,
+                                      conv_state_indices: torch.Tensor, qkv_dim: int, v_dim: int, num_v_heads: int,
+                                      head_v_dim: int, activation: str | None
+                                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``gdn.qkvzba_conv1d_update@1``, the first half of a GDN decode step
+    (``fused_qkvzba_causal_conv1d_update_contiguous``): the two input projections taken apart and
+    the conv stepped. ``mixed_qkvz`` ``[batch, qkv_dim + v_dim]`` is ``[q | k | v | z]``,
+    ``mixed_ba`` ``[batch, 2 * num_v_heads]`` is ``[b | a]``. Returns the convolved ``[q | k | v]``
+    (``causal_conv1d_update`` on the conv state pool), ``z`` ``[batch, num_v_heads, head_v_dim]``,
+    ``b`` and ``a``. The reference returns ``z``, ``b`` and ``a`` as views of the projections."""
+    assert mixed_qkvz.shape[1] == qkv_dim + v_dim and v_dim == num_v_heads * head_v_dim
+    z = mixed_qkvz[:, qkv_dim:].view(mixed_qkvz.shape[0], num_v_heads, head_v_dim)
+    mixed_qkv = causal_conv1d_update(mixed_qkvz[:, :qkv_dim], conv_state, conv_weight, conv_bias, activation,
+                                     conv_state_indices)
+    return mixed_qkv, z, mixed_ba[:, :num_v_heads], mixed_ba[:, num_v_heads:]
 
 
 # ------------------------------------------------------------------ GDN: gating and delta rule
@@ -508,7 +570,7 @@ def fused_sigmoid_gating_delta_rule_update(A_log: torch.Tensor, dt_bias: torch.T
                                            initial_state_source: torch.Tensor, initial_state_indices: torch.Tensor,
                                            cu_seqlens: torch.Tensor, use_qk_l2norm_in_kernel: bool = True
                                            ) -> torch.Tensor:
-    """``gdn.recurrent_update@1``, the decode rule ``TritonGDNKernel.decode`` calls: one token per
+    """The decode rule ``TritonGDNKernel.decode`` calls: one token per
     sequence, ``sigmoid_gating_delta_rule_update`` of the CPU test on the pool at
     ``initial_state_indices``, updated in place. ``q``, ``k`` ``[1, B, HK, K]``; ``v``
     ``[1, B, HV, V]``; ``a``, ``b`` ``[B, HV]``. Returns ``[1, B, HV, V]``. A negative index is a
@@ -528,6 +590,26 @@ def fused_sigmoid_gating_delta_rule_update(A_log: torch.Tensor, dt_bias: torch.T
     assert last_recurrent_state is not None
     initial_state_source[idx] = last_recurrent_state.transpose(-1, -2).contiguous().to(initial_state_source.dtype)
     return core_attn_out.transpose(0, 1)
+
+
+def fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+                                                   A_log: torch.Tensor, dt_bias: torch.Tensor, scale: float,
+                                                   ssm_states: torch.Tensor, cache_indices: torch.Tensor,
+                                                   num_v_heads: int, head_v_dim: int) -> torch.Tensor:
+    """``gdn.packed_decode@1``, the second half of a GDN decode step (``TritonGDNKernel.
+    packed_decode``): ``mixed_qkv`` ``[batch, qkv_dim]`` is the convolved ``[q | k | v]``, which the
+    kernel reads in place of separate q, k and v; then ``fused_sigmoid_gating_delta_rule_update``
+    on the temporal state pool at ``cache_indices``. ``scale`` is ``head_k_dim ** -0.5``. Returns
+    ``[1, batch, num_v_heads, head_v_dim]``; a padded lane's (negative index) is undefined."""
+    batch, head_k_dim = mixed_qkv.shape[0], ssm_states.shape[-1]
+    assert abs(scale - head_k_dim ** -0.5) < 1e-9, "the reference scales q by head_k_dim ** -0.5"
+    v_dim = num_v_heads * head_v_dim
+    k_dim = (mixed_qkv.shape[1] - v_dim) // 2
+    query, key, value = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim=-1)
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log, dt_bias, query.reshape(1, batch, -1, head_k_dim), key.reshape(1, batch, -1, head_k_dim),
+        value.reshape(1, batch, num_v_heads, head_v_dim), a, b, ssm_states, cache_indices,
+        torch.arange(batch + 1, dtype=torch.int32, device=mixed_qkv.device))
 
 
 # ------------------------------------------------------------------ sampling

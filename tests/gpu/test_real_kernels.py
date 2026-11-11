@@ -9,7 +9,8 @@ CUDA compiler on ``PATH`` for FlashInfer's first plan of a shape, as under ``uv 
     uv run pytest tests/gpu/test_real_kernels.py -s
 
 - Each solution against the reference of its definition, on the same inputs and state pools,
-  within the definition's tolerance (stage2-contract.md §6).
+  within the definition's tolerance (stage2-contract.md §6): the Triton GDN kernels, FlashInfer's
+  paged attention and its Gemma RMSNorm.
 - The worker stack on the first 4 layers of the model in bf16 (``QWEN38_MODEL``, or random weights
   from ``make_checkpoint``): ``auto`` picks the real kernels for every phase; a step replayed from
   a graph, with padded lanes and changing buckets, gives the logits and leaves the states an
@@ -62,35 +63,79 @@ def triton() -> Any:
 def test_triton_gdn_decode_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,
                                                                  ssm_dtype: torch.dtype) -> None:
     """One decode step of five rows at scattered slots, and a padded lane (slot -1), which the
-    kernels leave alone: its output is undefined, the pools are untouched."""
+    kernels leave alone: its output is undefined, the pools are untouched. The two input
+    projections go in as the GEMMs leave them, and the packed result of the conv into the
+    delta rule."""
     gen = torch.Generator(device="cuda").manual_seed(0)
     rand: Callable[..., torch.Tensor] = lambda *shape: torch.randn(*shape, device=DEVICE, generator=gen)
     weight, A_log, dt_bias = (0.3 * rand(CONV_DIM, WIDTH)).to(dtype), (0.5 * rand(HV)).to(dtype), (0.5 * rand(HV)).to(dtype)
-    conv0, ssm0 = (0.5 * rand(9, CONV_DIM, WIDTH - 1)).to(torch.bfloat16), (0.1 * rand(9, HV, V, K)).to(ssm_dtype)
+    conv0, ssm0 = (0.5 * rand(9, CONV_DIM, WIDTH - 1)).to(dtype), (0.1 * rand(9, HV, V, K)).to(ssm_dtype)
     slots = torch.tensor([3, 1, 7, -1, 5, 2], device=DEVICE, dtype=torch.int32)
     real = slots >= 0
-    x = rand(6, CONV_DIM).to(dtype)
+    qkvz, ba = rand(6, CONV_DIM + HV * V).to(dtype), rand(6, 2 * HV).to(dtype)
+    unpack = (CONV_DIM, HV * V, HV, V, "silu")
 
     conv_ref, conv_tri = conv0.clone(), conv0.clone()
-    want = ref.causal_conv1d_update(x[real].clone(), conv_ref, weight, None, "silu", slots[real])
-    got = triton.causal_conv1d_update(x.clone(), conv_tri, weight, None, "silu", slots)
-    close("gdn.conv1d_update@1", got[real], want)
+    want = ref.fused_qkvzba_causal_conv1d_update(qkvz[real], ba[real], conv_ref, weight, None, slots[real], *unpack)
+    got = triton.fused_qkvzba_causal_conv1d_update(qkvz, ba, conv_tri, weight, None, slots, *unpack)
+    close("gdn.qkvzba_conv1d_update@1", got[0][real], want[0])
+    for mine, theirs in zip(got[1:], want[1:], strict=True):  # z, b, a: moved, not computed
+        assert mine.is_contiguous() and torch.equal(mine[real], theirs)
+    assert got[1].shape == (6, HV, V) and got[2].shape == got[3].shape == (6, HV)
     assert torch.equal(conv_tri[1:], conv_ref[1:]) and torch.equal(conv_tri[0], conv0[0])
 
-    q, k, v = (t.contiguous() for t in torch.split(want, [HK * K, HK * K, HV * V], dim=-1))
-    lanes = int(real.sum())
-    q, k, v = q.view(1, lanes, HK, K), k.view(1, lanes, HK, K), v.view(1, lanes, HV, V)
-    a, b = rand(lanes, HV).to(dtype), rand(lanes, HV).to(dtype)
-    cu = torch.arange(lanes + 1, device=DEVICE, dtype=torch.int32)
+    mixed_qkv, _, b, a = got
     ssm_ref, ssm_tri = ssm0.clone(), ssm0.clone()
-    want = ref.fused_sigmoid_gating_delta_rule_update(A_log, dt_bias, q, k, v, a, b, ssm_ref, slots[real], cu)
-    got = triton.fused_sigmoid_gating_delta_rule_update(A_log, dt_bias, q, k, v, a, b, ssm_tri, slots[real], cu)
-    close("gdn.recurrent_update@1", got, want)
-    close("gdn.recurrent_update@1", ssm_tri, ssm_ref)
+    want_out = ref.fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv[real], a[real], b[real], A_log, dt_bias,
+                                                                  K ** -0.5, ssm_ref, slots[real], HV, V)
+    got_out = triton.fused_recurrent_gated_delta_rule_packed_decode(mixed_qkv, a, b, A_log, dt_bias, K ** -0.5,
+                                                                    ssm_tri, slots, HV, V)
+    assert got_out.shape == (1, 6, HV, V)
+    close("gdn.packed_decode@1", got_out[:, real], want_out)
+    close("gdn.packed_decode@1", ssm_tri, ssm_ref)
+    assert torch.equal(ssm_tri[0], ssm0[0])
 
+    lanes = int(real.sum())
     xn, z, wn = rand(lanes * HV, V).to(dtype), rand(lanes * HV, V).to(dtype), rand(V).to(dtype)
     close("norm.rms_gated@1", triton.rms_norm_gated(xn, wn, None, z, 1e-6, None, True),
           ref.rms_norm_gated(xn, wn, None, z, 1e-6, None, True))
+    # a prefill step's z: a view of the projection, by token and head
+    strided = rand(lanes, CONV_DIM + HV * V).to(dtype)[:, CONV_DIM:].view(lanes, HV, V)
+    assert not strided.is_contiguous()
+    close("norm.rms_gated@1", triton.rms_norm_gated(xn, wn, None, strided, 1e-6, None, True),
+          ref.rms_norm_gated(xn, wn, None, strided, 1e-6, None, True))
+
+
+@pytest.mark.parametrize(("dtype", "has_gate"), [(torch.bfloat16, True), (torch.float16, True), (torch.bfloat16, False)])
+def test_triton_attention_glue_stays_within_its_definitions(triton: Any, dtype: torch.dtype, has_gate: bool) -> None:
+    """What an attention layer runs around its attention: Q/K norm, RoPE on the first quarter of
+    each head and the split of the output gate in one kernel, at a decode step's positions and a
+    prefill step's; and the output gate, written over the attention's output."""
+    from layers.rope.unit import rope_cos_sin_cache
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    rand: Callable[..., torch.Tensor] = lambda *shape: torch.randn(*shape, device=DEVICE, generator=gen)
+    rotary_dim = HEAD_DIM // 4
+    cache = rope_cos_sin_cache(rotary_dim, 4096, 10_000_000.0).to(DEVICE)
+    q_weight, k_weight = (0.1 * rand(HEAD_DIM)).to(dtype), (0.1 * rand(HEAD_DIM)).to(dtype)
+    for positions in (torch.tensor([0, 4095, 17, 300], device=DEVICE), torch.arange(700, 1900, device=DEVICE)):
+        tokens = positions.shape[0]
+        q_gate = rand(tokens, HEADS * (1 + has_gate) * HEAD_DIM).to(dtype)
+        k = rand(tokens, KV_HEADS * HEAD_DIM).to(dtype)
+        args = (q_gate, k, q_weight, k_weight, cache, positions, 1e-6, HEADS, KV_HEADS, HEAD_DIM, rotary_dim, has_gate)
+        got, want = triton.fused_qk_gemma_rmsnorm_rope_gate(*args), ref.fused_qk_gemma_rmsnorm_rope_gate(*args)
+        close("attn.qk_norm_rope_gate@1", got[0], want[0])
+        close("attn.qk_norm_rope_gate@1", got[1], want[1])
+        assert got[0].shape == (tokens, HEADS * HEAD_DIM) and got[1].shape == (tokens, KV_HEADS * HEAD_DIM)
+        if not has_gate:
+            assert got[2] is None and want[2] is None
+            continue
+        assert got[2] is not None and want[2] is not None and torch.equal(got[2], want[2])
+        attn_output = rand(tokens, HEADS * HEAD_DIM).to(dtype)
+        want_gated = ref.fused_sigmoid_mul(attn_output, want[2])
+        gated = triton.fused_sigmoid_mul(mine := attn_output.clone(), got[2])
+        assert gated is mine
+        close("act.sigmoid_mul@1", gated, want_gated)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -197,6 +242,44 @@ def test_flashinfer_paged_attention_stays_within_its_definitions() -> None:
         ops.PagedExtend(workspace, *shape, buffers)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_flashinfer_rmsnorm_stays_within_its_definition(dtype: torch.dtype) -> None:
+    """The hidden states of a decode step and of a prefill step, and the per-head Q/K norm; with
+    a residual the solution writes the sum over ``residual`` and the norm over ``x``, and returns
+    those two tensors."""
+    from kernels.flashinfer import ops
+
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for rows, width in ((8, 5120), (2000, 5120), (8 * HEADS, HEAD_DIM)):
+        x = torch.randn(rows, width, device=DEVICE, generator=gen).to(dtype)
+        residual = torch.randn(rows, width, device=DEVICE, generator=gen).to(dtype)
+        weight = (0.1 * torch.randn(width, device=DEVICE, generator=gen)).to(dtype)
+        plain, want_plain = ops.gemma_rms_norm(x, weight, 1e-6), ref.gemma_rms_norm(x, weight, 1e-6)
+        assert isinstance(plain, torch.Tensor) and isinstance(want_plain, torch.Tensor)
+        close("norm.gemma_rms@1", plain, want_plain)
+        fused, want_fused = ops.gemma_rms_norm(mine := x.clone(), weight, 1e-6, mine_sum := residual.clone()), \
+            ref.gemma_rms_norm(x, weight, 1e-6, residual)
+        assert isinstance(fused, tuple) and isinstance(want_fused, tuple)
+        (got, got_sum), (want, want_sum) = fused, want_fused
+        assert got is mine and got_sum is mine_sum
+        close("norm.gemma_rms@1", got, want)
+        assert torch.equal(got_sum, want_sum)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_flashinfer_silu_and_mul_stays_within_its_definition(dtype: torch.dtype) -> None:
+    """The MLP's activation at Qwen3.8-27B's intermediate size, for a decode step and a prefill
+    step (FlashInfer's takes no fp32)."""
+    from kernels.flashinfer import ops
+
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    for rows in (8, 2000):
+        x = torch.randn(rows, 2 * 17408, device=DEVICE, generator=gen).to(dtype)
+        got = ops.silu_and_mul(x)
+        assert got.shape == (rows, 17408) and got.dtype == dtype
+        close("act.silu_and_mul@1", got, ref.silu_and_mul(x))
+
+
 # ------------------------------------------------------------------ the worker stack, 4 layers in bf16
 
 
@@ -223,29 +306,49 @@ def state(w: Worker) -> list[torch.Tensor]:
 PROMPTS = {0: [9707, 11, 1879, 0, 3555, 374, 279, 1888], 1: list(range(1000, 1040)), 2: [151, 2]}
 
 
+def real_kernels(w: Worker, graphs: bool) -> None:
+    """``auto`` chose the real kernels for every phase of ``w``."""
+    resolved = w.service("plan@1").resolved
+    tables = ("prefill", "decode", "graph") if graphs else ("prefill", "decode")
+    assert {resolved[t]["layers.attn@1"][d] for t, d in zip(tables, (
+        "attn.paged_extend@1", "attn.paged_decode@1", "attn.paged_decode@1"), strict=False)} == {
+        "flashinfer.attn.paged_extend@1", "flashinfer.attn.paged_decode@1"}
+    gdn = {s for t in tables for d, s in resolved[t]["layers.gdn@1"].items() if d != "backend"}
+    assert gdn and all(s.startswith("triton.gdn.") for s in gdn), gdn
+    assert resolved["decode"]["layers.gdn@1"] == {
+        "backend": "auto", "gdn.qkvzba_conv1d_update@1": "triton.gdn.qkvzba_conv1d_update@1",
+        "gdn.packed_decode@1": "triton.gdn.packed_decode@1"}
+    catalog = w.service("kernels.catalog@1")  # the layers' kernels are chosen at their first call
+    for definition, shape, solution in (
+            ("norm.gemma_rms@1", {"hidden": 5120}, "flashinfer.norm.gemma_rms@1"),
+            ("norm.rms_gated@1", {"hidden": 128}, "triton.norm.rms_gated@1"),
+            ("act.silu_and_mul@1", {"hidden": 17408, "fp32": 0}, "flashinfer.act.silu_and_mul@1"),
+            ("act.sigmoid_mul@1", {"hidden": 6144}, "triton.act.sigmoid_mul@1"),
+            ("attn.qk_norm_rope_gate@1", {"head_dim": 256, "rotary_dim": 64, "fp32": 0},
+             "triton.attn.qk_norm_rope_gate@1")):
+        assert catalog.select(definition, shape).solution == solution
+
+
+ROUNDS: tuple[dict[int, int], ...] = ({0: 8, 1: 40, 2: 2}, {2: 1, 0: 1, 1: 1}, {1: 1}, {0: 1, 1: 1}, {1: 1, 2: 1, 0: 1},
+                                      {2: 1}, {0: 1, 2: 1}, {0: 1, 1: 1, 2: 1})
+"""Three rows prefill, then decode three, one, two, three, one, two and three at a time."""
+
+
 @pytest.mark.timeout(1800)
 def test_auto_runs_the_real_kernels_and_a_replayed_step_is_the_eager_step(checkpoint: Path) -> None:
-    """Three rows in a bucket of four (one padded lane), then two, one, and three again; a row
-    leaves and another takes its place. The same kernels run eagerly and in the graph, so the
-    logits and the states agree to bf16 rounding and the greedy tokens are the same."""
-    eager, graph = worker(checkpoint, False), worker(checkpoint, True)
+    """With a bucket for every number of rows a replayed step runs what the eager step runs, at
+    the same batch size: the logits and the states agree to bf16 rounding and the greedy tokens
+    are the same, also after a row leaves and another takes its place."""
+    eager, graph = worker(checkpoint, False), worker(checkpoint, True, **{"plan.graph_buckets": [1, 2, 3, 4]})
     try:
-        for w in (eager, graph):
-            resolved = w.service("plan@1").resolved
-            tables = ("prefill", "decode", "graph") if w is graph else ("prefill", "decode")
-            assert {resolved[t]["layers.attn@1"][d] for t, d in zip(tables, (
-                "attn.paged_extend@1", "attn.paged_decode@1", "attn.paged_decode@1"), strict=False)} == {
-                "flashinfer.attn.paged_extend@1", "flashinfer.attn.paged_decode@1"}
-            gdn = {s for t in tables for d, s in resolved[t]["layers.gdn@1"].items() if d != "backend"}
-            assert gdn and all(s.startswith("triton.gdn.") for s in gdn), gdn
-        assert graph.service("plan@1").buckets("decode") == [1, 2, 4]
+        real_kernels(eager, False)
+        real_kernels(graph, True)
+        assert graph.service("plan@1").buckets("decode") == [1, 2, 3, 4]
         a, b = Driver(eager), Driver(graph)
         for d in (a, b):
             for row, prompt in PROMPTS.items():
                 d.add(row, prompt)
-        rounds: list[dict[int, int]] = [{0: 8, 1: 40, 2: 2}, {2: 1, 0: 1, 1: 1}, {1: 1}, {0: 1, 1: 1},
-                                       {1: 1, 2: 1, 0: 1}, {2: 1}, {0: 1, 2: 1}, {0: 1, 1: 1, 2: 1}]
-        for chunks in rounds:
+        for chunks in ROUNDS:
             x, y = a.step(chunks), b.step(chunks)
             torch.testing.assert_close(y.logits.float(), x.logits.float(), rtol=2e-2, atol=2e-2)
             assert y.finish() == x.finish()
@@ -262,6 +365,108 @@ def test_auto_runs_the_real_kernels_and_a_replayed_step_is_the_eager_step(checkp
         eager.close()
         graph.close()
         free_gpu()
+
+
+@pytest.mark.timeout(1800)
+def test_a_padded_bucket_gives_the_real_rows_what_they_get_alone(checkpoint: Path) -> None:
+    """Three rows replayed from the bucket of four: one lane is padding, with no GDN slot and
+    the padding row's KV. The GEMMs then run four rows where the eager step runs three, and a
+    BLAS library may take another kernel for another number of rows (a SM100 does), so the logits
+    are held to their direction, and the greedy tokens to being the same wherever the eager
+    step's two best candidates are not nearly tied (stage2-contract.md §1.3)."""
+    eager, graph = worker(checkpoint, False), worker(checkpoint, True)
+    try:
+        assert graph.service("plan@1").buckets("decode") == [1, 2, 4]
+        a, b = Driver(eager), Driver(graph)
+        for d in (a, b):
+            for row, prompt in PROMPTS.items():
+                d.add(row, prompt)
+        for chunks in ROUNDS:
+            x, y = a.step(chunks), b.step(chunks)
+            lx, ly = x.logits.float(), y.logits.float()
+            assert bool((torch.nn.functional.cosine_similarity(lx, ly, dim=-1) > 0.999).all())
+            best = lx.topk(2, dim=-1).values
+            tied = (best[:, 0] - best[:, 1]) < 0.5
+            tx, ty = list(x.finish().tokens.values()), list(y.finish().tokens.values())
+            parted = [i for i, (p, q) in enumerate(zip(tx, ty, strict=True)) if p != q]
+            assert all(bool(tied[i]) for i in parted), (chunks, parted)
+            if parted:  # from a near tie on, the two runs decode different texts
+                break
+    finally:
+        eager.close()
+        graph.close()
+        free_gpu()
+
+
+def test_what_the_graphs_keep_is_counted_alike_cold_and_after_a_reload(checkpoint: Path) -> None:
+    """FlashInfer's workspace (384 MiB, for every step, eager ones too) is allocated before the
+    graphs' memory is counted: a budget below it still records the graphs on a cold start, and a
+    reload of the plan alone counts what the cold start counted."""
+    budget = 200 << 20
+    w = worker(checkpoint, True, **{"plan.graph_memory_bytes": budget})
+    try:
+        cold = w.service("plan@1").resolved["cuda_graph"]
+        assert cold["buckets"] == [1, 2, 4] and 0 < cold["kept_bytes"] < budget, cold
+        w.runtime.reload(ReloadPlan(units_to_reload=[spec("core.plan")])).unwrap()
+        again = w.service("plan@1").resolved["cuda_graph"]
+        assert again["buckets"] == [1, 2, 4], again
+        assert abs(again["kept_bytes"] - cold["kept_bytes"]) <= 16 << 20, (cold, again)
+    finally:
+        w.close()
+        free_gpu()
+
+
+def test_graphs_that_are_refused_or_only_checked_leave_nothing_in_the_backends(checkpoint: Path) -> None:
+    """Without a bucket of one row, the graph recorded for the check alone is closed and the
+    backends keep nothing for it. Graphs over their budget are closed, and the backends keep no
+    bucket; eager steps go on with the same kernels."""
+    w = worker(checkpoint, True, **{"plan.graph_buckets": [2, 4]})
+    try:
+        attn, gdn = w.service("layers.attn@1"), w.service("layers.gdn@1")
+        assert w.service("plan@1").buckets("decode") == [2, 4]
+        assert sorted(attn.paged.graph_metadata) == [2, 4] and sorted(gdn.graph_metadata) == [2, 4]
+        assert sorted(key for key in attn.paged.operators if key[0] == "graph") == [("graph", 2), ("graph", 4)]
+        assert not [name for name in (*attn.binding.buffers(), *gdn.binding.buffers()) if name.split(".")[-2] == "1"]
+    finally:
+        w.close()
+        free_gpu()
+    w = worker(checkpoint, True, **{"plan.cuda_graph": "auto", "plan.graph_memory_bytes": 4096})
+    try:
+        attn, gdn = w.service("layers.attn@1"), w.service("layers.gdn@1")
+        refused = w.service("plan@1").resolved["cuda_graph"]
+        assert refused["buckets"] == [] and "plan.graph_memory_bytes" in refused["reason"], refused
+        assert not attn.paged.graph_metadata and not gdn.graph_metadata and not attn.binding.buffers()
+        assert not [key for key in attn.paged.operators if key[0] == "graph"]
+        d = Driver(w)
+        d.add(0, PROMPTS[0])
+        d.generate([0], 4)
+        assert len(d.requests[0].outputs) == 4
+    finally:
+        w.close()
+        free_gpu()
+
+
+def test_a_cache_of_another_16_bit_dtype_than_the_model_is_not_flashinfers(checkpoint: Path) -> None:
+    """FlashInfer loads a 16-bit cache as the queries' type: a bf16 model over an fp16 cache would
+    read wrong numbers. ``auto`` leaves that combination to the native kernels, which convert;
+    named, FlashInfer fails the start."""
+    mixed = {"state.kv.dtype": "f16"}
+    w = worker(checkpoint, True, **{"plan.cuda_graph": "auto", **mixed})
+    try:
+        resolved = w.service("plan@1").resolved
+        assert resolved["decode"]["layers.attn@1"]["attn.decode@1"] == "reference.attn.decode@1 (fallback)"
+        assert resolved["prefill"]["layers.attn@1"]["attn.extend@1"] == "reference.attn.extend@1 (fallback)"
+        assert resolved["graph"]["layers.attn@1"]["attn.decode@1"] == "torch_graph.attn.decode@1"
+        d = Driver(w)
+        d.add(0, PROMPTS[0])
+        d.generate([0], 4)
+    finally:
+        w.close()
+        free_gpu()
+    with pytest.raises(Exception, match=r"attn.backend = 'flashinfer': backend 'flashinfer' has no solution of "
+                                        r"attn\.paged_\w+@1 for \{'head_dim': 256, 'fp32': 0, 'kv_as_q': 0\}"):
+        worker(checkpoint, False, **{"attn.backend": "flashinfer", **mixed})
+    free_gpu()
 
 
 @pytest.mark.timeout(1800)
@@ -326,6 +531,6 @@ def test_flashinfer_named_for_an_fp32_model_fails_the_start(checkpoint: Path, ke
     fails saying so instead of running the reference in its place. ``auto`` runs fp32 on the
     native kernels (tests/gpu/test_qwen38_partial.py)."""
     with pytest.raises(Exception, match=rf"{key} = 'flashinfer': backend 'flashinfer' has no solution of "
-                                        r"attn\.paged_\w+@1 for \{'head_dim': 256, 'fp32': 1\}"):
+                                        r"attn\.paged_\w+@1 for \{'head_dim': 256, 'fp32': 1, 'kv_as_q': 1\}"):
         worker(checkpoint, False, **{"model.dtype": "f32", "state.gdn.conv_dtype": "f32", key: "flashinfer"})
     free_gpu()

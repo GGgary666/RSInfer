@@ -295,7 +295,8 @@ def main(argv: list[str]) -> int:
         s.add_argument("--cuda-graph", choices=("auto", "off", "required"), default="off",
                        help="decode graphs (plan.cuda_graph); auto and required run the worker on cuda_graph")
         s.add_argument("--graph-buckets", type=int, nargs="*", default=[],
-                       help="rows of each decode graph (default: powers of two up to min(--max-rows, 8))")
+                       help="rows of each decode graph (default: SGLang's sizes up to min(--max-rows, 64); "
+                            "powers of two up to 8 while the captured attention is the fixed-extent one)")
         s.add_argument("--graph-memory-bytes", type=int, default=1 << 30, help="device memory the graphs may keep")
         s.add_argument("--name", default="Qwen3.8-27B", help="model name the frontend answers with")
         s.add_argument("--bind", default="127.0.0.1")
