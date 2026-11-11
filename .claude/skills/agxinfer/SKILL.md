@@ -133,6 +133,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
 - `doc/framework-bugs/`：热改时发现的更新机制 bug 的报告，格式见其中的 `README.md`。
+- `doc/rsi/`：agent 用热更新做开发的过程记录（文件名带日期）：一次工作里实际热改了多少、冷启动了多少、为什么，以及专门对更新机制做的试验和结论。属于历史，不随代码更新。发现的 bug 仍然写进 `doc/framework-bugs/`。
 - `doc/archive/`：旧版文档，不再维护。
 - `doc/figures/`：图片。
 
