@@ -143,6 +143,8 @@ class PyTorchExecutor:
         self.platform.synchronize(0)
 
     def submit(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps) -> Step | Resync:
+        # PROBE: a torch.profiler window over the next steps when profile.request is in the cwd
+        self._probe(len(plan.rows), plan.phase)
         start = time.perf_counter()
         check_plan(plan)
         reason = self.batch.check(delta, plan)
@@ -221,6 +223,52 @@ class PyTorchExecutor:
         for c in state.copy:
             if c.when == when:
                 self.stores[c.kind].copy([int(x) for x in c.src.values()], [int(x) for x in c.dst.values()])
+
+    def _probe(self, rows: int, phase: str) -> None:  # PROBE
+        """``profile.request`` holds ``<tag> <steps> [trace]``: profile that many steps, write
+        ``profile_<tag>.json`` (kernel time per name) and, with ``trace``, the chrome trace."""
+        import json
+        import os
+        import sys
+        try:
+            p: Any = getattr(self, "_probe_state", None)
+            if p is None:
+                if not os.path.exists("profile.request"):
+                    return
+                words = open("profile.request").read().split()
+                os.remove("profile.request")
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                          torch.profiler.ProfilerActivity.CUDA])
+                torch.cuda.synchronize()
+                prof.__enter__()
+                self._probe_state = {"prof": prof, "tag": words[0], "steps": int(words[1]),
+                                     "trace": "trace" in words, "seen": [], "t0": time.perf_counter()}
+                return
+            p["seen"].append((rows, phase))
+            if len(p["seen"]) < p["steps"]:
+                return
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - p["t0"]
+            p["prof"].__exit__(None, None, None)
+            self._probe_state = None
+            kernels: dict[str, dict[str, Any]] = {}
+            for e in p["prof"].key_averages():
+                if str(e.device_type).endswith("CUDA") and e.count:
+                    kernels[e.key] = {"count": e.count, "us": e.self_device_time_total}
+            n = len(p["seen"])
+            out = {"tag": p["tag"], "steps": n, "seen": sorted(set(p["seen"])), "wall_ms_per_step": wall * 1e3 / n,
+                   "device_us_per_step": sum(k["us"] for k in kernels.values()) / n,
+                   "launches_per_step": sum(k["count"] for k in kernels.values()) / n,
+                   "kernels": dict(sorted(kernels.items(), key=lambda kv: -kv[1]["us"]))}
+            with open(f"profile_{p['tag']}.json", "w") as f:
+                json.dump(out, f, indent=1)
+            if p["trace"]:
+                p["prof"].export_chrome_trace(f"trace_{p['tag']}.json")
+            print(f"PROBE profile {p['tag']}: {n} steps, {out['device_us_per_step']:.1f} us/step on the device, "
+                  f"{out['launches_per_step']:.1f} kernels/step", file=sys.stderr, flush=True)
+        except Exception as e:  # a probe must not stop the engine
+            self._probe_state = None
+            print(f"PROBE failed: {e!r}", file=sys.stderr, flush=True)
 
 
 class Unit:
