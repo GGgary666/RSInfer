@@ -12,14 +12,16 @@ from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from kernels.reference import ops
+from kernels.reference.paged import PagedDecode, PagedExtend
 from kernels.reference.unit import DEFINITIONS
 from layers.rope.unit import rope_cos_sin_cache
 
 torch.manual_seed(0)
 
-INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.extend@1", "attn.decode@1", "gdn.conv1d_fn@1",
-             "gdn.chunk_delta_rule@1"}
-"""Loop over sequences or only move data; checked bit for bit below."""
+INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.extend@1", "attn.decode@1", "attn.paged_extend@1",
+             "attn.paged_decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1"}
+"""Loop over sequences or only move data; checked bit for bit below (the paged attention through
+the native one, whose bits it gives).""" 
 
 
 def test_only_the_per_sequence_references_claim_batch_invariance() -> None:
@@ -133,6 +135,32 @@ def test_attention_is_causal_sdpa_per_sequence_wherever_the_tokens_sit() -> None
     decoded = ops.attention_decode(p["q"][last], torch.empty_like(p["q"][last]), p["k_cache"], p["v_cache"],
                                    p["req_to_token"], p["rows"], p["lens"], 32 ** -0.5, True)
     torch.testing.assert_close(decoded, out[last], rtol=1e-5, atol=1e-5)
+
+
+def test_paged_attention_gives_the_bits_of_the_native_one_over_the_same_token_lists() -> None:
+    """The operator planned over each row's list of token slots computes what ``attn.extend@1``
+    and ``attn.decode@1`` compute from ``req_to_token``: the same SDPA per sequence."""
+    gen = torch.Generator().manual_seed(5)
+    for dtype in (torch.float32, torch.bfloat16):
+        for n in (1, 3, 8):
+            p = _paged(n, dtype, gen)
+            lens, new = [int(x) for x in p["lens"]], [int(x) for x in p["new"]]
+            kv_indptr = torch.tensor([0, *torch.cumsum(p["lens"], 0).tolist()], dtype=torch.int32)
+            kv_indices = torch.cat([p["req_to_token"][r + 1, :lens[r]] for r in range(n)])
+            operator = PagedExtend(4, 2, 32, dtype, dtype, torch.device("cpu"))
+            operator.plan(torch.tensor([0, *torch.cumsum(p["new"], 0).tolist()], dtype=torch.int32), kv_indptr,
+                          kv_indptr, kv_indices)
+            native = ops.attention_extend(p["q"], torch.empty_like(p["q"]), p["k_cache"], p["v_cache"],
+                                          p["req_to_token"], p["rows"], p["lens"], p["lens"] - p["new"], p["new"],
+                                          32 ** -0.5, True, True)
+            assert torch.equal(operator.run(p["q"], p["k_cache"], p["v_cache"], 32 ** -0.5), native), (dtype, n)
+            last = torch.cumsum(p["new"], 0) - 1
+            operator = PagedDecode(4, 2, 32, dtype, dtype, torch.device("cpu"))
+            operator.plan(torch.arange(n + 1, dtype=torch.int32), kv_indptr, kv_indptr, kv_indices)
+            native = ops.attention_decode(p["q"][last], torch.empty_like(p["q"][last]), p["k_cache"], p["v_cache"],
+                                          p["req_to_token"], p["rows"], p["lens"], 32 ** -0.5, True)
+            assert torch.equal(operator.run(p["q"][last], p["k_cache"], p["v_cache"], 32 ** -0.5), native), (dtype, n)
+            assert new  # the rows hold between one and three new tokens each
 
 
 def test_the_batch_invariant_references_give_a_row_the_same_bits_alone_and_batched() -> None:

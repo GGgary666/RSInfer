@@ -23,6 +23,9 @@ from core.contracts.state import StateDecl
 from layers.solutions import Kernels
 
 KIND = "gdn.slots"
+PAD_SLOT = -1
+"""SGLang's ``pad_slot_id``, the slot of a padded lane: a kernel reads and writes no state for it,
+and what it returns for the lane is undefined."""
 
 
 def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -51,6 +54,7 @@ class Metadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     has_initial_state: torch.Tensor
+    extend_seq_lens_cpu: Sequence[int] = ()
     graph: bool = False
     """The metadata of a graph bucket: fixed buffers, filled before each replay."""
 
@@ -58,9 +62,11 @@ class Metadata:
 class GDNAttnBackend:
     """``layers.gdn@1``."""
 
-    def __init__(self, kernels: Kernels, states: Any) -> None:
+    def __init__(self, kernels: Kernels, states: Any, fp32: bool) -> None:
         self.kernels = kernels
         self.states = states
+        self.fp32 = fp32
+        """The activations are fp32: some kernels take bf16 / fp16 only."""
         self.forward_metadata: Metadata | None = None
         self.graph_metadata: dict[int, Metadata] = {}
         self.generation = 0
@@ -72,7 +78,7 @@ class GDNAttnBackend:
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         _, head_v_dim, head_k_dim = next(d.tensors["temporal"][0] for d in states if d.kind == KIND)
-        shape = {"head_k_dim": head_k_dim, "head_v_dim": head_v_dim}
+        shape = {"head_k_dim": head_k_dim, "head_v_dim": head_v_dim, "fp32": int(self.fp32)}
         return self.kernels.resolve({
             "prefill": {"gdn.conv1d_fn@1": shape, "gdn.gating@1": shape, "gdn.chunk_delta_rule@1": shape},
             "decode": {"gdn.conv1d_update@1": shape, "gdn.recurrent_update@1": shape}})
@@ -81,8 +87,8 @@ class GDNAttnBackend:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
         device = mapping.device
         if key.bucket:
-            # The bucket's fixed buffers; a padded lane takes the padding row's slot, index 0, as
-            # SGLang's padded rows do (get_mamba_indices of req_pool_indices padded with zeros).
+            # The bucket's fixed buffers; a padded lane has no slot (PAD_SLOT), as SGLang's padded
+            # rows (MambaAttnBackendBase._replay_metadata): lanes sharing one slot would race on it.
             size, n = key.bucket, len(plan.rows)
             m = self.graph_metadata.get(size)
             if m is None:
@@ -93,7 +99,7 @@ class GDNAttnBackend:
                 self.graph_buffers.update({f"{size}.query_start_loc": m.query_start_loc,
                                            f"{size}.mamba_cache_indices": m.mamba_cache_indices})
                 self.generation += 1
-            m.mamba_cache_indices[n:].zero_()
+            m.mamba_cache_indices[n:].fill_(PAD_SLOT)
             if n:
                 rows = on_device(torch.tensor(list(plan.rows.values()), dtype=torch.int64) + 1, device)
                 m.mamba_cache_indices[:n].copy_(mapping[rows])
@@ -110,7 +116,8 @@ class GDNAttnBackend:
             query_start_loc = torch.cat([torch.zeros(1, dtype=torch.int32, device=device),
                                          torch.cumsum(extend, dim=0, dtype=torch.int32)])
         # get_mamba_indices: req_index_to_mamba_index_mapping[req_pool_indices]
-        self.forward_metadata = Metadata(decode, query_start_loc, mapping[rows + 1], prefix > 0)
+        self.forward_metadata = Metadata(decode, query_start_loc, mapping[rows + 1], prefix > 0,
+                                         [int(n) for n in plan.num_tokens.values()])
 
     def release_graphs(self) -> None:
         self.graph_metadata.clear()
@@ -146,7 +153,8 @@ class GDNAttnBackend:
 
         mixed_qkv = self.kernels("prefill", "gdn.conv1d_fn@1")(  # _convolve_prefill
             mixed_qkv.transpose(0, 1), conv_weights, bias, activation, conv_states,
-            m.has_initial_state, cache_indices, m.query_start_loc).transpose(0, 1)[: mixed_qkv.shape[0]]
+            m.has_initial_state, cache_indices, m.query_start_loc,
+            m.extend_seq_lens_cpu).transpose(0, 1)[: mixed_qkv.shape[0]]
         actual_seq_len = mixed_qkv.shape[0]
         query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
         query = query.view(1, actual_seq_len, num_k_heads, head_k_dim)
@@ -162,7 +170,8 @@ class GDNAttnBackend:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "gdn")
-        ctx.provide("layers.gdn@1", GDNAttnBackend(kernels, ctx.use("state.gdn.slots@1")))
+        ctx.provide("layers.gdn@1", GDNAttnBackend(kernels, ctx.use("state.gdn.slots@1"),
+                                                   config["model.dtype"] == "f32"))
 
 
 if TYPE_CHECKING:

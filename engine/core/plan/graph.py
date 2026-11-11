@@ -16,9 +16,11 @@ from core.contracts.tensor import Tensor
 from unit.runtime.proxy import provision_of
 
 DEFAULT_MAX_BUCKET = 8
-"""Without ``plan.graph_buckets``: powers of two up to this many rows. The decode attention of a
-captured step costs by ``batch.max_context_len`` (``kernels.torch_graph``), which more rows than
-this did not win back (doc/evaluations/cuda-graph-review-fixes.md); larger steps run eagerly."""
+"""Without ``plan.graph_buckets``: powers of two up to this many rows. With the fixed-extent
+decode attention (``kernels.torch_graph``) a captured step costs by ``batch.max_context_len``,
+which more rows than this did not win back (doc/evaluations/cuda-graph-review-fixes.md); larger
+steps run eagerly. With a paged decode kernel the cost follows the rows' lengths, and the limit
+has not been measured again (doc/evaluations/real-kernels-4090d.md)."""
 
 
 def buckets(mode: str, values: Sequence[int], rows: int, budget: int) -> list[int]:
@@ -34,10 +36,12 @@ def buckets(mode: str, values: Sequence[int], rows: int, budget: int) -> list[in
     return chosen
 
 
-def no_rows() -> BatchPlan:
-    """A decode step without rows: every lane of a bucket is padding."""
-    return BatchPlan(Column.of("i32", []), Column.of("i32", []), Column.of("i32", []),
-                     Column.of("i64", []), Column.of("u8", []), "decode", 0)
+def padding_row() -> BatchPlan:
+    """A decode step of the padding row alone (row -1, on the stores' scratch items): a lane with
+    a defined result while there are no requests. A bucket's other lanes are padding: what a
+    kernel computes for a padded lane is undefined, and they all write the padding items."""
+    return BatchPlan(Column.of("i32", [-1]), Column.of("i32", [1]), Column.of("i32", [0]),
+                     Column.of("i64", [0]), Column.of("u8", [0]), "decode", 0)
 
 
 class Dependencies:
@@ -94,19 +98,20 @@ class GraphPlan:
         self.graph, self.output = None, None
 
     def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> torch.Tensor:
-        """An eager forward of a bucket of padding lanes, from a cleared padding item. The backends
-        allocate the bucket's fixed buffers here the first time, outside inference mode: every
-        later step updates them in place."""
+        """An eager forward of the bucket with the padding row in its first lane, from a cleared
+        padding item. The backends allocate the bucket's fixed buffers here the first time,
+        outside inference mode: every later step updates them in place."""
         for store in stores:
             store.clear(store.scratch())
         for backend in self.backends:
-            backend.prepare(batch, no_rows(), PlanKey("decode", self.size))
+            backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
         with torch.inference_mode():
             return model.forward(self.inputs, self.positions, self.last_index)
 
     def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
-        """Record the forward of a bucket of padding lanes; the replay must give the logits the
-        same kernels gave eagerly. That eager forward is the warm-up too."""
+        """Record the bucket's forward, after an eager one as the warm-up. A graph of one lane has
+        no padded lane beside the padding row, so what it replays is defined: it must be the
+        logits the same kernels gave eagerly."""
         with recorder.warmup():
             expected = self.padded(batch, model, stores).clone()
             for store in stores:
@@ -117,5 +122,6 @@ class GraphPlan:
         with recorder.warmup():
             graph.replay()
         assert self.output is not None
-        torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
-            f"decode graph of {self.size} rows replays other logits than the eager forward it recorded: {m}"))
+        if self.size == 1:
+            torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
+                f"a decode graph replays other logits than the eager forward it recorded: {m}"))

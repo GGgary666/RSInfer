@@ -4,9 +4,11 @@ Run manually with the GPU environment; this is not a pytest timing assertion.
 Model loading, capture, prefill and warm-up are outside the measured interval.
 Each case first primes its entire sequence-length trajectory, then measures repeats.
 
-The context length matters: a replayed step's attention costs by ``max_context`` whatever the
-rows' lengths (``kernels.torch_graph``), an eager step's by the lengths. The two run different
-attention kernels, so in bf16 their greedy tokens may part; the result says whether they did.
+The context length is varied because a replayed step's attention may cost by it: with FlashInfer
+(``kernels.flashinfer``, what ``auto`` picks for this bf16 model) a replayed and an eager step
+both cost by the rows' lengths and run the same kernels; without it a replayed step runs the
+fixed-extent attention of ``kernels.torch_graph``, which costs by ``max_context`` and may round
+another way than the eager kernel. The result says whether the greedy tokens of the two parted.
 """
 
 from __future__ import annotations

@@ -310,11 +310,13 @@ def causal_conv1d_update_ref(x: torch.Tensor, conv_state: torch.Tensor, weight: 
 
 def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, activation: str | None,
                      conv_states: torch.Tensor, has_initial_state: torch.Tensor, cache_indices: torch.Tensor,
-                     query_start_loc: torch.Tensor) -> torch.Tensor:
+                     query_start_loc: torch.Tensor, seq_lens_cpu: Sequence[int] | None = None) -> torch.Tensor:
     """``gdn.conv1d_fn@1``, the prefill conv ``GDNAttnBackend._convolve_prefill`` calls: varlen
     ``x`` ``(dim, total_tokens)``, sequence ``i`` is ``x[:, query_start_loc[i]:query_start_loc[i + 1]]``
     and continues from ``conv_states[cache_indices[i]]`` if ``has_initial_state[i]``; the states
-    are updated in place to each sequence's last ``width - 1`` inputs."""
+    are updated in place to each sequence's last ``width - 1`` inputs. ``seq_lens_cpu`` is the
+    sequences' lengths on the host, which SGLang's kernel sizes its launch by; the reference has
+    no use for them."""
     out = torch.empty_like(x)
     for i in range(cache_indices.shape[0]):
         start, end = int(query_start_loc[i]), int(query_start_loc[i + 1])
@@ -331,8 +333,9 @@ def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
 def causal_conv1d_update(x: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
                          activation: str | None, conv_state_indices: torch.Tensor) -> torch.Tensor:
     """``gdn.conv1d_update@1``, the decode conv: ``x`` ``(batch, dim)``, row ``i`` steps
-    ``conv_state[conv_state_indices[i]]`` in place."""
-    idx = conv_state_indices.to(torch.long)
+    ``conv_state[conv_state_indices[i]]`` in place. A negative index is a padded lane (SGLang's
+    ``pad_slot_id``), whose result is undefined: the reference runs it on the padding slot."""
+    idx = conv_state_indices.to(torch.long).clamp_min(0)
     states = conv_state[idx]
     out = causal_conv1d_update_ref(x, states, weight, bias, activation)
     conv_state[idx] = states
@@ -508,9 +511,10 @@ def fused_sigmoid_gating_delta_rule_update(A_log: torch.Tensor, dt_bias: torch.T
     """``gdn.recurrent_update@1``, the decode rule ``TritonGDNKernel.decode`` calls: one token per
     sequence, ``sigmoid_gating_delta_rule_update`` of the CPU test on the pool at
     ``initial_state_indices``, updated in place. ``q``, ``k`` ``[1, B, HK, K]``; ``v``
-    ``[1, B, HV, V]``; ``a``, ``b`` ``[B, HV]``. Returns ``[1, B, HV, V]``."""
+    ``[1, B, HV, V]``; ``a``, ``b`` ``[B, HV]``. Returns ``[1, B, HV, V]``. A negative index is a
+    padded lane, whose result is undefined: the reference runs it on the padding slot."""
     assert cu_seqlens.shape[0] == initial_state_indices.shape[0] + 1
-    idx = initial_state_indices.to(torch.long)
+    idx = initial_state_indices.to(torch.long).clamp_min(0)
     num_heads, num_value_heads = q.shape[2], v.shape[2]
     if num_value_heads // num_heads > 1:
         q = q.repeat_interleave(num_value_heads // num_heads, dim=2)

@@ -174,6 +174,14 @@ class Unit:
                 for backend in self.backends:
                     backend.release_graphs()
                 return f"uncapturable decode kernels: {uncapturable}", {}
+            if 1 not in graphs:
+                # Only a graph of one lane can be held to the eager logits (GraphPlan.capture):
+                # with no such bucket, record one for the check alone.
+                probe = GraphPlan(1, device, self.backends)
+                try:
+                    probe.capture(self.batch, self.model, stores, recorder)
+                finally:
+                    probe.close()
             # The largest first, into one pool: the smaller ones fit in what it took.
             for size, graph in graphs.items():
                 started = time.perf_counter()

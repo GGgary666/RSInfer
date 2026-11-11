@@ -14,3 +14,6 @@ services = ["kernels.catalog@1", "state.kv.paged@1"]
 "attn.backend" = { type = "str", default = "auto", binding = "startup", doc = "Full-attention kernels (SGLang's --attention-backend): auto, or a backend of the kernel catalog, e.g. reference" }
 "attn.prefill_backend" = { type = "str", default = "", binding = "startup", doc = "For prefill and mixed steps (SGLang's --prefill-attention-backend); empty: attn.backend" }
 "attn.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps (SGLang's --decode-attention-backend); empty: attn.backend" }
+
+[reads]
+config = ["model.dtype"]
