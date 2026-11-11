@@ -246,7 +246,7 @@ $C status                               # 也可以是 introspect（单元、配
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
 - 静态检查不过（`check` 或 `apply` 的诊断写明了哪条规则）；
-- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：单元在暂停期内重载，现编译要约一分钟，超过执行时限（30 秒），变更被撤回，引擎这段时间回 503，之后照常服务旧代码。**先在引擎外编译再 apply**：`PYTHONPATH=engine uv run python -m kernels.cuda.ops`（和 worker 同一个环境），之后的 apply 从缓存加载，两三秒。新增这个单元、或者冷启动时不受影响：那时的加载在准备阶段，时限是 `change.prepare_timeout_s`。
+- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：单元在暂停期内重载，现编译要约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），超过执行时限（30 秒），变更被撤回，引擎这段时间回 503，之后照常服务旧代码。**先在引擎外编译再 apply**：`PYTHONPATH=engine uv run python -m kernels.cuda.ops`（和 worker 同一个环境），之后的 apply 从缓存加载，4 层约两三秒、64 层重录 12 个桶约 6.4 秒。新增这个单元、或者冷启动时不受影响：那时的加载在准备阶段，时限是 `change.prepare_timeout_s`。
 
 可能是更新机制的 bug，写报告：
 - 提交了，可跑的还是旧代码，或者新旧代码混着跑；
