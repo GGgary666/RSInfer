@@ -11,11 +11,11 @@
 
 ## 结论
 
-1. **decode 一步的 kernel launch 从 238 次降到 85 次，SGLang 是 82 次。** 每层里的 kernel 数现在和 SGLang 相同：GDN 层 11 个（5 个 GEMM、2 个 norm、SiLU·mul、conv、delta rule、gated norm），attention 层 12 个（SGLang 也是 12 个，只是分法差一个：它的 KV 写入是 1 个 kernel、attention 是 2 个，这里反过来）。剩下的差别都是每步一次的准备工作，不随层数增长。
+1. **graph 回放的一步 decode，kernel launch 从 238 次降到 89 次，SGLang 是 82 次**（eager 的一步是 85 次）。 GDN 层里的 kernel 和 SGLang 一一对应，每层 11 个（5 个 GEMM、2 个 norm、SiLU·mul、conv、delta rule、gated norm）。attention 层在回放的步里是 13 个，SGLang 是 12 个：多的一个是 KV 写入（这里是两次 `index_put`，它是一个 kernel）。其余的差别是每步一次的准备工作，不随层数增长。
 2. **这台卡上，经 HTTP 的 decode 吞吐是 SGLang 的 98.5–100.6%**（第一批是 95.5–98.9%），**prefill 是 94.6–99.4%**（第一批 94%）。1 并发的 prefill 仍然慢 8 ms（70 对 62 ms），原因在 host 一侧，见下。
 3. **prefill 一步（2000 token）的 launch 从 311 次降到 162 次，比 SGLang 的 257 次少**；设备上的 kernel 时间 47.5–49.2 ms，和 SGLang 的 47.2 ms 持平（差别在 GEMM 自己的波动之内）。
 4. **review 提的问题都成立，都修了，各有回归测试。** 其中一个是静默的数值错误：bf16 模型配 f16 的 KV 时 FlashInfer 的输出完全不对（我在 GPU 上复现：和参照实现最大差 816）。
-5. **对 SM100 的预期没有验证过。** 按 Gemini 的归因（差距来自每层未融合的小算子和 launch 间隙，每层约 63 µs），每层多出的 launch 现在是 0，decode 应该接近 SGLang；这是推算，要以重测为准。
+5. **对 SM100 的预期没有验证过。** 按 Gemini 的归因（差距来自每层未融合的小算子和 launch 间隙，每层约 63 µs），每个 GDN 层多出的 launch 现在是 0，每个 attention 层是 1，decode 应该接近 SGLang；这是推算，要以重测为准。
 
 ## review 的修复
 
@@ -24,7 +24,7 @@
 | FlashInfer 把 16 位的 KV 直接当成 Q 的 dtype 读，`auto` 在 bf16 模型 + f16 KV 时仍选它 | Codex | attention 的 shape 多一项 `kv_as_q`（KV 的 dtype 是否等于模型的）；FlashInfer 的两个 attention solution 只接 `kv_as_q = 1`。`auto` 在不相等时退回会做转换的原有 kernel；点名 `flashinfer` 时启动失败 | CPU：`test_config.py::test_the_attention_kernels_are_asked_for_with_the_dtypes_of_queries_and_cache`；GPU：`test_a_cache_of_another_16_bit_dtype_than_the_model_is_not_flashinfers` |
 | FlashInfer 的 384 MiB workspace 在 graph 显存的统计窗口里第一次分配：冷启动算进 `plan.graph_memory_bytes`，只重载 `core.plan` 时不算，同一份配置两种结果 | Codex、Gemini | 录图之前先跑一次 padding 行的 eager decode 步，库在这一步里分配它所有步共用的东西；之后才取统计的起点 | GPU：`test_what_the_graphs_keep_is_counted_alike_cold_and_after_a_reload`（预算 200 MiB，比 workspace 小，冷启动照样录；重载后的 `kept_bytes` 和冷启动相差不超过 16 MiB） |
 | 配置里没有 1 行的桶时，为自检录的那个 1 行 graph 关掉以后，两个 backend 里还留着它的元数据、固定 buffer 和 FlashInfer wrapper | Gemini | 自检的 graph 关掉后让 backend 释放它们（这时还没有录别的桶） | GPU：`test_graphs_that_are_refused_or_only_checked_leave_nothing_in_the_backends` |
-| `gdn.conv1d_fn@1` 的 bf16 容差 1e-2 比一个 bf16 舍入单位还小（值在 2 附近时一个单位是 0.0156），SM100 上 270 万个元素里有 1 个差两个单位 | Gemini | bf16 结果的容差改成 2e-2（两个舍入单位），理由写在 `kernels/reference/unit.py` | 原测试 |
+| `gdn.conv1d_fn@1` 的 bf16 容差 1e-2（绝对加相对）容得下一个 bf16 舍入单位，容不下两个：SM100 上 270 万个元素里有 1 个在 2.09 附近差两个单位，0.03125，容差是 0.0309 | Gemini | bf16 结果的容差改成 2e-2（任何大小的值上都容得下两个舍入单位），理由写在 `kernels/reference/unit.py` | 原测试 |
 | "graph 等于 eager"的测试拿 3 行的 eager 和落进 4 行桶的 graph 逐值比；SM100 上 cuBLAS 给 3 行和 4 行选了不同的 GEMM kernel，logits 差 0.117（token 相同） | Gemini | 拆成两个测试：桶是 1、2、3、4 时两边行数相同，逐值比；带 padding 行的桶比方向（余弦）和 token，eager 的前两名相差不到 0.5 时允许分开 | GPU：`test_auto_runs_the_real_kernels_and_a_replayed_step_is_the_eager_step`、`test_a_padded_bucket_gives_the_real_rows_what_they_get_alone` |
 | 默认的 graph 桶只到 8 行；SM100 上 16–64 并发退回 eager 后慢 2.7–3.3 倍 | Gemini | 见下面"默认的桶" | CPU：`test_cuda_graph.py::test_default_buckets_and_required_coverage` |
 | `bench_serving.py`：只在事件带文本时记时间，会低估每 token 间隔；keep-alive 连接数没跟并发数走 | Gemini | 每个 token 的事件都记；`max_keepalive_connections` 设成并发数 | 重测了 SGLang：数字没变（这个 tokenizer 下没有空文本事件） |
@@ -39,7 +39,7 @@
 没配 `plan.graph_buckets` 时：
 
 - **graph 里的 attention 按行的长度算代价时**（paged decode）：用 SGLang 的默认档位 1、2、4、8、12，然后每 8 行一档，到 `min(batch.max_rows, 64)`，并且把这个上限本身也录上。这样任何行数的 decode 步都有 graph，`required` 在默认配置下也满足"覆盖 `batch.max_rows`"。`max_rows` 32 时是 1、2、4、8、12、16、24、32，和 SGLang 录的一样，`kept_bytes` 128 MiB。
-- **graph 里的 attention 是固定容量的那个时**（`kernels.torch_graph`：fp32、KV 和模型 dtype 不同、或没有 FlashInfer）：仍是 2 的幂到 8。它每行要搬 `max_context` 那么长的 K/V，64 行 × 4096 时光是 K 的 gather 就是 1.07 GB，超过 1 GiB 的默认预算；而预算是"全录或全不录"，放开上限会让小桶也录不成。
+- **graph 里的 attention 是固定容量的那个时**（`kernels.torch_graph`：fp32、KV 和模型 dtype 不同、或没有 FlashInfer）：仍是 2 的幂到 8。它每行要搬 `max_context` 那么长的 K/V，fp32 下 64 行 × 4096 时光是 K 的 gather 就是 1.07 GB，超过 1 GiB 的默认预算；而预算是"全录或全不录"，放开上限会让小桶也录不成。
 - `core.plan` 怎么知道是哪一种：录进 graph 的 solution 里有没有只给 graph 用的（`requires` 含 `CAPTURE`）。
 
 ## 融合路径
@@ -98,7 +98,7 @@
 
 ### decode（8 行，每步）
 
-按来源分的 launch 数是在 eager 下给每个 definition 的调用打标签量的；SGLang 一栏是按它 trace 里的 kernel 名字归的。
+按来源分的 launch 数是在 eager 下给每个 definition 的调用打标签量的；SGLang 一栏是按它 trace 里的 kernel 名字归的（graph 回放）。
 
 | 来源 | SGLang | 只换 RMSNorm | 融合以后 |
 |---|---:|---:|---:|
@@ -109,13 +109,14 @@
 | GDN 三层的 conv、delta rule、gated norm | 9 | 9 | 9 |
 | 模型里 kernel 之间的 torch 操作（拆投影、拼接、输出 gate、取每行最后一个 token） | 1（输出 gate） | 18 | 2 |
 | KV 写入 | 1 | 2 | 2 |
-| attention | 2 | 1 | 1 |
+| attention | 2 | 1（回放时 2） | 1（回放时 2） |
 | 采样 | 3 | 3 | 3 |
 | 每步一次的准备（各 backend 的 `prepare`、输入和状态的拷贝、embedding） | 29 | 31 | 31 |
 | 合计 | 82 | 127 | 85 |
 
-- 第一批是 238 次，其中参照实现的 RMSNorm 一项约 100 次。SGLang 的"每步一次的准备"是合计减去其余各行得到的，里面有 1 次是拼 KV 槽列表的 kernel。
-- graph 回放时量到的是 89 次（第一批 238，只换 RMSNorm 131）。
+- SGLang 的"每步一次的准备"是合计减去其余各行得到的，里面有 1 次是拼 KV 槽列表的 kernel。
+- graph 回放时量到的是 89 次（第一批 238，其中参照实现的 RMSNorm 一项约 100 次；只换 RMSNorm 131），比 eager 多 4 次。其中 1 次是 attention：给 graph 用的 FlashInfer wrapper 总是带一个合并分块结果的 kernel（SGLang 的回放里也有），eager 的 wrapper 在这个长度下不分块。其余净 3 次是回放前往固定 buffer 里拷贝，比 eager 现造张量多出来的。
+- 所以回放的步和 SGLang 比是 89 对 82：每个 attention 层多 1 次（KV 写入），每步一次的准备多 6 次。
 - 设备上 kernel 时间合计（graph 回放）：6.37 → 6.22 → 6.15 ms，SGLang 是 6.22 ms。其中 GEMM 5.94–5.96 ms。
 
 ### prefill（一步 2000 个 token，eager）
@@ -214,7 +215,7 @@ prefill（prompt 2000 token，生成 8 个，每个客户端 8 个请求）：
 
 这台机器上能做、这次没做的：
 
-- **KV 写入**：这里是两次 `index_put`，SGLang 是一个 `store_kvcache` kernel。它在编译好的 `sgl_kernel` 包里，不是 Triton，没法照搬源码。每个 attention 层多 1 次 launch（完整模型每步多 16 次）。
+- **KV 写入**：这里是两次 `index_put`，SGLang 是一个 `store_kvcache` kernel。它是 SGLang 自己用 C++ 写、由它的 JIT 编译的，不是 Triton，没法照搬源码。每个 attention 层多 1 次 launch（完整模型每步多 16 次）。
 - **attention 每步的准备**：每行的 token 槽列表是用 torch 的几个操作拼的，连同拷贝是 13 次 launch；SGLang 用一个 Triton kernel（`create_flashinfer_kv_indices_triton`）。这在 graph 之外、每步一次，不随层数增长。
 - **prefill 不走 graph。** SGLang 给 prefill 也录 graph。上面 1 并发 prefill 多出的 8 ms 多半在这里。这是一个新的 plan 种类，不是换 kernel。
 - **extend 的 ragged wrapper**：这里的 prefill 用 paged wrapper 在整段序列上算（SGLang 的 `SGLANG_FLASHINFER_USE_PAGED` 那条路）。
@@ -226,5 +227,5 @@ prefill（prompt 2000 token，生成 8 个，每个客户端 8 个请求）：
 ## 对 SM100 的预期（没有验证）
 
 - Gemini 的归因：64 层时每步比 SGLang 多约 4.07 ms，对应每层约 63 µs 的未融合小算子和 launch 间隙。
-- 按这里 4 层的计数换算到 64 层（48 层 GDN + 16 层 attention）：第一批每步比 SGLang 多 2000 多次 launch（每个 GDN 层约 25 次，每个 attention 层约 68 次）。现在每层的 kernel 数和 SGLang 相同，每步只多 3 次准备。
+- 按这里 4 层的计数换算到 64 层（48 层 GDN + 16 层 attention）：第一批每步比 SGLang 多 2000 多次 launch（每个 GDN 层约 25 次，每个 attention 层约 68 次）。现在 GDN 层不多，每个 attention 层多 1 次，加上每步一次的 6 次，合计约 22 次。
 - 所以 decode 应该接近 SGLang。prefill 每步的 launch 也少了一半，但它是 eager，host 一侧的代价在 SM100 上占多少我不知道。两项都要以 SM100 上的重测为准。
