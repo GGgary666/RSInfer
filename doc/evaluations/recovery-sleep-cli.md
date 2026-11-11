@@ -54,7 +54,7 @@
 
 ### 临时检查
 
-- skill 的「在引擎里做检查」改成：检查写在另一份工作区里（`rsync` 一份 `engine/`），从那里 apply，查完从仓库 apply 一次就撤掉了。这一轮就是这样做的（下面的 `ws_probe`）。
+- skill 的「在引擎里做检查」改成：检查写在另一份工作区里（拷一份 `engine/`），从那里 apply，查完从仓库 apply 一次就撤掉了。这一轮就是这样做的（下面的 `ws_probe`）。
 - `tests/scenarios/test_no_temporary_checks.py`：`engine/` 里有标着 `# PROBE` 的行就失败。
 
 ## 在跑着的引擎上的验证

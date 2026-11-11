@@ -214,7 +214,7 @@ $A control status                               # 也可以是 introspect（单�
 
    ```sh
    WS=<临时目录>
-   rsync -a --delete --exclude __pycache__ engine/ $WS/engine/   # 每轮之前同步一次
+   rm -rf $WS/engine && cp -r engine $WS/   # 每轮之前同步一次（先删，仓库里删掉的文件也就没了）
    # 在 $WS/engine 里改单元的代码，临时的几行前面加一行 `# PROBE` 注释
    ```
 
