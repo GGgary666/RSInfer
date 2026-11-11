@@ -13,7 +13,14 @@ frontend = ["transformers>=5,<6", "jinja2>=3.1", "fastapi>=0.115", "uvicorn>=0.3
 # The torch platforms (platforms.torch_eager) and the model units need one of the two;
 # they exclude each other. CI and machines without a GPU use `cpu`; SM100 hosts use `gpu`.
 cpu = ["torch==2.11.0", "safetensors==0.8.0"]
-gpu = ["torch==2.11.0 ; sys_platform == 'linux'", "safetensors==0.8.0"]
+gpu = [
+    "torch==2.11.0 ; sys_platform == 'linux'",
+    "safetensors==0.8.0",
+    # The real kernels (kernels.triton, kernels.flashinfer): Triton is the version torch pins;
+    # FlashInfer is the version SGLang e838360 pins.
+    "triton==3.6.0 ; sys_platform == 'linux'",
+    "flashinfer_python[cu13]==0.7.2 ; sys_platform == 'linux'",
+]
 
 [dependency-groups]
 dev = [
