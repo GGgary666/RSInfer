@@ -16,7 +16,7 @@ M2b（[../specs/stage2-contract.md](../specs/stage2-contract.md) §1.3）在这�
    benchmark 里开重叠的 graph 每步 6.0–6.4 ms，已经等于这个设备时间。换 kernel 之前，Triton GDN 让 graph 每步快了 0.3–1.0 ms，FlashInfer 再快 0–0.8 ms（见下表）。只有 4 层时 LM head 占了近一半；完整 64 层时它被摊薄，但每层的 GEMM（0.83 ms）仍是非 GEMM 部分（0.12 ms）的 7 倍。带宽高得多的 SM100 上占比会不同，要在那里重新 profile。
 3. **FlashInfer 的意义在于 graph 步的代价不再跟 `batch.max_context_len` 走。** 之前 graph 里的 attention 按表宽算，`max_context` 从 256 调到 4096，8 行的每步时间从 7.39 涨到 8.15 ms；现在两档都是 6.40 ms。
 4. **热更新没发现问题。** 在跑着的引擎上改 `kernels.triton`、`kernels.flashinfer` 的代码和 backend 配置，计划、生效、撤回、显存都符合预期（见下）。没有需要写进 `doc/framework-bugs/` 的。
-5. **没有和原生 SGLang 对比。** 这台机器没有装 SGLang 的环境（它钉 torch 2.14.1，另一套 CUDA 库，盘不够）。上面"压在 GEMM 上"是这次能给出的最接近的判断；SGLang 在 SM89 上用的也是 cuBLAS 的同一批 GEMM。
+5. **和原生 SGLang 对比（同一天补测，见"和原生 SGLang 对比"一节）：经 HTTP 的吞吐，decode 是它的 96–99%，prefill 是 94%。** 同一个 checkpoint、同一个 tokenizer、同样的请求，SGLang 是 `e838360` 的默认配置。每个 token 的间隔，agxinfer 比它多 0.2–0.3 ms（1 并发 6.00 对 5.80 ms，32 并发 7.55 对 7.35 ms）。这个差距没有逐项归因；SGLang 在这条路径上比我们多的是 GDN decode 的融合 kernel、QK norm + RoPE 的融合和 `sgl_kernel` 的小算子。
 
 ## 环境
 
@@ -116,6 +116,59 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 - 冷缓存下第一次编译：FlashInfer 的 prefill 模块约 18 秒（bf16、GQA 每组 6 个头时 decode 走 tensor core，用的也是它；不走 tensor core 的 decode 模块约 10 秒）；Triton 的 chunk kernel 连 autotune 约 10 秒，其余每个约 1 秒。之后从磁盘缓存加载。**Triton 的 prefill kernel 没有 warm-up，冷缓存时第一个请求会等这次编译。**
 - 录 4 个桶的 graph 共 0.1–0.2 秒。第一次录时 `kept_bytes` 是 532 MiB，里面有 FlashInfer 的 384 MiB workspace（它在第一个 operator 造出来时分配，正好落在统计窗口里）；重载后再录是 60 MiB。workspace 不是 graph 的显存，这个统计把它算进了 `plan.graph_memory_bytes` 的预算。
 
+## 和原生 SGLang 对比
+
+用户允许在这台机器上装原生 SGLang 以后补测的。
+
+### 怎么测的
+
+- **SGLang**：`e838360` 的源码（`~/sglang-e838360/python`，不安装，放在 `PYTHONPATH` 上），依赖照它的 `pyproject.toml` 装进单独的环境 `~/sglang-e838360/venv`（torch 2.14.1+cu130，flashinfer 0.7.2，sglang-kernel 0.4.10）。启动：
+
+  ```sh
+  python -m sglang.launch_server --model-path <checkpoint> --dtype bfloat16 \
+      --attention-backend flashinfer --context-length 4096 --max-running-requests 32
+  ```
+
+  其余默认：重叠调度开，radix cache 开，`chunked_prefill_size=4096`，`max_prefill_tokens=16384`，`mem_fraction_static` 自动定成 0.705，decode graph 录 1、2、4、8、12、16、24、32 行，另外还录 prefill graph。它选的 kernel：FlashInfer attention，Triton GDN（`packed_decode=True`，并用上了投影解包 + conv 的融合 kernel）。
+- **让 SGLang 加载这个 checkpoint 要两处调整**：
+  - `Qwen3_5ForConditionalGeneration` 是多模态结构，SGLang 会去找图像处理器的文件。在 config.json 里加 `"language_model_only": true`（SGLang 认 checkpoint 自己的这个声明）；`--language-model-only` 这个命令行开关在 `e838360` 不支持这个结构。
+  - tokenizer 用 HF 缓存里 `Qwen/Qwen3.6-27B` 的（本机已有，词表 248044）。测试里的词级 tokenizer 不行：SGLang 会"修正"它的组件，结果 prompt 变成 0 个 token，启动预热就挂。
+- **agxinfer**：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --graph-buckets 1 2 4 8 16 32 --token-budget 16384 --mem-fraction 0.75`。后三项是为了和 SGLang 对齐：graph 录到 32 行，prefill 每步的预算和它的 `max_prefill_tokens` 一样，留给激活的显存和它差不多（见下面的 OOM）。
+- **负载**：`tests/gpu/bench_serving.py`（新）。每档并发有那么多个客户端，各自一个接一个地发 `/v1/completions`（流式、贪心、`ignore_eos`）。每个请求的 prompt 全程唯一。
+  - decode：prompt 32 个 token，生成 256 个；每个客户端 4 个请求。
+  - prefill：prompt 2000 个 token，生成 8 个；每个客户端 8 个请求。
+- 两边在同一个 prompt 上生成的前 4 个 token 相同，之后分开（bf16、随机权重）。
+
+### 结果
+
+decode（输出 token/s；每 token 间隔是每个请求第一个 token 之后的平均间隔，取中位数）：
+
+| 并发 | SGLang token/s | agxinfer token/s | 比例 | SGLang 每 token | agxinfer 每 token |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 171.0 | 164.8 | 96.4% | 5.80 ms | 6.00 ms |
+| 4 | 656.7 | 627.1 | 95.5% | 6.01 ms | 6.31 ms |
+| 8 | 1276.8 | 1226.4 | 96.1% | 6.15 ms | 6.40 ms |
+| 16 | 2366.2 | 2340.1 | 98.9% | 6.44 ms | 6.66 ms |
+| 32 | 4164.3 | 4036.9 | 96.9% | 7.35 ms | 7.55 ms |
+
+prefill（输入 token/s；首 token 时间取中位数）：
+
+| 并发 | SGLang token/s | agxinfer token/s | 比例 | SGLang 首 token | agxinfer 首 token |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 19166 | 17987 | 93.8% | 63 ms | 64 ms |
+| 4 | 30801 | 29083 | 94.4% | 162 ms | 222 ms |
+| 8 | 35506 | 33196 | 93.5% | 258 ms | 427 ms |
+
+- 首 token 时间在 4、8 并发下差得多，是调度不同：SGLang 一步最多 4096 个 token（`chunked_prefill_size`），先到的请求先出结果；agxinfer 把预算内的请求放在一步里，一起出结果。吞吐是可比的。
+- decode 的首 token 时间：SGLang 17–81 ms，agxinfer 24–93 ms。
+- **agxinfer 的默认配置**（graph 桶到 8 行，`--token-budget 2048`，`--mem-fraction 0.85`）下 decode 是 164.8 / 624.0 / 1225.8 / 2199.2 / 3947.7 token/s：16 并发是 SGLang 的 93%，32 并发是 95%。超过 8 行的步走 eager，开重叠时差得不多。
+
+### 测的过程里碰到的
+
+- **第一版脚本不同并发档位之间有重复的 prompt，SGLang 的前缀缓存命中了**（它的日志里 `#cached-token: 3968`），8 并发的 prefill 看起来是我们的 1.7 倍。改成全程唯一以后是上表的 94%。agxinfer 现在没有前缀复用（M2d），真实负载里有重复前缀时这个差距会回来。
+- **`--token-budget 16384` 加默认的 `--mem-fraction 0.85` 会让 worker OOM。** 默认分给状态池 12.41 GiB，权重 7.6 GiB，graph 和 FlashInfer 的 workspace 约 0.6 GiB，剩下不到 3 GiB；一步 16000 个 token 的 prefill 的激活放不下，worker 报 `OutOfMemoryError`，引擎停止服务，只能重启。SGLang 自动定的 `mem_fraction_static` 是 0.705，建完池、录完 graph 以后还留着 5.3 GB。默认的 2048 没有这个问题。holder 分池时没有把 prefill 预算算进去。
+- SGLang 冷缓存的第一次启动约 95 秒，其中录 prefill graph 56–64 秒（50 个长度档位，含 Triton 的编译和 autotune）；缓存热了以后录 prefill graph 4.3 秒。
+
 ## 在跑着的引擎上热改
 
 `deploy/qwen38.py serve`（4 层、bf16、`--cuda-graph auto`、`--max-rows 8`），前端发 completions 请求，每次变更前后用同一个 prompt 取 24 个贪心 token：
@@ -149,7 +202,7 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 
 留给 SM100（这张卡是 SM89，跑不了）：
 - FlashInfer 的 GDN decode / prefill（SM90、SM100；SM100 上 decode 要求 ssm state 是 bf16），CuTe DSL 的 GDN，`trtllm_mha`；
-- 完整模型和原生 SGLang 的对比，以及那里的 profile。
+- 完整模型上和原生 SGLang 的对比（`tests/gpu/bench_serving.py` 两边通用），以及那里的 profile。
 
 这台机器上还能做、这次没做的：
 - **融合路径**：QK norm + RoPE + gate、`fused_sigmoid_mul`、GDN decode 的 packed decode 和投影解包 + conv、两个输入投影合成一次 GEMM。都要加 definition 并改 `models.qwen38` 的前向。按上面的 profile，除了合并 GEMM，其余在这张卡上每层最多省 0.1 ms 量级。
@@ -158,3 +211,4 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 - prefill kernel 的启动 warm-up。
 - 默认的 graph 桶只到 8 行（`core/plan/graph.py` 的 `DEFAULT_MAX_BUCKET`），理由是当时 graph 里的 attention 按 `max_context` 算。换成 FlashInfer 以后这个理由不成立了，更大的桶没有重新量。
 - 每步 plan 在 host 上多出的 0.3 ms。
+- holder 分池时给大的 prefill 预算留激活的显存（见上面的 OOM）。
