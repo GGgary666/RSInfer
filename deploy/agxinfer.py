@@ -180,6 +180,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     """Write ``topology.json`` and ``config.json`` into the run directory."""
     import msgspec
 
+    from core.change.config import ChangeTunables
     from core.common.ids import HostId
     from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 
@@ -225,7 +226,10 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     topo_file, config_file = run / "topology.json", run / "config.json"
     topo_file.write_bytes(msgspec.json.encode(topology))
     config_file.write_text(json.dumps(config, indent=1))
-    tunables = {"supervisor.checkin_timeout_s": float(args.timeout), "change.prepare_timeout_s": float(args.timeout)}
+    # A change's execution may read the weights again (a wake), as start-up does: it gets as long
+    # as start-up, and not less than the engine's own limit.
+    tunables = {"supervisor.checkin_timeout_s": float(args.timeout), "change.prepare_timeout_s": float(args.timeout),
+                "change.execute_timeout_s": max(float(args.timeout), ChangeTunables().execute_timeout_s)}
     return topo_file, config_file, tunables, recipe
 
 
@@ -517,7 +521,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
                    "(default: this repo); change it and apply it with control apply --source, without a restart")
     e.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="any other config key (a JSON value, or a string); may repeat")
-    e.add_argument("--timeout", type=int, default=3600, help="seconds for start-up and for a response")
+    e.add_argument("--timeout", type=int, default=3600, help="seconds for start-up and for a response; "
+                   "above 3600, also for a change's execution (a wake reads the weights again)")
     e.add_argument("--detach", action="store_true", help="run in the background: return once the engine is up")
     e.add_argument("--dry-run", action="store_true", help="write topology.json and config.json, print the "
                    "command, start nothing")

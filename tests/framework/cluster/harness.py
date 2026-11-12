@@ -64,7 +64,7 @@ def compile(work):
     """As ``torch.utils.cpp_extension.load``: the directory's lock is a file made with ``O_EXCL``,
     waited on while it is there and deleted in ``finally``; ``subprocess.run`` runs the compiler
     (``ninja``), which starts another (``nvcc``) and lasts what ``work/compile_s`` says. The
-    compilers' ids go to ``work/pids``."""
+    compilers' ids go to ``work/pids``; the id of the process whose step compiles, to ``work/host``."""
     lock = os.path.join(work, "lock")
     while True:
         try:
@@ -73,6 +73,8 @@ def compile(work):
         except FileExistsError:
             time.sleep(0.05)
     try:
+        with open(os.path.join(work, "host"), "w") as f:
+            print(os.getppid(), file=f)
         with open(os.path.join(work, "compile_s")) as f:
             seconds = f.read().strip()
         subprocess.run([sys.executable, "-c", COMPILER, os.path.join(work, "pids"), seconds, "spawn", COMPILER],

@@ -24,7 +24,6 @@ pause after the coordinator has confirmed every participant.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import signal
 import subprocess
@@ -37,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
 
+from core.change.build import signal_session
 from core.change.config import ChangeTunables
 from core.change.protocol import (
     Abort,
@@ -82,43 +82,12 @@ def _exited(pid: int) -> bool:
         return True
 
 
-def _signal_session(sid: int, sig: int) -> int:
-    """Send ``sig`` to every live process of session ``sid`` (``/proc/<pid>/stat``); how many."""
-    sent = 0
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry.name}/stat", "rb") as f:
-                fields = f.read().rsplit(b")", 1)[1].split()  # after "pid (comm)": state, ppid, pgrp, session
-        except OSError:
-            continue
-        if int(fields[3]) == sid and fields[0] != b"Z":
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(int(entry.name), sig)
-                sent += 1
-    return sent
-
-
 def _chain(*parts: Iterator[None]) -> Iterator[None]:
     """``itertools.chain`` that ``close`` reaches: closing it closes the part it is in (a build
     step's ``finally`` stops the step's process)."""
     for part in parts:
         yield from part
 
-
-_BUILD = ("import ctypes, importlib, signal, sys\n"
-          "def stop(signum, frame):\n"
-          "    raise SystemExit(128 + signum)\n"
-          "signal.signal(signal.SIGTERM, stop)\n"
-          "ctypes.CDLL(None).prctl(1, signal.SIGTERM)\n"
-          "module, _, function = sys.argv[1].partition(':')\n"
-          "getattr(importlib.import_module(module), function)()\n")
-"""A unit's build step, in a process of its own (``-c``: ``sys.argv[1]`` is the step). SIGTERM ends
-it with ``SystemExit``, so its cleanup runs: PyTorch's extension builder deletes the lock it holds
-on its build directory, and kills the ``ninja`` it waits for. It gets SIGTERM when the process that
-runs the change ends, however it ends (``PR_SET_PDEATHSIG``; should that process end before the
-step set it, the step builds to the end, and lets its locks go then)."""
 
 Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone",
                 "committed"]
@@ -327,8 +296,10 @@ class Participant:
         env = {**os.environ, "PYTHONPATH": code_root}
         for unit, entry in steps:
             t0 = time.monotonic()
-            # Its own session: an undo stops it and whatever it started (ninja, the compilers).
-            proc = subprocess.Popen([sys.executable, "-P", "-s", "-c", _BUILD, entry], env=env,
+            # Its own session: an undo stops it and whatever it started (ninja, the compilers); it
+            # does so itself should this process be gone by then (``core.change.build``).
+            proc = subprocess.Popen([sys.executable, "-P", "-s", "-m", "core.change.build", entry,
+                                     str(self.tun.build_stop_grace_s)], env=env,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
             try:
                 while proc.poll() is None:
@@ -346,14 +317,14 @@ class Participant:
     def _stop_build(self, proc: subprocess.Popen[bytes]) -> None:
         """Stop a build step that still runs, and its session (the session, not the process group:
         ``ninja`` runs each compiler in a group of its own): SIGTERM first, so that its cleanup runs
-        (``_BUILD``); what is left of the session after ``change.build_stop_grace_s`` is killed. The
-        step is reaped only after that: until then its id, its session's id, is not reused."""
-        _signal_session(proc.pid, signal.SIGTERM)
+        (``core.change.build``); what is left of the session after ``change.build_stop_grace_s`` is
+        killed. The step is reaped only after that: until then its id, its session's id, is not reused."""
+        signal_session(proc.pid, signal.SIGTERM)
         deadline = time.monotonic() + self.tun.build_stop_grace_s
         while not _exited(proc.pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         for _ in range(10):  # until nothing of it is left: a process may fork meanwhile
-            if not _signal_session(proc.pid, signal.SIGKILL):
+            if not signal_session(proc.pid, signal.SIGKILL):
                 break
             time.sleep(0.02)
         proc.wait()

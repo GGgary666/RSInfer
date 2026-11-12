@@ -5,6 +5,8 @@ before the pause."""
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import time
 from pathlib import Path
 
@@ -13,7 +15,7 @@ import pytest
 
 from core.change.coordinator import PlanInput
 from core.change.types import ActionPlan, ProcActions
-from tests.framework.change.engine import ALL, SCHED, W1, engine, run
+from tests.framework.change.engine import ALL, SCHED, W1, engine, run, wait_until
 from tests.framework.cluster.harness import ALL_ROLES
 from tests.framework.support import spec
 from unit.runtime import ReloadPlan
@@ -135,6 +137,41 @@ def test_an_undone_build_step_leaves_no_compiler_and_no_lock_and_the_source_buil
             r = await e.coord.submit(e.code_change())
             assert r.status == "committed", r.diagnostics
             assert all(e.versioned(p) == "versioned v2" for p in ALL)
+
+    run(main())
+
+
+def test_a_build_step_whose_process_was_killed_takes_its_compilers_with_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIGKILL to the process whose step compiles: nobody is left to stop the step's session from
+    outside. Before, the step got SIGTERM from the kernel, let its lock go and killed the ``ninja``
+    it waited for, and that was all: the compiler ``ninja`` had started went on, beside the next
+    build of the same source (Codex's second review of #55). Now a step whose process is gone ends
+    the rest of its session itself."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "compile_s").write_text("60")
+    monkeypatch.setenv("TOYC_BUILD_LOG", str(tmp_path / "builds.log"))
+    monkeypatch.setenv("TOYC_BUILD_WORK", str(work))
+
+    def compilers() -> list[int]:
+        return [int(x) for x in (work / "pids").read_text().split()] if (work / "pids").exists() else []
+
+    async def main() -> None:
+        async with engine(tmp_path / "engine", procs={"change.build_stop_grace_s": 1.0}, prepare_timeout_s=6.0) as e:
+            e.planner.script = reload_with_build
+            change = asyncio.ensure_future(e.coord.submit(e.code_change()))
+            await wait_until(lambda: len(compilers()) == 2)
+            its = compilers()  # ninja and nvcc of the one step that compiles; the others wait on the lock
+            host = int((work / "host").read_text())
+            assert host in [e.c.sup.local_pid(p) for p in ALL]
+            os.kill(host, signal.SIGKILL)
+            await wait_until(lambda: not any(alive(p) for p in its), timeout=10)  # a 1 s grace: they ignore SIGTERM
+            r = await change
+            assert r.status != "committed", r
+            # the other processes' steps, which got the lock meanwhile, were undone as before
+            await wait_until(lambda: not any(alive(p) for p in compilers()), timeout=10)
+            assert not (work / "lock").exists()
 
     run(main())
 
