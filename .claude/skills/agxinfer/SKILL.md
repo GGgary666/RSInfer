@@ -20,7 +20,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 | `.claude/skills/agxinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
-| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`qwen38.py`：在一台机器上起 Qwen3.8（`plan` / `serve` / `chat` / `checkpoint`），说明见 `deploy/README.md`；在 pyright 的范围内 |
+| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`agxinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`models/`：每个模型家族一个 recipe（现在只有 `qwen38.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
 
 ### `engine/`
 
@@ -102,14 +102,15 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。 `executors/test_paged_attention.py` 在 CPU 上把 attention 切到 paged 一族的参照 operator，对照原来那一族。
 - `tests/units/support/tokenizer.py`：测试用的真 HF tokenizer（词级、带 Qwen 的 chat 标记和模板）。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
-- `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/qwen38.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
+- `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。
   - `test_real_kernels.py`：`kernels.triton`、`kernels.flashinfer` 的每个 solution 对照参照实现；`kernels.cuda` 的 KV 写入逐位对照参照实现（含回退路径）；worker 栈（4 层、bf16）上 `auto` 选真 kernel、graph 对 eager（同样行数的桶逐值比，带 padding 行的桶比 token）、graph 显存的计量冷启动和重载一致、被拒绝或只用来自检的 graph 不在 backend 里留东西、KV 和模型 dtype 不同时不选 FlashInfer、kernel 单元带请求重载、按名字点 backend。`conftest.py`：每个测试结束时记下它 import 的第三方模块，下一个测试开始时放回去。`tests/conftest.py` 的隔离会忘掉它们，而 FlashInfer 的原生依赖同一进程里不能 import 两次，CuTe DSL 的子模块重新 import 以后编译不了下一个 kernel。记录见 `doc/evaluations/real-kernels-4090d.md`、`real-kernels-fused.md` 和 `real-kernels-kv-store-indices.md`；SM100 上完整模型的结果在 `real-kernels-sm100.md`。
   - `test_cuda_graph_adversarial.py`：A/B/C 共用的 GPU 验收，检查数值、实际 CUDA replay，以及 catalog 变更后在写状态之前拒绝旧图；实验分支、结果与复现命令见 `doc/evaluations/cuda-graph-abc.md`。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
-  - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/qwen38.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
+  - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/agxinfer.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；命令行在后台起引擎、`status`、`sleep` / `wake`、`stop`；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
+  - `test_no_temporary_checks.py`：`engine/` 里不能留下标着 `# PROBE` 的临时检查（「在引擎里做检查」）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区，但不拷 `engine/` 里控制面以外的单元（前端、请求表、kernel、模型等）。场景拓扑的角色不列单元，那些单元会在每个场景进程里加载；kernel 单元每次启动还要 import torch。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
 
@@ -146,10 +147,11 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 
 按这次要改、要看的东西起，需要什么就起什么。下面只是几个例子，没有推荐的哪一种：
 
-- 用 `deploy/qwen38.py`（说明在 `deploy/README.md`）在一台机器上起 Qwen3.8 的整个引擎：前端、调度宿主、一个 worker。例如：
-  - 真权重：`uv run python deploy/qwen38.py serve --model <模型目录>`；
+- 用 `deploy/agxinfer.py`（说明在 `deploy/README.md`）在一台机器上起整个引擎：前端、调度宿主、一个 worker。下面 `A="uv run python deploy/agxinfer.py"`：
+  - 真权重，在后台跑：`$A serve <模型目录> --detach`，引擎起来就返回；不加 `--detach` 就在前台跑到 Ctrl-C；
   - 只要前几层、dummy 权重：再加 `--layers N --dummy`；
-  - 整个引擎跑在 CPU 上：加 `--device cpu`，模型可以用 `deploy/qwen38.py checkpoint` 生成的小随机模型（`tests/scenarios/test_m2a.py` 就是这样起的）。
+  - 整个引擎跑在 CPU 上：加 `--device cpu`，模型可以用 `$A checkpoint` 生成的小随机模型（`tests/scenarios/test_m2a.py` 就是这样起的）；
+  - 没有专门参数的配置键：`--set 键=值`（值按 JSON 解析，解析不了就当字符串）。
 - 直接用控制面，起任意拓扑和单元组合（单机时 `--spawn-agents` 在本机给拓扑里每台主机起节点代理）：
 
   ```sh
@@ -160,29 +162,45 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 - 测试里的起法也可以参考：`tests/scenarios/harness.py`（进程内控制面加两台假主机）、`tests/units/scheduler/test_processes.py`（真实控制面加夹具 worker 进程）。
 
 起来以后：
-- 控制面地址：`deploy/qwen38.py` 打印的 `engine up: ... (control <地址>)`，也写在 `<run>/control/control.json` 的 `control` 里；
-- 引擎的源码是 `--source` 指向的工作区里的 `engine/`（`deploy/qwen38.py` 默认是仓库本身），各进程从按身份物化的快照目录加载它；
-- 各进程的日志：`<快照根目录>/.run/<角色>-<编号>-<n>/log`（`deploy/qwen38.py` 起的在 `<run>/host-a/snapshots/.run/` 下）；`serve` 自己的输出里有控制面和节点代理的日志。
+- **一个运行目录就是一个引擎**（`--run`，默认 `run/agxinfer`），后面的命令都靠它找到引擎：
+  - `$A status --run <目录>`：在不在跑、URL、控制面地址、身份、各进程的状态；
+  - `$A stop --run <目录>`：停引擎，等它的进程全部退出，到时限（默认 60 秒）还没退的 kill 掉；
+  - 同一个运行目录里已经有引擎在跑时，`serve` 会拒绝。
+- 控制面地址：`serve` 打印的 `engine up: ... (control <地址>)`，也写在 `<run>/engine.json` 和 `<run>/control/control.json` 里。用 `$A control` 就不用自己找。
+- 引擎的源码是 `--source` 指向的工作区里的 `engine/`（默认是仓库本身），各进程从按身份物化的快照目录加载它。
+- 各进程的日志：`<run>/host-a/snapshots/.run/<角色>-<编号>-<n>/log`；控制面和节点代理的日志在 `serve` 自己的输出里（`--detach` 时在 `<run>/engine.log`）。
+- 想用这张卡跑 GPU 测试又不想停引擎：`$A sleep`，见下面「让出显存」。
 
 ### 改一次
 
-在工作区里改文件，然后（`<地址>` 是控制面地址）：
+在工作区里改文件，然后：
 
 ```sh
-export PYTHONPATH=engine
-C="uv run python -m core.control.client --control <地址>"
-$C check --source <工作区>              # 静态检查：清单、服务、跨单元 import、配置键；不排队、不碰引擎
-$C apply --source <工作区> --dry-run    # 影响分析：哪些进程重载哪些单元、要不要重启引擎、notes
-$C apply --source <工作区> --intent "为什么改"
-$C apply --config '{"sched.overlap": true}'   # 只改配置，不改代码
-$C status                               # 也可以是 introspect（单元、配置、谁读了哪个键）、logs（变更日志）
+A="uv run python deploy/agxinfer.py"   # 加 --run <目录> 指定引擎，默认 run/agxinfer
+$A control check --source <工作区>              # 静态检查：清单、服务、跨单元 import、配置键；不排队、不碰引擎
+$A control apply --source <工作区> --dry-run    # 影响分析：哪些进程重载哪些单元、要不要重启引擎、notes
+$A control apply --source <工作区> --intent "为什么改"
+$A control apply --config '{"sched.overlap": true}'   # 只改配置，不改代码
+$A control status                               # 也可以是 introspect（单元、配置、谁读了哪个键）、logs（变更日志）
 ```
 
+- `$A control ...` 就是 `python -m core.control.client --control <地址> ...`，地址从运行目录里找。
 - `apply` 默认打印摘要（状态、身份、notes、每个进程动了什么、诊断），`--json` 打印完整结果；退出码 0 表示提交了（`--dry-run` 时是规划成功）。
 - 变更只作用于空引擎（`doc/specs/empty-apply.md`）：除了只改 live 键，引擎里有请求时 `apply` 被拒，诊断里写着有多少请求。接着：
   - `--wait-empty [秒]`：前端关门（新请求回 503），等里面的跑完再 apply，默认最多 3600 秒，到了就失败、什么都不中止；
   - `--force`：立刻结束里面的请求（客户端收到 503），再 apply。
-- 改完用请求验证：`deploy/qwen38.py chat ...`，或直接对前端发 HTTP；需要时对照冷启动的结果。
+- 改完用请求验证：`$A chat "..."`、`$A complete "..."`，或直接对前端发 HTTP；需要时对照冷启动的结果。
+
+### 让出显存（sleep / wake）
+
+2026-11-11 加的，记录见 `doc/evaluations/recovery-sleep-cli.md`。
+
+- `$A sleep`：一次变更（`holder.sleep` 设成 true）。worker 把权重换成不占内存的 meta 张量，KV 和 GDN 状态池缩到每种一项，不录 graph；调度器拒绝所有请求，错误信息说引擎睡着了。和 vLLM 的 sleep mode、SGLang 的 `release_memory_occupation` 是一类东西。
+- `$A wake`：改回去。从 checkpoint 重新读权重，重建状态池，重录 graph。`refit` 换过的权重会回到 checkpoint。
+- 4090 D 上 4 层的引擎：21,482 MiB 降到 962 MiB（剩下的是 CUDA 上下文和 kernel 库的工作区），睡 2 秒，醒 3.6 秒，醒来输出和睡前逐字相同。睡着的时候 `tests/gpu/` 八个文件全部能跑。
+- 和别的变更一样要求引擎是空的，`--wait-empty`、`--force` 照常可用。
+- 第一次醒来的身份和睡之前不一样：`holder.sleep` 这时显式写进了配置。之后每次醒来都是同一个身份。
+- 醒的时候读权重在暂停期里，受执行时限（30 秒，`supervisor.rpc_timeout_s`）约束。完整 64 层模型上还没试过，可能超时；超时的话变更撤回，引擎还睡着。
 
 ### 在引擎里做检查（排查和验证）
 
@@ -192,13 +210,21 @@ $C status                               # 也可以是 introspect（单元、配
 
 一轮是这样的：
 
-1. 在工作区里改单元的代码，临时的几行前面加一行 `# PROBE` 注释（方便 `git diff` 和 `grep` 找出来）。工作区用 worktree 更干净，临时代码不会混进提交。
-2. `apply --dry-run` 看计划，`apply`。
-3. 发请求（`deploy/qwen38.py chat`，或直接发 HTTP）。
+1. 临时检查写在**另一份工作区**里，不写进仓库。`apply --source` 收任何带 `engine/` 的目录：
+
+   ```sh
+   WS=<临时目录>
+   rm -rf $WS/engine && cp -r engine $WS/   # 每轮之前同步一次（先删，仓库里删掉的文件也就没了）
+   # 在 $WS/engine 里改单元的代码，临时的几行前面加一行 `# PROBE` 注释
+   ```
+
+   仓库里的代码改了，要再同步一次，否则 apply 上去的是旧的。万一写进了仓库，`tests/scenarios/test_no_temporary_checks.py` 会因为 `# PROBE` 失败。
+2. `$A control apply --source $WS --dry-run` 看计划，`$A control apply --source $WS`。
+3. 发请求（`$A chat`、`$A complete`，或直接发 HTTP）。
 4. 读结果：
    - `print(..., file=sys.stderr, flush=True)` 的输出在 worker 的日志里：`<run>/host-a/snapshots/.run/worker-<i>-<n>/log`，`core.plan: {...}` 也在这个文件里。日志只追加，先记下行数或用 `grep -c` 取增量。
    - 大的东西（张量、profiler 的 trace）存成文件。worker 进程的当前目录就是日志所在的目录，`os.getcwd()` 下的文件落在那里。
-5. `git checkout -- <文件>`，apply；改过的配置也改回去。用 `status` 确认身份回到了原值。
+5. `$A control apply --source .`（仓库本身），检查就撤掉了；改过的配置也改回去。用 `$A status` 确认身份回到了原值。
 
 试过的三种检查：
 
@@ -214,7 +240,7 @@ $C status                               # 也可以是 introspect（单元、配
 - **看到的是真的**：真实请求的激活、真实的调度路径。单测里的随机张量和测试夹具都只是近似。
 - **引擎不用停**。一张卡放不下引擎和 GPU 测试同时跑时，在 pytest 里查就得先停引擎，回来又是冷启动。
 - **顺带测了热更新机制**，这是 AGENTS.md 要的。
-- **多数写错的情况是安全的**：加载时或录 graph 时出错的改动会被撤回，引擎照常服务旧代码。例外见下面第 3 条。
+- **多数写错的情况是安全的**：加载时或录 graph 时出错的改动会被撤回，引擎照常服务旧代码。处理请求时才出错的，见下面第 3 条。
 
 **问题和注意点**：
 
@@ -223,9 +249,10 @@ $C status                               # 也可以是 introspect（单元、配
    - 在层里做检查时按 backend 的元数据跳过 graph 桶（`layers.attn`、`layers.gdn` 里是 `m.graph`）；
    - 或者把检查放在 graph 之外：executor 的 `submit` 里、`chosen.run(...)` 之后；
    - 也别把参照实现的计算留在被录的前向里，它会被录进 graph。
-3. **检查代码在处理请求时抛异常，引擎就停止服务，而且把代码改好再 apply 并不恢复**（`doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md`，未修）。
-   - 之后的请求回 400，错误信息里有异常的文字；出错时在途的非流式请求一直不返回。
-   - 恢复：让 `core.sched` 重载一次（在 `engine/core/sched/` 的某个文件末尾加一行注释，apply；去掉，再 apply），或者重启引擎。
+3. **检查代码在处理请求时抛异常，这一步失败，引擎里的请求立刻全部回错误**（2026-11-11 起；以前在途的请求一直挂着，改好再 apply 也不恢复，见 `doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md`）。
+   - 之后的新请求回 400，错误信息里有异常的文字，直到下一次变更提交；
+   - 把代码改好（或撤掉检查）apply 就恢复服务，不用 `--force`，也不用重启。真的 CUDA OOM（比如 `holder.mem_fraction` 调得太大）也一样：把配置改回来 apply；
+   - apply 救不回来的：CUDA 上下文坏了（非法访存、device 端 assert）、进程死了、某一步卡住。这些要重启引擎；
    - 预防：可能失败的部分包在 `try/except` 里，只打印不抛。检查写在层或模型里时，录 graph 的引擎（`auto` / `required`）在 apply 时会重录 graph，先跑一步 eager 的 padding 行，检查的输出这时就会出现在日志里，可以先看它对不对，再发请求。写在 executor 里的检查要等第一个请求才会跑到。
 4. **读张量的值要等设备**，重叠（`sched.overlap`）就没用了，吞吐会掉。带着这种检查量出来的时间不能用；量时间用 profiler，或者用不带检查的引擎。
 5. **静态检查照常管着临时代码**：
@@ -233,15 +260,16 @@ $C status                               # 也可以是 introspect（单元、配
    - 模块级不能放可变对象（`manifest.mutable_global`）。计数器、profiler 对象放在实例上（`self._probe_n`）。
 6. **实例上的状态会清零**：单元被重载时清，它依赖的单元被重载时也清。例如重载 `core.plan` 会连带重建 `executors.pytorch`。
 7. **有状态的 kernel 原地改状态池**，对照时别在真的池上再跑一遍，用拷贝。
-8. **每次 apply 都要求引擎是空的**。临时代码和临时配置会改变引擎的身份，查完要改回去。提交前 `grep -rn PROBE engine` 确认没有留下。
+8. **每次 apply 都要求引擎是空的**。临时代码和临时配置会改变引擎的身份，查完要改回去。
 9. **这条路径不代替测试。** 能复现的问题最后写成 pytest（`tests/gpu/` 或 `tests/units/`），提交前照常跑 pyright 和 pytest。
 10. 只试过 worker 里的单元（层、executor）。前端和调度宿主里没有这样试过。
 
 ### 哪些是正常的，哪些可能是 bug
 
 正常，按提示做就行：
-- 引擎里有请求时被拒；worker 出错以后只有 `--force` 能清空；
-  - 清空并把 worker 改好以后引擎仍然拒绝请求，这是已知的 bug（`doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md`）：再让 `core.sched` 重载一次，或者重启引擎；
+- 引擎里有请求时被拒；
+- worker 某一步出错：引擎里的请求立刻全部回错误，新请求回 400，直到下一次变更提交，之后照常服务；
+- 引擎睡着（`holder.sleep`）时请求回 400，说引擎睡着了；
 - 改了框架本体（`engine/framework.toml` 列的模块）或控制面单元的原生扩展：`escalate.restart_engine`，只能重启引擎（AGENTS.md「框架改动」）；
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
@@ -258,7 +286,6 @@ $C status                               # 也可以是 introspect（单元、配
 
 ### 踩过的坑
 
-- 停引擎要按 `serve` 进程的精确 PID 发 SIGTERM（`deploy/qwen38.py` 起的子进程在命令行退出时会跟着收到 SIGTERM）；别用 `pkill -f` 之类按命令行匹配，它会匹配到发命令的 shell 自己。
-- 停完确认 `unit.runtime.host` 进程都退了、显存放了（`ps`、`nvidia-smi`）。`ps | grep` 可能先匹配到启动 `serve` 的那个进程，杀了它，`serve` 和它的子进程还在。
+- 停引擎用 `$A stop --run <目录>`。别自己按命令行找进程杀：`pkill -f` 会匹配到发命令的 shell 自己；`ps | grep` 可能先匹配到外层启动 `serve` 的那个进程，杀了它，控制面和它起的进程都还在，显存也不放。`stop` 按进程参数精确地找：控制面的 `--state-dir <run>/control`，节点代理和进程宿主参数里 `<run>/host-a/` 下的路径（快照、spec）；运行目录下面另一个目录里的引擎不算它的。
 - GPU 上的第一步可能很慢；超时都按 `--timeout` 放长了。
-- `deploy/qwen38.py checkpoint` 生成的 checkpoint 很大（27B 结构的 4 层约 7.6 GiB），用完删掉；快照目录是只读的，删之前先 `chmod -R u+w`。
+- `$A checkpoint` 生成的 checkpoint 很大（27B 结构的 4 层约 7.6 GiB），用完删掉；快照目录是只读的，删之前先 `chmod -R u+w`。

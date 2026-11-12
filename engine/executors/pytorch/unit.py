@@ -153,6 +153,17 @@ class PyTorchExecutor:
         device = last_token.device
         begin = Mark(device)
         self.batch.apply(delta, state)
+        try:
+            return self._run(epoch, plan, state, chosen, eager, last_token, begin, start)
+        except BaseException:
+            # The batch is changed and the step did not finish: a step sent after this one (with
+            # sched.overlap) would run on half-changed tables. Refuse those until a full delta.
+            self.batch.invalidate()
+            raise
+
+    def _run(self, epoch: int, plan: BatchPlan, state: StateOps, chosen: Plan, eager: Plan, last_token: torch.Tensor,
+             begin: Mark, start: float) -> Step:
+        device = last_token.device
         rows = [int(r) for r in plan.rows.values()]
         num_tokens = [int(n) for n in plan.num_tokens.values()]
         positions = [int(p) for p in plan.positions.values()]

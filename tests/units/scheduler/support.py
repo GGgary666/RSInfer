@@ -55,9 +55,9 @@ DECLS = [StateDecl("kv.paged", 0, {"k": ((PAGE, 1, 8), "bf16")}, "request", toke
 PAGES = {"kv.paged": PAGE, "gdn.slots": 0}
 CAPACITY = {"kv.paged": 64, "gdn.slots": 8}
 UNITS = ("sched/reqs", "core/state/alloc", "policies/fcfs", "policies/prefill_first", "core/sched")
-READ = ("worker/batch", "state/kv_paged")
+READ = ("worker/batch", "state/kv_paged", "core/state/holder")
 """The worker units whose keys the scheduler host's units read (``batch.max_rows``,
-``batch.max_context_len``, ``state.kv.page_size``); not loaded."""
+``batch.max_context_len``, ``state.kv.page_size``, ``holder.sleep``); not loaded."""
 
 
 class Directory:

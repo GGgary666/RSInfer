@@ -135,6 +135,7 @@ class Unit:
         sizes = buckets(mode, config["plan.graph_buckets"], config["batch.max_rows"], budget,
                         fixed_extent=any(CAPTURE in self.catalog.describe(s).requires for s in captured))
         reason = ("disabled" if mode == "off" else
+                  "asleep (holder.sleep)" if config["holder.sleep"] else
                   "platform has no CUDA graph support" if "cuda_graph" not in resolved["device"] else
                   f"uncapturable decode kernels: {uncapturable}" if uncapturable else "")
         build: dict[str, Any] = {}
@@ -145,7 +146,7 @@ class Unit:
                 if self.plans.required:
                     raise
                 reason = "the graphs do not fit: " + ". ".join(str(e).split(". ")[:2])
-        if reason and self.plans.required:
+        if reason and self.plans.required and not config["holder.sleep"]:  # asleep, nothing runs
             raise ValueError(f"plan.cuda_graph=required: {reason}")
         # No rebuild action: core.deps reloads this unit when one of these changes, or when a unit
         # that registers kernels is added. Also without graphs: a kernel unit may bring them.

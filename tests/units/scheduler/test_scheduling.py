@@ -157,7 +157,7 @@ def test_ranks_that_disagree_whether_a_step_ran_stop_the_engine() -> None:
         assert b.errors() == []
 
 
-def test_a_failed_worker_stops_the_steps_and_new_requests_get_an_error() -> None:
+def test_a_failed_worker_stops_the_steps_and_ends_every_request() -> None:
     with bed(overlap=True, delay_s=0.002) as b:
         held = request(1, [1, 2, 3], 40)
         b.client.send([held])
@@ -175,11 +175,66 @@ def test_a_failed_worker_stops_the_steps_and_new_requests_get_an_error() -> None
         assert b.client.outputs[2].error is not None and "stopped serving" in b.client.outputs[2].error
         assert b.engine.table.last_submitted == last  # no step went out since
         assert all(e <= last for w in b.workers for e in w.fixture.received)
-        assert b.client.outputs[1].finished is None  # held, for whoever changes the engine next
+        # The running request ended with the failure: no step goes out, so it could never end by
+        # itself, and its client is not left waiting (#42 held it for the next change).
+        b.run_until(b.finished(1))
+        assert "stopped serving" in (b.client.outputs[1].error or "")
         t0 = time.monotonic()
         b.engine.loop.quiesce()  # does not wait for the failed steps: a change can still pause
         assert time.monotonic() - t0 < 1.0
-        assert b.engine.loop.report().running == 1
+        assert b.engine.loop.occupancy() == (0, 0, 0)  # what it still holds goes back once a change commits
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_a_change_that_commits_after_a_failure_brings_serving_back(overlap: bool) -> None:
+    """The change meant to repair the worker commits: the identity served is not the one that
+    failed, and the loop starts over as a new instance would. The steps that never came back are
+    given up (their items go back), and the first plan is a full delta, which drops the rows the
+    workers still had (doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md)."""
+    with bed(overlap=overlap, delay_s=0.002) as b:
+        b.client.send([request(1, [1, 2, 3], 40), request(2, list(range(5, 20)), 30)])
+        b.run_until(lambda: all(len(b.client.outputs[r].tokens) >= 2 for r in (1, 2)))
+        b.workers[0].fixture.script[b.engine.table.last_submitted + 1] = "fail"
+        b.run_until(lambda: b.engine.loop.fault is not None)
+        b.run_until(b.finished(1, 2))
+        b.client.send([request(3, [7, 7], 3)])
+        b.run_until(b.finished(3))
+        assert all("stopped serving" in (b.client.outputs[r].error or "") for r in (1, 2, 3))
+        boundary = b.engine.table.last_submitted
+        # With overlap, the step after the failed one was on its way already: rank 0 gets a plan
+        # that assumes the failed step ran, and the fixture says so. Nothing after the change may.
+        before = b.errors()
+        assert all(int(e.split()[1].rstrip(":")) <= boundary for e in before), before
+        assert overlap or not before
+        for w in b.workers:
+            w.fixture.errors.clear()
+        b.new_identity("v2")
+        fresh = [request(4, [6, 5, 4], 6), request(5, list(range(9, 30)), 5)]
+        b.client.send(fresh)
+        b.run_until(b.finished(4, 5))
+        assert [d.full for e, _, d in b.workers[0].fixture.plans_seen if e > boundary][0]
+        assert any("serving again" in d for d in b.engine.loop.report().diagnostics)
+        check(b, fresh)
+
+
+def test_a_change_that_does_not_repair_the_worker_fails_the_same_way_again() -> None:
+    with bed() as b:
+        b.client.send([request(1, [1, 2, 3], 40)])
+        b.run_until(lambda: len(b.client.outputs[1].tokens) >= 1)
+        b.workers[1].fixture.script[b.engine.table.last_submitted + 1] = "fail"
+        b.run_until(lambda: b.engine.loop.fault is not None)
+        b.new_identity("v2")
+        b.client.send([request(2, [4, 4, 4], 30)])
+        b.run_until(lambda: len(b.client.outputs[2].tokens) >= 1)
+        b.workers[1].fixture.script[b.engine.table.last_submitted + 1] = "fail"
+        b.run_until(b.finished(2))
+        assert "stopped serving" in (b.client.outputs[2].error or "")
+        assert b.engine.loop.fault is not None
+        b.new_identity("v3")
+        fresh = request(3, [2, 2], 4)
+        b.client.send([fresh])
+        b.run_until(b.finished(3))
+        check(b, [fresh])
 
 
 def test_a_step_without_an_answer_counts_as_a_failure() -> None:
@@ -240,17 +295,16 @@ def test_reloading_the_scheduler_keeps_requests_running(overlap: bool) -> None:
         check(b, reqs)
 
 
-def test_after_a_failure_a_reload_ends_the_requests_of_the_lost_steps() -> None:
-    """Until changes can choose what to do with a failed worker (step 5), reloading the
-    scheduler is how to go on: what the lost steps held ends with an error, the rest goes on."""
+def test_after_a_failure_a_reload_of_the_scheduler_serves_again() -> None:
+    """A new instance gives up the steps the old one lost, as a committed change does."""
     with bed() as b:
         b.client.send([request(1, [1, 2, 3], 40)])
         b.run_until(lambda: len(b.client.outputs[1].tokens) >= 2)
         b.workers[0].fixture.script[b.engine.table.last_submitted + 1] = "fail"
         b.run_until(lambda: b.engine.loop.fault is not None)
+        b.run_until(b.finished(1))  # it ended with the failure
+        assert "stopped serving" in (b.client.outputs[1].error or "")
         b.engine.reload(b.engine.spec("core.sched"))
-        b.run_until(b.finished(1))
-        assert b.client.outputs[1].error is not None and "never came back" in b.client.outputs[1].error
         fresh = request(2, [6, 5, 4], 5)
         b.client.send([fresh])
         b.run_until(b.finished(2))

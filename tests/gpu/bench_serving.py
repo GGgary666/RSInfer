@@ -1,5 +1,5 @@
 """Serving throughput over HTTP, the same load against any OpenAI-compatible server: this engine
-(``deploy/qwen38.py serve``) or a native SGLang serving the same checkpoint.
+(``deploy/agxinfer.py serve``) or a native SGLang serving the same checkpoint.
 
 Run manually; this is not a pytest timing assertion. Per concurrency level, that many clients
 each send requests one after another (``/v1/completions``, streamed, greedy, ``ignore_eos``, so

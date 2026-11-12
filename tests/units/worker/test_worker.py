@@ -328,3 +328,37 @@ def test_an_executor_failure_reaches_the_scheduler_as_step_failure(checkpoint: t
         fault = b.engine.loop.fault
         assert fault is not None and "injected device fault" in fault.reason and fault.rank == 0
         assert workers[0].loop.failures == 1
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_after_an_executor_failure_a_committed_change_serves_again_as_hf(
+        checkpoint: tuple[dict[str, Any], Path, Any], reference: dict[int, list[int]], overlap: bool) -> None:
+    """The failure ends the requests in flight; the change that commits after it (here only the
+    identity moves on) brings the loop back with a full delta, and the real persistent batch, which
+    still had the failed requests' rows, generates what HF does
+    (doc/framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md)."""
+    def inject(w: RealWorker) -> None:
+        real = w.loop.executor
+
+        class Failing:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+            def submit(self, *args: Any) -> Any:
+                w.loop.executor = real
+                raise RuntimeError("injected device fault")
+
+        w.loop.executor = cast(Any, Failing())
+
+    with stack(checkpoint[0], checkpoint[1], overlap=overlap) as (b, workers):
+        b.client.send(greedy({1: PROMPTS[1], 2: PROMPTS[2]}, steps=20))
+        b.run_until(lambda: all(len(b.client.outputs[r].tokens) >= 2 for r in (1, 2)), timeout=60)
+        workers[0].call(inject)
+        b.run_until(b.finished(1, 2), timeout=30)
+        assert all("injected device fault" in (b.client.outputs[r].error or "") for r in (1, 2))
+        b.new_identity("v2")
+        again = {10 + rid: prompt for rid, prompt in PROMPTS.items()}
+        b.client.send(greedy(again))
+        b.run_until(b.finished(*again), timeout=60)
+        assert {rid - 10: b.client.outputs[rid].tokens for rid in again} == reference
+        assert b.engine.loop.fault is None and workers[0].loop.failures == 1

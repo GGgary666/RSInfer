@@ -1,31 +1,66 @@
-# 部署：在一台机器上跑 Qwen3.8（2026-11-09）
+# 部署：在一台机器上跑引擎（2026-11-11 起是 `agxinfer.py`）
 
 `deploy/` 放的是不属于 pytest 的部署工具。用户同意为它新开这个顶层目录。
 
-`qwen38.py` 是一个命令行工具，在一台机器上起整个引擎：前端、调度宿主、一个 worker（TP1），中间经过 `python -m core.control serve --spawn-agents`。它有四个子命令：
+- `agxinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
+- `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。现在只有 `qwen38.py`（`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`）。`hf.py` 是几个 recipe 共用的读配置、截层。
 
-| 子命令 | 做什么 |
+## 命令
+
+`A="uv run python deploy/agxinfer.py"`（GPU 环境不是 uv 管的时候，用那个环境的 `python`）。
+
+| 命令 | 做什么 |
 |---|---|
-| `plan` | 按模型目录生成拓扑和配置（`topology.json`、`config.json`，写进 `--run` 目录），并打印对应的 `serve` 命令 |
-| `serve` | 先做 `plan`，再起引擎，一直跑到 Ctrl-C。引擎起来后打印前端地址 |
-| `chat` | 发一个请求（chat，或者加 `--completion` 发 completions），把流式结果打到标准输出 |
-| `checkpoint` | 按一份配置生成随机权重（HF 的初始化，带 seed），布局和 Qwen3.8 的真 checkpoint 一样：多模态命名 `model.language_model.*`，外加加载器会跳过的 `visual`、`mtp` 张量。可以只保留前 N 层 |
+| `$A serve <模型目录>` | 起一个引擎：前端、调度宿主、一个 worker（TP1），经过 `python -m core.control serve --spawn-agents`。默认在前台跑到 Ctrl-C；`--detach` 在后台跑，引擎起来就返回；`--dry-run` 只写拓扑和配置、打印命令 |
+| `$A status` | 引擎在不在跑、URL、控制面地址、身份、各进程状态、`/health` |
+| `$A stop` | 停引擎：给控制面发 SIGTERM（控制面已经不在时，给留下的每个进程都发），等这个引擎的进程全部退出；到 `--timeout`（默认 60 秒）还没退的 kill 掉。这个引擎的进程只按 `<run>/control` 和 `<run>/host-a/` 认，嵌在运行目录里的另一个引擎不受影响 |
+| `$A sleep` / `$A wake` | 让出显存 / 拿回来（`holder.sleep`，见下面「睡和醒」） |
+| `$A control <命令> ...` | 控制面客户端（`python -m core.control.client`）：`check`、`apply`、`status`、`introspect`、`logs`，参数照旧；控制面地址从运行目录里找 |
+| `$A chat "..."` / `$A complete "..."` | 发一个请求（chat 或 completions），流式打到标准输出 |
+| `$A checkpoint --config <目录> --out <目录>` | 按一份配置生成随机权重，布局和这个模型家族的真 checkpoint 一样（Qwen3.8：多模态命名 `model.language_model.*`，外加加载器会跳过的 `visual`、`mtp` 张量）；可以只保留前 N 层 |
 
-## 用法
+**运行目录**（`--run`，默认 `run/agxinfer`）就是一个引擎：拓扑和配置（`topology.json`、`config.json`）、控制面的状态（`control/`）、快照和各进程的日志（`host-a/snapshots/`）、`engine.json`（控制面进程、URL、控制面地址），`--detach` 时还有 `engine.log`。每个命令都靠 `--run` 找到它的引擎；一个运行目录里同时只能有一个引擎，上一个引擎还有进程留着（比如控制面崩了，worker 还在）时 `serve` 也拒绝，先 `stop`。
 
 ```sh
 uv sync --python 3.12 --extra gpu --extra frontend      # 没有 GPU 的机器用 --extra cpu
 
-# 真权重（SM100，完整模型）
-uv run python deploy/qwen38.py serve --model /path/to/Qwen3.8-27B
-# 只要前 8 层，用 dummy 权重（显存不够放完整模型时）
-uv run python deploy/qwen38.py serve --model /path/to/Qwen3.8-27B --layers 8 --dummy
-# 另开一个终端
-uv run python deploy/qwen38.py chat "你好"
-uv run python deploy/qwen38.py chat --completion "The capital of France is"
+$A serve /path/to/Qwen3.8-27B --detach                  # 真权重（SM100，完整模型）
+$A serve /path/to/Qwen3.8-27B --layers 8 --dummy        # 只要前 8 层，dummy 权重
+$A status
+$A chat "你好"
+$A complete "The capital of France is"
+$A control apply --source . --dry-run                   # 改了工作区：看计划
+$A control apply --source . --intent "为什么改"
+$A stop
 ```
 
+和 vLLM、SGLang 的对应：`serve` 的模型目录是位置参数（`vllm serve <model>`），`--served-model-name`、`--host`、`--port` 同名；`--mem-fraction` 是 SGLang 的 `--mem-fraction-static`，`--kv-dtype` 是 `--kv-cache-dtype`。改跑着的引擎是我们自己的事，放在 `control` 下面。
+
+和 `qwen38.py` 比改了的：
+
+- 模型目录从 `--model` 改成位置参数（`--model` 还认）；
+- `--bind` 改叫 `--host`，`--name` 改叫 `--served-model-name`（旧名字还认）；`--host` 只管 HTTP（可以给 `0.0.0.0`），控制面和节点代理另由 `--control-host` 定，默认只在本机（2026-11-12：谁连得上控制面谁就能改引擎的代码）；
+- `plan` 并进了 `serve --dry-run`，`chat --completion` 改成 `complete`；
+- 新增 `--detach`、`--set 键=值`（任何配置键，值按 JSON 解析，解析不了当字符串）、`status`、`stop`、`sleep`、`wake`、`control`。
+
+### 睡和醒（2026-11-11）
+
+`sleep` 是一次变更，把 `holder.sleep` 设成 true：
+
+- worker 把权重换成不占内存的 meta 张量，KV 和 GDN 状态池缩到每种一项，不录 graph；
+- 调度器拒绝所有请求，回 400，说引擎睡着了。
+
+`wake` 把它改回 false：从 checkpoint 重新读权重，重建状态池，重录 graph（和 vLLM 第 2 级的 sleep 一样不留权重的副本，`refit` 换过的权重回到 checkpoint）。
+
+4090 D 上 4 层的引擎：21,482 MiB 降到 962 MiB，剩下的是 CUDA 上下文和 kernel 库的工作区。睡 2 秒，醒 3.6 秒，醒来输出和睡前逐字相同。睡着的时候 `tests/gpu/` 的八个文件都能在同一张卡上跑。记录见 [recovery-sleep-cli.md](../doc/evaluations/recovery-sleep-cli.md)。
+
+- 和别的变更一样要求引擎是空的，`sleep` 收 `--wait-empty`、`--force`。
+- 醒的时候读权重在暂停期里，受执行时限（30 秒）约束；完整 64 层模型上还没试过。
+
 ## 几个参数
+
+`serve` 的参数分组见 `$A serve --help`。
+
 
 - `--layers N`：只保留配置里的前 N 层。和完整模型一样，每 4 层里有 1 层全注意力。用于完整模型放不下的时候。
 - 权重：
@@ -42,16 +77,17 @@ uv run python deploy/qwen38.py chat --completion "The capital of France is"
 - `--overlap`：一步重叠（`sched.overlap`）。
 - `--gpu`：worker 用哪张卡（物理编号）。不给时取 `CUDA_VISIBLE_DEVICES` 的第一张，没设就是 0。节点代理只按拓扑设卡，所以靠 `CUDA_VISIBLE_DEVICES` 选卡时也是经这里生效。
 - `--device cpu`：整个引擎跑在 CPU 上（`tests/scenarios/test_m2a.py` 就是这样跑的）。
+- `--set 键=值`：没有专门参数的配置键，可以重复。
 
-## 跑过的（2026-11-09）
+## 跑过的（2026-11-09，当时的命令是 `deploy/qwen38.py serve --model <目录>`）
 
 ### CUDA Graph 参数（2026-11-10）
 
 默认 `--cuda-graph off`：worker 在 `torch_eager` 平台上，全部步都是 eager。`auto` 和 `required` 让 worker 用 `cuda_graph` 平台，给 decode 步录图；prefill 和 mixed 步仍然是 eager。
 
 ```sh
-uv run python deploy/qwen38.py serve --model /path/to/model --cuda-graph auto
-uv run python deploy/qwen38.py serve --model /path/to/model \
+$A serve /path/to/model --cuda-graph auto
+$A serve /path/to/model \
   --cuda-graph required --max-rows 16 --graph-buckets 1 2 4 8 16
 ```
 

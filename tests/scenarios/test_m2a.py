@@ -1,5 +1,5 @@
 """Stage 2's M2a (stage2-contract.md §1.3): the whole engine on the CPU, started the way an operator
-starts it (``deploy/qwen38.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
+starts it (``deploy/agxinfer.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
 layout and a real HF tokenizer. Text through HTTP, out of the frontend, the scheduler host and a
 worker process, equals what HF's model computes, greedy, token by token."""
 
@@ -21,7 +21,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
-from tests.scenarios.deploy import ENV, REPO, cli, post, served
+from tests.scenarios.deploy import CLI, ENV, REPO, cli, free_port, post, served
 from tests.units.support.tokenizer import save_tokenizer
 from tests.units.support.worker import hf_greedy, tiny_config
 
@@ -225,11 +225,126 @@ def test_a_kernel_change_that_cannot_run_rolls_back_and_the_engine_keeps_serving
         assert text() == baseline
 
 
+def test_the_cli_runs_an_engine_in_the_background_puts_it_to_sleep_and_stops_it(model: Path, tokenizer: Path,
+                                                                              tmp_path: Path) -> None:
+    """``agxinfer serve --detach`` returns once the engine is up. ``status``, ``control`` and the
+    rest find it through its run directory. ``sleep`` gives its memory back and requests are refused;
+    ``wake`` loads the weights again and serves what it served before. ``stop`` leaves no process of it."""
+    run, port = tmp_path / "run", free_port()
+    serve = ["serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype", "f32",
+             "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8",
+             "--cpu-bytes", str(4 << 20), "--timeout", "120", "--port", str(port), "--run", str(run)]
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "max_tokens": 8, "temperature": 0.0, "ignore_eos": True}
+
+    def status() -> tuple[int, dict[str, Any]]:
+        out = subprocess.run([sys.executable, str(CLI), "status", "--run", str(run)], env=ENV, capture_output=True,
+                             text=True, timeout=60)
+        return out.returncode, json.loads(out.stdout)
+
+    try:
+        cli(*serve, "--detach", timeout=180)
+        code, now = status()
+        assert code == 0 and now["running"] and now["health"] == "ok", now
+        assert now["url"] == f"http://127.0.0.1:{port}" and set(now["procs"].values()) == {"RUNNING"}, now
+        again = subprocess.run([sys.executable, str(CLI), *serve, "--detach"], env=ENV, capture_output=True, text=True,
+                               timeout=60)
+        assert again.returncode != 0 and "already runs" in again.stderr, again.stderr  # one engine per run directory
+        url = now["url"]
+        baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
+        assert baseline
+
+        assert json.loads(cli("sleep", "--run", str(run)))["status"] == "committed"
+        with pytest.raises(AssertionError, match="asleep"):
+            post(url + "/v1/completions", body)
+        assert json.loads(cli("wake", "--run", str(run)))["status"] == "committed"
+        assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+        # The client's options, with the engine's after them.
+        checked = json.loads(cli("control", "check", "--source", str(REPO), "--run", str(run)))
+        assert checked["diagnostics"] == [], checked
+        assert cli("complete", "w1 w2 w3 w4 w5", "--run", str(run), "--max-tokens", "8")
+    finally:
+        cli("stop", "--run", str(run), timeout=120)
+    code, now = status()
+    assert code == 1 and not now["running"] and now["processes"] == 0, now
+    assert "no engine runs" in subprocess.run([sys.executable, str(CLI), "stop", "--run", str(run)], env=ENV,
+                                              capture_output=True, text=True, timeout=60).stderr
+
+
+def test_stop_leaves_an_engine_run_from_inside_the_run_directory_alone(model: Path, tokenizer: Path,
+                                                                      tmp_path: Path) -> None:
+    """``stop`` took every engine process whose arguments named a path under the run directory, so
+    also those of an engine run from a directory inside it (Codex's review of #54). And ``--host``
+    is the frontend's alone: with ``0.0.0.0`` the control plane still listens on this machine only,
+    and the URL a client is given is the loopback one."""
+    from deploy.agxinfer import engine_processes
+
+    outer, inner = tmp_path / "run", tmp_path / "run" / "nested"
+    ports = {outer: free_port(), inner: free_port()}
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3", "max_tokens": 4, "temperature": 0.0, "ignore_eos": True}
+
+    def serve(run: Path, *more: str) -> None:
+        cli("serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype",
+            "f32", "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8", "--cpu-bytes",
+            str(4 << 20), "--timeout", "120", "--port", str(ports[run]), "--run", str(run), "--detach", *more,
+            timeout=180)
+
+    try:
+        serve(outer)
+        serve(inner, "--host", "0.0.0.0")
+        (_, mine), (_, theirs) = engine_processes(outer), engine_processes(inner)
+        assert len(mine) == len(theirs) == 5 and not set(mine) & set(theirs), (mine, theirs)  # control, agent, 3 hosts
+        record = json.loads((inner / "engine.json").read_text())
+        assert record["url"] == f"http://127.0.0.1:{ports[inner]}", record
+        assert record["control"].startswith("tcp://127.0.0.1:"), record
+        assert post(record["url"] + "/v1/completions", body)["choices"][0]["text"]
+
+        cli("stop", "--run", str(outer), timeout=120)
+        assert engine_processes(outer) == (None, [])
+        assert engine_processes(inner)[1] == theirs
+        assert post(record["url"] + "/v1/completions", body)["choices"][0]["text"]
+    finally:
+        for run in (outer, inner):
+            cli("stop", "--run", str(run), timeout=120)
+
+
+def test_serve_refuses_a_run_directory_whose_last_engine_left_processes(monkeypatch: pytest.MonkeyPatch,
+                                                                         tmp_path: Path) -> None:
+    """Its control plane is gone, a worker it started is not: that worker keeps its GPU memory, and
+    another engine would start beside it."""
+    import deploy.agxinfer as agx
+
+    monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [4242]))
+    with pytest.raises(SystemExit, match=r"processes \[4242\] of an earlier engine .* agxinfer stop"):
+        agx.cmd_serve(agx.parser().parse_args(["serve", str(tmp_path), "--run", str(tmp_path / "run")]))
+    assert [agx.reachable(h) for h in ("0.0.0.0", "::", "127.0.0.1", "fe80::1")] == \
+        ["127.0.0.1", "[::1]", "127.0.0.1", "[fe80::1]"]
+
+
+def test_stop_without_a_control_plane_asks_every_process_left_to_stop(monkeypatch: pytest.MonkeyPatch,
+                                                                     tmp_path: Path) -> None:
+    """The control plane is gone and so is the node agent: nothing stops the process hosts for one
+    another. Before, only the first one got SIGTERM; the others stayed until ``--timeout`` passed,
+    were killed, and ``stop`` failed (Gemini's review of #54)."""
+    import deploy.agxinfer as agx
+
+    left = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]) for _ in range(3)]
+    try:
+        monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [p.pid for p in left if p.poll() is None]))
+        t0 = time.monotonic()
+        assert agx.cmd_stop(agx.parser().parse_args(["stop", "--run", str(tmp_path), "--timeout", "20"])) == 0
+        assert time.monotonic() - t0 < 10
+        assert [p.returncode for p in left] == [-15, -15, -15]  # each one by SIGTERM, none killed
+    finally:
+        for p in left:
+            p.kill()
+            p.wait()
+
+
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a
     machine landed on GPU 0."""
-    from deploy.qwen38 import worker_gpu
+    from deploy.agxinfer import worker_gpu
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert worker_gpu(None) == 0

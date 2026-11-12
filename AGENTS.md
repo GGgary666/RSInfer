@@ -13,7 +13,7 @@
 ## 开发方式：在跑着的引擎上热改（2026-11-10）
 
 - 默认这样开发：按这次需要把引擎拉起来，改完用 `apply` 生效，而不是每次改完都冷启动。开发本身也就是在测热更新机制（变更协议、单元运行时的重载、`core.deps` 的计划）。怎么起、怎么改、哪些行为是正常的，见 skill「在跑着的引擎上热改」。
-- 排查和验证也先在引擎上做（2026-11-11）：把检查临时写进单元的代码里（对照参照 kernel、存 logits、包 profiler），apply，发请求，读 worker 的日志；查完去掉再 apply。不要一上来就在 pytest 里另搭一套 worker 栈。做法、好处和注意点见 skill「在引擎里做检查」；最后要留下来的回归测试仍然写成 pytest。
+- 排查和验证也先在引擎上做（2026-11-11）：把检查临时写进单元的代码里（写在另一份工作区里，不写进仓库；对照参照 kernel、存 logits、包 profiler），apply，发请求，读 worker 的日志；查完去掉再 apply。不要一上来就在 pytest 里另搭一套 worker 栈。做法、好处和注意点见 skill「在引擎里做检查」；最后要留下来的回归测试仍然写成 pytest。
 - 发现更新机制本身的问题（热改以后跑的不是新代码、计划不对、撤回不干净、热改和冷启动结果不同等），在 `doc/framework-bugs/` 写一份报告，格式见那里的 `README.md`。
 - 实在绕不过去，就重启引擎，退回每次冷启动的开发方式，并在报告里写明。
 - 热改不代替提交前的测试：pyright、pytest 和 formal 照下面「常用命令」跑。
@@ -46,7 +46,8 @@ uv run pyright                       # strict；检查 engine/ 和 tests/（含 
 uv run pytest                        # 默认测试；不收集 tests/framework/formal；串行
 uv run pytest -n 8                   # 全量并行（pytest-xdist）：约 30 秒，串行约 165 秒
 uv run pytest tests/framework/ipc -q # 只跑某个目录
-# 起引擎、用客户端热改：见 .claude/skills/agxinfer/SKILL.md「在跑着的引擎上热改」
+# 起引擎、热改、停引擎：uv run python deploy/agxinfer.py serve|control|status|stop|sleep|wake ...
+#   见 .claude/skills/agxinfer/SKILL.md「在跑着的引擎上热改」和 deploy/README.md
 # formal 全流程：需要 Java 11+；首次 --bootstrap 下载并校验 TLC 1.7.4
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```

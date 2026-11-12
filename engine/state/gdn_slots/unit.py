@@ -65,6 +65,8 @@ class MambaPool:
         decls = sorted(decls, key=lambda d: d.layer)
         if decls == self.decls:
             return
+        if decls and self.holder is not None and self.holder.asleep:
+            self.size = 1  # asleep (holder.sleep): whatever state.gdn.slots says
         if not self.size:
             self.size = self.holder.items(KIND) if self.holder is not None else 0
             if not self.size:
