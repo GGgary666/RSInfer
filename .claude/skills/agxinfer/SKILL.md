@@ -16,7 +16,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。跑在组织自己的 Linux runner 上（`runs-on: ubuntu-latest`，2026-11-12 起；不用 GitHub 的 runner，那边按分钟算配额），`notify.yml` 也是。runner 是常驻的，uv 的缓存留在它的 `~/.cache/uv`。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
+| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。跑在组织自己的 Linux runner 上（`runs-on: ubuntu-latest`，2026-11-12 起；不用 GitHub 的 runner，那边按分钟算配额），`notify.yml` 也是。runner 是常驻的，uv 的缓存留在它的 `~/.cache/uv`。CI 里 `OMP_NUM_THREADS=1`：runner 的机器核多，不限的话每个引擎进程的 torch 都按核数开线程，两次 CI 同时跑会互相拖到单个测试超时；测试用的模型很小，一个线程跑得一样快。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
 | `.claude/skills/agxinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
