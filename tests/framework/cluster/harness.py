@@ -39,8 +39,8 @@ ADDRESS = "127.0.0.1"  # test data: every fake host lives on this machine
 
 TOY = {
     "toyc/builder.py": '''
-"""A build step (``[unit] build``): after ``TOYC_BUILD_S`` seconds, appends a line to the file
-``TOYC_BUILD_LOG`` names (the step's process does not know the toy log); exits 3 when
+"""A build step (``[unit] build``): after ``TOYC_BUILD_S`` seconds, appends a line with this file's
+path to the file ``TOYC_BUILD_LOG`` names (the step's process does not know the toy log); exits 3 when
 ``TOYC_BUILD_FAIL`` is set. With ``TOYC_BUILD_WORK``, it first builds as PyTorch's extension
 builder does there (``compile``)."""
 import os
@@ -88,7 +88,7 @@ def make():
         compile(os.environ["TOYC_BUILD_WORK"])
     time.sleep(float(os.environ.get("TOYC_BUILD_S", "0")))
     with open(os.environ["TOYC_BUILD_LOG"], "a") as f:
-        f.write(f"built {sys.path[0] if sys.path else ''}\\n")
+        f.write(f"built {__file__}\\n")  # where this code was loaded from: the change's snapshot
     if os.environ.get("TOYC_BUILD_FAIL"):
         sys.exit(3)
 ''',
