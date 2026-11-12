@@ -320,6 +320,26 @@ def test_serve_refuses_a_run_directory_whose_last_engine_left_processes(monkeypa
         ["127.0.0.1", "[::1]", "127.0.0.1", "[fe80::1]"]
 
 
+def test_stop_without_a_control_plane_asks_every_process_left_to_stop(monkeypatch: pytest.MonkeyPatch,
+                                                                     tmp_path: Path) -> None:
+    """The control plane is gone and so is the node agent: nothing stops the process hosts for one
+    another. Before, only the first one got SIGTERM; the others stayed until ``--timeout`` passed,
+    were killed, and ``stop`` failed (Gemini's review of #54)."""
+    import deploy.agxinfer as agx
+
+    left = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]) for _ in range(3)]
+    try:
+        monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [p.pid for p in left if p.poll() is None]))
+        t0 = time.monotonic()
+        assert agx.cmd_stop(agx.parser().parse_args(["stop", "--run", str(tmp_path), "--timeout", "20"])) == 0
+        assert time.monotonic() - t0 < 10
+        assert [p.returncode for p in left] == [-15, -15, -15]  # each one by SIGTERM, none killed
+    finally:
+        for p in left:
+            p.kill()
+            p.wait()
+
+
 def test_a_change_s_execution_gets_as_long_as_start_up_and_not_less_than_the_engine_s_limit(
         model: Path, tokenizer: Path, tmp_path: Path) -> None:
     """A wake reads the weights again while it executes, as start-up does before the check-in: with

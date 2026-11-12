@@ -128,6 +128,12 @@ Codex 和 Gemini 审了 #54，成立的几条：
 
 Gemini 第 6 条的其余部分不成立：worker 按顺序处理步，设备上同一条 stream 排队，旧步写完之前新步不会开始写；迟到的旧答案被丢掉；恢复和以前"重载调度器"走同一条路。第 7.3 条（状态池没声明读 `holder.sleep`）不用改：它们读的是 holder 服务给的值，holder 重载会带着它们重载。
 
+### 第二轮（2026-11-12）
+
+两边都通过了。Gemini 提了一条不挡合并的，成立，改了：
+
+- **控制面已经不在时，`stop` 只给留下的第一个进程发 SIGTERM**。控制面和节点代理都没了、留下几个进程宿主时，其余的要等满 `--timeout` 才被 kill，`stop` 还返回失败。现在控制面不在就给留下的每个进程都发。`test_m2a.py::test_stop_without_a_control_plane_asks_every_process_left_to_stop` 留 3 个进程：改之前等满时限、kill 掉 2 个、返回 1；改之后 3 个都由 SIGTERM 退出、返回 0。
+
 ## 没做的、要注意的
 
 - **醒的时候读权重在暂停期里**，受执行时限（`supervisor.rpc_timeout_s`，30 秒）约束。4 层 7.6 GiB 用 1.6 秒；完整 64 层模型上没试过。
