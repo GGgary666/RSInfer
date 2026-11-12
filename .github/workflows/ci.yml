@@ -6,12 +6,24 @@ on:
   pull_request:
 jobs:
   check:
+    # The organization's own Linux runners (shared organization runners), not GitHub's: hosted minutes are a
+    # quota. All four labels, so that the job stays off the pool's other machines.
     runs-on: ubuntu-latest
+    env:
+      # One torch thread per process. A runner's machine has many cores, and torch starts a thread
+      # on each of them in every engine process of every test: two runs at once took 2.5 times as
+      # long and ran into a test's 120 s limit. The tests' models are tiny: with one thread the suite
+      # takes as long, on a fraction of the CPU time.
+      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the base of a pull request, to see what it changed
       - uses: astral-sh/setup-uv@v6
+        with:
+          # These runners persist: uv's cache stays on their disk, nothing goes to GitHub's cache.
+          enable-cache: false
+          cache-local-path: ~/.cache/uv
       - run: uv sync --python 3.12 --extra cpu
       - run: uv run pyright
       - id: scope
@@ -24,9 +36,10 @@ jobs:
             true|false) echo "framework=$framework" >> "$GITHUB_OUTPUT" ;;
             *) echo "unexpected answer: '$framework'"; exit 1 ;;
           esac
+      # 8 workers, not one per core: a runner shares its machine with other jobs.
       - name: pytest
         if: steps.scope.outputs.framework != 'false'
-        run: uv run pytest -n auto
+        run: uv run pytest -n 8
       - name: pytest without tests/framework (the framework did not change)
         if: steps.scope.outputs.framework == 'false'
-        run: uv run pytest -n auto --ignore=tests/framework
+        run: uv run pytest -n 8 --ignore=tests/framework
