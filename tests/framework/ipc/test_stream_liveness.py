@@ -1,7 +1,8 @@
 """A peer that holds the GIL past ``ipc.peer_timeout_s`` is busy, not gone (shared memory): its
 heartbeat thread stops, but the kernel still holds its process's lock on the ring
 (doc/framework-bugs/2026-11-10-a-long-gil-hold-looks-like-a-dead-peer.md). A killed peer is still
-reported (``test_streams.py``). Over TCP the kernel decides already, so these run on shm only."""
+reported (``test_streams.py``). Over TCP the kernel decides already, so these run on shm only.
+Linux only, as the engine (open file description locks)."""
 
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import signal
 import time
 import uuid
 
+import pytest
 import zmq
 
 from core.common.ids import HostId
@@ -53,15 +55,21 @@ def test_a_writer_waits_for_a_reader_that_holds_the_gil() -> None:
         child.join(10)
 
 
-def test_a_reader_waits_for_a_writer_that_holds_the_gil() -> None:
+@pytest.mark.parametrize("second", [False, True], ids=["alone", "after a refused second writer"])
+def test_a_reader_waits_for_a_writer_that_holds_the_gil(second: bool) -> None:
+    """``second``: the writer's process tried a second writer of the ring first, which was refused
+    and closed its descriptor of the segment. With POSIX record locks that let the first writer's
+    lock go too, and the hold looked like death (Codex's review of #55)."""
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
     reader, addr = open_reader(zctx, local=HostId(HOST), peer=HostId(HOST), bind_host=BIND, shm_name=shm_name(),
                                tun=TUN)
     events = SPAWN.Queue()
-    child = SPAWN.Process(target=write_holding_the_gil, args=(addr, HOST, events, HOLD_S))
+    child = SPAWN.Process(target=write_holding_the_gil, args=(addr, HOST, events, HOLD_S, second))
     child.start()
     try:
         assert reader.read(timeout=20) == b"before"
+        if second:
+            assert events.get(timeout=20) == "second writer refused"
         assert events.get(timeout=20) == "holding"
         t0 = time.monotonic()
         got = None

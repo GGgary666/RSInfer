@@ -11,11 +11,10 @@ as ``PeerLost``; the caller reports that to the control plane. On shared memory
 the proof is a heartbeat written by a thread, which a call holding the GIL stops
 for as long as it runs; so a stale heartbeat is checked with the kernel before
 the peer counts as lost: each end holds a lock on its own byte of the segment
-(``_Ring.lock``), which the kernel releases when its process ends however it
-ends. A peer whose heartbeat is stale while its lock is held is alive and busy,
-and is waited for; what takes too long is for the callers' own time limits.
-Where shared memory has no such locks, the heartbeat alone decides. Over TCP
-the kernel decides already (keepalive, FIN/RST).
+(``_Ring.lock``), which the kernel releases when that end's descriptor closes or
+its process ends however it ends. A peer whose heartbeat is stale while its lock
+is held is alive and busy, and is waited for; what takes too long is for the
+callers' own time limits. Over TCP the kernel decides already (keepalive, FIN/RST).
 
 A reader opened ``replaceable`` outlives its producers: when one closes or dies, the
 next one takes over, one at a time, and ``writer_generation`` says which producer wrote the
@@ -25,7 +24,6 @@ record just returned. The process host keeps such readers for its units
 
 from __future__ import annotations
 
-import errno
 import fcntl
 import math
 import os
@@ -120,8 +118,14 @@ _HEADER = 128
 _MARK = 0xFFFFFFFF
 # offsets in the header
 _O_MAGIC, _O_CAP, _O_HEAD, _O_TAIL, _O_WBEAT, _O_RBEAT, _O_WCLOSED, _O_RCLOSED, _O_WGEN = range(0, 72, 8)
-# the bytes of the segment whose POSIX record locks say that an end's process lives
+# the bytes of the segment whose locks (_Ring.lock) say that an end lives
 _L_READER, _L_WRITER = 0, 1
+_FLOCK = struct.Struct("hhqqi4x")
+"""``struct flock`` on 64-bit Linux: ``l_type``, ``l_whence``, ``l_start``, ``l_len``, ``l_pid``."""
+_F_OFD_GETLK: int = getattr(fcntl, "F_OFD_GETLK", 36)
+_F_OFD_SETLK: int = getattr(fcntl, "F_OFD_SETLK", 37)
+"""Linux's values (``asm-generic/fcntl.h``): a Python built without them (python-build-standalone's,
+which ``uv`` installs) has no ``fcntl.F_OFD_*``."""
 
 
 def _pad(n: int) -> int:
@@ -180,27 +184,29 @@ class _Ring:
         return last != 0.0 and time.monotonic() - last > timeout
 
     def lock(self, byte: int) -> None:
-        """Hold the POSIX record lock on ``byte`` while this process lives (it is let go when the
-        process closes the segment, or ends however it ends): the proof that this end lives,
-        which no stalled thread can withhold. Best effort: where the lock cannot be taken, the
-        other end goes by the heartbeat alone."""
-        fd: int = self.shm._fd  # type: ignore[attr-defined]
+        """Hold the lock on ``byte`` while this end's descriptor of the segment is open: the proof
+        that this end lives, which no stalled thread can withhold. The kernel lets it go when the
+        descriptor closes or the process ends however it ends.
+
+        An open file description lock (``F_OFD_SETLK``), not a POSIX record lock (``lockf``): a
+        record lock is the process's, and closing any descriptor of the segment in the process lets
+        all of them go, a rejected duplicate ``ShmWriter``'s too (2026-11-12, Codex's review of
+        #55); this one is the descriptor's, and the other end in the same process sees it. Shared
+        memory descriptors are closed on exec; a child forked without exec would hold it too.
+        Best effort: where it cannot be taken, the other end goes by the heartbeat alone."""
         try:
-            os.lseek(fd, byte, os.SEEK_SET)
-            os.lockf(fd, os.F_TLOCK, 1)
+            fcntl.fcntl(self.shm._fd, _F_OFD_SETLK, _FLOCK.pack(fcntl.F_WRLCK, os.SEEK_SET, byte, 1, 0))  # type: ignore[attr-defined]
         except OSError:
             pass
 
     def held(self, byte: int) -> bool:
-        """Whether another process holds the lock on ``byte`` (``lock``). ``False`` too where the
-        platform cannot tell, and for a lock this process holds itself: the heartbeat decides then."""
-        fd: int = self.shm._fd  # type: ignore[attr-defined]
+        """Whether another descriptor of the segment holds the lock on ``byte`` (``lock``): the
+        other end's, in this process or another. ``False`` where it cannot be told."""
         try:
-            os.lseek(fd, byte, os.SEEK_SET)
-            os.lockf(fd, os.F_TEST, 1)
-        except OSError as e:
-            return e.errno in (errno.EACCES, errno.EAGAIN)
-        return False
+            got = fcntl.fcntl(self.shm._fd, _F_OFD_GETLK, _FLOCK.pack(fcntl.F_WRLCK, os.SEEK_SET, byte, 1, 0))  # type: ignore[attr-defined]
+        except OSError:
+            return False
+        return _FLOCK.unpack(got)[0] != fcntl.F_UNLCK
 
     def gone(self, beat: int, byte: int, timeout: float) -> bool:
         """The end that beats at ``beat`` and locks ``byte`` is gone: its heartbeat is stale and its

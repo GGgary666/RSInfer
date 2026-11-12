@@ -65,6 +65,11 @@ class UnitSection(msgspec.Struct, frozen=True, forbid_unknown_fields=True, omit_
     def entry_class(self) -> str:
         return self.entry.partition(":")[2]
 
+    @property
+    def build_module(self) -> str:
+        """The module of ``build``; ``""`` without a build step."""
+        return self.build.partition(":")[0]
+
 
 class Provides(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     services: list[str] = []

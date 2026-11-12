@@ -55,7 +55,7 @@ $A stop
 4090 D 上 4 层的引擎：21,482 MiB 降到 962 MiB，剩下的是 CUDA 上下文和 kernel 库的工作区。睡 2 秒，醒 3.6 秒，醒来输出和睡前逐字相同。睡着的时候 `tests/gpu/` 的八个文件都能在同一张卡上跑。记录见 [recovery-sleep-cli.md](../doc/evaluations/recovery-sleep-cli.md)。
 
 - 和别的变更一样要求引擎是空的，`sleep` 收 `--wait-empty`、`--force`。
-- 醒的时候读权重在暂停期里，受执行时限（30 秒）约束；完整 64 层模型上还没试过。
+- 醒的时候读权重在暂停期里。执行时限原来是 30 秒，64 层模型在 SM100 上读权重加录 graph 就要 30 秒以上；2026-11-12 起是 `change.execute_timeout_s`（默认 3600 秒）。完整 64 层模型上还没试过。
 
 ## 几个参数
 

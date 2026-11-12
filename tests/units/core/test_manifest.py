@@ -62,6 +62,12 @@ def change(**edits: Any) -> dict[str, str]:
 CASES: list[tuple[str, dict[str, str], str]] = [
     ("entry module missing", change(**{"pkg/b/unit.toml": manifest_toml(
         "pkg.b", "pkg.b.gone:Unit", requires=["pkg.a@1"], reads=["pkg.k"])}), "manifest.missing_entry"),
+    ("build module missing", change(**{"pkg/b/unit.toml": manifest_toml(
+        "pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"], reads=["pkg.k"], build="pkg.b.gone:make")}),
+     "manifest.missing_entry"),
+    ("builds with another unit's code", change(**{"pkg/b/unit.toml": manifest_toml(
+        "pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"], reads=["pkg.k"], build="pkg.a.unit:make")}),
+     "manifest.cross_unit_import"),
     ("unit declared twice", change(**{"pkg/c/unit.toml": manifest_toml("pkg.a", "pkg.c.unit:Unit"),
                                       "pkg/c/unit.py": "class Unit:\n    pass\n"}), "manifest.duplicate_unit"),
     ("two owners of a key", change(**{"pkg/b/unit.toml": manifest_toml(

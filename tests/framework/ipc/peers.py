@@ -16,7 +16,7 @@ import zmq.asyncio
 from core.common.ids import Endpoint, HostId, ProcId
 from core.common.messages import Envelope, SchemaRegistry
 from core.common.result import Ok, Result
-from core.ipc import IpcTunables, PeerLost, RpcServer, StreamAddress, open_reader, open_writer
+from core.ipc import IpcTunables, PeerLost, RingBusy, RpcServer, StreamAddress, open_reader, open_writer
 
 BIND = "127.0.0.1"  # test data: the address of every fake host
 TUN = IpcTunables(heartbeat_interval_s=0.05, peer_timeout_s=0.5, stream_hwm=4,
@@ -144,11 +144,20 @@ def read_holding_the_gil(q: Queue[Any], host: str, peer: str, shm_name: str, hol
     time.sleep(60)
 
 
-def write_holding_the_gil(address: StreamAddress, host: str, events: Queue[str], hold_s: float) -> None:
-    """A writer that writes one record, holds the GIL for ``hold_s``, writes another and closes."""
+def write_holding_the_gil(address: StreamAddress, host: str, events: Queue[str], hold_s: float,
+                          second: bool = False) -> None:
+    """A writer that writes one record, holds the GIL for ``hold_s``, writes another and closes.
+    ``second``: before the hold, this process opens a second writer of the ring, which is refused
+    (and closes its own descriptor of the segment)."""
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
     w = open_writer(zctx, local=HostId(host), address=address, tun=TUN)
     w.write(b"before", timeout=5)
+    if second:
+        try:
+            open_writer(zctx, local=HostId(host), address=address, tun=TUN)
+            events.put("second writer opened")
+        except RingBusy:
+            events.put("second writer refused")
     events.put("holding")
     hold_the_gil(hold_s)
     try:

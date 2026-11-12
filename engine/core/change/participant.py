@@ -24,8 +24,9 @@ pause after the coordinator has confirmed every participant.
 
 from __future__ import annotations
 
-import itertools
+import contextlib
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -72,10 +73,52 @@ if TYPE_CHECKING:
 
 COMPONENT = "change.participant"
 
-_BUILD = ("import importlib, sys\n"
+
+def _exited(pid: int) -> bool:
+    """Whether child ``pid`` exited, without reaping it."""
+    try:
+        return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+
+
+def _signal_session(sid: int, sig: int) -> int:
+    """Send ``sig`` to every live process of session ``sid`` (``/proc/<pid>/stat``); how many."""
+    sent = 0
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat", "rb") as f:
+                fields = f.read().rsplit(b")", 1)[1].split()  # after "pid (comm)": state, ppid, pgrp, session
+        except OSError:
+            continue
+        if int(fields[3]) == sid and fields[0] != b"Z":
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(entry.name), sig)
+                sent += 1
+    return sent
+
+
+def _chain(*parts: Iterator[None]) -> Iterator[None]:
+    """``itertools.chain`` that ``close`` reaches: closing it closes the part it is in (a build
+    step's ``finally`` stops the step's process)."""
+    for part in parts:
+        yield from part
+
+
+_BUILD = ("import ctypes, importlib, signal, sys\n"
+          "def stop(signum, frame):\n"
+          "    raise SystemExit(128 + signum)\n"
+          "signal.signal(signal.SIGTERM, stop)\n"
+          "ctypes.CDLL(None).prctl(1, signal.SIGTERM)\n"
           "module, _, function = sys.argv[1].partition(':')\n"
           "getattr(importlib.import_module(module), function)()\n")
-"""A unit's build step, in a process of its own (``-c``: ``sys.argv[1]`` is the step)."""
+"""A unit's build step, in a process of its own (``-c``: ``sys.argv[1]`` is the step). SIGTERM ends
+it with ``SystemExit``, so its cleanup runs: PyTorch's extension builder deletes the lock it holds
+on its build directory, and kills the ``ninja`` it waits for. It gets SIGTERM when the process that
+runs the change ends, however it ends (``PR_SET_PDEATHSIG``; should that process end before the
+step set it, the step builds to the end, and lets its locks go then)."""
 
 Phase = Literal["preparing", "prepared", "draining", "drained", "pausing", "paused", "executed", "undone",
                 "committed"]
@@ -237,7 +280,7 @@ class Participant:
                 c.staged = True  # an undo discards whatever it built
                 then = self._staging_then(c, staging, list(a.actions))
                 c.slicing.append((f"staging {len(a.stage)} new unit(s)",
-                                  itertools.chain(builds, then) if builds is not None else then))
+                                  _chain(builds, then) if builds is not None else then))
             elif builds is not None:  # the builds first: preparing an action may load what they make
                 c.slicing.append(("build steps", self._builds_then(c, builds, list(a.actions))))
             else:
@@ -280,24 +323,55 @@ class Participant:
         """Each step in a process of its own, from the change's code (``code_root``), one after
         another, polled once per slice: this process keeps serving, and holds no lock and no GIL
         the build needs. Its output goes where this process's goes. A step that exits non-zero
-        fails the change before anything paused; an undo (``close``) kills the one running."""
+        fails the change before anything paused; an undo (``close``) stops the one running (``_stop_build``)."""
         env = {**os.environ, "PYTHONPATH": code_root}
         for unit, entry in steps:
             t0 = time.monotonic()
-            proc = subprocess.Popen([sys.executable, "-P", "-s", "-c", _BUILD, entry], env=env, stdin=subprocess.DEVNULL)
+            # Its own session: an undo stops it and whatever it started (ninja, the compilers).
+            proc = subprocess.Popen([sys.executable, "-P", "-s", "-c", _BUILD, entry], env=env,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
             try:
                 while proc.poll() is None:
                     yield
             finally:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
+                if proc.returncode is None:
+                    self._stop_build(proc)
             took = time.monotonic() - t0
             if proc.returncode != 0:
                 raise StagingFailed(fail(COMPONENT, "prepare", f"{unit}: its build step {entry} exited with "
                                          f"{proc.returncode} after {took:.1f}s; its output is in this process's log",
                                          subject=str(unit), code="change.build_failed"))
             print(f"core.change: {unit}: build step {entry} done in {took:.1f}s", file=sys.stderr, flush=True)
+
+    def _stop_build(self, proc: subprocess.Popen[bytes]) -> None:
+        """Stop a build step that still runs, and its session (the session, not the process group:
+        ``ninja`` runs each compiler in a group of its own): SIGTERM first, so that its cleanup runs
+        (``_BUILD``); what is left of the session after ``change.build_stop_grace_s`` is killed. The
+        step is reaped only after that: until then its id, its session's id, is not reused."""
+        _signal_session(proc.pid, signal.SIGTERM)
+        deadline = time.monotonic() + self.tun.build_stop_grace_s
+        while not _exited(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        for _ in range(10):  # until nothing of it is left: a process may fork meanwhile
+            if not _signal_session(proc.pid, signal.SIGKILL):
+                break
+            time.sleep(0.02)
+        proc.wait()
+
+    def close(self) -> None:
+        """This process is stopping: end what the change in progress still runs here (a build
+        step's process). Nothing else is undone: the process unloads every unit next."""
+        c = self.change
+        if c is None:
+            return
+        for what, it in c.slicing:
+            close = getattr(it, "close", None)
+            try:
+                if close is not None:
+                    close()
+            except Exception as e:  # noqa: BLE001
+                print(f"core.change: closing {what}: {e}", file=sys.stderr, flush=True)
+        c.slicing.clear()
 
     def _builds_then(self, c: _Change, builds: Iterator[None], actions: list[UnitAction]) -> Iterator[None]:
         yield from builds

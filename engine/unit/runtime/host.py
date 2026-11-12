@@ -335,6 +335,7 @@ class ProcessHost:
             self.epoch = epoch
 
     def shutdown(self) -> int:
+        self.participant.close()  # a build step it runs ends with this process
         quiesced = self.quiesce()
         if isinstance(quiesced, Failed):
             # Device work may still be running: unit teardown could free memory it uses. Leave

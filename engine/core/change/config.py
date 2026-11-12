@@ -12,6 +12,13 @@ class ChangeTunables(msgspec.Struct, frozen=True):
     """The coordinator renews every participant's lease this often while a change runs."""
     prepare_timeout_s: float = 600.0
     """How long the coordinator waits for ``Prepared`` (sliced prepares take a while)."""
+    execute_timeout_s: float = 3600.0
+    """How long the coordinator waits for ``Executed``, and for the ``Abort`` that follows a change
+    that failed in or after execute. The reload at the safe point may read a checkpoint (waking
+    from ``holder.sleep``, a change to the weight store) and record CUDA graphs: about 30 s for
+    a 64-layer model on a SM100, more than ``supervisor.rpc_timeout_s``."""
+    build_stop_grace_s: float = 5.0
+    """An undo stops a running build step with SIGTERM, then SIGKILLs what is left after this."""
     drain_timeout_s: float = 10.0
     commit_retry_interval_s: float = 1.0
     """Pause between attempts of ``Commit``/``Resume`` to participants that did not confirm yet."""

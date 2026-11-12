@@ -17,7 +17,8 @@
 - 复现与回归：`tests/units/scheduler/test_ledger.py::test_a_pool_of_a_billion_items_lists_none_of_them` 和 `test_a_pool_hands_out_the_items_a_listed_stack_would`（进 CI）。端到端的复现要 152 GiB 的虚拟内存，没有放进测试；命令见上面「引擎」。`tests/gpu/test_cuda_graph_apply.py::test_repeated_kernel_changes_leave_the_device_as_it_was` 按卡的 85% 分状态池，在 SM100 上就是这 1.59 亿页，所以它在大卡上同时是这个问题的端到端回归（Opus 在 SM100 上跑过：改之前 3 次都失败，改之后通过，48.8 s）。
 - 绕过：改之前可以用小一点的 `--mem-fraction`，或者调大 `ipc.peer_timeout_s`。
 - 机制的修复（2026-11-11，用户在讨论里定的"心跳核实"）：
-  - 共享内存的两端各在环的段上持有一把 POSIX 记录锁：读端锁第 0 字节，写端锁第 1 字节（`os.lockf`）。进程不管怎么结束，内核都会放掉它，占着 GIL 的线程也拦不住。
+  - 共享内存的两端各在环的段上持有一把锁：读端锁第 0 字节，写端锁第 1 字节。进程不管怎么结束，内核都会放掉它，占着 GIL 的线程也拦不住。
+  - 起先用 POSIX 记录锁（`os.lockf`）；2026-11-12 改成 open file description 锁（`F_OFD_SETLK`）。记录锁属于进程，同一进程关掉这个段的任何一个描述符（比如被拒的第二个写端）就把它全放掉了（Codex 在 #55 上复现）。
   - 心跳超时、锁也没人持有，才算对端不在了（`_Ring.gone`）。心跳超时但锁还被持有，对端是活着、在忙，接着等。
   - 卡死的进程不再由流来判定，交给调用方自己的时限（调度器的 `sched.step_timeout_s` 等）。
   - 测锁用 `F_TEST`，只看不拿，不会挡住别人。拿不到这种锁的平台（锁不支持、或者两端在同一个进程里）退回只看心跳，和原来一样。

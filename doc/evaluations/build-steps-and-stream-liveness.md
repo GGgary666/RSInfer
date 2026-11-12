@@ -84,4 +84,37 @@
 - 构建步骤每次都另起一个 Python 进程，光 import torch 就一两秒。只有改了声明它的单元的代码才会跑。
 - 醒来（`holder.sleep` 改回 false）时读权重仍在暂停期里（PR #54），没有改成构建步骤：读进来的权重要放在这个进程里，另起的进程帮不上。要挪出暂停期，得让单元在准备阶段、在自己的进程里分片读，是另一件事。
 - 心跳线程本身没挪走。卡死而活着的对端，流不再替调用方判定。
-- 两端在同一个进程里时，锁测不出来（POSIX 锁按进程算），退回只看心跳。引擎里流的两端总在不同的进程里。
+- ~~两端在同一个进程里时，锁测不出来（POSIX 锁按进程算），退回只看心跳。~~ 2026-11-12 换成 OFD 锁以后同一进程的两端也测得出（见下）。
+
+## 审查以后改的（2026-11-12）
+
+Codex 和 Gemini 审了 #55。成立的几条都改了，每条都有在旧代码上失败的测试。项目只支持 Linux，只关于 macOS 的意见不改。
+
+- **撤回构建只杀 Python 父进程**（Codex 复现；Gemini 也提了）。编译器子进程留着，PyTorch 的锁文件（`<build_dir>/lock`）也留着，它等锁时不看持锁的进程还在不在，于是同一份源码以后的每次构建都卡在等锁上，冷启动的加载也一样。现在：
+  - 构建进程在自己的会话里。撤回时先给会话里每个进程发 SIGTERM（按 `/proc/<pid>/stat` 里的会话号找），构建进程把它变成 `SystemExit`，PyTorch 的 `finally` 删锁、杀 `ninja`。`change.build_stop_grace_s`（默认 5 秒）以后，会话里剩下的进程全部 SIGKILL；构建进程收尸之前就发，它的会话号这时还不会被复用。
+  - 按会话找，不按进程组：`ninja` 把每个编译命令放进它自己的进程组。第一版按进程组发信号，在 4090 D 上撤回以后还有一个 `nvcc` 接着编译。玩具测试里的 "ninja" 现在也把编译器放进自己的进程组，按进程组发的版本在它上面失败。
+  - 跑变更的进程结束时，构建进程收到 SIGTERM（`PR_SET_PDEATHSIG`）；进程停机（`ProcessHost.shutdown`）时也先停掉它。
+  - `kernels.cuda.ops.build` 在 PyTorch 的锁外面再套一把 `flock`（`only_builder`），持有者怎么结束它都会被放掉。拿到它时如果还有 `lock`，那一定是死掉的构建留下的，删掉。顺带解决了 Gemini 的第 4 条：同机多个 rank 同时构建，在锁外写源码文件。
+  - 测试：`tests/framework/change/test_build_steps.py` 里，玩具构建照 PyTorch 的方式拿锁文件、跑一个"编译器"，"编译器"再起一个不理 SIGTERM 的子进程。变更超过准备时限撤回以后，两个编译器进程都不在了，锁文件也没了，同一份源码再 apply 能提交。旧代码上两个编译器进程都还活着。`tests/units/kernels/test_cuda_build.py`：构建进程拿着 PyTorch 的锁被 SIGKILL，下一个构建照样往下走。
+- **`itertools.chain` 没有 `close()`**（Gemini）。撤回时 CPython 按引用计数回收，里面的生成器其实也关了，但不该靠这个。换成普通生成器 `_chain`。
+- **存活锁用的 POSIX 记录锁属于进程**（Codex 复现；Gemini 也提了）。进程里关掉这个段的任何一个描述符，它在段上的锁就全放掉了，比如被拒的第二个写端关自己的描述符。之后原来的写端一占 GIL，就被当成死了。换成 open file description 锁（`F_OFD_SETLK`/`F_OFD_GETLK`）：锁跟着描述符走，不用 `lseek`，同一进程的两端也互相看得见。代价：不经 exec 的 fork 子进程会共享它（共享内存的描述符在 exec 时关掉）；引擎里没有这样的 fork。测试：`test_stream_liveness.py` 加一种情况，写端的进程先开第二个写端被拒，再占住 GIL，读端不报 `PeerLost`。旧代码上这一条失败。
+- **执行时限**（Gemini 的第 5 条，加上用户的决定）。`Execute` 原来用 `supervisor.rpc_timeout_s`（30 秒）。SM100 上 64 层模型醒来要读 55 GB 权重（约 25 秒）、录 12 个 graph 桶（约 6.4 秒），超过 30 秒。随后的 `Abort` 也是 30 秒，参与者 Execute 没返回之前读不到它；执行超过 60 秒，引擎就要求恢复。现在 `change.execute_timeout_s` 默认 3600 秒，执行以后发的 `Abort` 也等这么久；控制面客户端等回复的时限放到 7200 秒（加上 `--wait-empty` 的时间）。测试：`tests/framework/change/test_execute_time_limit.py`，`rpc_timeout_s` 设成 1 秒：执行 3 秒的变更能提交；执行时限 2 秒、执行 3 秒的变更撤回，撤回得到确认，引擎不要求恢复。旧代码上两条都失败。
+- **`core.deps` 和 `core.manifest` 不知道 `[unit] build`**（Gemini 的第 1 条）。
+  - 影响分析只从入口模块算 import 闭包，构建步骤的模块要是 import 了入口没 import 的源码，改那份源码不会重载这个单元。现在两个模块都算。
+  - 静态检查现在也查构建模块存在（`manifest.missing_entry`）、是这个单元自己的（`manifest.cross_unit_import`）。
+  - `kernels.cuda` 不受这条影响：它的构建模块就在入口的闭包里。
+  - 测试：`tests/units/core/test_deps.py`、`test_manifest.py`，旧代码上 3 条都失败。
+  - 不成立的部分：只改 `unit.toml` 里的 `build` 字段本身也会重载，清单一变就算改动。新单元能不能在准备阶段装上（`stageable`）也不用把构建模块算进去，因为构建步骤在自己的进程里、用新代码跑，装新单元之前先跑完。
+
+在 4090 D 上的验证（4 层、dummy 权重、开 graph，`change.prepare_timeout_s` 设成 20 秒）：
+
+| 步骤 | 结果 |
+|---|---|
+| apply 改过一行注释的 `kernels.cuda` C++ 源码，编译约 55 秒 | 20 秒时准备超时，`aborted`。撤回后 0.5 秒，`nvcc`、`cicc`、`ptxas`、`ninja` 一个也不在了，构建目录里没有 PyTorch 的 `lock`。这期间每 0.5 秒一个请求，67 个全部 200 |
+| 引擎外手工构建同一份源码（`python -m kernels.cuda.ops`） | 54.4 秒编完，没有等锁 |
+| 再 apply 同一份源码 | `committed`：准备 1.85 秒（构建步骤命中缓存，1.6 秒），暂停 0.02 秒，执行 0.19 秒；输出和 apply 之前逐字相同 |
+| `sleep` / `wake` | 962 MiB / 21480 MiB，醒来以后输出相同 |
+
+第一次起这个引擎失败了：GPU 环境的 Python 是 python-build-standalone 的（`uv` 装的），编译时没带 `fcntl.F_OFD_SETLK`，单元加载时报 `AttributeError`。现在按 Linux 的值（36、37）兜底，两种 Python 上 `test_stream_liveness.py` 都过。
+
+还没做（Gemini 和我都提到的）：协调者等一个进程回复时不看它是不是已经死了。执行时限长了以后，worker 在执行时崩掉，变更要等满 3600 秒才撤回，这段时间引擎一直暂停。补法是让进程管家的调用在目标进程退出时立刻失败，等用户决定。

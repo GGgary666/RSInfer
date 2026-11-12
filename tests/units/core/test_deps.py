@@ -209,6 +209,18 @@ def test_a_library_change_reloads_the_units_that_import_it(tmp_path: Path) -> No
     assert reloaded(pa) == ["pkg.b"] and pa.reload is not None and pa.reload.changed_modules == ["pkg.lib"]
 
 
+def test_a_change_to_what_only_a_build_step_imports_reloads_its_unit(tmp_path: Path) -> None:
+    """``[unit] build`` may import what the entry does not (the source of what it compiles): a change
+    there reloads the unit, and its build step runs (Gemini's review of #55)."""
+    built = {"pkg/b/unit.toml": manifest_toml("pkg.b", "pkg.b.unit:Unit", requires=["pkg.a@1"], reads=["pkg.live"],
+                                              build="pkg.b.make:build"),
+             "pkg/b/make.py": "from pkg.b import source\n\ndef build():\n    pass\n",
+             "pkg/b/source.py": "CODE = 'v1'\n"}
+    base = {**BASE, **built}
+    pa = only(Case(tmp_path, base=base, new={**base, "pkg/b/source.py": "CODE = 'v2'\n"}).plan())
+    assert reloaded(pa) == ["pkg.b"] and pa.reload is not None and pa.reload.changed_modules == ["pkg.b.source"]
+
+
 def test_a_new_unit_is_staged_unless_it_imports_changed_code(tmp_path: Path) -> None:
     c = {"pkg/c/unit.toml": manifest_toml("pkg.c", "pkg.c.unit:Unit"), "pkg/c/unit.py": "class Unit:\n    pass\n"}
     pa = only(Case(tmp_path / "1", new={**BASE, **c}).plan())

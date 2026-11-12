@@ -48,7 +48,7 @@ python -m core.control serve --source <工作区> --topology <topology.json> --s
 
 | 检查 | 诊断码 |
 |---|---|
-| 每个 `unit.toml` 能解析，单元 id 不重复，入口模块存在 | `manifest.invalid`、`manifest.duplicate_unit`、`manifest.missing_entry` |
+| 每个 `unit.toml` 能解析，单元 id 不重复，入口模块存在，构建步骤（`[unit] build`，2026-11-12）的模块存在且是这个单元自己的 | `manifest.invalid`、`manifest.duplicate_unit`、`manifest.missing_entry`、`manifest.cross_unit_import` |
 | 每个 `.py` 都能解析（报文件和行号）；解析不了的模块，后面读代码的检查跳过它 | `manifest.syntax_error` |
 | 每个配置键只有一个主人；`[reads]` 里的键必须有人声明 | `manifest.config_owner`、`manifest.undeclared_read` |
 | 代码里 `config["k"]`、`config.get("k")`、`config.peek("k")` 读到的键必须在清单里声明；声明了却从没读过的报警告 | `manifest.read_not_declared`、`manifest.unused_read`（警告） |

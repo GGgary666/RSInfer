@@ -71,9 +71,18 @@ def _parse_all(tree: Tree, errors: list[Diagnostic]) -> dict[str, ast.Module]:
 
 def _entries(tree: Tree, errors: list[Diagnostic]) -> None:
     for uid, s in tree.units.items():
-        if s.manifest.unit.entry_module not in tree.modules:
-            errors.append(diag(COMPONENT, "manifest", f"entry module {s.manifest.unit.entry_module} does not exist",
+        unit = s.manifest.unit
+        if unit.entry_module not in tree.modules:
+            errors.append(diag(COMPONENT, "manifest", f"entry module {unit.entry_module} does not exist",
                                subject=uid, code="manifest.missing_entry"))
+        if not unit.build:
+            continue
+        if unit.build_module not in tree.modules:
+            errors.append(diag(COMPONENT, "manifest", f"build module {unit.build_module} does not exist",
+                               subject=uid, code="manifest.missing_entry"))
+        elif (other := tree.owner.get(unit.build_module)) is not None and other != uid:
+            errors.append(diag(COMPONENT, "imports", f"build step {unit.build} is code of {other}", subject=uid,
+                               code="manifest.cross_unit_import", hint="a unit builds with its own code"))
 
 
 def _config(tree: Tree, parsed: Mapping[str, ast.Module], errors: list[Diagnostic],

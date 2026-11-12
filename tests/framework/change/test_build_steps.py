@@ -5,6 +5,7 @@ before the pause."""
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import msgspec
@@ -84,6 +85,56 @@ def test_a_failing_build_step_fails_the_change_before_anything_paused(tmp_path: 
                 assert st.identity == old and not st.paused and e.versioned(p) == "versioned v1"
                 assert await e.epochs_advance(p)
             assert builds(log)  # the steps did run
+
+    run(main())
+
+
+def alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(") ")[1][0] != "Z"
+    except (FileNotFoundError, IndexError):
+        return False
+
+
+def test_an_undone_build_step_leaves_no_compiler_and_no_lock_and_the_source_builds_again(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The change fails while the step builds (here: past ``change.prepare_timeout_s``). Before,
+    the undo SIGKILLed the step's process alone: the compilers it started went on, and its lock on
+    the build directory stayed, so every later build of the source waited on it (Codex's review of
+    #55). Now the step's whole session gets SIGTERM, its ``finally`` deletes the lock, and what does
+    not stop on SIGTERM is killed: the session, not the step's process group, since ninja runs each
+    compiler in a group of its own (seen on the 4090 D: an ``nvcc`` went on after the undo)."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "compile_s").write_text("60")
+    monkeypatch.setenv("TOYC_BUILD_LOG", str(tmp_path / "builds.log"))
+    monkeypatch.setenv("TOYC_BUILD_WORK", str(work))
+
+    def compilers() -> list[int]:
+        return [int(x) for x in (work / "pids").read_text().split()] if (work / "pids").exists() else []
+
+    async def main() -> None:
+        async with engine(tmp_path / "engine", prepare_timeout_s=4.0) as e:
+            old = e.coord.identity
+            e.planner.script = reload_with_build
+            r = await e.coord.submit(e.code_change())
+            assert r.status == "aborted" and e.coord.identity == old, r
+            started = compilers()
+            assert len(started) == 2, started  # one step compiled (ninja, nvcc), the others waited on the lock
+            deadline = time.monotonic() + 10
+            while any(alive(p) for p in started) and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            assert not [p for p in started if alive(p)]
+            assert not (work / "lock").exists()
+            for p in ALL:
+                st = await e.status(p)
+                assert st.identity == old and not st.paused and e.versioned(p) == "versioned v1"
+
+            (work / "compile_s").write_text("0.2")
+            e.coord.tun = msgspec.structs.replace(e.coord.tun, prepare_timeout_s=30.0)
+            r = await e.coord.submit(e.code_change())
+            assert r.status == "committed", r.diagnostics
+            assert all(e.versioned(p) == "versioned v2" for p in ALL)
 
     run(main())
 
