@@ -55,7 +55,7 @@ $A stop
 4090 D 上 4 层的引擎：21,482 MiB 降到 962 MiB，剩下的是 CUDA 上下文和 kernel 库的工作区。睡 2 秒，醒 3.6 秒，醒来输出和睡前逐字相同。睡着的时候 `tests/gpu/` 的八个文件都能在同一张卡上跑。记录见 [recovery-sleep-cli.md](../doc/evaluations/recovery-sleep-cli.md)。
 
 - 和别的变更一样要求引擎是空的，`sleep` 收 `--wait-empty`、`--force`。
-- 醒的时候读权重在暂停期里，受执行时限（30 秒）约束；完整 64 层模型上还没试过。
+- 醒的时候读权重在暂停期里。执行时限原来是 30 秒，64 层模型在 SM100 上读权重加录 graph 就要 30 秒以上；2026-11-12 起是 `change.execute_timeout_s`（默认 3600 秒）。完整 64 层模型上还没试过。
 
 ## 几个参数
 
@@ -74,6 +74,7 @@ $A stop
 - `--timeout`（默认 3600 秒）：
   - 启动时等进程签到、等启动变更准备，各用这个时长。单元会在签到之前加载权重，大模型要几分钟。
   - 前端两次响应之间最长的沉默，也是这个时长。
+  - 变更的执行时限（`change.execute_timeout_s`，默认 3600 秒）不会比它短：`wake` 在执行阶段重读权重，启动要多久它就可能要多久。给的值超过 3600 时，执行时限跟着放长。
 - `--overlap`：一步重叠（`sched.overlap`）。
 - `--gpu`：worker 用哪张卡（物理编号）。不给时取 `CUDA_VISIBLE_DEVICES` 的第一张，没设就是 0。节点代理只按拓扑设卡，所以靠 `CUDA_VISIBLE_DEVICES` 选卡时也是经这里生效。
 - `--device cpu`：整个引擎跑在 CPU 上（`tests/scenarios/test_m2a.py` 就是这样跑的）。
@@ -97,7 +98,7 @@ $A serve /path/to/model \
 - `--graph-memory-bytes`：全部图可以留下的设备显存，默认 1 GiB，来自 `--mem-fraction` 留给激活的那部分；状态池的大小与不开 graph 时相同。实际留下多少在日志的 `cuda_graph.kept_bytes`。
 - 回放的 decode 步用的是固定容量的 attention（`kernels.torch_graph`），代价随 `--max-context` 增长而不是随序列的实际长度；4090 D 上 4 层模型，8 行在 4096 时比 eager 快 1.1–1.2 倍，在 16384 时比 eager 慢。eager 的 decode 步仍然用参照实现。数字见 [cuda-graph-review-fixes.md](../doc/evaluations/cuda-graph-review-fixes.md)，设计见 [cuda-graph.md](../doc/specs/cuda-graph.md)。完整 27B 上改过以后还没有重新验收。
 - 2026-11-11：bf16 模型在装了 `gpu` extra 的机器上，attention 和 GDN 默认用真 kernel（FlashInfer、Triton），eager 和回放的步是同一套，回放的代价不再随 `--max-context` 增长；上一条只适用于 fp32 或没有 FlashInfer 的情况。FlashInfer 第一次 plan 要编译，`PATH` 上要有 `ninja` 和 CUDA 编译器：用 `uv run` 起，或者把环境的 `bin` 加进 `PATH`。见 [real-kernels-4090d.md](../doc/evaluations/real-kernels-4090d.md)。
-- 2026-11-11：有 CUDA 设备时 worker 还会加载 `kernels.cuda`，它在加载时编译一个 C++/CUDA kernel（KV 写入）。一台机器上第一次启动因此多等约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），之后从 `~/.cache/torch_extensions` 加载；和 FlashInfer 一样要求 `PATH` 上有 `ninja` 和 CUDA 编译器。
+- 2026-11-11：有 CUDA 设备时 worker 还会加载 `kernels.cuda`，它在加载时编译一个 C++/CUDA kernel（KV 写入）。一台机器上第一次启动因此多等约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），之后从 `~/.cache/torch_extensions` 加载；和 FlashInfer 一样要求 `PATH` 上有 `ninja` 和 CUDA 编译器。改了它的 C++ 源码以后直接 `control apply` 就行：编译在变更的准备阶段另起进程做，引擎照常服务（2026-11-11 起）。
 - 改 `plan.*` 的配置或 kernel 单元的代码会在空引擎上重载 `core.plan` 并重录；范围以 `apply --dry-run` 为准。
 
 ### 原 eager 验证记录

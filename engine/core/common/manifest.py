@@ -40,13 +40,22 @@ def is_service_name(name: str) -> bool:
     return _SERVICE_RE.fullmatch(name) is not None
 
 
-class UnitSection(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+class UnitSection(msgspec.Struct, frozen=True, forbid_unknown_fields=True, omit_defaults=True):
+    """``[unit]``. Optional fields left at their defaults are not encoded: a spec without a build step
+    decodes where ``build`` is unknown."""
+
     id: UnitId
     kind: UnitKind
     process: list[str]
     """Process roles this unit is installed in."""
     entry: str
     """``"module:Class"``."""
+    build: str = ""
+    """``"module:function"``, optional: what is slow to make for this unit (a native extension
+    compiled into a cache), made ahead of its load. When a change reloads the unit, or adds it to a
+    process that already serves, the function runs from the change's code in a process of its own
+    while the engine serves (the prepare phase), and the load at the pause finds it made
+    (``core.change.participant``, change.md §4.6). Its exit status is the outcome."""
 
     @property
     def entry_module(self) -> str:
@@ -55,6 +64,11 @@ class UnitSection(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     @property
     def entry_class(self) -> str:
         return self.entry.partition(":")[2]
+
+    @property
+    def build_module(self) -> str:
+        """The module of ``build``; ``""`` without a build step."""
+        return self.build.partition(":")[0]
 
 
 class Provides(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -128,6 +142,8 @@ def check_manifest(m: UnitManifest) -> list[str]:
         problems.append(f"bad unit id {m.unit.id!r}")
     if not _ENTRY_RE.fullmatch(m.unit.entry):
         problems.append(f"bad entry {m.unit.entry!r}; expected 'module:Class'")
+    if m.unit.build and not _ENTRY_RE.fullmatch(m.unit.build):
+        problems.append(f"bad build {m.unit.build!r}; expected 'module:function'")
     if not m.unit.process:
         problems.append("unit.process is empty")
     for name in [*m.provides.services, *m.requires.services, *m.requires.optional]:

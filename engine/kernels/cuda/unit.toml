@@ -3,6 +3,8 @@ id = "kernels.cuda"
 kind = "logic"
 process = ["worker"]
 entry = "kernels.cuda.unit:Unit"
+# Compiled ahead of a reload, while the engine serves (core.change): the load then finds it built.
+build = "kernels.cuda.ops:build"
 
 [requires]
 services = ["kernels.catalog@1"]

@@ -340,6 +340,23 @@ def test_stop_without_a_control_plane_asks_every_process_left_to_stop(monkeypatc
             p.wait()
 
 
+def test_a_change_s_execution_gets_as_long_as_start_up_and_not_less_than_the_engine_s_limit(
+        model: Path, tokenizer: Path, tmp_path: Path) -> None:
+    """A wake reads the weights again while it executes, as start-up does before the check-in: with
+    ``--timeout`` above the engine's limit (3600 s), start-up had longer than the wake after it
+    (Gemini's second review of #55)."""
+    import deploy.agxinfer as agx
+
+    def limits(timeout: str) -> tuple[float, float]:
+        args = agx.parser().parse_args(["serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu",
+                                        "--run", str(tmp_path / timeout), "--timeout", timeout])
+        tunables = agx.plan(args)[2]
+        return tunables["supervisor.checkin_timeout_s"], tunables["change.execute_timeout_s"]
+
+    assert limits("7200") == (7200.0, 7200.0)
+    assert limits("120") == (120.0, 3600.0)
+
+
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a

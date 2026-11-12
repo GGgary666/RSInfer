@@ -34,6 +34,7 @@ def manifest_toml(
     config: dict[str, dict[str, Any]] | None = None,
     reads: Sequence[str] = (),
     capabilities: str = "",
+    build: str = "",
 ) -> str:
     lines = [
         "[unit]",
@@ -41,6 +42,7 @@ def manifest_toml(
         f'kind = "{kind}"',
         f"process = {_toml_list(list(process))}",
         f'entry = "{entry}"',
+        *([f'build = "{build}"'] if build else []),
         "[provides]",
         f"services = {_toml_list(list(provides))}",
         "[requires]",

@@ -24,7 +24,7 @@ from core.change.state import IdentityManifest
 from core.change.types import EMPTY, ActionPlan, ChangeSet, ProcActions, UnitAction
 from core.common.framework import FrameworkModules
 from core.common.ids import ProcId, UnitId
-from core.common.manifest import ConfigKeyDecl
+from core.common.manifest import ConfigKeyDecl, UnitSection
 from core.common.result import Diagnostic, Failed, Ok, Result, diag
 from core.context.config import config_entries
 from core.sourcetree import Tree, module_of
@@ -161,6 +161,11 @@ def _check_state_requests(w: World) -> list[Diagnostic]:
     return out
 
 
+def _roots(unit: UnitSection) -> list[str]:
+    """Where a unit's code starts: its entry module, and its build step's."""
+    return [unit.entry_module, *([unit.build_module] if unit.build else [])]
+
+
 class _Planner:
     def __init__(self, w: World, changed_paths: list[str], changed_modules: list[str]) -> None:
         assert w.base_tree is not None
@@ -179,12 +184,14 @@ class _Planner:
     # ------------------------------------------------------------- code
 
     def code_changed(self, uid: UnitId) -> bool:
-        """Its manifest changed, or its code imports (transitively) a changed module."""
+        """Its manifest changed, or its code imports (transitively) a changed module: the code its
+        entry imports, and its build step's (``[unit] build``), which may import what the entry
+        does not (the source of what it compiles), and runs again when it changed."""
         new, old = self.w.new_tree.units.get(uid), self.base_tree.units.get(uid)
         if new is None or old is None or new.manifest != old.manifest:
             return True
-        closure = self.new_graph.imports_closure([new.manifest.unit.entry_module]) | \
-            self.base_graph.imports_closure([old.manifest.unit.entry_module])
+        closure = self.new_graph.imports_closure(_roots(new.manifest.unit)) | \
+            self.base_graph.imports_closure(_roots(old.manifest.unit))
         return bool(closure & self.changed)
 
     def stageable(self, uid: UnitId) -> bool:

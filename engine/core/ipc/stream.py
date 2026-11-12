@@ -7,7 +7,14 @@ same ``StepWriter`` / ``StepReader``, and the backend is chosen by comparing
 ``HostId``s, never addresses (P7) — two fake hosts on one machine use TCP.
 
 A peer that stops proving it is alive for ``ipc.peer_timeout_s`` is reported
-as ``PeerLost``; the caller reports that to the control plane.
+as ``PeerLost``; the caller reports that to the control plane. On shared memory
+the proof is a heartbeat written by a thread, which a call holding the GIL stops
+for as long as it runs; so a stale heartbeat is checked with the kernel before
+the peer counts as lost: each end holds a lock on its own byte of the segment
+(``_Ring.lock``), which the kernel releases when that end's descriptor closes or
+its process ends however it ends. A peer whose heartbeat is stale while its lock
+is held is alive and busy, and is waited for; what takes too long is for the
+callers' own time limits. Over TCP the kernel decides already (keepalive, FIN/RST).
 
 A reader opened ``replaceable`` outlives its producers: when one closes or dies, the
 next one takes over, one at a time, and ``writer_generation`` says which producer wrote the
@@ -19,6 +26,7 @@ from __future__ import annotations
 
 import fcntl
 import math
+import os
 import secrets
 import struct
 import threading
@@ -110,6 +118,14 @@ _HEADER = 128
 _MARK = 0xFFFFFFFF
 # offsets in the header
 _O_MAGIC, _O_CAP, _O_HEAD, _O_TAIL, _O_WBEAT, _O_RBEAT, _O_WCLOSED, _O_RCLOSED, _O_WGEN = range(0, 72, 8)
+# the bytes of the segment whose locks (_Ring.lock) say that an end lives
+_L_READER, _L_WRITER = 0, 1
+_FLOCK = struct.Struct("hhqqi4x")
+"""``struct flock`` on 64-bit Linux: ``l_type``, ``l_whence``, ``l_start``, ``l_len``, ``l_pid``."""
+_F_OFD_GETLK: int = getattr(fcntl, "F_OFD_GETLK", 36)
+_F_OFD_SETLK: int = getattr(fcntl, "F_OFD_SETLK", 37)
+"""Linux's values (``asm-generic/fcntl.h``): a Python built without them (python-build-standalone's,
+which ``uv`` installs) has no ``fcntl.F_OFD_*``."""
 
 
 def _pad(n: int) -> int:
@@ -167,6 +183,36 @@ class _Ring:
         last = self.f64(off)
         return last != 0.0 and time.monotonic() - last > timeout
 
+    def lock(self, byte: int) -> None:
+        """Hold the lock on ``byte`` while this end's descriptor of the segment is open: the proof
+        that this end lives, which no stalled thread can withhold. The kernel lets it go when the
+        descriptor closes or the process ends however it ends.
+
+        An open file description lock (``F_OFD_SETLK``), not a POSIX record lock (``lockf``): a
+        record lock is the process's, and closing any descriptor of the segment in the process lets
+        all of them go, a rejected duplicate ``ShmWriter``'s too (2026-11-12, Codex's review of
+        #55); this one is the descriptor's, and the other end in the same process sees it. Shared
+        memory descriptors are closed on exec; a child forked without exec would hold it too.
+        Best effort: where it cannot be taken, the other end goes by the heartbeat alone."""
+        try:
+            fcntl.fcntl(self.shm._fd, _F_OFD_SETLK, _FLOCK.pack(fcntl.F_WRLCK, os.SEEK_SET, byte, 1, 0))  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+    def held(self, byte: int) -> bool:
+        """Whether another descriptor of the segment holds the lock on ``byte`` (``lock``): the
+        other end's, in this process or another. ``False`` where it cannot be told."""
+        try:
+            got = fcntl.fcntl(self.shm._fd, _F_OFD_GETLK, _FLOCK.pack(fcntl.F_WRLCK, os.SEEK_SET, byte, 1, 0))  # type: ignore[attr-defined]
+        except OSError:
+            return False
+        return _FLOCK.unpack(got)[0] != fcntl.F_UNLCK
+
+    def gone(self, beat: int, byte: int, timeout: float) -> bool:
+        """The end that beats at ``beat`` and locks ``byte`` is gone: its heartbeat is stale and its
+        process no longer holds its lock."""
+        return self.peer_lost(beat, timeout) and not self.held(byte)
+
     def hold(self) -> bool | None:
         """Take the producer's lock: an exclusive ``flock`` on the segment, held until this
         mapping closes, released by the kernel when the process ends however it ends. ``False``:
@@ -207,7 +253,7 @@ class ShmWriter:
     def __init__(self, name: str, tun: IpcTunables) -> None:
         self._ring = r = _Ring.attach(name)
         self._tun = tun
-        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, tun.peer_timeout_s):
+        if r.u64(_O_RCLOSED) or r.gone(_O_RBEAT, _L_READER, tun.peer_timeout_s):
             r.close()
             raise PeerLost(f"{name}: the step-stream reader is gone")
         held = r.hold()
@@ -220,6 +266,7 @@ class ShmWriter:
         self._gen = r.u64(_O_WGEN) + 1
         r.set_u64(_O_WGEN, self._gen)
         r.set_u64(_O_WCLOSED, 0)
+        r.lock(_L_WRITER)
         r.beat(_O_WBEAT)
         self._hb = _Heartbeat(tun.heartbeat_interval_s, self._beat)
         self._hb.start()
@@ -235,7 +282,7 @@ class ShmWriter:
         r = self._ring
         if not self._owns():
             raise PeerLost("another producer took this step-stream ring over")
-        if r.u64(_O_RCLOSED) or r.peer_lost(_O_RBEAT, self._tun.peer_timeout_s):
+        if r.u64(_O_RCLOSED) or r.gone(_O_RBEAT, _L_READER, self._tun.peer_timeout_s):
             raise PeerLost("step-stream reader is gone")
 
     def write(self, data: bytes, timeout: float | None = None) -> None:
@@ -295,6 +342,7 @@ class ShmReader:
         self._replaceable = replaceable
         self.name = name
         self._gen = 0
+        self._ring.lock(_L_READER)
         self._ring.beat(_O_RBEAT)
         self._hb = _Heartbeat(tun.heartbeat_interval_s, lambda: self._ring.beat(_O_RBEAT))
         self._hb.start()
@@ -323,7 +371,7 @@ class ShmReader:
             if not self._replaceable:
                 if r.u64(_O_WCLOSED):
                     raise StreamClosed("producer closed the stream")
-                if r.peer_lost(_O_WBEAT, self._tun.peer_timeout_s):
+                if r.gone(_O_WBEAT, _L_WRITER, self._tun.peer_timeout_s):
                     raise PeerLost("step-stream writer is gone")
             if deadline is not None and time.monotonic() > deadline:
                 return None

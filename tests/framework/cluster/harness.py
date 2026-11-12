@@ -38,6 +38,60 @@ ENGINE = REPO / "engine"
 ADDRESS = "127.0.0.1"  # test data: every fake host lives on this machine
 
 TOY = {
+    "toyc/builder.py": '''
+"""A build step (``[unit] build``): after ``TOYC_BUILD_S`` seconds, appends a line with this file's
+path to the file ``TOYC_BUILD_LOG`` names (the step's process does not know the toy log); exits 3 when
+``TOYC_BUILD_FAIL`` is set. With ``TOYC_BUILD_WORK``, it first builds as PyTorch's extension
+builder does there (``compile``)."""
+import os
+import subprocess
+import sys
+import time
+
+COMPILER = """
+import os, signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a compiler that does not stop on SIGTERM
+with open(sys.argv[1], "a") as f:
+    print(os.getpid(), file=f)
+if sys.argv[3] == "spawn":  # ninja's compiler: in a process group of its own, as ninja runs them
+    subprocess.Popen([sys.executable, "-c", sys.argv[4], sys.argv[1], sys.argv[2], "wait", sys.argv[4]],
+                     process_group=0)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+def compile(work):
+    """As ``torch.utils.cpp_extension.load``: the directory's lock is a file made with ``O_EXCL``,
+    waited on while it is there and deleted in ``finally``; ``subprocess.run`` runs the compiler
+    (``ninja``), which starts another (``nvcc``) and lasts what ``work/compile_s`` says. The
+    compilers' ids go to ``work/pids``; the id of the process whose step compiles, to ``work/host``."""
+    lock = os.path.join(work, "lock")
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL))
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+    try:
+        with open(os.path.join(work, "host"), "w") as f:
+            print(os.getppid(), file=f)
+        with open(os.path.join(work, "compile_s")) as f:
+            seconds = f.read().strip()
+        subprocess.run([sys.executable, "-c", COMPILER, os.path.join(work, "pids"), seconds, "spawn", COMPILER],
+                       check=True)
+    finally:
+        os.unlink(lock)
+
+
+def make():
+    if os.environ.get("TOYC_BUILD_WORK"):
+        compile(os.environ["TOYC_BUILD_WORK"])
+    time.sleep(float(os.environ.get("TOYC_BUILD_S", "0")))
+    with open(os.environ["TOYC_BUILD_LOG"], "a") as f:
+        f.write(f"built {__file__}\\n")  # where this code was loaded from: the change's snapshot
+    if os.environ.get("TOYC_BUILD_FAIL"):
+        sys.exit(3)
+''',
     "toyc/__init__.py": "",
     "toyc/units.py": '''
 import time
@@ -183,6 +237,7 @@ class Op:
 
     def execute(self, args):
         self._phase("execute", args)
+        time.sleep(args.get("execute_s", 0))
         if args.get("needs_prepare") and not self.prepared:
             raise RuntimeError("executed on an instance that was never prepared")
 
@@ -359,6 +414,11 @@ class Cluster:
     def log_of(self, p: ProcId) -> list[str]:
         f = self.logs / f"{p.host}-{p.role}-{p.index}.log"
         return f.read_text().splitlines() if f.exists() else []
+
+    def output_of(self, p: ProcId) -> list[str]:
+        """What the process (every incarnation of it) wrote to its stdout and stderr."""
+        runs = sorted((self.tmp / str(p.host) / "snapshots" / ".run").glob(f"{p.role}-{p.index}-*/log"))
+        return [line for f in runs for line in f.read_text(errors="replace").splitlines()]
 
     async def wait_loss(self, kind: str, timeout: float = 10.0) -> Loss:
         loss = await asyncio.wait_for(self.sup.losses.get(), timeout)

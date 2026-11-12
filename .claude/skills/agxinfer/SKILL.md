@@ -34,7 +34,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 | `engine/core/ipc/` | RPC、pubsub、step stream（同机共享内存环 / 跨机 TCP）、open records、宿主替单元持有的数据通道 `proc.streams@1`（`channels.py`） | `ipc.md` |
 | `engine/core/nodeagent/` | 每台机器一个的节点代理（`python -m core.nodeagent`） | `nodeagent.md` |
 | `engine/core/supervisor/` | 进程管家、拓扑、管家与节点代理之间的消息 | `supervisor.md` |
-| `engine/core/change/` | 变更事务：协调者、参与者、事件日志、blob 存储、队列 | `change.md` |
+| `engine/core/change/` | 变更事务：协调者、参与者、事件日志、blob 存储、队列；`build.py` 是单元构建步骤跑在里面的那个进程 | `change.md` |
 | `engine/core/control/` | 控制面进程（`python -m core.control serve`）、控制接口的消息和客户端（`python -m core.control.client`） | `control-plane.md` |
 | `engine/unit/runtime/` | 单元运行时：加载 / 重载 / 撤销、`ProcessHost`、注册表、静态 import 图 | `unit-runtime.md` |
 | `engine/platforms/` | 平台接口 `base.py`；CI 用的 `fake/`；真张量、只做 eager 的 `torch_eager/`（CPU 或进程自己的 CUDA 卡）；`cuda_graph/` 复用 torch 分配并提供进程 capture stream、warm-up、capture/replay/close。合法平台名 `PLATFORMS`（`__init__.py`），由拓扑角色的 `platform` 决定 | `platform.md`、`cuda-graph.md` |
@@ -69,7 +69,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/kernels/torch_graph/` | `kernels.torch_graph`：只给从 graph 回放的步用的 PyTorch solution（`requires=[CAPTURE]`），固定容量的 decode attention，代价随 `batch.max_context_len` 增长。有 FlashInfer 的 bf16 模型不会选到它；fp32 的 graph、没有 FlashInfer 的 GPU 和 CPU 上的回放测试还用 |
 | `engine/kernels/triton/` | `kernels.triton`：SGLang 的 Triton kernel，登记成 `triton.*`，只在有 CUDA 设备的进程里登记：GDN 的 prefill conv、gating、chunk，decode 的"投影解包 + conv"和 packed decode，gated RMSNorm；attention 层的两个融合 kernel（Q/K norm + RoPE + gate 拆分、输出 gate 的 sigmoid·mul）；以及 paged attention 每步拼 KV 槽列表的 kernel（`attn.kv_indices@1`）。`ops.py` 把 definition 的签名接到 SGLang 的调法上；其余文件和 `fla/` 是搬来的 kernel，只去掉了对 `sglang.srt` 的依赖，第一行 `# type: ignore` |
 | `engine/kernels/flashinfer/` | `kernels.flashinfer`：FlashInfer 的 paged prefill / decode wrapper（`flashinfer.attn.paged_*`），以及它的 Gemma RMSNorm（`flashinfer.norm.gemma_rms@1`，带 residual 时原地改）和 SiLU·mul（`flashinfer.act.silu_and_mul@1`），同样只在有 CUDA 设备时登记。attention 和 SiLU·mul 不收 fp32；attention 还要求 KV 的 dtype 和模型的相同。第一次 plan 某个 shape 时要编译，`PATH` 上要有 `ninja` 和 CUDA 编译器（`uv run` 下有） |
-| `engine/kernels/cuda/` | `kernels.cuda`：自己用 C++/CUDA 写、单元加载时编译的 kernel，现在只有 `cuda.kv.store@1`（KV 写入合成一个 kernel，照 SGLang 的 `store_kvcache` 写的）。源码放在 Python 模块 `kv_store_cu.py` 的字符串里，这样改它能被 `core.deps` 看到；`ops.build` 用 PyTorch 的扩展加载器编译，产物按源码摘要命名，放在 `TORCH_EXTENSIONS_DIR`。没编译过的源码第一次加载要约一分钟，`PATH` 上要有 `ninja` 和 CUDA 编译器；只在有 CUDA 设备的进程里编译和登记 |
+| `engine/kernels/cuda/` | `kernels.cuda`：自己用 C++/CUDA 写、单元加载时编译的 kernel，现在只有 `cuda.kv.store@1`（KV 写入合成一个 kernel，照 SGLang 的 `store_kvcache` 写的）。源码放在 Python 模块 `kv_store_cu.py` 的字符串里，这样改它能被 `core.deps` 看到；`ops.build` 用 PyTorch 的扩展加载器编译，产物按源码摘要命名，放在 `TORCH_EXTENSIONS_DIR`。没编译过的源码第一次加载要约一分钟，`PATH` 上要有 `ninja` 和 CUDA 编译器；只在有 CUDA 设备的进程里编译和登记。`ops.build` 也是它的构建步骤（`unit.toml` 的 `[unit] build`）：改了源码的变更在准备阶段另起进程编译，引擎照常服务 |
 | `engine/core/state/weights/` | `core.state.weights`（`state.weights@1`）：参数存储、safetensors 读取、dummy 权重、`refit` |
 | `engine/models/qwen38/` | `models.qwen38`（`model@1`）：SGLang `Qwen3_5ForCausalLM` 的搬运，参数名、`load_weights`、前向 |
 | `engine/layers/` | `layers.linear`、`embedding`、`norm`、`rope`（cos/sin 表，和 attention 层在 attention 之前的那一个融合调用 `attn.qk_norm_rope_gate@1`）、`activation`（SiLU·mul 和输出 gate）、`sampler`；`layers.attn`、`layers.gdn` 是 attention / GDN 外壳加 backend（SGLang 的 `TorchNativeAttnBackend`、`GDNAttnBackend`；GDN 的 backend 直接接两个输入投影，自己拆）；`layers/attn/paged.py` 是 paged attention kernel 的 backend（SGLang `FlashInferAttnBackend` 的普通路径），`layers.attn` 按阶段在它和 `TorchNativeAttnBackend` 之间选；`solutions.py` 是 attention 和 GDN 的 backend 共用的库：按 `attn.*` / `gdn.*` 的 backend 配置在启动时固定每个阶段的 kernel |
@@ -200,7 +200,7 @@ $A control status                               # 也可以是 introspect（单�
 - 4090 D 上 4 层的引擎：21,482 MiB 降到 962 MiB（剩下的是 CUDA 上下文和 kernel 库的工作区），睡 2 秒，醒 3.6 秒，醒来输出和睡前逐字相同。睡着的时候 `tests/gpu/` 八个文件全部能跑。
 - 和别的变更一样要求引擎是空的，`--wait-empty`、`--force` 照常可用。
 - 第一次醒来的身份和睡之前不一样：`holder.sleep` 这时显式写进了配置。之后每次醒来都是同一个身份。
-- 醒的时候读权重在暂停期里，受执行时限（30 秒，`supervisor.rpc_timeout_s`）约束。完整 64 层模型上还没试过，可能超时；超时的话变更撤回，引擎还睡着。
+- 醒的时候读权重在暂停期里，受执行时限 `change.execute_timeout_s`（默认 3600 秒；2026-11-12 以前是 `supervisor.rpc_timeout_s` 的 30 秒，64 层模型在 SM100 上不够）约束。完整 64 层模型上还没试过。
 
 ### 在引擎里做检查（排查和验证）
 
@@ -274,7 +274,7 @@ $A control status                               # 也可以是 introspect（单�
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
 - 静态检查不过（`check` 或 `apply` 的诊断写明了哪条规则）；
-- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：单元在暂停期内重载，现编译要约一到两分钟（4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒），超过执行时限（30 秒），变更被撤回，引擎这段时间回 503，之后照常服务旧代码。**先在引擎外编译再 apply**：`PYTHONPATH=engine uv run python -m kernels.cuda.ops`（和 worker 同一个环境），之后的 apply 从缓存加载，4 层约两三秒、64 层重录 12 个桶约 6.4 秒。新增这个单元、或者冷启动时不受影响：那时的加载在准备阶段，时限是 `change.prepare_timeout_s`。
+- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：它的构建步骤（`[unit] build`）在准备阶段另起一个进程编译，4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒；这段时间引擎照常服务，暂停期内的重载从缓存加载（2026-11-11 起，见 `doc/evaluations/build-steps-and-stream-liveness.md`）。准备阶段的时限是 `change.prepare_timeout_s`（默认 600 秒，`deploy/agxinfer.py` 设成 `--timeout`）。编译失败时变更在暂停之前就失败，诊断是 `change.build_failed`，编译器的输出在 worker 的日志里。以前要先在引擎外编译（`PYTHONPATH=engine uv run python -m kernels.cuda.ops`），现在不用了，这样做也还行。
 
 可能是更新机制的 bug，写报告：
 - 提交了，可跑的还是旧代码，或者新旧代码混着跑；

@@ -2,7 +2,7 @@
 
 - 日期：2026-11-10
 - 报告人：Claude Opus 5.5 / Devin 在 SM100 上复验 PR #45 时碰到现象；Claude Fable 5.2 在 CPU 上复现并找到原因
-- 状态：触发它的那一处已修（账本不再列出全部空闲项）；机制本身没有改。不是热更新时出现的，放在这里是因为它是框架本体（`core.ipc` 的存活判定）的性质，任何单元都可能再碰到。
+- 状态：触发它的那一处已修（账本不再列出全部空闲项）；机制本身 2026-11-11 也修了（共享内存上，心跳超时先问内核对端的进程还在不在，见文末「机制的修复」）。不是热更新时出现的，放在这里是因为它是框架本体（`core.ipc` 的存活判定）的性质，任何单元都可能再碰到。
 - 引擎：
   - SM100：`deploy/qwen38.py serve`，很小的模型（`tests/gpu/test_cuda_graph_apply.py` 的 `deployment()`），`--mem-fraction 0.85`，holder 分出 `kv.paged 158961853`；`--cuda-graph off` 和 `required` 都一样。
   - CPU 复现：同一个小模型，`--device cpu --page-size 4 --max-slots 8 --cpu-bytes $((152 << 30))`，holder 分出 `kv.paged 159383485`（CPU 上这 152 GiB 是 calloc 出来的，不写就不占物理内存）。
@@ -16,3 +16,21 @@
 - 没有改的：心跳线程依赖 GIL。任何单元在有流的进程里做一次占住 GIL 超过 2 s 的调用（把很大的 Python 容器一次建出来、不释放 GIL 的扩展调用）都会有同样的后果。可能的方向是把心跳放到不需要 GIL 的线程里；这一轮没有做。
 - 复现与回归：`tests/units/scheduler/test_ledger.py::test_a_pool_of_a_billion_items_lists_none_of_them` 和 `test_a_pool_hands_out_the_items_a_listed_stack_would`（进 CI）。端到端的复现要 152 GiB 的虚拟内存，没有放进测试；命令见上面「引擎」。`tests/gpu/test_cuda_graph_apply.py::test_repeated_kernel_changes_leave_the_device_as_it_was` 按卡的 85% 分状态池，在 SM100 上就是这 1.59 亿页，所以它在大卡上同时是这个问题的端到端回归（Opus 在 SM100 上跑过：改之前 3 次都失败，改之后通过，48.8 s）。
 - 绕过：改之前可以用小一点的 `--mem-fraction`，或者调大 `ipc.peer_timeout_s`。
+- 机制的修复（2026-11-11，用户在讨论里定的"心跳核实"）：
+  - 共享内存的两端各在环的段上持有一把锁：读端锁第 0 字节，写端锁第 1 字节。进程不管怎么结束，内核都会放掉它，占着 GIL 的线程也拦不住。
+  - 起先用 POSIX 记录锁（`os.lockf`）；2026-11-12 改成 open file description 锁（`F_OFD_SETLK`）。记录锁属于进程，同一进程关掉这个段的任何一个描述符（比如被拒的第二个写端）就把它全放掉了（Codex 在 #55 上复现）。
+  - 心跳超时、锁也没人持有，才算对端不在了（`_Ring.gone`）。心跳超时但锁还被持有，对端是活着、在忙，接着等。
+  - 卡死的进程不再由流来判定，交给调用方自己的时限（调度器的 `sched.step_timeout_s` 等）。
+  - 测锁用 `F_TEST`，只看不拿，不会挡住别人。拿不到这种锁的平台（锁不支持、或者两端在同一个进程里）退回只看心跳，和原来一样。
+  - TCP 不用改：它本来就由内核判定（keepalive、FIN/RST）。
+  - 心跳线程本身没挪走。改成不需要 GIL 的原生线程，得到的信息和锁一样，还要多一段原生代码。
+  - 测试：`tests/framework/ipc/test_stream_liveness.py`（进 CI）。子进程用 `ctypes.PyDLL` 调 libc 的 `usleep`，占住 GIL 4 倍的 `peer_timeout_s`：
+    - 读端占着 GIL，写端写满了环就等着，不报 `PeerLost`，放开以后 400 条记录全部按序到达；
+    - 写端占着 GIL，读端等着，不报 `PeerLost`；
+    - 占着 GIL 的读端被 SIGKILL，写端在 `peer_timeout_s` 加 2 秒以内报 `PeerLost`。
+    - 前两条在旧代码上都报 `PeerLost` 失败。`test_streams.py` 里"杀掉对端要报出来"的测试照旧通过。
+  - 在跑着的引擎上（4090 D，4 层）：临时检查在调度器的一步里占住 GIL 5 秒（`peer_timeout_s` 是 2 秒），请求生成到一半：
+    - PR #54 的代码：请求回 400，`results of rank 0 come from a new producer (a new worker process?): what the request had there is gone`，调度器的日志 `1 request(s) ended, step(s) [43, 44] given up`；
+    - 修过的代码：请求 200，96 个 token 都在，用了 5.59 秒，文本和前者恢复以后的请求相同。
+  - 记录见 [../evaluations/build-steps-and-stream-liveness.md](../evaluations/build-steps-and-stream-liveness.md)。
+

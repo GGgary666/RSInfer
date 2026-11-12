@@ -138,6 +138,8 @@ class _Run:
     diags: list[Diagnostic] = field(default_factory=list[Diagnostic])
     """Reported by participants along the way (e.g. one-shot prepares)."""
     drain_outcomes: dict[str, int] = field(default_factory=dict[str, int])
+    executing: bool = False
+    """``Execute`` went out: a participant may still be in it, or undo a reload, when ``Abort`` comes."""
     _t: float = field(default_factory=time.monotonic)
 
     def lap(self, phase: str) -> None:
@@ -493,7 +495,9 @@ class Coordinator:
         run.lap("pause")
 
     async def _execute(self, run: _Run, manifest: IdentityManifest) -> None:
-        executed = await self._gather([(pa.proc, self._call(pa.proc, Execute(run.id))) for pa in run.prepared])
+        run.executing = True
+        executed = await self._gather([(pa.proc, self._call(pa.proc, Execute(run.id), timeout=self.tun.execute_timeout_s))
+                                       for pa in run.prepared])
         for proc, e in executed.items():
             if isinstance(e, Executed):
                 run.diags += e.diagnostics
@@ -615,7 +619,9 @@ class Coordinator:
             self.recovery_required = True
             out.append(diag(COMPONENT, "abort", "Abort not sent (injected)", code="change.injected_fault"))
         else:
-            results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id)) for pa in run.asked))
+            # After Execute, a participant reads Abort once its Execute is done, then reloads back.
+            wait = self.tun.execute_timeout_s if run.executing else None
+            results = await asyncio.gather(*(self._call(pa.proc, Abort(run.id), timeout=wait) for pa in run.asked))
             for pa, r in zip(run.asked, results, strict=True):
                 if isinstance(r, Ok) and isinstance(r.value, Resumed) \
                         and r.value.change_id == run.id and r.value.rolled_back:

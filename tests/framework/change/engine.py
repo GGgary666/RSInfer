@@ -98,10 +98,10 @@ def reload_everywhere(fail: dict[ProcId, str] | None = None) -> Callable[[PlanIn
 
 @asynccontextmanager
 async def engine(tmp: Path, *, agent: dict[str, float] | None = None, sup: dict[str, float] | None = None,
-                 **tun: Any) -> AsyncGenerator[Engine]:
+                 procs: dict[str, float] | None = None, **tun: Any) -> AsyncGenerator[Engine]:
     """``tun``: coordinator tunables (``ChangeTunables`` fields); ``agent``, ``sup``: node agent
-    and supervisor tunables."""
-    async with cluster(tmp, ["host-a", "host-b"], agent_tunables=agent, sup_tunables=sup) as c:
+    and supervisor tunables; ``procs``: the processes' (``change.build_stop_grace_s``)."""
+    async with cluster(tmp, ["host-a", "host-b"], proc_tunables=procs, agent_tunables=agent, sup_tunables=sup) as c:
         planner = Scripted(c)
         coord = Coordinator(c.sup, EventLog(tmp / "events.sqlite", c.blobs), planner=planner,
                             tun=msgspec.structs.replace(ChangeTunables(coordinator_timeout_s=30.0, drain_timeout_s=5.0),

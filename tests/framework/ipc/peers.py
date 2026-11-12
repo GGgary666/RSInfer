@@ -16,7 +16,7 @@ import zmq.asyncio
 from core.common.ids import Endpoint, HostId, ProcId
 from core.common.messages import Envelope, SchemaRegistry
 from core.common.result import Ok, Result
-from core.ipc import IpcTunables, PeerLost, RpcServer, StreamAddress, open_reader, open_writer
+from core.ipc import IpcTunables, PeerLost, RingBusy, RpcServer, StreamAddress, open_reader, open_writer
 
 BIND = "127.0.0.1"  # test data: the address of every fake host
 TUN = IpcTunables(heartbeat_interval_s=0.05, peer_timeout_s=0.5, stream_hwm=4,
@@ -108,3 +108,63 @@ def serve_rpc(q: Queue[Any]) -> None:
         await server.serve(handle)
 
     asyncio.run(main())
+
+
+def hold_the_gil(seconds: float) -> None:
+    """Block this process's every thread, its heartbeat's too, for ``seconds``: a libc call through
+    ``ctypes.PyDLL`` keeps the GIL, as a long C call of a unit does (a ``list.extend`` over 10^8
+    items, doc/framework-bugs/2026-11-10-a-long-gil-hold-looks-like-a-dead-peer.md)."""
+    import ctypes
+    import ctypes.util
+
+    libc = ctypes.PyDLL(ctypes.util.find_library("c"))
+    libc.usleep(ctypes.c_uint(int(seconds * 1e6)))
+
+
+def read_holding_the_gil(q: Queue[Any], host: str, peer: str, shm_name: str, hold_s: float, n: int) -> None:
+    """A reader that, after the first record, holds the GIL for ``hold_s``; then reads until ``n``
+    records came, or the writer was lost; reports how many it read."""
+    zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
+    r, addr = open_reader(zctx, local=HostId(host), peer=HostId(peer), bind_host=BIND, shm_name=shm_name, tun=TUN)
+    q.put(addr)
+    got = 0
+    try:
+        while got < 1:
+            got += r.read(timeout=20) is not None
+        q.put("holding")
+        hold_the_gil(hold_s)
+        q.put("released")
+        while got < n:
+            rec = r.read(timeout=20)
+            assert rec is not None
+            got += 1
+        q.put(got)
+    except PeerLost as e:
+        q.put(f"lost: {e}")
+    time.sleep(60)
+
+
+def write_holding_the_gil(address: StreamAddress, host: str, events: Queue[str], hold_s: float,
+                          second: bool = False) -> None:
+    """A writer that writes one record, holds the GIL for ``hold_s``, writes another and closes.
+    ``second``: before the hold, this process opens a second writer of the ring, which is refused
+    (and closes its own descriptor of the segment)."""
+    zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
+    w = open_writer(zctx, local=HostId(host), address=address, tun=TUN)
+    w.write(b"before", timeout=5)
+    if second:
+        try:
+            open_writer(zctx, local=HostId(host), address=address, tun=TUN)
+            events.put("second writer opened")
+        except RingBusy:
+            events.put("second writer refused")
+    events.put("holding")
+    hold_the_gil(hold_s)
+    try:
+        w.write(b"after", timeout=5)
+        events.put("wrote after")
+    except PeerLost as e:
+        events.put(f"lost: {e}")
+    w.close()
+    zctx.term()
+    time.sleep(60)
