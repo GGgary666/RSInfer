@@ -312,14 +312,19 @@ def prog() -> str:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    """SIGTERM to the control plane, which stops what it started; once ``--timeout`` passed,
-    SIGKILL to whatever of the engine is left (a process left behind keeps its GPU memory)."""
+    """SIGTERM to the control plane, which stops what it started (without it, to every process
+    that is left: nobody stops them for one another); once ``--timeout`` passed, SIGKILL to
+    whatever of the engine is left (a process left behind keeps its GPU memory)."""
     run = args.run.resolve()
     control, procs = engine_processes(run)
     if not procs:
         print(f"no engine runs in {run}", file=sys.stderr)
         return 0
-    os.kill(control if control is not None else procs[0], signal.SIGTERM)
+    for pid in [control] if control is not None else procs:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         _, procs = engine_processes(run)

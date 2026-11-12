@@ -13,7 +13,7 @@
 |---|---|
 | `$A serve <模型目录>` | 起一个引擎：前端、调度宿主、一个 worker（TP1），经过 `python -m core.control serve --spawn-agents`。默认在前台跑到 Ctrl-C；`--detach` 在后台跑，引擎起来就返回；`--dry-run` 只写拓扑和配置、打印命令 |
 | `$A status` | 引擎在不在跑、URL、控制面地址、身份、各进程状态、`/health` |
-| `$A stop` | 停引擎：给控制面发 SIGTERM，等这个引擎的进程全部退出；到 `--timeout`（默认 60 秒）还没退的 kill 掉。这个引擎的进程只按 `<run>/control` 和 `<run>/host-a/` 认，嵌在运行目录里的另一个引擎不受影响 |
+| `$A stop` | 停引擎：给控制面发 SIGTERM（控制面已经不在时，给留下的每个进程都发），等这个引擎的进程全部退出；到 `--timeout`（默认 60 秒）还没退的 kill 掉。这个引擎的进程只按 `<run>/control` 和 `<run>/host-a/` 认，嵌在运行目录里的另一个引擎不受影响 |
 | `$A sleep` / `$A wake` | 让出显存 / 拿回来（`holder.sleep`，见下面「睡和醒」） |
 | `$A control <命令> ...` | 控制面客户端（`python -m core.control.client`）：`check`、`apply`、`status`、`introspect`、`logs`，参数照旧；控制面地址从运行目录里找 |
 | `$A chat "..."` / `$A complete "..."` | 发一个请求（chat 或 completions），流式打到标准输出 |
