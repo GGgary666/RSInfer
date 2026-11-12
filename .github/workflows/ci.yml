@@ -9,6 +9,12 @@ jobs:
     # The organization's own Linux runners (shared organization runners), not GitHub's: hosted minutes are a
     # quota. All four labels, so that the job stays off the pool's other machines.
     runs-on: ubuntu-latest
+    env:
+      # One torch thread per process. A runner's machine has many cores, and torch starts a thread
+      # on each of them in every engine process of every test: two runs at once took 2.5 times as
+      # long and ran into a test's 120 s limit. The tests' models are tiny: with one thread the suite
+      # takes as long, on a fraction of the CPU time.
+      OMP_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
         with:
