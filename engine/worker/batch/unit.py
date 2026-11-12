@@ -68,7 +68,8 @@ class PersistentBatch:
     allocated: list[Any] = field(default_factory=list[Any])
     generation: int = 0
     rebuilt: bool = True
-    """Built and not yet given a full delta: it refuses every other one (``Resync``)."""
+    """Built, or left half changed by a step that failed (``invalidate``), and not yet given a full
+    delta: it refuses every other one (``Resync``)."""
 
     def __post_init__(self) -> None:
         # +1 padding row at index 0: padded batches read and write there harmlessly.
@@ -98,7 +99,7 @@ class PersistentBatch:
                for p, n in zip(plan.positions.values(), plan.num_tokens.values(), strict=True)):
             raise ValueError("plan exceeds batch.max_context_len")
         if self.rebuilt and not delta.full:
-            return "the persistent batch was rebuilt and waits for a full delta"
+            return "the persistent batch was rebuilt (or a step failed after changing it) and waits for a full delta"
         known = set() if delta.full else set(self.rows)
         for r in (int(x) for x in delta.removed.values()):
             if r not in known:
@@ -180,6 +181,12 @@ class PersistentBatch:
         self.tensors["last_token"][index] = tokens.to(torch.int64)
         for r in rows:
             self.rows[r].has_previous = True
+
+    def invalidate(self) -> None:
+        """A step failed after ``apply`` changed the batch: what it holds no longer matches what the
+        scheduler thinks it does (rows added, their last tokens not recorded). Until a full delta
+        rebuilds it, every other step is refused (``Resync``), not run on the half-changed tables."""
+        self.rebuilt = True
 
     def free(self) -> None:
         self.generation += 1

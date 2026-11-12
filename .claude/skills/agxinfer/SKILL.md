@@ -286,6 +286,6 @@ $A control status                               # 也可以是 introspect（单�
 
 ### 踩过的坑
 
-- 停引擎用 `$A stop --run <目录>`。别自己按命令行找进程杀：`pkill -f` 会匹配到发命令的 shell 自己；`ps | grep` 可能先匹配到外层启动 `serve` 的那个进程，杀了它，控制面和它起的进程都还在，显存也不放。`stop` 按进程参数里的运行目录精确地找（控制面的 `--state-dir <run>/control`，节点代理和进程宿主的快照路径）。
+- 停引擎用 `$A stop --run <目录>`。别自己按命令行找进程杀：`pkill -f` 会匹配到发命令的 shell 自己；`ps | grep` 可能先匹配到外层启动 `serve` 的那个进程，杀了它，控制面和它起的进程都还在，显存也不放。`stop` 按进程参数精确地找：控制面的 `--state-dir <run>/control`，节点代理和进程宿主参数里 `<run>/host-a/` 下的路径（快照、spec）；运行目录下面另一个目录里的引擎不算它的。
 - GPU 上的第一步可能很慢；超时都按 `--timeout` 放长了。
 - `$A checkpoint` 生成的 checkpoint 很大（27B 结构的 4 层约 7.6 GiB），用完删掉；快照目录是只读的，删之前先 `chmod -R u+w`。

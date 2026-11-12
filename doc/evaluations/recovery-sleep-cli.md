@@ -117,9 +117,23 @@
 - `tests/scenarios/test_m2a.py`：CPU 上用命令行在后台起引擎，然后 `status`、`sleep`（请求被拒）、`wake`（输出和睡前相同）、`control check`、`complete`、`stop`（不留进程）；同一个运行目录里第二个引擎被拒。
 - `tests/scenarios/test_no_temporary_checks.py`。
 
+## 审查以后改的（2026-11-12）
+
+Codex 和 Gemini 审了 #54，成立的几条：
+
+- **`stop` 会停掉嵌在运行目录里的另一个引擎**（Codex）。以前参数里带运行目录下任何路径的引擎进程都算；现在只认 `<run>/control`（控制面）和 `<run>/host-a/`（节点代理、进程宿主）。`test_m2a.py` 在 `run` 和 `run/nested` 各起一个引擎，停外面的，里面的照常服务。
+- **`serve` 只在控制面活着时拒绝**（Gemini）。控制面崩了、worker 还在时，现在也拒绝，提示先 `stop`。
+- **`--host 0.0.0.0` 连控制面也绑到所有网卡**（Gemini）。谁连得上控制面谁就能改引擎的代码。现在 `--host` 只管 HTTP，控制面和节点代理用 `--control-host`（默认 127.0.0.1）；`engine.json` 里的 URL 对通配地址给回环地址。
+- **开重叠时，出错那一步之后的一步会在改了一半的 batch 上跑**（Gemini 第 6 条里成立的部分）。`executors.pytorch` 在 batch 改过之后出错，就让 `worker.batch` 只收全量增量（`invalidate`），之后的步回 `Resync`。调度器恢复时本来就先发全量增量，所以恢复不受影响；这样只是不再在旧表上白跑一步，也少一个把 CUDA 上下文弄坏的机会。`tests/units/executors/test_pytorch.py` 有测试，旧代码上失败。
+
+Gemini 第 6 条的其余部分不成立：worker 按顺序处理步，设备上同一条 stream 排队，旧步写完之前新步不会开始写；迟到的旧答案被丢掉；恢复和以前"重载调度器"走同一条路。第 7.3 条（状态池没声明读 `holder.sleep`）不用改：它们读的是 holder 服务给的值，holder 重载会带着它们重载。
+
 ## 没做的、要注意的
 
-- **醒的时候读权重在暂停期里**，受执行时限（`supervisor.rpc_timeout_s`，30 秒）约束。4 层 7.6 GiB 用 1.6 秒；完整 64 层模型上没试过，可能超时，超时的话变更撤回，引擎还睡着。第二个 PR 让单元能在准备阶段做慢的事，以后可以把读 checkpoint 也挪过去。
+- **醒的时候读权重在暂停期里**，受执行时限（`supervisor.rpc_timeout_s`，30 秒）约束。4 层 7.6 GiB 用 1.6 秒；完整 64 层模型上没试过。
+  - 2026-11-12 更正（Gemini 的审查）：SM100 上暂停期内重读 55 GB 约 25 秒（`reload-time-vs-vllm-sglang.md`，页缓存热、eager），64 层重录 12 个 graph 桶约 6.4 秒，加起来超过 30 秒，开着 graph 很可能超时。
+  - 超时以后不一定"撤回、还睡着"。worker 在一个线程里处理控制消息，Execute 没返回之前读不到随后的 Abort（也是 30 秒）。执行 30 到 60 秒：撤回，还睡着；超过 60 秒：Abort 也超时，引擎要求恢复，只能重启。
+  - 第二个 PR（#55）给执行阶段单独的时限 `change.execute_timeout_s`，默认 3600 秒。
 - 睡着时剩下的 962 MiB 是 CUDA 上下文和 kernel 库自己的工作区（FlashInfer 的 384 MiB 等），没有放。
 - apply 救不回来的仍然救不回来：CUDA 上下文坏了（非法访存、device 端 assert）、进程死了、某一步卡住。这些要重启 worker 进程，现在没有不重启引擎的办法。
 - 只改状态内容、不换身份的变更（`refit`）不会让调度器恢复。

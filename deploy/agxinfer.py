@@ -81,7 +81,7 @@ def engine_record(run: Path) -> dict[str, Any]:
     if config.is_file():
         values = json.loads(config.read_text())
         if "url" not in record and "frontend.http_port" in values:
-            record["url"] = f"http://{values.get('frontend.http_bind') or '127.0.0.1'}:{values['frontend.http_port']}"
+            record["url"] = f"http://{reachable(values.get('frontend.http_bind') or '')}:{values['frontend.http_port']}"
         if "served_model_name" not in record and "frontend.model" in values:
             record["served_model_name"] = values["frontend.model"]
     return record
@@ -116,8 +116,11 @@ def _processes() -> dict[int, list[str]]:
 
 def engine_processes(run: Path) -> tuple[int | None, list[int]]:
     """The engine of ``run``: its control plane (``core.control serve --state-dir <run>/control``)
-    and every process started for it (their arguments name a path under ``run``)."""
-    root, control_dir = str(run.resolve()), str(run.resolve() / "control")
+    and the processes started for it, node agents and process hosts, whose arguments name a path
+    in its host's directory (``<run>/host-a/``: the snapshots, the processes' specs). Only these two
+    places count, not any path under ``run``: another engine may run from a directory inside it."""
+    run = run.resolve()
+    control_dir, host_dir = str(run / "control"), str(run / HOST)
     control: int | None = None
     procs: list[int] = []
     for pid, argv in _processes().items():
@@ -126,7 +129,7 @@ def engine_processes(run: Path) -> tuple[int | None, list[int]]:
         if "core.control" in argv and "serve" in argv and _value(argv, "--state-dir") == control_dir:
             control = pid
             procs.append(pid)
-        elif any(a == root or a.startswith(root + os.sep) for a in argv) and _is_engine(argv):
+        elif _is_engine(argv) and any(a == host_dir or a.startswith(host_dir + os.sep) for a in argv):
             procs.append(pid)
     return control, sorted(procs)
 
@@ -195,7 +198,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     host = HostId(HOST)
     graphs = cuda and args.cuda_graph != "off"
     topology = Topology(
-        hosts=[HostSpec(host, args.host, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
+        hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
         placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
                RoleSpec("worker", [], per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
@@ -229,9 +232,19 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
 def serve_command(args: argparse.Namespace, topo: Path, config: Path, tunables: dict[str, float]) -> list[str]:
     graphs = args.device == "cuda" and args.cuda_graph != "off"
     return [sys.executable, "-m", "core.control", "serve", "--source", str(args.source.resolve()), "--topology", str(topo),
-            "--state-dir", str(args.run.resolve() / "control"), "--host", HOST, "--bind", args.host,
+            "--state-dir", str(args.run.resolve() / "control"), "--host", HOST, "--bind", args.control_host,
             "--config", str(config), "--spawn-agents", "--platform",
             json.dumps({"name": "cuda_graph" if graphs else "torch_eager"}), "--tunables", json.dumps(tunables)]
+
+
+def reachable(host: str) -> str:
+    """The address a client on this machine reaches a server listening on ``host`` at: the
+    loopback one for a wildcard (``0.0.0.0``, ``::``), an IPv6 address in brackets."""
+    if host in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if host == "::":
+        return "[::1]"
+    return f"[{host}]" if ":" in host else host
 
 
 def _stop_with_parent() -> None:
@@ -248,9 +261,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if not args.model:
         raise SystemExit("serve: give the model directory (agxinfer serve <model dir>)")
     run = args.run.resolve()
-    running, _ = engine_processes(run)
+    running, procs = engine_processes(run)
     if running is not None:
         raise SystemExit(f"an engine already runs in {run} (process {running}): agxinfer stop --run {args.run}")
+    if procs:  # its control plane is gone, not what it started: a worker left behind keeps its GPU memory
+        raise SystemExit(f"processes {procs} of an earlier engine in {run} are still running: stop them first with "
+                         f"agxinfer stop --run {args.run}")
     topo, config, tunables, recipe = plan(args)
     command = serve_command(args, topo, config, tunables)
     if args.dry_run:
@@ -267,7 +283,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         proc = subprocess.Popen(command, env=env(), start_new_session=True, preexec_fn=_stop_with_parent)
         signal.signal(signal.SIGINT, lambda *_: proc.send_signal(signal.SIGTERM))
         signal.signal(signal.SIGTERM, lambda *_: proc.send_signal(signal.SIGTERM))
-    url = f"http://{args.host}:{args.port}"
+    url = f"http://{reachable(args.host)}:{args.port}"
     record = {"pid": proc.pid, "url": url, "model": str(Path(args.model).resolve()), "recipe": recipe.NAME,
               "served_model_name": args.served_model_name or recipe.SERVED_NAME, "source": str(args.source.resolve()),
               "detached": bool(args.detach), "started": time.time()}
@@ -490,8 +506,11 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     sched.add_argument("--token-budget", type=int, default=2048, help="prompt tokens per step")
     sched.add_argument("--overlap", action="store_true", help="one step of overlap (sched.overlap)")
     e = s.add_argument_group("engine")
-    e.add_argument("--host", "--bind", dest="host", default="127.0.0.1", help="address the frontend and the control "
-                   "plane listen on")
+    e.add_argument("--host", "--bind", dest="host", default="127.0.0.1",
+                   help="address the frontend (HTTP) listens on, e.g. 0.0.0.0 for every interface")
+    e.add_argument("--control-host", default="127.0.0.1",
+                   help="address the control plane and the node agent listen on; whoever reaches it can change the "
+                        "engine's code (default: this machine only)")
     e.add_argument("--port", type=int, default=8000)
     _run_option(s)
     e.add_argument("--source", type=Path, default=REPO, help="workspace whose engine/ the engine starts from "
