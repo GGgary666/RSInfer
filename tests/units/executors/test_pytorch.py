@@ -92,6 +92,30 @@ def test_a_rebuilt_batch_answers_resync_until_a_full_delta_then_continues(worker
     assert {row: d.requests[row].outputs for row in PROMPTS} == want
 
 
+def test_a_step_that_fails_after_changing_the_batch_leaves_it_refusing_all_but_a_full_delta(worker: Worker) -> None:
+    """With ``sched.overlap`` the step after a failed one is already on its way: it must not run on
+    the tables the failed step half changed (its rows added, their last tokens not recorded). The
+    scheduler ends the failed step's requests and starts over with a full delta, which serves."""
+    want, _ = run(worker, [0, 1])
+    d = Driver(worker)
+    for row in PROMPTS:
+        d.add(row, PROMPTS[row])
+    d.generate([0, 1], 2)
+    sampler = worker.service("executor@1").sampler  # a service proxy: setting goes to the sampler
+    real = sampler.sample
+
+    def failing(*args: object) -> object:
+        sampler.sample = real
+        raise RuntimeError("injected device fault")
+
+    sampler.sample = failing
+    with pytest.raises(RuntimeError, match="injected device fault"):
+        d.step({0: 1, 1: 1})  # the model ran, the sampler failed: nothing recorded
+    resync = d.step({0: 1, 1: 1})
+    assert isinstance(resync, Resync) and "waits for a full delta" in resync.reason
+    assert run(worker, [0, 1])[0] == want  # new requests, from a full delta
+
+
 def test_a_request_restored_from_a_snapshot_continues_as_one_computed_from_scratch(worker: Worker) -> None:
     """Request A's GDN state is snapshotted when its prompt ends (StateCopy after); B, whose prompt
     starts with A's, reads A's KV pages and restores the snapshot (StateCopy before) instead of

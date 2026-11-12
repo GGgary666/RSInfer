@@ -270,6 +270,56 @@ def test_the_cli_runs_an_engine_in_the_background_puts_it_to_sleep_and_stops_it(
                                               capture_output=True, text=True, timeout=60).stderr
 
 
+def test_stop_leaves_an_engine_run_from_inside_the_run_directory_alone(model: Path, tokenizer: Path,
+                                                                      tmp_path: Path) -> None:
+    """``stop`` took every engine process whose arguments named a path under the run directory, so
+    also those of an engine run from a directory inside it (Codex's review of #54). And ``--host``
+    is the frontend's alone: with ``0.0.0.0`` the control plane still listens on this machine only,
+    and the URL a client is given is the loopback one."""
+    from deploy.agxinfer import engine_processes
+
+    outer, inner = tmp_path / "run", tmp_path / "run" / "nested"
+    ports = {outer: free_port(), inner: free_port()}
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3", "max_tokens": 4, "temperature": 0.0, "ignore_eos": True}
+
+    def serve(run: Path, *more: str) -> None:
+        cli("serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype",
+            "f32", "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8", "--cpu-bytes",
+            str(4 << 20), "--timeout", "120", "--port", str(ports[run]), "--run", str(run), "--detach", *more,
+            timeout=180)
+
+    try:
+        serve(outer)
+        serve(inner, "--host", "0.0.0.0")
+        (_, mine), (_, theirs) = engine_processes(outer), engine_processes(inner)
+        assert len(mine) == len(theirs) == 5 and not set(mine) & set(theirs), (mine, theirs)  # control, agent, 3 hosts
+        record = json.loads((inner / "engine.json").read_text())
+        assert record["url"] == f"http://127.0.0.1:{ports[inner]}", record
+        assert record["control"].startswith("tcp://127.0.0.1:"), record
+        assert post(record["url"] + "/v1/completions", body)["choices"][0]["text"]
+
+        cli("stop", "--run", str(outer), timeout=120)
+        assert engine_processes(outer) == (None, [])
+        assert engine_processes(inner)[1] == theirs
+        assert post(record["url"] + "/v1/completions", body)["choices"][0]["text"]
+    finally:
+        for run in (outer, inner):
+            cli("stop", "--run", str(run), timeout=120)
+
+
+def test_serve_refuses_a_run_directory_whose_last_engine_left_processes(monkeypatch: pytest.MonkeyPatch,
+                                                                         tmp_path: Path) -> None:
+    """Its control plane is gone, a worker it started is not: that worker keeps its GPU memory, and
+    another engine would start beside it."""
+    import deploy.agxinfer as agx
+
+    monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [4242]))
+    with pytest.raises(SystemExit, match=r"processes \[4242\] of an earlier engine .* agxinfer stop"):
+        agx.cmd_serve(agx.parser().parse_args(["serve", str(tmp_path), "--run", str(tmp_path / "run")]))
+    assert [agx.reachable(h) for h in ("0.0.0.0", "::", "127.0.0.1", "fe80::1")] == \
+        ["127.0.0.1", "[::1]", "127.0.0.1", "[fe80::1]"]
+
+
 def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a

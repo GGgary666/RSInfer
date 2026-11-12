@@ -13,13 +13,13 @@
 |---|---|
 | `$A serve <模型目录>` | 起一个引擎：前端、调度宿主、一个 worker（TP1），经过 `python -m core.control serve --spawn-agents`。默认在前台跑到 Ctrl-C；`--detach` 在后台跑，引擎起来就返回；`--dry-run` 只写拓扑和配置、打印命令 |
 | `$A status` | 引擎在不在跑、URL、控制面地址、身份、各进程状态、`/health` |
-| `$A stop` | 停引擎：给控制面发 SIGTERM，等这个引擎的进程全部退出；到 `--timeout`（默认 60 秒）还没退的 kill 掉 |
+| `$A stop` | 停引擎：给控制面发 SIGTERM，等这个引擎的进程全部退出；到 `--timeout`（默认 60 秒）还没退的 kill 掉。这个引擎的进程只按 `<run>/control` 和 `<run>/host-a/` 认，嵌在运行目录里的另一个引擎不受影响 |
 | `$A sleep` / `$A wake` | 让出显存 / 拿回来（`holder.sleep`，见下面「睡和醒」） |
 | `$A control <命令> ...` | 控制面客户端（`python -m core.control.client`）：`check`、`apply`、`status`、`introspect`、`logs`，参数照旧；控制面地址从运行目录里找 |
 | `$A chat "..."` / `$A complete "..."` | 发一个请求（chat 或 completions），流式打到标准输出 |
 | `$A checkpoint --config <目录> --out <目录>` | 按一份配置生成随机权重，布局和这个模型家族的真 checkpoint 一样（Qwen3.8：多模态命名 `model.language_model.*`，外加加载器会跳过的 `visual`、`mtp` 张量）；可以只保留前 N 层 |
 
-**运行目录**（`--run`，默认 `run/agxinfer`）就是一个引擎：拓扑和配置（`topology.json`、`config.json`）、控制面的状态（`control/`）、快照和各进程的日志（`host-a/snapshots/`）、`engine.json`（控制面进程、URL、控制面地址），`--detach` 时还有 `engine.log`。每个命令都靠 `--run` 找到它的引擎；一个运行目录里同时只能有一个引擎。
+**运行目录**（`--run`，默认 `run/agxinfer`）就是一个引擎：拓扑和配置（`topology.json`、`config.json`）、控制面的状态（`control/`）、快照和各进程的日志（`host-a/snapshots/`）、`engine.json`（控制面进程、URL、控制面地址），`--detach` 时还有 `engine.log`。每个命令都靠 `--run` 找到它的引擎；一个运行目录里同时只能有一个引擎，上一个引擎还有进程留着（比如控制面崩了，worker 还在）时 `serve` 也拒绝，先 `stop`。
 
 ```sh
 uv sync --python 3.12 --extra gpu --extra frontend      # 没有 GPU 的机器用 --extra cpu
@@ -39,7 +39,7 @@ $A stop
 和 `qwen38.py` 比改了的：
 
 - 模型目录从 `--model` 改成位置参数（`--model` 还认）；
-- `--bind` 改叫 `--host`，`--name` 改叫 `--served-model-name`（旧名字还认）；
+- `--bind` 改叫 `--host`，`--name` 改叫 `--served-model-name`（旧名字还认）；`--host` 只管 HTTP（可以给 `0.0.0.0`），控制面和节点代理另由 `--control-host` 定，默认只在本机（2026-11-12：谁连得上控制面谁就能改引擎的代码）；
 - `plan` 并进了 `serve --dry-run`，`chat --completion` 改成 `complete`；
 - 新增 `--detach`、`--set 键=值`（任何配置键，值按 JSON 解析，解析不了当字符串）、`status`、`stop`、`sleep`、`wake`、`control`。
 
