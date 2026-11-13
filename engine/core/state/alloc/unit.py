@@ -61,7 +61,9 @@ class JointLedger:
             given[kind] = admitted.items
         return Admitted(0, given)
 
-    def reserve(self, request: int, upto: int, step: int) -> Reserved | None:
+    def reserve(self, request: int, upto: int, step: int, speculative: bool = False) -> Reserved | None:
+        """Without a cache, speculation changes nothing here: the pages up to ``upto`` are what a
+        speculative step may write, and a position counts pages only."""
         given: dict[str, list[int]] = {}
         for kind, pool in self.pools.items():
             holding = pool.holdings[request]
@@ -93,7 +95,7 @@ class JointLedger:
         for pool in self.pools.values():
             pool.release(request, last_step)
 
-    def retire(self, step: int, ran: bool = True) -> None:
+    def retire(self, step: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> None:
         for pool in self.pools.values():
             pool.retire(step, ran)
 
@@ -114,6 +116,11 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         declarations = msgspec.convert(config["alloc.states"], list[StateDecl])
         check_page_size(declarations, config["state.kv.page_size"])
+        if config["alloc.radix_cache"] and config["spec.algorithm"] and \
+                config["alloc.mamba_track_interval"] < config["spec.num_draft_tokens"]:
+            # A verify step crosses one tracking boundary at most (SGLang's mamba_hook).
+            raise ValueError(f"alloc.mamba_track_interval = {config['alloc.mamba_track_interval']} must be at least "
+                             f"spec.num_draft_tokens = {config['spec.num_draft_tokens']} (as SGLang's)")
         if config["alloc.radix_cache"]:
             ctx.provide("ledger@1", RadixLedger(declarations, track_interval=config["alloc.mamba_track_interval"],
                                                 max_states_per_path=config["alloc.mamba_max_states_per_path"]))

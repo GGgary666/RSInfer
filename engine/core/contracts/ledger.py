@@ -80,10 +80,12 @@ class Ledger(Protocol):
         some kind did not have them, and nothing is held."""
         ...
 
-    def reserve(self, request: int, upto: int, step: int) -> Reserved | None:
+    def reserve(self, request: int, upto: int, step: int, speculative: bool = False) -> Reserved | None:
         """``step`` computes the request's input up to position ``upto`` (exclusive). ``None``: what
         it needs is not there, and what ``step`` took for the request is given back at once (as
-        ``cancel``)."""
+        ``cancel``). ``speculative``: a decode step that verifies drafts (doc/specs/mtp.md): it
+        writes up to ``upto`` at most, advances by what is accepted (``retire``), and a GDN state it
+        keeps for the prefix cache is at the boundary it crosses, if any (``StateTrack`` ``upto -1``)."""
         ...
 
     def items(self, request: int) -> dict[str, list[int]]:
@@ -112,9 +114,10 @@ class Ledger(Protocol):
         item 5), what it computed enters the prefix cache and its other items return."""
         ...
 
-    def retire(self, step: int, ran: bool = True) -> None:
+    def retire(self, step: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> None:
         """Every rank answered ``step``. ``ran=False`` (``Resync``): its input was not computed, so
-        the request's position goes back to before the step; its items stay with it."""
+        the request's position goes back to before the step; its items stay with it. ``advanced``:
+        request -> tokens its speculative reservation of the step accepted."""
         ...
 
     def check(self) -> list[str]:

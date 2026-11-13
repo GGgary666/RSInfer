@@ -180,14 +180,17 @@ class RequestTable:
             entry.identities.append(identity)
         return token_events(identity, {request: []}, {request: reason})
 
-    def retire(self, epoch: int, ran: bool = True) -> list[int]:
-        """All ranks finished this step. Return terminal requests whose resources may now go."""
+    def retire(self, epoch: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> list[int]:
+        """All ranks finished this step. Return terminal requests whose resources may now go.
+        ``advanced``: row -> tokens a speculative decode row accepted (doc/specs/mtp.md), instead of
+        the count the step was planned with."""
         step = self.steps.pop(epoch)
         ready: list[int] = []
         for row, rid in step.rows.items():
             request = self.requests[rid]
             if ran:
-                request.computed += step.counts.get(row, 0)
+                request.computed += advanced[row] if advanced is not None and row in advanced else \
+                    step.counts.get(row, 0)
             request.pending.remove(epoch)
             if request.reclaimable:
                 ready.append(rid)

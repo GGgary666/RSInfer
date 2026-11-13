@@ -303,6 +303,9 @@ class Holding:
     prev_seqlen: int | None = None
     restore_step: int | None = None
     restored: bool = True
+    committed: int = 0
+    """Tokens computed, as the retired steps say: ``position`` runs ahead of it by the steps in
+    flight, and by the drafts a speculative step may not accept (doc/specs/mtp.md)."""
 
 
 @dataclass
@@ -313,6 +316,8 @@ class Reservation:
     track: tuple[int, int] | None = None
     decode: bool = False
     restore: bool = False
+    upto: int = 0
+    speculative: bool = False
 
 
 class RadixLedger:
@@ -470,7 +475,8 @@ class RadixLedger:
             self.tree.lock(anchor)  # the restore source, until the state is copied
         self.holdings[request] = Holding(
             len(prompt), [*prefix_pages, *pages], set(pages), slots[0], slots[1:], anchor,
-            anchor if hit else None, m.prefix, aligned if aligned > m.prefix else None, restored=not hit)
+            anchor if hit else None, m.prefix, aligned if aligned > m.prefix else None, restored=not hit,
+            committed=m.prefix)
         self.reservations[step, request] = Reservation(m.prefix, admission=True)
         return Admitted(m.prefix, {KV: [*prefix_pages, *pages], GDN: [slots[0]]})
 
@@ -487,9 +493,10 @@ class RadixLedger:
             at = b  # the branching point is in this chunk: track it there
         return at, False
 
-    def reserve(self, request: int, upto: int, step: int) -> Reserved | None:
+    def reserve(self, request: int, upto: int, step: int, speculative: bool = False) -> Reserved | None:
         h = self.holdings[request]
         r = self.reservations.setdefault((step, request), Reservation(h.position))
+        r.upto, r.speculative = upto, speculative
         start = h.position
         added = self._take(KV, max(0, self._count(upto) - len(h.pages)))
         if added is None:
@@ -504,7 +511,16 @@ class RadixLedger:
             restore[GDN] = (h.restore_from.state, h.run)
             h.restore_step, r.restore = step, True
         track: dict[str, tuple[int, int]] = {}
-        where = self._track(h, start, upto)
+        if speculative:
+            # Every speculative decode step carries the next tracking slot (SGLang's
+            # mamba_track_indices); whether it crosses a boundary is known once it retired. Two in
+            # flight share the slot: one step crosses at most one boundary (mamba_track_interval
+            # >= num_draft_tokens), and two in a row do not (a boundary every decode_grid tokens).
+            track[GDN] = (h.track[h.next_idx], -1)
+            r.track, r.decode = (h.next_idx, -1), True
+            where = None
+        else:
+            where = self._track(h, start, upto)
         if where is not None:
             idx = h.next_idx
             track[GDN] = (h.track[idx], where[0])
@@ -546,14 +562,27 @@ class RadixLedger:
             del self.reservations[key]
         self._flush_if_idle()
 
-    def retire(self, step: int, ran: bool = True) -> None:
+    def retire(self, step: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> None:
         for key, r in list(self.reservations.items()):
             epoch, request = key
             if epoch != step:
                 continue
             del self.reservations[key]
             h = self.holdings[request]
-            if ran:
+            if ran and r.speculative:
+                if advanced is None or request not in advanced:
+                    raise ValueError(f"speculative step {step} retired without request {request}'s accepted length")
+                start, end = h.committed, h.committed + advanced[request]
+                if r.track is not None and start // self.decode_grid != end // self.decode_grid:
+                    # _verify_commit_step_indices: the worker kept the state at the boundary
+                    h.prev_seqlen = h.last_seqlen
+                    h.last_seqlen, h.last_idx = end // self.decode_grid * self.decode_grid, r.track[0]
+                    h.next_idx = 1 - r.track[0]
+                h.committed = end
+                if r.restore:
+                    h.restored = True
+                    self._restored(h)
+            elif ran:
                 if r.track is not None:  # TrackingAdvance
                     if r.decode:
                         h.prev_seqlen = h.last_seqlen
@@ -561,9 +590,11 @@ class RadixLedger:
                 if r.restore:
                     h.restored = True
                     self._restored(h)
+                if r.upto:  # an admission's own reservation has none until its first chunk is reserved
+                    h.committed = r.upto
             else:
                 h.position = min(h.position, r.previous)
-                if r.track is not None:
+                if r.track is not None and not r.speculative:
                     h.next_idx = 1 - h.last_idx
                 if r.restore:
                     h.restore_step = None
@@ -626,6 +657,7 @@ class RadixLedger:
         self.tree.lock(h.anchor)
         h.position, h.branching, h.restored, h.restore_step = 0, None, True, None
         h.last_seqlen = h.prev_seqlen = None
+        h.committed = 0
         return True
 
     def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:

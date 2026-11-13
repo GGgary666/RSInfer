@@ -9,3 +9,10 @@ services = ["executor@1"]
 
 [requires]
 services = ["worker.batch@1", "plan@1", "layers.sampler@1", "state.kv.paged@1", "state.gdn.slots@1"]
+
+[config]
+# Speculative decoding with the model's MTP layer (doc/specs/mtp.md), SGLang's EAGLE chain.
+"spec.algorithm" = { type = "str", default = "", binding = "startup", doc = "SGLang's --speculative-algorithm: \"\" (off, the default) or \"eagle\" (the model's MTP layer drafts; SGLang runs NEXTN as EAGLE)." }
+"spec.num_steps" = { type = "int", default = 3, binding = "startup", doc = "SGLang's --speculative-num-steps: draft tokens per step, the first from the draft extend." }
+"spec.eagle_topk" = { type = "int", default = 1, binding = "startup", doc = "SGLang's --speculative-eagle-topk; only 1 (a chain) is supported." }
+"spec.num_draft_tokens" = { type = "int", default = 4, binding = "startup", doc = "SGLang's --speculative-num-draft-tokens: tokens a decode row verifies, num_steps + 1 for a chain." }

@@ -11,7 +11,7 @@ services = ["ledger@1"]
 drain_on_reload = true
 
 [reads]
-config = ["state.kv.page_size"]
+config = ["state.kv.page_size", "spec.algorithm", "spec.num_draft_tokens"]
 
 [config]
 "alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them: request pages and request slots." }
