@@ -80,7 +80,11 @@ class Drain:
         self.loop.ledger.flush()
 
     def abort(self) -> None:
+        """The change was undone: the units it reloaded are back, but not what their stores held.
+        A worker's state pools rebuilt for it, then rebuilt again by the undo, keep none of the
+        cached states (Codex, #59): the prefix cache goes here too."""
         self._open()
+        self.loop.ledger.flush()
 
     def _open(self) -> None:
         self.loop.drain_mode, self.loop.held = None, False

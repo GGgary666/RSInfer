@@ -251,7 +251,12 @@ class Engine:
         """``proc.control@1``: the identity the engine serves (the workers serve it too)."""
         self.runtime.provide_host("proc.control@1", self.control)
         self.runtime.provide_host("proc.streams@1", self.channels)
-        self.runtime.load_process_plan(ProcessPlan(SCHED, Identity("v1"), self.units, config=self.config)).unwrap()
+        try:
+            self.runtime.load_process_plan(ProcessPlan(SCHED, Identity("v1"), self.units, config=self.config)).unwrap()
+        except BaseException:  # a unit refused its configuration: no socket is left for the GC's zmq term to wait on
+            self.channels.close()
+            self.zctx.destroy(linger=0)
+            raise
 
     @property
     def loop(self) -> Scheduler:

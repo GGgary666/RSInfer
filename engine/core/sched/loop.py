@@ -252,6 +252,12 @@ class Scheduler:
             raise ValueError("one plan writer and one result reader per rank")
         if settings.max_batch < 1 or settings.token_budget < 1:
             raise ValueError("sched.max_batch and sched.token_budget must be positive")
+        if settings.token_budget % ledger.align:
+            # A chunk that does not end its prompt ends on a page (_carry_out): a smaller budget
+            # never computes one. SGLang: chunked_prefill_size must be divisible by page_size.
+            raise ValueError(f"sched.token_budget = {settings.token_budget} must be a multiple of the prefix "
+                             f"cache's page, state.kv.page_size = {ledger.align} (as SGLang's "
+                             "chunked_prefill_size), or alloc.radix_cache = false")
         self.table, self.ledger, self.order, self.compose = table, ledger, order, compose
         self.requests, self.results = requests, list(results)
         self.plans = [Outbox(w) for w in plans]

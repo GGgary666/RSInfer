@@ -338,6 +338,9 @@ class RadixLedger:
         self.decode_grid = math.lcm(self.grid, track_interval)
         """``mamba_track_grid``: where decoding tracks its state."""
         self.max_states_per_path = max_states_per_path
+        self.matches: dict[int, int] = {}
+        """``match`` of the requests still waiting, on the tree of ``matches_version``."""
+        self.matches_version = -1
         self.tree = self._new_tree()
         self.capacity = {KV: 0, GDN: 0}
         self.free = {KV: Free(), GDN: Free()}
@@ -346,12 +349,12 @@ class RadixLedger:
         self.releases: dict[int, tuple[int, list[int]]] = {}
         self.retired = -1
         self.ready = False
-        self.matches: dict[int, int] = {}
-        self.matches_version = -1
         self.stale = False
         """Flushed while requests held items: no match, nothing kept, until the last one ended."""
 
     def _new_tree(self) -> RadixTree:
+        self.matches.clear()  # a new tree counts its versions from 0 again
+        self.matches_version = -1
         tree = RadixTree(self.page, self.max_states_per_path)
         tree.freed_states = []
         return tree
@@ -454,6 +457,7 @@ class RadixLedger:
             self.tree.unlock(anchor)
             return None
         self.tree.touch(anchor)
+        self.matches.pop(request, None)  # no longer waiting
         aligned = m.kv // self.grid * self.grid
         hit = anchor is not self.tree.root
         if hit:
@@ -597,6 +601,7 @@ class RadixLedger:
             self.free[GDN].extend([donated])
 
     def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:
+        self.matches.pop(request, None)  # it may end while still waiting
         if request not in self.holdings:
             return
         self.releases[request] = (last_step, list(tokens))

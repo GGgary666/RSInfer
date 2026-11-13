@@ -164,3 +164,29 @@ def test_a_flush_drops_the_cache_once_no_request_holds_items_and_a_repeated_capa
     led.release(3, 2, a)
     assert not led.holdings and led.tree.held() == ([], []) and led.check() == []
     assert len(led.free[KV]) == 64 and len(led.free[GDN]) == 20
+
+
+def test_a_match_is_kept_only_while_its_request_waits_and_only_on_its_own_tree() -> None:
+    """Requests too short for a checkpoint never change the tree: their matches stayed and grew
+    with every request served (Codex, #59). A new tree counts its versions from 0 again: a match
+    made on the old one must not pass for one on it."""
+    led = ledger()
+    for rid in range(1, 1001):
+        prompt = [rid % 7 + 1] * 10
+        assert led.match(rid, prompt) == 0
+        run(led, rid, prompt, rid, 10, admit=12)
+        led.release(rid, rid, prompt)
+    led.match(5000, [1] * 10)
+    led.release(5000, 1000)  # it ended while still waiting
+    assert led.matches == {} and not led.holdings and led.check() == []
+    a, c = list(range(200)), list(range(1000, 1200))
+    run(led, 1001, c, 1001, 200, admit=210)
+    led.commit(1001, c)
+    led.release(1001, 1001, c)
+    assert led.match(9, a) == 0
+    version = led.tree.version
+    led.flush()  # nothing is held: a new tree at once
+    run(led, 1002, a, 1002, 200, admit=210)
+    led.commit(1002, a)
+    led.release(1002, 1002, a)
+    assert led.tree.version == version and led.match(9, a) == 192

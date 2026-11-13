@@ -451,3 +451,18 @@ def test_admission_keeps_to_what_a_row_of_the_workers_holds() -> None:
         rows = {a.row for _, _, d in b.workers[0].fixture.plans_seen for a in d.added}
         assert rows <= {0, 1}
         check(b, fits)
+
+
+def test_with_the_prefix_cache_a_token_budget_that_is_not_a_multiple_of_the_page_is_refused() -> None:
+    """A chunk that does not end its prompt ends on a page: with a budget below a page none ever ran,
+    and a long request waited forever (Codex, #59). Refused when the scheduler loads, as SGLang
+    refuses a ``chunked_prefill_size`` that is not a multiple of ``page_size``; without the cache
+    chunks end anywhere."""
+    with pytest.raises(Exception, match=r"sched.token_budget = 2 must be a multiple of .*page_size = 4"):
+        with bed(token_budget=2, config={"alloc.radix_cache": True}):
+            pass
+    with bed(token_budget=2) as b:
+        r = request(1, list(range(1, 12)), 3)
+        b.client.send([r])
+        b.run_until(b.finished(1))
+        check(b, [r])

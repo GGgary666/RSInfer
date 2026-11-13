@@ -206,13 +206,18 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 - **重复的页**：树里已经有的 token，请求自己的页不交给树，到请求结束才放。worker 的表只往后加，SGLang 是把树里的页写进请求那一行。
 - **prefill 末尾的 conv 状态**：从这一行自己的槽里拷，SGLang 从输入里取窗口。行比窗口长时两者相同，比窗口短时只有前者对。
 - **最多几个请求**：账本到了数就不再接纳；SGLang 是启动时把 `max_running_requests` 限住。超过 `sched.max_batch` 时调度器在日志里说。
-- **丢掉缓存**（`flush`）：每次提交的变更（排空的 `commit`，`refit` 也算）和换了 worker 时都丢，比 SGLang 只在换权重时丢更保守。空闲时 worker 每秒重报一次 `Capacity`，数一样就什么也不动。
+- **丢掉缓存**（`flush`）：每次提交的变更（排空的 `commit`，`refit` 也算）、每次撤回的变更（排空的 `abort`）和换了 worker 时都丢，比 SGLang 只在换权重时丢更保守。撤回也要丢：变更可能已经重建了状态池，后面的单元加载失败、撤回时旧单元重新加载，池子是空的（Codex，#59）。空闲时 worker 每秒重报一次 `Capacity`，数一样就什么也不动。
 - **淘汰**：没搬 `_cascade_evict`。中间节点只摘掉状态，留下 KV。
-- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。
+- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。记下的命中只留给还在等的请求：接纳时、请求结束时（还没接纳就结束的也算）删掉，换一棵新树时全清，因为新树的版本号从 0 重新数（Codex，#59）。
+- **token 预算**：开着缓存时，`sched.token_budget` 必须是 `state.kv.page_size` 的整数倍，否则调度器加载失败（启动时起不来，apply 时撤回）。不到最后的 chunk 要停在整页上，预算小于一页就永远算不了，请求一直挂着（Codex，#59）。SGLang 在启动时同样要求 `chunked_prefill_size % page_size == 0`，不管开不开缓存；我们关着缓存时 chunk 不对齐页，所以不要求。
 
 ### 7.3 测试（CPU，进 CI）
 
-- **账本**：`tests/units/scheduler/test_radix.py`，9 条：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`。
+- **账本**：`tests/units/scheduler/test_radix.py`，10 条：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`、记下的命中只留给还在等的请求（换新树时也不串）。
+- **排空和配置**（Codex 在 #59 的评审，2026-11-13）：
+  - `tests/units/scheduler/test_drain.py::test_an_undone_change_drops_the_prefix_cache_as_a_committed_one_does`：撤回以后不再命中；
+  - `tests/units/scheduler/test_scheduling.py::test_with_the_prefix_cache_a_token_budget_that_is_not_a_multiple_of_the_page_is_refused`：开着缓存、预算 2、页 4 时调度器不加载，关着缓存时照常跑完。
+  - 三处修复各自拿掉，对应的测试都失败。
 - **worker**：`tests/units/executors/test_prefix_track.py`。
   - 存下的状态和单独算到那里的相同，chunk 中间、chunk 末尾、decode 三种位置都测；
   - 从存下的状态恢复、共享页再算 4 个 token：状态和 logits 是整个提示词的，不恢复的对照差得远；
