@@ -162,7 +162,8 @@ class PyTorchExecutor:
         reason = self.batch.check(delta, plan)
         if reason:
             return Resync(reason)
-        chosen, eager = self._plans(plan)
+        # A speculative step picks its plans itself (PlanService.verify), after the rows' positions.
+        chosen, eager = self._plans(plan) if self.spec is None else (self.plans.get(PlanKey("prefill", 0)),) * 2
         last_token = self.batch.binding.buffers()["last_token"]
         device = last_token.device
         begin = Mark(device)

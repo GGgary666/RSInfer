@@ -156,3 +156,86 @@ class GraphPlan:
         if self.size == 1:
             torch.testing.assert_close(self.output, expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
                 f"a decode graph replays other logits than the eager forward it recorded: {m}"))
+
+
+def verify_padding_row(steps: int) -> BatchPlan:
+    """A verify step of the padding row alone (doc/specs/mtp.md): ``steps`` tokens on the scratch items."""
+    return BatchPlan(Column.of("i32", [-1]), Column.of("i32", [steps]), Column.of("i32", [0]),
+                     Column.of("i64", []), Column.of("u8", [0]), "decode", 0, steps)
+
+
+class VerifyGraphPlan:
+    """A verify step for one bucket of rows (doc/specs/mtp.md): SGLang's decode graph runner in
+    ``TARGET_VERIFY``, ``num_tokens_per_bs`` the step's D tokens a row; the target's logits and hidden
+    states of every token. The rows are padded with the padding row, D tokens each."""
+
+    def __init__(self, size: int, steps: int, device: torch.device, backends: Sequence[Backend]) -> None:
+        self.size, self.steps, self.backends = size, steps, list(backends)
+        self.inputs = torch.zeros(size * steps, dtype=torch.int64, device=device)
+        self.positions = torch.zeros_like(self.inputs)
+        self.every = torch.arange(size * steps, device=device)
+        self.output: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.graph: Any = None
+
+    def run(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor
+            ) -> tuple[Tensor, Tensor]:
+        n = len(view.rows)
+        if view.draft_tokens != self.steps or not 0 < n <= self.size:
+            raise ValueError(f"a verify graph runs {self.steps} tokens a row, at most its bucket of {self.size} rows")
+        for backend in self.backends:
+            backend.prepare(batch, view, PlanKey("decode", self.size))
+        tokens = n * self.steps
+        self.inputs[:tokens].copy_(input_ids)
+        self.positions[:tokens].copy_(positions)
+        self.inputs[tokens:].zero_()
+        self.positions[tokens:].zero_()
+        self.graph.replay()
+        assert self.output is not None
+        logits, hidden = self.output
+        return logits[:tokens], hidden[:tokens]
+
+    def close(self) -> None:
+        if self.graph is not None:
+            self.graph.close()
+        self.graph, self.output = None, None
+
+    def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        for store in stores:
+            store.clear(store.scratch())
+        for backend in self.backends:
+            backend.prepare(batch, verify_padding_row(self.steps), PlanKey("decode", self.size))
+        # Not inference mode: FlashInfer's prefill wrapper allocates buffers at its first forward that
+        # each later plan, outside inference mode, writes into.
+        with torch.no_grad():
+            return model.forward_hidden(self.inputs, self.positions, self.every)
+
+    def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
+        """As ``GraphPlan.capture``: a warm-up eager forward, the capture, a replay. Not held to the eager
+        logits: the padding row's D tokens all store their K/V in one slot (its row of ``req_to_token`` is
+        the padding slot everywhere), which of them lands there is up to the device, eagerly as in the
+        replay. A real row's tokens have slots of their own (tests/gpu: a replayed verify step is the
+        eager one)."""
+        with recorder.warmup():
+            self.padded(batch, model, stores)
+            for store in stores:
+                store.clear(store.scratch())
+        with torch.inference_mode(), recorder.capture() as graph:
+            self.output = model.forward_hidden(self.inputs, self.positions, self.every)
+        self.graph = graph
+        with recorder.warmup():
+            graph.replay()
+        assert self.output is not None
+
+
+def eager_verify_padding_step(batch: PersistentBatch, model: Any, backends: Sequence[Backend], stores: Sequence[Any],
+                              device: torch.device, steps: int) -> None:
+    """``eager_padding_step`` for speculation: one eager verify step of the padding row."""
+    for store in stores:
+        store.clear(store.scratch())
+    for backend in backends:
+        backend.prepare(batch, verify_padding_row(steps), PlanKey("decode", 0))
+    tokens = torch.zeros(steps, dtype=torch.int64, device=device)
+    with torch.no_grad():  # as VerifyGraphPlan.padded: the operators made here are planned later
+        model.forward_hidden(tokens, torch.arange(steps, device=device), torch.arange(steps, device=device))
+    for store in stores:
+        store.clear(store.scratch())

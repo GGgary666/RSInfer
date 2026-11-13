@@ -602,7 +602,7 @@ def test_the_kernel_units_reload_under_running_requests(checkpoint: Path) -> Non
             for _ in range(3):
                 d.step({0: 1, 2: 1})
         attn = reloaded.service("layers.attn@1")
-        before = attn.active.operators["graph", 2][0]
+        before = attn.active.operators["graph", 2, False][0]
         version = reloaded.service("kernels.catalog@1").version
         for _ in range(2):
             reloaded.runtime.reload(ReloadPlan(units_to_reload=[
@@ -614,7 +614,7 @@ def test_the_kernel_units_reload_under_running_requests(checkpoint: Path) -> Non
             x, y = a.step({0: 1, 2: 1}), b.step({0: 1, 2: 1})
             torch.testing.assert_close(y.logits.float(), x.logits.float(), rtol=2e-2, atol=2e-2)
             assert y.finish() == x.finish()
-        assert attn.active.operators["graph", 2][0] is not before
+        assert attn.active.operators["graph", 2, False][0] is not before
     finally:
         steady.close()
         reloaded.close()

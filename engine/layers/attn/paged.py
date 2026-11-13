@@ -65,6 +65,9 @@ class Metadata:
     req_pool_indices: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
     kv_last_page_len: torch.Tensor | None = None
+    extend: bool = False
+    """A graph bucket of verify steps (doc/specs/mtp.md): D tokens a lane, the extend operator."""
+    qo_indptr: torch.Tensor | None = None
 
 
 class PagedAttnBackend:
@@ -80,13 +83,15 @@ class PagedAttnBackend:
         self.kv_indices_buffer: torch.Tensor | None = None
         """One for all buckets, as SGLang's ``cuda_graph_kv_indices``: a bucket of rows times the
         width of ``req_to_token``."""
-        self.operators: dict[tuple[str, int], tuple[Any, tuple[Any, ...]]] = {}
-        """Per (table, bucket): the operator, and the head counts and dtypes it was made for."""
+        self.operators: dict[tuple[str, int, bool], tuple[Any, tuple[Any, ...]]] = {}
+        """Per (table, bucket, extend): the operator, and the head counts and dtypes it was made for."""
+        self.verify_metadata: dict[int, Metadata] = {}
         self.operators_version = -1
         """The kernel resolution the operators were made by (``Kernels.version``)."""
 
     def release_graphs(self) -> None:
         self.graph_metadata.clear()
+        self.verify_metadata.clear()
         self.graph_buffers.clear()
         self.kv_indices_buffer = None
         self.operators = {key: op for key, op in self.operators.items() if key[0] != GRAPH}
@@ -97,13 +102,16 @@ class PagedAttnBackend:
         """The operator of ``m``'s steps if it was made, by the solutions as they are now."""
         if self.operators and self.kernels.catalog.version != self.operators_version:
             self.operators.clear()  # a kernel unit was reloaded: its operators are the old code's
-        return self.operators.get((m.table, m.bucket))
+        return self.operators.get((m.table, m.bucket, m.extend))
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         req_to_token = batch.binding.buffers()["req_to_token"]
         device = req_to_token.device
         rows = [int(r) + 1 for r in plan.rows.values()]
-        if key.bucket:
+        if key.bucket and plan.draft_tokens:
+            m = self._verify(key.bucket, plan.draft_tokens, rows, [int(p) for p in plan.positions.values()],
+                             req_to_token)
+        elif key.bucket:
             m = self._bucket(key.bucket, req_to_token)
             assert m.req_pool_indices is not None and m.seq_lens is not None
             # init_forward_metadata_replay_cuda_graph: a padded lane is the padding row, index 0,
@@ -164,6 +172,41 @@ class PagedAttnBackend:
         self.generation += 1
         return m
 
+    def _verify(self, size: int, steps: int, rows: list[int], positions: list[int],
+                req_to_token: torch.Tensor) -> Metadata:
+        """A verify bucket's buffers filled for this step (``init_forward_metadata_replay_cuda_graph``
+        in ``TARGET_VERIFY``): each lane attends over its sequence up to its ``steps`` new tokens, which
+        it stores first; a padded lane is the padding row, ``steps`` tokens on the padding page."""
+        device, width = req_to_token.device, req_to_token.shape[1]
+        m = self.verify_metadata.get(size)
+        if m is None:
+            qo = torch.arange(size + 1, dtype=torch.int32) * steps
+            m = Metadata(GRAPH, size, qo, indptr_of([steps] * size), torch.zeros(size + 1, dtype=torch.int32, device=device),
+                         torch.zeros(size * width, dtype=torch.int32, device=device),
+                         torch.zeros(size * steps, dtype=torch.int64, device=device),
+                         req_pool_indices=torch.zeros(size, dtype=torch.int64, device=device),
+                         seq_lens=torch.full((size,), steps, dtype=torch.int64, device=device),
+                         kv_last_page_len=torch.ones(size, dtype=torch.int32, device=device), extend=True,
+                         qo_indptr=qo.to(device))
+            self.verify_metadata[size] = m
+            assert m.qo_indptr is not None and m.kv_last_page_len is not None
+            self.graph_buffers.update({f"verify.{size}.qo_indptr": m.qo_indptr, f"verify.{size}.kv_indptr": m.kv_indptr,
+                                       f"verify.{size}.kv_indices": m.kv_indices,
+                                       f"verify.{size}.kv_last_page_len": m.kv_last_page_len,
+                                       f"verify.{size}.out_cache_loc": m.out_cache_loc})
+            self.generation += 1
+        assert m.req_pool_indices is not None and m.seq_lens is not None
+        pad = size - len(rows)
+        lengths = [p + steps for p in positions] + [steps] * pad
+        m.req_pool_indices.copy_(on_device(torch.tensor(rows + [0] * pad, dtype=torch.int64), device))
+        m.kv_indptr_cpu = indptr_of(lengths)
+        m.kv_indptr.copy_(on_device(m.kv_indptr_cpu, device))
+        m.seq_lens.copy_(on_device(torch.tensor(lengths, dtype=torch.int64), device))
+        self.kernels(GRAPH, KV_INDICES)(req_to_token, m.req_pool_indices, m.seq_lens, m.kv_indptr, m.kv_indices, None)
+        at = m.seq_lens[:, None] - steps + torch.arange(steps, device=device)
+        m.out_cache_loc.copy_(req_to_token[m.req_pool_indices[:, None], at].flatten())
+        return m
+
     @staticmethod
     def _plan(m: Metadata, operator: Any) -> None:
         if not m.planned:
@@ -182,10 +225,11 @@ class PagedAttnBackend:
         shape = (num_heads, num_kv_heads, head_dim, q.dtype, k_cache.dtype)
         made = self.operator(m)
         if made is None:
-            make = self.kernels(m.table, DEFINITIONS["prefill" if m.table == "prefill" else "decode"])
+            make = self.kernels(m.table, DEFINITIONS["prefill" if m.table == "prefill" or m.extend else "decode"])
             buffers = None if m.table != GRAPH else {"kv_indptr": m.kv_indptr, "kv_indices": m.kv_indices,
-                                                     "kv_last_page_len": m.kv_last_page_len}
-            made = self.operators[m.table, m.bucket] = (make(*shape, q.device, buffers), shape)
+                                                     "kv_last_page_len": m.kv_last_page_len,
+                                                     **({"qo_indptr": m.qo_indptr} if m.qo_indptr is not None else {})}
+            made = self.operators[m.table, m.bucket, m.extend] = (make(*shape, q.device, buffers), shape)
             self.operators_version = self.kernels.catalog.version
         operator, planned_for = made
         if planned_for != shape:

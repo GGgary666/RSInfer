@@ -36,7 +36,7 @@ class Unit:
             solution = f"{BACKEND}.{definition}"
             ctx.register("kernels.catalog@1", Implementation(
                 Solution(solution, definition, f"{ops.__name__}:{operator.__name__}", library=library,
-                         shapes={"fp32": [0], "kv_as_q": [1]}, capturable=operator is ops.PagedDecode,
+                         shapes={"fp32": [0], "kv_as_q": [1]}, capturable=True,
                          requires=["cuda"]),
                 partial(operator, self.workspace)), label=f"solution {solution}")
         for definition, fn, fp32 in (("norm.gemma_rms@1", ops.gemma_rms_norm, True),
