@@ -1,6 +1,6 @@
 # 前缀复用：照 SGLang 搬（计划，2026-11-13）
 
-- 状态：计划，实现中（2026-11-13）。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
+- 状态：实现了（2026-11-13，#59），CPU 和 4090 D 上验收过，SM100 还没有。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
 - 来源：SGLang `e838360`，和 kernel 是同一个版本（`~/sglang-e838360/python/sglang/srt/`，下面的路径都相对于它）。Qwen3.5 结构在开重叠或 `page_size > 1` 时，SGLang 默认用的那一套：radix cache 加 mamba 状态的 `extra_buffer` 策略。
 - 取代：stage2-contract.md §5.3 前缀缓存的设计，也就是块哈希、`reusable` / `common_prefix`、快照与发布；还有 §5.4 的"快照只能在一步的末尾打"。和 §5.5 一样，改成严格照 SGLang。
 - 继续有效：§5.3 末尾的账本验收测试（按树的说法改写）、§5.5.4 的规则（共享页不续写、恢复到请求自己的可写状态）、§5.5.6 的 M2d 部分，以及五组对比里的"前缀命中对不命中"。
@@ -215,13 +215,32 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 - **账本**：`tests/units/scheduler/test_radix.py`，9 条：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`。
 - **worker**：`tests/units/executors/test_prefix_track.py`。
   - 存下的状态和单独算到那里的相同，chunk 中间、chunk 末尾、decode 三种位置都测；
-  - 从存下的状态恢复、共享页继续生成，和算整个提示词逐 token 相同；
+  - 从存下的状态恢复、共享页再算 4 个 token：状态和 logits 是整个提示词的，不恢复的对照差得远；
   - 不在 64 倍数上的位置被拒。
 - **graph 路径**：`tests/units/executors/test_cuda_graph.py::test_a_captured_step_keeps_states_for_the_prefix_cache_as_the_eager_one`，用替身录制器在 CPU 上回放。它还查一个桶上次回放存过状态、下次不存的情况：清 mask 那一步拿掉，这条就失败。
-- **端到端**：`tests/units/worker/test_prefix_cache.py`，真调度器加真 worker。第一个请求结束、空闲 2.5 秒以后，另外两个请求从 64 开始，三个请求的输出都和 HF 逐 token 相同，开不开重叠都测。按每次报 `Capacity` 就丢缓存的写法，这条失败。
+- **端到端**：`tests/units/worker/test_prefix_cache.py`，真调度器加真 worker。
+  - 第一个请求结束、空闲 2.5 秒以后，另外三个请求从 64 开始，所有请求的输出都和 HF 逐 token 相同，开不开重叠都测。
+  - 按每次报 `Capacity` 就丢缓存的写法，这条失败；调度器不发恢复的拷贝，也失败。
 - **其余**：调度器那组测试用的 worker 是夹具，不算状态，所以在它们的台子上关着缓存（`tests/units/scheduler/support.py`）。
+- **恢复测试要只算几个 token**：随机权重下，GDN 状态几十个 token 就淡掉了，恢复以后算 36 个 token，什么都不恢复的对照也对得上。所以：
+  - worker 的恢复测试改成恢复后算 4 个 token，并带上这个对照；
+  - 端到端测试加了一个缓存后只剩 2 个 token 的请求，调度器不发恢复的拷贝时这条失败。
 
-### 7.4 还没做的
+### 7.4 GPU（2026-11-13，RTX 4090 D，4 层随机权重）
 
-- GPU 上的验收（§5）：Triton 跟踪 kernel 在真 graph 里、4090 D 4 层、SM100 64 层、和 SGLang 同配置比性能。
+在引擎上的过程见 [../rsi/2026-11-13-prefix-cache-on-a-live-engine.md](../rsi/2026-11-13-prefix-cache-on-a-live-engine.md)。
+
+- **热改上去**：从 master 起的引擎，一次 apply 换上 #59，2.4 秒提交。
+- **正确性**：fp32 下，命中和不命中逐字相同。bf16 下，存在 chunk 中间的状态是 bf16 的 `h`，和 SGLang 一样（它的 Triton GDN kernel 没有 fp32 快照），所以输出可能不同。
+  - 存下的状态离单独算到那里的 1.5e-2（conv）、2.4e-2（temporal），错一个 token 的对照 1.4、1.3；
+  - 恢复后算两个 token，状态离整个提示词的 2e-2，不恢复的对照 1.1。
+  - 这三项是 `tests/gpu/test_prefix_cache.py`。它还查了 graph 回放里存下的状态就是那一行的槽，和 eager 的相同，没被选中的槽一位不动。
+- **性能**：
+  - 共享约 3000 token 系统提示，命中时首 token 27–35 ms，关掉缓存 102–122 ms；
+  - 不命中时 decode 吞吐不变（169.2 / 1272.5 对 169.2 / 1270.4 token/s，1 和 8 并发）。
+- **GPU 测试**：9 个文件 53 项全过，包括缓存默认开着的 `test_qwen38_serve`。
+
+### 7.5 还没做的
+
+- SM100 上的 64 层模型，以及和 SGLang 同配置（共享系统提示的负载）的对比。
 - A/B/C。

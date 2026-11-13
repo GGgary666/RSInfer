@@ -20,7 +20,9 @@ from tests.units.worker.support import stack
 
 PREFIX = [(5 * i + 1) % 97 for i in range(90)]
 FIRST = {1: [*PREFIX, 3, 4, 5]}
-LATER = {2: [*PREFIX[:80], 9, 8, 7, 6, 5, 4, 3, 2, 1, 11, 12, 13], 3: [*PREFIX, 3, 4, 5]}
+LATER = {2: [*PREFIX[:80], 9, 8, 7, 6, 5, 4, 3, 2, 1, 11, 12, 13], 3: [*PREFIX, 3, 4, 5], 4: [*PREFIX[:64], 9, 8]}
+"""Request 4 computes 2 tokens after the cached 64: the GDN state fades within a few dozen tokens
+with these weights, so without the restored state its tokens would not be HF's."""
 STEPS = 6
 CONFIG = {"batch.max_context_len": 128}
 
@@ -51,7 +53,7 @@ def test_a_request_that_begins_with_a_computed_prompt_starts_from_the_cache_and_
         until = time.monotonic() + 2.5  # idle: the workers say their capacity again (worker.announce_every_s)
         b.run_until(lambda: time.monotonic() > until, timeout=10)
         # the first prompt's state at 64 (the checkpoint grid) is cached; both later ones start there
-        assert [b.engine.ledger.match(0, p) for p in LATER.values()] == [64, 64]
+        assert [b.engine.ledger.match(0, p) for p in LATER.values()] == [64, 64, 64]
         b.client.send(greedy(LATER))
         b.run_until(b.finished(*LATER), timeout=60)
         assert {rid: b.client.outputs[rid].tokens for rid in want} == want
