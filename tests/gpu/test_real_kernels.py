@@ -97,6 +97,23 @@ def test_triton_gdn_verify_kernels_stay_within_their_definitions(triton: Any, dt
     close("gdn.verify_recurrent@1", kept_tri, kept_ref)
     assert torch.equal(ssm_tri, ssm0) and torch.equal(ssm_ref, ssm0)
 
+    # The commit (every layer at once: pools [layers, slots, ...], intermediates [layers, lanes, D, ...]):
+    # each row's accepted step into its slot; rows 1 and 3 also keep the step at a tracking boundary.
+    layers = 3
+    pools = [(0.5 * rand(layers, 9, CONV_DIM, WIDTH - 1)).to(dtype), (0.1 * rand(layers, 9, HV, V, K)).to(ssm_dtype)]
+    inters = [(0.5 * rand(layers, rows, steps, CONV_DIM, WIDTH - 1)).to(dtype),
+              (0.1 * rand(layers, rows, steps, HV, V, K)).to(ssm_dtype)]
+    accepted = torch.tensor([3, 0, 2, 1, 0], device=DEVICE)
+    track_dst = torch.tensor([0, 8, 0, 6, 0], device=DEVICE, dtype=torch.int32)
+    track = torch.tensor([-1, 0, -1, 1, -1], device=DEVICE)
+    mine, theirs = [p.clone() for p in pools], [p.clone() for p in pools]
+    triton.commit_states(mine[0], mine[1], inters[0], inters[1], slots, lanes, accepted, track_dst, track)
+    ref_spec.commit_states(theirs[0], theirs[1], inters[0], inters[1], slots, lanes, accepted, track_dst, track)
+    for got, want, pool, inter in zip(mine, theirs, pools, inters, strict=True):
+        assert torch.equal(got, want)  # copies: exactly the reference's
+        assert torch.equal(got[:, 7], inter[:, 2, 2]) and torch.equal(got[:, 8], inter[:, 1, 0])
+        assert torch.equal(got[:, 0], pool[:, 0])  # no lane tracks into the padding slot: untouched
+
 @pytest.mark.parametrize(("dtype", "ssm_dtype"), [(torch.bfloat16, torch.float32), (torch.bfloat16, torch.bfloat16),
                                                   (torch.float32, torch.float32)])
 def test_triton_gdn_decode_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,

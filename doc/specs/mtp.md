@@ -1,6 +1,6 @@
 # MTP 投机解码：照 SGLang 搬（计划，2026-11-13）
 
-- 状态：实现了（2026-11-13，和计划同一个 PR），CPU、4090 D 和 SM100 的完整 64 层上验收过（§6.5）；草稿和草稿扩展还不录 graph，GDN 状态的提交还是参照实现（§6.6）。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
+- 状态：实现了（2026-11-13，和计划同一个 PR），CPU、4090 D 和 SM100 的完整 64 层上验收过（§6.5）。之后又照 SM100 的 profile 做了两项：GDN 状态的提交换成 SGLang 的融合 kernel，草稿和草稿扩展也录 graph（§6.6），SM100 上还没重量。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
 - 来源：SGLang `e838360`（`~/sglang-e838360/python/sglang/srt/`，下面的路径都相对于它）。Qwen3.5 结构的 MTP：`models/qwen3_5_mtp.py`，EAGLE 的 v2 worker（`speculative/eagle_worker_v2.py`、`eagle_worker_common.py`、`spec_utils.py`、`eagle_utils.py`），GDN 的验证路径（`layers/attention/linear/gdn_backend.py`、`hybrid_linear_attn_backend.py`），状态的提交（`kernels/ops/mamba/mamba_state_scatter_triton.py`）。
 - 取代：stage2-contract.md §4.2、§4.4 第 7 条留给 M2d 的"草稿放在哪、验证步怎么数、开投机时位置怎么写"。
 
@@ -159,8 +159,8 @@ CUDA 上默认不开 `speculative_use_rejection_sampling`，用 target-only 的�
   - `models.qwen38`：草稿模型（`mtp.*` 参数，KV 是 `kv.paged` 的第 `num_hidden_layers` 层），`forward_hidden`；holder 的预算先扣掉验证用的中间缓存。
   - `state.gdn_slots`：每行一份 D 步的中间状态（`verify_buffers`、`verify_pools`）。
   - `layers.gdn`：验证模式和 `commit`；`layers.attn`：验证步按 extend 算，graph 里用 decode 那一路的 extend。
-  - kernel：`kernels/reference/spec.py`（验证的 conv 和递归、提交、接受），`kernels.triton` 的 `verify_conv1d_update`、`verify_recurrent`（SGLang 的 `fused_sigmoid_gating_delta_rule_update` 只留 GDN 链式那条路，`kernels/triton/fla/fused_sigmoid_gating_recurrent.py`）。
-  - `core.plan`：开投机时录验证步的 graph（`VerifyGraphPlan`），不录 decode 的；录之前先建好持久 batch 里投机用的表（`prepare_spec`，§6.2）。FlashInfer 的 prefill wrapper 在 graph 里用固定 buffer（`kernels.flashinfer` 的 `PagedExtend` 现在能录）。
+  - kernel：`kernels/reference/spec.py`（验证的 conv 和递归、提交、接受），`kernels.triton` 的 `verify_conv1d_update`、`verify_recurrent`、`commit_states`（SGLang 的 `fused_mamba_state_scatter_with_mask`，在 `kernels/triton/mamba_track.py`）（SGLang 的 `fused_sigmoid_gating_delta_rule_update` 只留 GDN 链式那条路，`kernels/triton/fla/fused_sigmoid_gating_recurrent.py`）。
+  - `core.plan`：开投机时录验证步的 graph（`VerifyGraphPlan`），不录 decode 的；每个桶还录草稿模型的一次 decode forward（`DraftGraphPlan`）和验证步之后的草稿扩展（`DraftExtendGraphPlan`，§6.6）。录之前先建好持久 batch 里投机用的表（`prepare_spec`，§6.2）。FlashInfer 的 prefill wrapper 在 graph 里用固定 buffer（`kernels.flashinfer` 的 `PagedExtend` 现在能录）。
   - `worker.batch`：`prepare_spec` 再要同样的表时原样返回，`spec.num_draft_tokens` 或模型变了才重建，并放掉旧的。
 - **部署**：`serve --speculative-algorithm EAGLE`（和 SGLang 同名的四个参数）；`checkpoint` 写完整的随机 MTP 层。
 - **热改**：`apply --config '{"spec.algorithm": "eagle"}'` 在跑着的引擎上打开投机，调度宿主重载 `core.sched`、`core.state.alloc`，worker 重载模型、GDN 存储和后端、executor（4090 D 上 3.9 秒）。
@@ -227,10 +227,32 @@ CUDA 上默认不开 `speculative_use_rejection_sampling`，用 target-only 的�
 - batch 8 时，提交占一步的 36%。参照实现的 `commit_states` 先把选中的中间状态整份 gather 出来再写回；跟踪的那份不管跨没跨边界，都要做一遍 `torch.where`。SGLang 用融合的 scatter kernel，一步 0.55 ms。
 - 草稿和草稿扩展在 host 上的时间：我们 3.08、1.93 ms，SGLang 1.27、1.22 ms（它们录了 graph）。
 
-### 6.6 还没做的
+### 6.6 照 SM100 的 profile 做的两项（2026-11-13）
 
-- GDN 状态的提交换成 SGLang 的融合 scatter kernel（`kernels/ops/mamba/mamba_state_scatter_triton.py`）：SM100 上 batch 8 时最大的一块（§6.5）。
-- 草稿（S - 1 次 decode）和草稿扩展录 graph（SGLang 的 `EAGLEDraftCudaGraphRunner`、`EAGLEDraftExtendCudaGraphRunner`）：4090 D 上是带宽受限，SM100 上 launch 开销占得多，要在那里量。
-- SM100 上用真 MTP 权重的接受长度和吞吐，和 SGLang 同配置比；多 rank（Devin 在做）下的投机。
-- 接受和提交还没录进 graph（SGLang 的 post-verify graph）。
+用户定：两项都放进 #61。
+
+**GDN 状态的提交换成 SGLang 的融合 kernel。**
+- `kernels.triton` 的 `gdn.commit_states@1` 是 `scatter_mamba_states_after_mtp_verify` 的做法：每个池两次带掩码的 scatter（接受的那一步进行的槽，跨了边界的那一步进跟踪槽），一次 launch 管所有层。
+- 和 SGLang 的一处不同：SGLang 的 conv 中间窗口是去重的重叠视图，要用 `fused_conv_window_scatter_*`；我们的是稠密的 `[layers, lanes, D, ...]`，和递归状态用同一个 kernel。
+- 4090 D 上按 64 层模型的状态形状（48 层 GDN）量，参照实现 → Triton：1 行 2.0 → 0.38 ms，8 行 13.4 → 3.1 ms。8 行要搬 2.4 GB，3.1 ms 已接近这张卡的带宽；SM100 的带宽约是 8 倍，应当接近 SGLang 的 0.55 ms。
+
+**草稿和草稿扩展录 graph。**
+- 草稿的 decode forward：每个桶录一次 forward，一步里回放 D - 2 次，每次回放前按这次的位置 prepare attention。SGLang 的 `EAGLEDraftCudaGraphRunner` 把几次 forward 录在一个 graph 里，每次用自己的一套 metadata；我们的 attention backend 一个桶只有一套 decode buffer，所以拆成几次回放。每次之间多一次 FlashInfer 的 plan，SGLang 在回放前也要为每一次 plan。
+- 草稿扩展：每个桶跟在这个桶的验证 graph 后面录，**用验证步 prepare 好的 attention metadata，自己不 prepare**：它在验证步同样的 D 个位置上 attend，长度、页表、写入的槽都一样。所以它只在本步的验证是从 graph 回放的时候回放（`Plans.replayed`），否则 eager。SGLang 的 `EAGLEDraftExtendCudaGraphRunner` 自己准备一套。
+- 为此执行器给草稿扩展的 view 改成和验证步一样（decode 加 `draft_tokens`）。eager 时 attention 照样按 extend 算，和原来相同。
+- `plan.cuda_graph = required` 时，没有 graph 能回放的草稿 forward 和草稿扩展都会被拒，不退回 eager。
+- 4090 D 上一步在 host 上的时间（中位数，ms）：草稿 2.36 → 0.95，草稿扩展 1.44 → 0.24。剩下的主要是草稿两次 forward 前的 prepare。
+- 4090 D 上的吞吐没变（4 层，设备一侧是瓶颈）：单流 59.4 / 59.5 token/s，8 并发 437.6 / 435.2（eager / graph）。开投机的 eager 比 §6.4 的 55.8 快了一点，是提交 kernel 和 Codex 那处事件顺序的改动。
+
+**测试**：
+- `tests/gpu/test_real_kernels.py`：Triton 的提交和参照实现逐位相同，跨边界和不跨边界的行都有。
+- `tests/gpu/test_speculation.py` 的 graph 那一条：先在冷启动录的 graph 上跑一个请求，`required` 下 graph 过期就失败；再换上预言（`Oracle` 现在只用张量运算，graph 能录进去），重载 `core.plan` 重录，回放和 eager 的 token、接受长度都相同。临时改坏草稿扩展取的行、草稿 forward 的位置，这一条都失败。
+- `tests/units/executors/test_cuda_graph.py`：`Plans` 在 CPU 上走的路：每个 forward 回放哪个桶、草稿扩展只跟着回放过的验证步、`required` 时拒绝。
+
+### 6.7 还没做的
+
+- SM100 上重量这两项以后的吞吐和每个阶段的时间，并且把 SGLang 每个阶段的时间和它的平均接受长度也报出来：§6.5 只有我们的接受长度，两边的吞吐还不能直接比。
+- 多 rank 下的投机（v1，[v1-distributed.md](v1-distributed.md)）。
+- 接受和提交录进 graph（SGLang 的 post-verify graph；SGLang 默认关，`SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`，不在 §6.5 对比的基线里）。
+- 不开投机时剩下的约 5% 设备时间（[../evaluations/real-kernels-sm100.md](../evaluations/real-kernels-sm100.md)：KV 写入、graph 外的准备、GDN 输入投影的双 stream），也会让验证步变快。
 

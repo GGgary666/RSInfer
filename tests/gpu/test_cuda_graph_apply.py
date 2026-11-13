@@ -68,7 +68,7 @@ def test_config_changes_recapture_only_graph_dependencies(tmp_path: Path) -> Non
     original = graph_source.read_text()
     # Observe completed capture contexts in the test snapshot, without changing production code.
     target = "        self.graph = graph\n"
-    assert original.count(target) == 2  # GraphPlan's, and VerifyGraphPlan's (speculation, off here)
+    assert original.count(target) == 4  # GraphPlan's; and the verify, draft and draft extend plans' (speculation, off here)
     graph_source.write_text(original.replace(target, target + '        print("TEST_GRAPH_CAPTURE_COMPLETED", flush=True)\n'))
     run = tmp_path / "run"
     cases: list[tuple[str, dict[str, Any], bool, list[int]]] = [

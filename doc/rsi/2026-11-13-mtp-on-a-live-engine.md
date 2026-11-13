@@ -50,3 +50,17 @@
   - 检查写进哪个单元，哪个单元就重载，它的重载可能正好修好要查的问题。查冷启动的行为，检查要放在不会让被查的单元重载的地方，或者带着检查冷启动。
   - 要知道 graph 用没用，用 `plan.cuda_graph = required` 冷启动。
 
+## 第二轮：提交 kernel 和草稿的 graph（2026-11-13）
+
+照 Codex 的 SM100 profile 做了两项（[../specs/mtp.md](../specs/mtp.md) §6.6）。
+
+| 做了什么 | 冷启动还是热改，为什么 | 结果 |
+|---|---|---|
+| 提交 kernel 的 microbench：64 层的状态形状，参照实现对 Triton | 不起引擎：一个脚本，只比两个 kernel | 8 行 13.4 → 3.1 ms |
+| 吞吐：开投机，`--cuda-graph off` 和 `required` | 两次冷启动：比的是两种配置各自冷启动的结果，`required` 也顺带验了冷启动时 graph 不过期 | 单流 59.4 / 59.5，8 并发 437.6 / 435.2 token/s |
+| host 时间：探针写进 `executors/pytorch/spec.py`，apply；再 `apply --config '{"plan.cuda_graph": "off"}'` | 一次冷启动（`required`）加两次热改 | 草稿 0.95 / 2.36 ms，草稿扩展 0.24 / 1.44 ms（graph / eager） |
+
+- **探针这次放在 executor 里，没放在 `core.plan` 里**（上面"更正"那条的教训）：executor 重载不会让 `core.plan` 重录，量到的是冷启动录的 graph。日志里打了 `graphs=True`，确认是在 graph 上量的。
+- 关 graph 用的是热改配置：`core.plan` 重载，探针还在（变更的源码还是带探针的那份工作区）。
+- 4090 D 上吞吐不变，是因为 4 层的模型一步压在设备上（LM head）。host 时间省下来的部分要在 SM100 的 64 层上才看得出来，交给 Codex 重量。
+

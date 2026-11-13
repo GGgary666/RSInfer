@@ -26,6 +26,7 @@ SOLUTIONS: tuple[tuple[str, str, bool, tuple[tuple[str, int], ...]], ...] = (
     ("gdn.track_states@1", "track_states", True, ()),
     ("gdn.verify_conv1d_update@1", "verify_conv1d_update", True, ()),
     ("gdn.verify_recurrent@1", "verify_recurrent", True, ()),
+    ("gdn.commit_states@1", "commit_states", True, ()),
 )
 """(definition, function in ``ops``, capturable, the shape keys it fits one value of). The prefill
 conv and the chunked delta rule read sequence lengths on the host, so a graph would freeze them. A

@@ -4,9 +4,10 @@ its MTP layer drafting, through the real scheduler and a real worker on CUDA wit
 
 Drafts come from an oracle (``Oracle``): the tokens the engine decodes without speculation, wrong at
 every 7th position, so steps accept 1 to D tokens; the random MTP weights of the checkpoint would
-accept next to nothing. fp32 holds speculation to the tokens of decoding without it; bf16 holds a
-verify step replayed from a graph to the eager one. A checkpoint is ~8.4 GiB (``QWEN38_MODEL``
-reuses one)."""
+accept next to nothing. It takes the draft model's place before ``core.plan`` is reloaded, so the draft
+graphs record it. fp32 holds speculation to the tokens of decoding without it; bf16 holds a step
+replayed from graphs (the draft's decode forwards, the verify, the draft extend) to the eager one.
+A checkpoint is ~8.4 GiB (``QWEN38_MODEL`` reuses one)."""
 
 from __future__ import annotations
 
@@ -20,14 +21,18 @@ import pytest
 from core.contracts.columns import Column
 from core.contracts.requests import NewRequest
 from core.contracts.sampling import SamplingParams
+from unit.runtime.types import ReloadPlan
 from platforms.cuda_graph import CudaGraphPlatform
 from platforms.torch_eager import TorchEagerPlatform
 from tests.gpu.support import free_gpu, make_checkpoint
-from tests.units.worker.support import Oracle, stack
+from tests.units.support.worker import spec as unit_spec
+from tests.units.worker.support import Oracle, RealWorker, stack
 
 PROMPTS = {1: [(1000 + 37 * i) % 150000 for i in range(40)], 2: [(77 + 13 * i) % 150000 for i in range(9)],
            3: [(5000 + 101 * i) % 150000 for i in range(70)]}
 STEPS = 24
+WARM = [7, 8, 9, 10, 11]
+"""A prompt none of ``PROMPTS`` begins with: what it leaves in the prefix cache matches none of them."""
 SPEC: dict[str, Any] = {"spec.algorithm": "eagle", "spec.num_steps": 3, "spec.num_draft_tokens": 4}
 ROWS: dict[str, Any] = {"batch.max_context_len": 256, "batch.max_rows": 8}
 
@@ -35,6 +40,14 @@ ROWS: dict[str, Any] = {"batch.max_context_len": 256, "batch.max_rows": 8}
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return Path(os.environ["QWEN38_MODEL"]) if os.environ.get("QWEN38_MODEL") else make_checkpoint(tmp_path_factory, 4)
+
+
+def draft_with(worker: RealWorker, oracle: Oracle) -> None:
+    """The oracle in the draft model's place, and ``core.plan`` reloaded, as a change would reload it
+    (the loop quiesced first): its graphs are recorded again, over the oracle."""
+    setattr(cast(Any, worker.runtime).instance("models.qwen38").model, "draft_forward", oracle)
+    worker.loop.quiesce()
+    cast(Any, worker.runtime).reload(ReloadPlan(units_to_reload=[unit_spec("core.plan")])).unwrap()
 
 
 def generate(checkpoint: Path, dtype: str, *, spec: bool, graphs: bool, oracle: Oracle | None = None
@@ -48,10 +61,13 @@ def generate(checkpoint: Path, dtype: str, *, spec: bool, graphs: bool, oracle: 
     try:
         with stack(cfg, checkpoint, overlap=True, token_budget=256, platform=platform,
                    sched={**ROWS, **(SPEC if spec else {})}, **worker) as (b, workers):
+            if spec:  # a request on what the cold start recorded: with graphs, required fails a stale one
+                b.client.send([NewRequest(0, Column.of("i64", WARM), SamplingParams(temperature=0.0, seed=0), 4)])
+                b.run_until(b.finished(0), timeout=600)
+                b.run_until(b.idle, timeout=60)
             if oracle is not None:
                 for w in workers:
-                    w.call(lambda w: setattr(cast(Any, w.runtime).instance("models.qwen38").model, "draft_forward",
-                                             oracle))
+                    w.call(lambda w: draft_with(w, oracle))
             table: Any = b.engine.table
             sample = table.sample
 
@@ -71,7 +87,7 @@ def generate(checkpoint: Path, dtype: str, *, spec: bool, graphs: bool, oracle: 
 
 
 def oracle_for(tokens: dict[int, list[int]], vocab: int) -> Oracle:
-    return Oracle({rid: [*PROMPTS[rid], *tokens[rid]] for rid in PROMPTS}, vocab)
+    return Oracle({rid: [*PROMPTS[rid], *tokens[rid]] for rid in PROMPTS}, vocab, device="cuda")
 
 
 @pytest.mark.timeout(3600)
@@ -89,13 +105,15 @@ def test_speculation_on_the_real_structure_generates_what_decoding_without_it_do
 
 @pytest.mark.timeout(3600)
 def test_a_verify_step_replayed_from_a_graph_gives_what_the_eager_one_gives(checkpoint: Path) -> None:
-    """bf16, the same kernels eagerly and replayed (FlashInfer's prefill wrapper over a bucket's fixed
-    buffers): the same tokens and the same accepted lengths."""
+    """bf16, the same kernels eagerly and replayed (FlashInfer's wrappers over a bucket's fixed buffers;
+    the draft extend on the verify step's): the same tokens and the same accepted lengths, which the
+    oracle recorded into the draft graphs decides."""
     plain, _ = generate(checkpoint, "bf16", spec=False, graphs=False)
     vocab = json.loads((checkpoint / "config.json").read_text())["text_config"]["vocab_size"]
     oracle = oracle_for(plain, vocab)
     eager = generate(checkpoint, "bf16", spec=True, graphs=False, oracle=oracle)
     replayed = generate(checkpoint, "bf16", spec=True, graphs=True, oracle=oracle)
-    assert replayed == eager
+    assert replayed[0] == eager[0]
     expected = {rid: oracle.counts(len(p), STEPS, SPEC["spec.num_draft_tokens"]) for rid, p in PROMPTS.items()}
-    assert {rid: c[:len(expected[rid])] for rid, c in eager[1].items()} == expected
+    for run in (eager, replayed):  # with overlap, a step more where the next was planned before the end was known
+        assert {rid: c[:len(expected[rid])] for rid, c in run[1].items()} == expected

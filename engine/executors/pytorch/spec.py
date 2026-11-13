@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The speculative step of ``executors.pytorch`` (doc/specs/mtp.md): SGLang's ``EAGLEWorkerV2`` for a
 chain (srt/speculative/eagle_worker_v2.py, eagle_worker_common.py, spec_utils.py, e838360;
-LICENSE.sglang), eager.
+LICENSE.sglang). With graphs, the draft's decode forwards, the verify and the draft extend replay
+(``core.plan``); the accept and the commit run eagerly between them.
 
 A decode step of D tokens per row, from the length ``L`` the row is at, its last accepted token ``b``
 (``last_token``) and its first draft ``d1`` with the draft model's hidden state there (``spec.drafts``,
@@ -176,7 +177,9 @@ class Speculative:
             lengths.copy_(accept, non_blocking=True)
             event = torch.cuda.Event()
             event.record()
-        draft_logits, draft_hidden = self.plans.draft(batch, view(rows, [d] * bs, starts, "prefill"), tokens.flatten(),
+        # Over the verify step's D positions: a decode view with its draft tokens, which attends as the
+        # verify step does (an extend), and replays on its metadata when it was replayed.
+        draft_logits, draft_hidden = self.plans.draft(batch, view(rows, [d] * bs, starts, "decode", d), tokens.flatten(),
                                                       positions_all, target_hidden, lanes * d + accept - 1)
         self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
         done = Accepted(rows, starts, lengths, event)

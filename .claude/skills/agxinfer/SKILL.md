@@ -226,9 +226,9 @@ $A control status                               # 也可以是 introspect（单�
 做法和数见 `doc/specs/mtp.md`，过程见 `doc/rsi/2026-11-13-mtp-on-a-live-engine.md`。
 
 - 打开：冷启动 `serve --speculative-algorithm EAGLE`（还有 `--speculative-num-steps` 等，和 SGLang 同名，默认 3、1、4），或者在跑着的引擎上 `$A control apply --config '{"spec.algorithm": "eagle"}'`：调度宿主重载 `core.sched`、`core.state.alloc`，worker 重载模型、GDN 存储和后端、executor，几秒。关掉是把它改回 `""`。checkpoint 里要有 `mtp.*`；`$A checkpoint` 生成的有（随机的）。
-- 打开以后正常的现象：KV 页变少（草稿模型的那层 attention 也占页）、GDN 槽变少（验证要的中间状态先从预算里扣）；`core.plan` 录的是验证步的 graph（日志里 `"verify": true`），不录 decode 的。
-- 随机权重的 MTP 几乎什么都不接受，所以本机上开投机更慢，这是对的：4 层时 LM head 占满带宽（mtp.md §6.4）。要看接受多个 token 的路径，测试里用 `Oracle` 换掉 `models.qwen38` 实例的 `draft_forward`。
-- **验证步的 graph 有没有真在用**：用 `plan.cuda_graph = required`（`--cuda-graph required`）冷启动。graph 过期时，第一个验证步就报 `StaleGraph`，不会悄悄退回 eager；`tests/gpu/test_speculation.py` 也这样测。2026-11-13 的第一版里，graph 一录完就过期，`auto` 下全退回了 eager。我在 4090 D 上没查出来，是 Codex 在 SM100 上发现的（`doc/evaluations/mtp-sm100.md`），原因见下一节第 11 条。
+- 打开以后正常的现象：KV 页变少（草稿模型的那层 attention 也占页）、GDN 槽变少（验证要的中间状态先从预算里扣）；`core.plan` 录的是验证步的 graph（日志里 `"verify": true`），不录 decode 的；还录草稿模型的 decode forward 和验证步之后的草稿扩展（`"draft": true`）。草稿扩展用验证步 prepare 好的 attention metadata，只跟在回放过的验证步后面回放。
+- 随机权重的 MTP 几乎什么都不接受，所以本机上开投机更慢，这是对的：4 层时 LM head 占满带宽（mtp.md §6.4）。要看接受多个 token 的路径，测试里用 `Oracle` 换掉 `models.qwen38` 实例的 `draft_forward`。录了 graph 的，换掉以后还要重载 `core.plan`（`tests/gpu/test_speculation.py` 的 `draft_with`），否则回放的还是录 graph 时的草稿模型；`Oracle` 只用张量运算，graph 录得进去。
+- **投机的 graph 有没有真在用**：用 `plan.cuda_graph = required`（`--cuda-graph required`）冷启动。graph 过期时，第一个投机步就报 `StaleGraph`（草稿、验证、草稿扩展都这样），不会悄悄退回 eager；`tests/gpu/test_speculation.py` 也这样测。2026-11-13 的第一版里，graph 一录完就过期，`auto` 下全退回了 eager。我在 4090 D 上没查出来，是 Codex 在 SM100 上发现的（`doc/evaluations/mtp-sm100.md`），原因见下一节第 11 条。
 - 开投机前后文本不同时，先分清是 kernel 的数值还是 bug：用 fp32，并且两边都 `--set gdn.backend=reference --set attn.backend=reference`，再比。2026-11-13 就是这样查出开重叠时清掉刚 prefill 完的 GDN 状态那个 bug（只在 GPU 上、请求一个一个来时出现）。
 
 ### 撤回没成功、引擎要求恢复的时候

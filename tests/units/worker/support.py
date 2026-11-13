@@ -137,24 +137,29 @@ def stack(hf_config: dict[str, Any], checkpoint: Path, *, ranks: int = 1, overla
 class Oracle:
     """The draft model replaced: at position ``p`` after input ``S[p + 1]`` (the MTP layer's convention:
     the token after the position) it drafts ``S[p + 2]``, the target's greedy token, of whichever
-    request ``S`` that is; wrong where ``p % WRONG_EVERY == WRONG_AT``. So steps accept every length."""
+    request ``S`` that is; wrong where ``p % WRONG_EVERY == WRONG_AT``. So steps accept every length.
+    Tensor operations only, on ``device``, so that a graph can record it in place of the draft model."""
 
     WRONG_EVERY, WRONG_AT = 7, 3
 
-    def __init__(self, sequences: dict[int, list[int]], vocab: int) -> None:
-        self.next: dict[tuple[int, int], int] = {}
+    def __init__(self, sequences: dict[int, list[int]], vocab: int, device: str = "cpu") -> None:
+        nexts: dict[tuple[int, int], int] = {}
         for s in sequences.values():
             for p in range(len(s) - 2):
-                assert self.next.setdefault((p, s[p + 1]), s[p + 2]) == s[p + 2], "two requests meet: pick others"
+                assert nexts.setdefault((p, s[p + 1]), s[p + 2]) == s[p + 2], "two requests meet: pick others"
+        keys = sorted(nexts)  # by position, then token: the order of p * vocab + token
+        self.keys = torch.tensor([p * vocab + t for p, t in keys], dtype=torch.int64, device=device)
+        self.values = torch.tensor([nexts[k] for k in keys], dtype=torch.int64, device=device)
         self.vocab = vocab
 
     def __call__(self, input_ids: Any, positions: Any, hidden: Any, last_index: Any) -> tuple[Any, Any]:
-        rows = [(int(positions[i]), int(input_ids[i])) for i in last_index.tolist()]
-        drafts = [self.next.get(key, 0) for key in rows]
-        drafts = [(d + 1) % self.vocab if p % self.WRONG_EVERY == self.WRONG_AT else d
-                  for (p, _), d in zip(rows, drafts, strict=True)]
-        logits = torch.zeros(len(rows), self.vocab)
-        logits[torch.arange(len(rows)), torch.tensor(drafts)] = 1.0
+        p, t = positions[last_index].long(), input_ids[last_index].long()
+        q = p * self.vocab + t
+        i = torch.searchsorted(self.keys, q).clamp(max=self.keys.numel() - 1)
+        draft = torch.where(self.keys[i] == q, self.values[i], torch.zeros_like(q))
+        draft = torch.where(p % self.WRONG_EVERY == self.WRONG_AT, (draft + 1) % self.vocab, draft)
+        logits = torch.zeros(q.shape[0], self.vocab, device=q.device)
+        logits.scatter_(1, draft[:, None], 1.0)
         return logits, hidden[last_index]
 
     def counts(self, prompt: int, steps: int, draft_tokens: int) -> list[int]:

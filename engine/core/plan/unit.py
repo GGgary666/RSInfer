@@ -35,8 +35,8 @@ from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
 from core.contracts.tensor import Tensor
 from platforms.base import StaleGraph
-from core.plan.graph import (Dependencies, GraphPlan, VerifyGraphPlan, buckets, eager_padding_step,
-                             eager_verify_padding_step)
+from core.plan.graph import (Dependencies, DraftExtendGraphPlan, DraftGraphPlan, GraphPlan, VerifyGraphPlan,
+                             buckets, eager_draft_padding_steps, eager_padding_step, eager_verify_padding_step)
 from unit.runtime.proxy import provision_of
 
 
@@ -88,7 +88,12 @@ class Plans:
         """The start-up record (``resolution``, and what became of the graphs)."""
         self.graphs: dict[int, GraphPlan] = {}
         self.verify_graphs: dict[int, VerifyGraphPlan] = {}
-        """With speculation, the verify steps' graphs instead of the decode steps' (doc/specs/mtp.md)."""
+        """With speculation, the verify steps' graphs instead of the decode steps' (doc/specs/mtp.md), each
+        with the draft model's extend after it."""
+        self.draft_graphs: dict[int, DraftGraphPlan] = {}
+        """With speculation of more than two tokens, the draft model's decode forward."""
+        self.replayed: VerifyGraphPlan | None = None
+        """The verify graph the step in progress replayed: its draft extend replays on its metadata."""
         self.deps: Dependencies | None = None
         """What every bucket was recorded over."""
 
@@ -115,10 +120,14 @@ class Plans:
 
     def verify(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor,
                positions: Tensor) -> tuple[Tensor, Tensor]:
+        self.replayed = None
         fits = [b for b in self.verify_graphs if b >= len(view.rows)]
         if fits and self.deps is not None and self.deps.valid():
             try:
-                return self.verify_graphs[min(fits)].run(batch, view, input_ids, positions)
+                graph = self.verify_graphs[min(fits)]
+                out = graph.run(batch, view, input_ids, positions)
+                self.replayed = graph
+                return out
             except StaleGraph:
                 if self.required:
                     raise
@@ -131,6 +140,20 @@ class Plans:
 
     def draft(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor, hidden: Tensor,
               last_index: Tensor) -> tuple[Tensor, Tensor]:
+        """The draft model's forward: replayed for a speculative step's decode forwards and its extend
+        (a decode view with ``draft_tokens``, after ``verify``), eager for a prefill's extend."""
+        if view.phase == "decode" and view.draft_tokens:
+            graph, self.replayed = self.replayed, None
+            if graph is not None and graph.extend is not None:
+                return graph.extend.run(view, input_ids, last_index)
+            if self.required and self.verify_graphs:
+                raise StaleGraph("a draft extend after a verify step that was not replayed, and graphs are required")
+        elif view.phase == "decode":
+            fits = [b for b in self.draft_graphs if b >= len(view.rows)]
+            if fits and self.deps is not None and self.deps.valid():
+                return self.draft_graphs[min(fits)].run(batch, view, input_ids, positions, hidden)
+            if self.required and self.draft_graphs:
+                raise StaleGraph(f"no ready draft graph holds {len(view.rows)} rows, and graphs are required")
         for backend in self.attention:
             backend.prepare(batch, view, PlanKey(phase_of(view), 0))
         return self.eager.model.draft_forward(input_ids, positions, hidden, last_index)
@@ -146,9 +169,9 @@ class Plans:
         if not self.graphs and not self.verify_graphs:
             return
         torch.cuda.synchronize()
-        for graph in [*self.graphs.values(), *self.verify_graphs.values()]:
+        for graph in [*self.graphs.values(), *self.verify_graphs.values(), *self.draft_graphs.values()]:
             graph.close()
-        self.graphs, self.verify_graphs, self.deps = {}, {}, None
+        self.graphs, self.verify_graphs, self.draft_graphs, self.deps, self.replayed = {}, {}, {}, None, None
         for backend in self.eager.backends:
             backend.release_graphs()
         torch.cuda.empty_cache()
@@ -201,7 +224,8 @@ class Unit:
         ctx.derived("decode_graphs", rebuild="",
                     units=[*self.catalog.sources(), str(provision_of(self.catalog).owner.unit)])
         resolved["cuda_graph"] = {"mode": mode, "buckets": list(self.plans.graphs or self.plans.verify_graphs),
-                                  **({"verify": True} if self.plans.verify_graphs else {}), "reason": reason, **build}
+                                  **({"verify": True} if self.plans.verify_graphs else {}),
+                                  **({"draft": True} if self.plans.draft_graphs else {}), "reason": reason, **build}
         self.plans.resolved = resolved
         print(f"core.plan: {json.dumps(resolved, sort_keys=True)}", file=sys.stderr, flush=True)
         ctx.provide("plan@1", self.plans)
@@ -219,9 +243,13 @@ class Unit:
         # steps share, eager ones included: that is not the graphs', stays when they are closed,
         # and is there before their memory is counted, on a cold start as after a reload.
         steps = int(getattr(self.model, "draft_tokens", 0))  # speculation: verify steps are replayed instead
+        attention = self.plans.attention
+        hidden = self.batch.binding.buffers()["spec.hidden"][:1] if steps else None
         with recorder.warmup(), self.catalog.recording() as used:
             if steps:
+                assert hidden is not None
                 eager_verify_padding_step(self.batch, self.model, self.backends, stores, device, steps)
+                eager_draft_padding_steps(self.batch, self.model, attention, stores, device, steps, hidden.clone())
             else:
                 eager_padding_step(self.batch, self.model, self.backends, stores, device)
         uncapturable = sorted(s for s in used if not self.catalog.describe(s).capturable)
@@ -229,6 +257,8 @@ class Unit:
             return f"uncapturable decode kernels: {uncapturable}", {}
         graphs: dict[int, Any] = {size: VerifyGraphPlan(size, steps, device, self.backends) if steps
                                   else GraphPlan(size, device, self.backends) for size in sorted(sizes, reverse=True)}
+        drafts: dict[int, DraftGraphPlan] = ({size: DraftGraphPlan(size, self.model.hidden_size, hidden.dtype, device, attention)
+                                              for size in graphs} if steps > 2 and hidden is not None else {})
         seconds: dict[str, float] = {}
         before = 0
         try:
@@ -250,6 +280,11 @@ class Unit:
             for size, graph in graphs.items():
                 started = time.perf_counter()
                 graph.capture(self.batch, self.model, stores, recorder)
+                if steps:  # its draft extend runs on its metadata and its output: right after it
+                    graph.extend = DraftExtendGraphPlan(graph, attention)
+                    graph.extend.capture(self.batch, self.model, stores, recorder)
+                if size in drafts:
+                    drafts[size].capture(self.batch, self.model, stores, recorder)
                 seconds[str(size)] = round(time.perf_counter() - started, 3)
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
@@ -259,7 +294,7 @@ class Unit:
                                   f"plan.graph_memory_bytes = {budget}")
         except BaseException:
             torch.cuda.synchronize(device)
-            for graph in graphs.values():
+            for graph in [*graphs.values(), *drafts.values()]:
                 graph.close()
             for backend in self.backends:
                 backend.release_graphs()
@@ -274,6 +309,7 @@ class Unit:
              *(lambda kind=kind: self.stores[kind].bind(layer[kind]) for kind in self.stores)], self.catalog)
         if steps:
             self.plans.verify_graphs = dict(sorted(graphs.items()))
+            self.plans.draft_graphs = dict(sorted(drafts.items()))
         else:
             self.plans.graphs = dict(sorted(graphs.items()))
         return "", {"seconds": seconds, "kept_bytes": kept}

@@ -176,6 +176,8 @@ class VerifyGraphPlan:
         self.every = torch.arange(size * steps, device=device)
         self.output: tuple[torch.Tensor, torch.Tensor] | None = None
         self.graph: Any = None
+        self.extend: DraftExtendGraphPlan | None = None
+        """The draft model's extend after this bucket's verify step, recorded after it."""
 
     def run(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor
             ) -> tuple[Tensor, Tensor]:
@@ -195,9 +197,11 @@ class VerifyGraphPlan:
         return logits[:tokens], hidden[:tokens]
 
     def close(self) -> None:
+        if self.extend is not None:
+            self.extend.close()
         if self.graph is not None:
             self.graph.close()
-        self.graph, self.output = None, None
+        self.graph, self.output, self.extend = None, None, None
 
     def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> tuple[torch.Tensor, torch.Tensor]:
         for store in stores:
@@ -239,3 +243,150 @@ def eager_verify_padding_step(batch: PersistentBatch, model: Any, backends: Sequ
         model.forward_hidden(tokens, torch.arange(steps, device=device), torch.arange(steps, device=device))
     for store in stores:
         store.clear(store.scratch())
+
+
+class DraftGraphPlan:
+    """The draft model's decode forward for one bucket of rows (doc/specs/mtp.md): one of the D - 2
+    forwards of SGLang's ``EAGLEDraftCudaGraphRunner``, replayed for each of them, the attention
+    backends prepared before every replay for that forward's positions (SGLang plans each forward's
+    metadata before its replay too). The rows padded with the padding row, as a decode graph's."""
+
+    def __init__(self, size: int, hidden_size: int, dtype: torch.dtype, device: torch.device,
+                 backends: Sequence[Backend]) -> None:
+        self.size, self.backends = size, list(backends)
+        self.inputs = torch.zeros(size, dtype=torch.int64, device=device)
+        self.positions = torch.zeros_like(self.inputs)
+        self.hidden = torch.zeros(size, hidden_size, dtype=dtype, device=device)
+        self.last_index = torch.arange(size, device=device)
+        self.output: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.graph: Any = None
+
+    def run(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor,
+            hidden: Tensor) -> tuple[Tensor, Tensor]:
+        n = len(view.rows)
+        if view.phase != "decode" or view.draft_tokens or not 0 < n <= self.size \
+                or any(t != 1 for t in view.num_tokens.values()):
+            raise ValueError(f"a draft graph runs one token per row, at most its bucket of {self.size} rows")
+        for backend in self.backends:
+            backend.prepare(batch, view, PlanKey("decode", self.size))
+        self.inputs[:n].copy_(input_ids)
+        self.positions[:n].copy_(positions)
+        self.hidden[:n].copy_(hidden)
+        self.inputs[n:].zero_()
+        self.positions[n:].zero_()
+        self.hidden[n:].zero_()
+        self.graph.replay()
+        assert self.output is not None
+        logits, out = self.output
+        return logits[:n], out[:n]
+
+    def close(self) -> None:
+        if self.graph is not None:
+            self.graph.close()
+        self.graph, self.output = None, None
+
+    def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        for store in stores:
+            store.clear(store.scratch())
+        for backend in self.backends:
+            backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
+        with torch.no_grad():  # as VerifyGraphPlan.padded
+            return model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
+
+    def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
+        """As ``GraphPlan.capture``, with the same check: one lane is the padding row alone, one token,
+        so what it replays is defined and must be what the same kernels gave eagerly."""
+        with recorder.warmup():
+            expected = self.padded(batch, model, stores)[0].clone()
+            for store in stores:
+                store.clear(store.scratch())
+        with torch.no_grad(), recorder.capture() as graph:
+            self.output = model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
+        self.graph = graph
+        with recorder.warmup():
+            graph.replay()
+        assert self.output is not None
+        if self.size == 1:
+            torch.testing.assert_close(self.output[0], expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
+                f"a draft graph replays other logits than the eager forward it recorded: {m}"))
+
+
+class DraftExtendGraphPlan:
+    """The draft model's extend after a verify step replayed from ``verify`` (doc/specs/mtp.md, SGLang's
+    ``EAGLEDraftExtendCudaGraphRunner``): the same D positions a lane, on the target's hidden states
+    that graph left in its output. It attends over the same extents as that verify step, so it runs on
+    the attention metadata the verify step prepared and prepares nothing: it replays right after its
+    verify graph, nothing in between preparing the attention backends (``Plans.draft``). Each lane's
+    logits and hidden state at its accepted end; a padded lane's at its first token."""
+
+    def __init__(self, verify: VerifyGraphPlan, backends: Sequence[Backend]) -> None:
+        self.verify, self.backends = verify, list(backends)
+        size, steps = verify.size, verify.steps
+        device = verify.inputs.device
+        self.inputs = torch.zeros(size * steps, dtype=torch.int64, device=device)
+        self.first = torch.arange(size, device=device) * steps
+        self.last_index = self.first.clone()
+        self.output: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.graph: Any = None
+
+    def run(self, view: BatchPlan, input_ids: Tensor, last_index: Tensor) -> tuple[Tensor, Tensor]:
+        n, steps = len(view.rows), self.verify.steps
+        if view.draft_tokens != steps or not 0 < n <= self.verify.size:
+            raise ValueError(f"a draft extend graph runs {steps} tokens a row, at most {self.verify.size} rows")
+        self.inputs[:n * steps].copy_(input_ids)
+        self.inputs[n * steps:].zero_()
+        self.last_index[:n].copy_(last_index)
+        self.last_index[n:].copy_(self.first[n:])
+        self.graph.replay()
+        assert self.output is not None
+        logits, hidden = self.output
+        return logits[:n], hidden[:n]
+
+    def close(self) -> None:
+        if self.graph is not None:
+            self.graph.close()
+        self.graph, self.output = None, None
+
+    def _forward(self, model: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.verify.output is not None, "the verify graph is recorded first"
+        return model.draft_forward(self.inputs, self.verify.positions, self.verify.output[1], self.last_index)
+
+    def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
+        """After ``verify``'s capture: a warm-up eager forward on the verify bucket's metadata, the capture,
+        a replay. Not held to the eager logits, for the reason a verify graph is not."""
+        with recorder.warmup():
+            for store in stores:
+                store.clear(store.scratch())
+            for backend in self.backends:
+                backend.prepare(batch, verify_padding_row(self.verify.steps), PlanKey("decode", self.verify.size))
+            with torch.no_grad():
+                self._forward(model)
+            for store in stores:
+                store.clear(store.scratch())
+        with torch.no_grad(), recorder.capture() as graph:
+            self.output = self._forward(model)
+        self.graph = graph
+        with recorder.warmup():
+            graph.replay()
+
+
+def eager_draft_padding_steps(batch: PersistentBatch, model: Any, backends: Sequence[Backend], stores: Sequence[Any],
+                              device: torch.device, steps: int, hidden: torch.Tensor) -> None:
+    """The draft model's forwards a speculative step runs, eagerly on the padding row: a decode
+    forward and the extend of a verify step, so that the kernels they use are seen before any of them
+    is recorded (``eager_padding_step``). ``hidden`` ``[1, hidden_size]`` of the draft's dtype."""
+    for store in stores:
+        store.clear(store.scratch())
+    token = torch.zeros(1, dtype=torch.int64, device=device)
+    with torch.no_grad():
+        for backend in backends:
+            backend.prepare(batch, padding_row(), PlanKey("decode", 0))
+        model.draft_forward(token, torch.zeros_like(token), hidden, torch.arange(1, device=device))
+        for backend in backends:
+            backend.prepare(batch, verify_padding_row(steps), PlanKey("decode", 0))
+        tokens = torch.zeros(steps, dtype=torch.int64, device=device)
+        model.draft_forward(tokens, torch.arange(steps, device=device), hidden.expand(steps, -1).contiguous(),
+                            torch.zeros(1, dtype=torch.int64, device=device))
+    for store in stores:
+        store.clear(store.scratch())
+
