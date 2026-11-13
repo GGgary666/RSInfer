@@ -163,6 +163,10 @@ class Unit:
         self.model, self.backends = model, backends
         self.catalog = ctx.use("kernels.catalog@1")
         self.batch, self.weights = ctx.use("worker.batch@1"), ctx.use("state.weights@1")
+        if steps := int(getattr(model, "draft_tokens", 0)):
+            # Record graph dependencies after all batch buffers exist; the executor's
+            # initialization must not invalidate the verify graphs just captured here.
+            self.batch.prepare_spec(steps, model.hidden_size, model.dtype)
         self.stores = {kind: ctx.use(service) for kind, service in
                        (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
                        if any(d.kind == kind for d in model.assembly.states)}

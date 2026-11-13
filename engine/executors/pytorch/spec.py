@@ -167,9 +167,8 @@ class Speculative:
         kept = track_steps(start, accept, grids.pop()) if grids else torch.full_like(start, -1)
         self.plans.commit(accept - 1, kept)
         batch.record(rows, tokens.gather(1, (accept - 1).view(-1, 1)).view(-1))
-        draft_logits, draft_hidden = self.plans.draft(batch, view(rows, [d] * bs, starts, "prefill"), tokens.flatten(),
-                                                      positions_all, target_hidden, lanes * d + accept - 1)
-        self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
+        # Publish the accepted lengths before draft extend, as EAGLE v2 does: the next
+        # step can prepare its CPU metadata while the GPU finishes extending the draft.
         lengths = accept
         event = None
         if device.type == "cuda":
@@ -177,6 +176,9 @@ class Speculative:
             lengths.copy_(accept, non_blocking=True)
             event = torch.cuda.Event()
             event.record()
+        draft_logits, draft_hidden = self.plans.draft(batch, view(rows, [d] * bs, starts, "prefill"), tokens.flatten(),
+                                                      positions_all, target_hidden, lanes * d + accept - 1)
+        self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
         done = Accepted(rows, starts, lengths, event)
         self.pending = done
         return tokens, accept, done
