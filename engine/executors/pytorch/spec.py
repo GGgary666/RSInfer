@@ -108,8 +108,8 @@ class Speculative:
         self.batch.speculated(rows, [starts[r] + lengths[r] for r in rows])
 
     def prefill(self, plan: BatchPlan, rows: list[int], num_tokens: list[int], positions: list[int],
-                input_ids: torch.Tensor, pos: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
-        """The target's prefill and the draft model's extend; the sampled token of each row."""
+                input_ids: torch.Tensor, pos: torch.Tensor, last_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The target's prefill and the draft model's extend; the sampled token of each row, and the logits."""
         logits, hidden = self.plans.prefill_hidden(self.batch, plan, input_ids, pos, last_index)
         sampled = self.sampler.sample(logits, self.batch.sampling(rows),
                                       [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)]).to(torch.int64)
@@ -122,7 +122,7 @@ class Speculative:
         self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
         self.batch.record(rows, sampled)
         self.batch.speculated(rows, [p + n for p, n in zip(positions, num_tokens, strict=True)])
-        return sampled
+        return sampled, logits
 
     def decode(self, plan: BatchPlan, rows: list[int], positions: list[int], bonus: torch.Tensor,
                state_track: tuple[list[int], list[int], list[int]]) -> tuple[torch.Tensor, torch.Tensor, Accepted]:
@@ -130,7 +130,9 @@ class Speculative:
         d, bs, batch = self.draft_tokens, len(rows), self.batch
         prev = [int(x) for x in plan.from_previous.values()]
         starts = [c if f and (c := batch.committed(r)) is not None else p for r, p, f in zip(rows, positions, prev, strict=True)]
-        own = [bool(f) and batch.has_drafts(r) for r, f in zip(rows, prev, strict=True)]
+        # Drafts are the row's own once it ran since it was added (a full delta adds every row again),
+        # whether the scheduler names its token (from_previous, a step in flight) or gives it.
+        own = [batch.has_drafts(r) for r in rows]
         tables = batch.binding.buffers()
         device = bonus.device
         idx = on_device(torch.tensor(rows, dtype=torch.int64) + 1, device)

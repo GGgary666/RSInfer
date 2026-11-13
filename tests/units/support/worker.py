@@ -87,6 +87,32 @@ def save_checkpoint(model: Qwen3_5ForCausalLM, directory: Path) -> Path:
     return directory
 
 
+def mtp_weights(cfg: Qwen3_5TextConfig, seed: int = 0, scale: float = 0.05) -> dict[str, torch.Tensor]:
+    """Random weights of the MTP layer (``mtp.*``, the checkpoint's names; doc/specs/mtp.md): the draft
+    model of speculation. HF's model has none."""
+    g = torch.Generator().manual_seed(seed)
+    h, heads, kv, hd, inter = (cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+                               cfg.intermediate_size)
+
+    def w(*shape: int) -> torch.Tensor:
+        return scale * torch.randn(*shape, generator=g)
+
+    p = "mtp.layers.0."
+    return {"mtp.fc.weight": w(h, 2 * h), "mtp.pre_fc_norm_embedding.weight": w(h), "mtp.pre_fc_norm_hidden.weight": w(h),
+            p + "self_attn.q_proj.weight": w(heads * hd * 2, h),  # q and its output gate, as HF's
+            p + "self_attn.k_proj.weight": w(kv * hd, h), p + "self_attn.v_proj.weight": w(kv * hd, h),
+            p + "self_attn.o_proj.weight": w(h, heads * hd), p + "self_attn.q_norm.weight": w(hd),
+            p + "self_attn.k_norm.weight": w(hd), p + "mlp.gate_proj.weight": w(inter, h),
+            p + "mlp.up_proj.weight": w(inter, h), p + "mlp.down_proj.weight": w(h, inter),
+            p + "input_layernorm.weight": w(h), p + "post_attention_layernorm.weight": w(h), "mtp.norm.weight": w(h)}
+
+
+def save_mtp(weights: dict[str, torch.Tensor], directory: Path) -> Path:
+    """Beside a checkpoint's ``model.safetensors``, as a second file of it."""
+    save_file({k: v.contiguous() for k, v in weights.items()}, str(directory / "mtp.safetensors"))
+    return directory
+
+
 def hf_greedy(model: Qwen3_5ForCausalLM, prompt: list[int], steps: int) -> tuple[list[int], list[torch.Tensor]]:
     """HF generation, token by token with its cache: the tokens and each step's logits."""
     from transformers.cache_utils import DynamicCache
