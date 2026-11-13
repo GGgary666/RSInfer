@@ -114,13 +114,20 @@ class WeightStore:
     def declare(self, decls: Sequence[WeightDecl]) -> None:
         moved = False
         existing = bool(self.decls)
+        decls = [d for d in decls if self.decls.get(d.name) != d]
         for d in decls:
-            if self.decls.get(d.name) == d:
-                continue
-            moved |= existing
             if d.name in self.buffers_:
                 self.platform.free(self.buffers_.pop(d.name))
                 moved = True
+        if decls and not self.asleep:
+            # As the state stores do: memory freed before (this store's, or that of the instances a
+            # change unloaded) stays in PyTorch's cache, and these allocations would be cut out of
+            # its blocks. A rollback after a failed reload then had the old weights pin the blocks
+            # the failed attempt freed, and the old state pools no longer fit
+            # (doc/framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md).
+            torch.cuda.empty_cache()
+        for d in decls:
+            moved |= existing
             if self.asleep:
                 self.tensors[d.name] = torch.empty(d.shape, dtype=META_DTYPES[d.format], device="meta")
             else:

@@ -1,6 +1,6 @@
 ---
 name: agxinfer
-description: Working in the agxinfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
+description: Working in the agxinfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
 ---
 
 # agxinfer：目录地图与热改开发
@@ -104,6 +104,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
+  - `test_state_rebuild.py`：状态池原地重建（新池比旧池稍大）和撤回时旧权重、旧池重新装回（一次更大的尝试失败以后）都放得下，大小按设备空闲显存定（2026-11-10、2026-11-13 两份 framework-bugs 报告）。
   - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。
@@ -203,6 +204,30 @@ $A control status                               # 也可以是 introspect（单�
 - 第一次醒来的身份和睡之前不一样：`holder.sleep` 这时显式写进了配置。之后每次醒来都是同一个身份。
 - 醒的时候读权重在暂停期里，受执行时限 `change.execute_timeout_s`（默认 3600 秒；2026-11-12 以前是 `supervisor.rpc_timeout_s` 的 30 秒，64 层模型在 SM100 上不够）约束。完整 64 层模型上还没试过。
 
+### 换权重（2026-11-13）
+
+在 4090 D 上实际试过，记录见 `doc/rsi/2026-11-13-weight-swap-on-a-live-engine.md`。都是普通的变更：引擎要是空的（`--wait-empty`、`--force` 照常可用），前缀缓存在提交时丢掉，graph 在暂停期内重录。换完照常用请求验证，需要时对照用新配置冷启动的输出。
+
+- **换一份 checkpoint**：`$A control apply --config '{"weights.path": "<目录>"}'`。
+  - worker 重载 `core.state.weights` 和用它的单元，在暂停期内读新的 checkpoint。旧权重先释放再读新的，不用放得下两份。
+  - 4090 D 上 4 层（7.6 GiB）整个 apply 3.2 秒，输出和用这份 checkpoint 冷启动逐字相同。大模型读权重要几分钟，受 `change.execute_timeout_s`（默认 3600 秒）约束。
+  - 只换内容：新 checkpoint 的结构要和现在的模型一样（模型结构是 `model.hf_config` 等别的键）。只试过同结构的两份随机 checkpoint。
+  - 目录里没有 `*.safetensors`：`aborted`，旧权重从原来的 checkpoint 读回来，照常服务。所以撤回也要重读一遍，大模型同样要几分钟。
+- **换 dtype**：`$A control apply --config '{"model.dtype": "f32", "state.gdn.conv_dtype": "f32"}'`（`serve --dtype`、`--conv-dtype` 对应的键）。
+  - 权重按新 dtype 从 checkpoint 重读。holder 按新权重的大小重新给状态定数量，KV 池和 GDN 池跟着重新申请，和用这个 dtype 冷启动一样：4090 D 上 4 层，bf16 是 656 个槽、107,020 页，f32 是 250 个槽、20,934 页。输出和冷启动逐字相同，改回来也一样。
+  - 池子大小显式定死了的（`state.kv.pages`、`state.gdn.slots` 不为 0），不跟着变，可能放不下：`aborted`，旧版本照常服务。
+  - 2026-11-13 以前这个变更在 24 GB 的卡上 OOM、撤回也失败，只能重启（`doc/framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md`）。
+- **`refit`**：`core.state.weights` 的动作，把 checkpoint 读进同一组张量，不重录 graph，撤回时读回原来的内容。现在只有引擎内部发起的变更能请求它（`ChangeSet.state`），控制接口和 `$A control` 还没有入口。从外面换权重用 `weights.path`。
+- `$A wake` 从 `weights.path` 重读，`refit` 换过的内容回到 checkpoint。
+
+### 撤回没成功、引擎要求恢复的时候
+
+- 表现：`apply` 的结果是 `failed`，诊断里有 `escalate.restart_process`（"reload rolled back, but units did not come back: `<单元>` is FAILED: `<原因>`"）、`change.abort_unacknowledged`、`change.recovery_required`。之后每次 `apply` 都被拒。
+- **这时 `status` 里各进程的单元是过期的**：那是进程上次检入、确认提交或确认撤回时报的，撤回没得到确认就不更新，可能还显示 ACTIVE、旧的代数，其实是 FAILED。看真实状态用 `$A control introspect`，它现问每个进程。请求发过去可能一直没有回应。
+- 处理：v0 没有在线恢复，`$A stop` 再 `serve`，重启引擎。先从诊断里的原因和 worker 日志找为什么没回来；撤回本该成功的，按 `doc/framework-bugs/README.md` 写报告。
+- 2026-11-13 以前，这种时候诊断里还有一句 "reload rolled back; the previous units are serving"，是错的。现在只有单元全都回来了才这么说。
+- 撤回时 OOM，一个原因是 PyTorch 缓存的碎片：诊断里 "reserved by PyTorch but unallocated" 很大，加上设备空闲其实够。释放了旧的块以后，新的一批大申请会从旧块里切，把它们钉住，下一块大的就放不下了。要大块显存的单元，先放掉旧的、`torch.cuda.empty_cache()`，再申请。权重存储和两个状态存储都这样做了，新写的这类单元也照做。
+
 ### 在引擎里做检查（排查和验证）
 
 2026-11-11 在 4090 D 上实际试过，记录见 `doc/rsi/2026-11-11-real-kernels-hot-apply.md`。
@@ -227,13 +252,14 @@ $A control status                               # 也可以是 introspect（单�
    - 大的东西（张量、profiler 的 trace）存成文件。worker 进程的当前目录就是日志所在的目录，`os.getcwd()` 下的文件落在那里。
 5. `$A control apply --source .`（仓库本身），检查就撤掉了；改过的配置也改回去。用 `$A status` 确认身份回到了原值。
 
-试过的三种检查：
+试过的四种检查：
 
 | 要看什么 | 加在哪 | 怎么做 |
 |---|---|---|
 | 一个 kernel 和参照实现在真实激活上差多少 | 调这个 kernel 的层（`layers/*/unit.py`） | 参照实现从目录里取：`catalog.resolve("reference.<definition>")`。有状态的 kernel 先把这几行的状态拷出来（`pool[idx].clone()`），参照实现在拷贝上按 0..n-1 的下标跑，再比输出和状态 |
 | graph 回放和 eager 的 logits 是否相同 | `executors/pytorch/unit.py` 的 `submit`，`chosen.run(...)` 之后 | 每步把 logits 存文件。同一个请求在 `plan.cuda_graph` 为 `off` 和 `auto` 时各跑一遍（`apply --config`），离线比 |
 | 每步发了哪些 kernel、各花多少时间 | `submit` 开头 | 在实例上数步数，第 N 步进 `torch.profiler.profile(...)`，第 N+20 步 `torch.cuda.synchronize()`、退出、`export_chrome_trace` 到文件。Kineto 看得到 graph 回放里的 kernel |
+| 显存到哪去了（重载或撤回时 OOM） | 单元加载、卸载的前后；要看卸载和撤回之间的，加在 `unit.runtime` 的 `_reload`、`_rollback` 里（框架本体，只能冷启动带进去，2026-11-13 这样查过） | `torch.cuda.memory_allocated()`、`memory_reserved()`；`gc.get_objects()` 里的 CUDA 张量按 `untyped_storage().data_ptr()` 去重求和；`gc.set_debug(gc.DEBUG_SAVEALL)` 后 `gc.collect()`，`gc.garbage` 里的就是循环引用里还没回收的，看完 `gc.garbage.clear()`、`gc.set_debug(0)`，状态和查之前一样 |
 
 **好处**：
 
@@ -271,6 +297,7 @@ $A control status                               # 也可以是 introspect（单�
 - 引擎里有请求时被拒；
 - worker 某一步出错：引擎里的请求立刻全部回错误，新请求回 400，直到下一次变更提交，之后照常服务；
 - 引擎睡着（`holder.sleep`）时请求回 400，说引擎睡着了；
+- 变更放不下（比如 OOM）：`aborted`，诊断最后是 "reload rolled back; the previous units are serving"，旧版本照常服务，不要求恢复；
 - 改了框架本体（`engine/framework.toml` 列的模块）或控制面单元的原生扩展：`escalate.restart_engine`，只能重启引擎（AGENTS.md「框架改动」）；
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
@@ -281,7 +308,7 @@ $A control status                               # 也可以是 introspect（单�
 - 提交了，可跑的还是旧代码，或者新旧代码混着跑；
 - 提交以后请求出错、引擎停止服务，或者输出和用同一份代码冷启动的不一样；
 - 计划不对：`--dry-run` 漏了该重载的单元、重载了不相干的、该要求重启的没要求（或反过来）；
-- 撤回（`aborted` / `failed`）以后行为和变更之前不一样，或者引擎进入要求恢复的状态；
+- 撤回（`aborted` / `failed`）以后行为和变更之前不一样，或者引擎进入要求恢复的状态（怎么处理见上面「撤回没成功、引擎要求恢复的时候」）；
 - 同一个改动 apply 两次结果不同，或者 `--dry-run` 的计划和实际执行的不一样；
 - 进程、显存、文件句柄这类资源在多次 apply 之后一直涨。
 

@@ -858,14 +858,15 @@ class UnitRuntime:
             else:
                 slot.state, slot.error = InstanceState.PENDING, None
         self._settle()
-        out = [diag(COMPONENT, "rollback", "reload rolled back; the previous units are serving",
-                    code="unit.rolled_back", severity="warning")]
         lost = sorted(u for u, b in before.items()
                       if b.state is InstanceState.ACTIVE and self._slots[u].state is not InstanceState.ACTIVE)
-        if lost:
-            out.append(self._diag("rollback", f"units did not come back: {lost}", code=ESCALATE_PROCESS,
-                                  hint="restart the process"))
-        return out
+        if not lost:
+            return [diag(COMPONENT, "rollback", "reload rolled back; the previous units are serving",
+                         code="unit.rolled_back", severity="warning")]
+        return [self._diag("rollback", "reload rolled back, but units did not come back: " + "; ".join(
+            f"{u} is {self._slots[u].state}" + (f": {self._slots[u].error}" if self._slots[u].error else
+                                                 f", waiting for {self._missing(self._slots[u])}")
+            for u in lost), code=ESCALATE_PROCESS, hint="restart the process")]
 
     def _purge_modules(self, accepted: set[str]) -> _ModuleBackup:
         """Drop changed modules and their importers from the module cache (§6.2 step 4)."""

@@ -60,7 +60,10 @@ def relative(a: torch.Tensor, b: torch.Tensor) -> float:
 def test_a_state_kept_inside_or_at_the_end_of_a_prefill_chunk_is_the_state_computed_up_to_there(
         checkpoint: Path) -> None:
     """Against the state of the same 128 tokens computed alone, to bf16 (another batch shape rounds the
-    GEMMs otherwise); a state one token off is a hundred times further."""
+    GEMMs otherwise); a state one token off is at least ten times further, in each part. Not a fixed
+    bound on it: how far one token moves the state depends on the weights (the 4 random layers here
+    move it more than 100%, the full model's real ones 57% conv and 14% temporal, against 0.85% and
+    0.30% kept; doc/evaluations/prefix-cache-sm100.md)."""
     w = worker(checkpoint, False)
     try:
         resolved = w.service("plan@1").resolved
@@ -77,7 +80,7 @@ def test_a_state_kept_inside_or_at_the_end_of_a_prefill_chunk_is_the_state_compu
         off = [relative(a, b) for a, b in zip(state(w, early.slot), want, strict=True)]
         print(f"kept inside a chunk (conv, temporal): {kept[0]:.1e}, {kept[1]:.1e}; one token off: "
               f"{off[0]:.1e}, {off[1]:.1e}")
-        assert max(kept) < 5e-2 and min(off) > 0.5
+        assert max(kept) < 5e-2 and all(o > 10 * k for o, k in zip(off, kept, strict=True))
         d.add(3, PROMPT[:128])
         d.step({3: 128}, track=track([3], [5], [128]))  # at the end: the state itself
         assert max(relative(a, b) for a, b in zip(state(w, 5), want, strict=True)) < 5e-2

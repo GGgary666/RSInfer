@@ -49,7 +49,8 @@ class KVPool:
     platform: Any
     page_size: int
     pages: int
-    """Usable pages; 0: as many as the holder gave ``kv.paged`` (``state.holder@1``)."""
+    """Usable pages; 0: as many as the holder gives ``kv.paged`` (``state.holder@1``), taken again
+    at every declaration (``_count``)."""
     holder: Any = None
     decls: dict[int, StateDecl] = field(default_factory=dict[int, StateDecl])
     k_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
@@ -60,19 +61,38 @@ class KVPool:
     """The dtype key the model declares the KV in. Read here so that changing it reloads this
     unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
     (``model.dtype``) the weight store reads."""
+    configured: int = field(init=False, default=0)
+    """``state.kv.pages``; 0: the holder's count."""
+
+    def __post_init__(self) -> None:
+        self.configured = self.pages
 
     @property
     def size(self) -> int:
         """Token slots requests can use."""
         return self.pages * self.page_size
 
+    def _count(self) -> int:
+        """The pages to hold. The model sizes the states again each time it allocates its weights
+        (``state.holder@1``), and weights of another size (``model.dtype``) leave another budget,
+        though this unit is not reloaded: a pool kept at the old count in a larger dtype took more
+        than the budget, and a hot ``model.dtype`` change from bf16 to f32 ran out of memory where a
+        cold start fits."""
+        if self.holder is not None and self.holder.asleep:
+            return 1  # asleep (holder.sleep): whatever state.kv.pages says
+        if self.configured:
+            return self.configured
+        return self.holder.items(KIND) if self.holder is not None else 0
+
     def declare(self, decls: Sequence[StateDecl]) -> None:
-        if decls and self.holder is not None and self.holder.asleep:
-            self.pages = 1  # asleep (holder.sleep): whatever state.kv.pages says
-        if not self.pages and decls:
-            self.pages = self.holder.items(KIND) if self.holder is not None else 0
-            if not self.pages:
+        if decls:
+            pages = self._count()
+            if not pages:
                 raise RuntimeError(f"{KIND}: no page count: set state.kv.pages, or size the states first (state.holder@1)")
+            if pages != self.pages:
+                for layer in list(self.allocated):  # another count: every layer is allocated again
+                    self._free_layer(layer)
+            self.pages = pages
         changed: list[StateDecl] = []
         for d in decls:
             if d.kind != KIND or d.tokens_per_item != self.page_size:

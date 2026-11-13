@@ -214,6 +214,43 @@ def test_broken_new_code_rolls_back(world: World, snapshot: Snapshot) -> None:
     assert ask(rt, world) == 1
 
 
+FULL_AFTER_ONE = '''
+from tests.framework.support import events
+
+class Store:
+    """Loads once; after that its device has no room for it, as for the old weights in the cache
+    a failed reload left (doc/framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md)."""
+
+    def __init__(self, ctx, config):
+        events.append(("store", str(ctx.id)))
+        if len(events) > 1:
+            raise MemoryError("no room on the device")
+        ctx.provide("store@1", self)
+'''
+
+
+def test_a_rollback_that_cannot_bring_a_unit_back_says_which_and_why_and_not_that_the_old_units_serve(
+        pkg: str, snapshot: Snapshot) -> None:
+    files = {f"{pkg}/store.py": FULL_AFTER_ONE, f"{pkg}/user.py": USER.replace("pol@1", "store@1")}
+    v1 = snapshot("v1", files)
+    v2 = snapshot("v2", {**files, f"{pkg}/store.py": FULL_AFTER_ONE + "# v2\n"})
+    store = spec(f"{pkg}.store", f"{pkg}.store:Store", provides=["store@1"])
+    user = spec(f"{pkg}.user", f"{pkg}.user:User", requires=["store@1"])
+    events.clear()
+    rt = UnitRuntime(PROC)
+    rt.load_process_plan(ProcessPlan(PROC, Identity("v1"), [store, user], code_root=str(v1))).unwrap()
+
+    r = rt.reload(ReloadPlan(changed_modules=[f"{pkg}.store"], units_to_reload=[store], new_code_root=str(v2)))
+
+    assert len(events) == 3  # the first load, the new version's, and the old one's in the rollback
+    assert isinstance(r, Failed) and r.has_code(ESCALATE_PROCESS) and not r.has_code("unit.rolled_back")
+    [lost] = [d for d in r.diagnostics if d.phase == "rollback"]
+    assert lost.severity == "error" and lost.code == ESCALATE_PROCESS
+    assert f"{pkg}.store is FAILED: MemoryError: no room on the device" in lost.reason
+    assert f"{pkg}.user is PENDING, waiting for ['store@1']" in lost.reason
+    assert rt.snapshot().states() == {store.id: InstanceState.FAILED, user.id: InstanceState.PENDING}
+
+
 def test_declared_native_extension_change_restarts_process_without_unloading(world: World) -> None:
     native = spec(f"{world.pkg}.native", f"{world.pkg}.other:Native",
                   capabilities=f'native_extensions = ["{world.pkg}._fast"]')

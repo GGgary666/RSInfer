@@ -48,7 +48,8 @@ class MambaPool:
 
     platform: Any
     size: int
-    """Usable slots; 0: as many as the holder gave ``gdn.slots`` (``state.holder@1``)."""
+    """Usable slots; 0: as many as the holder gives ``gdn.slots`` (``state.holder@1``), taken again
+    at every declaration (as ``state.kv_paged`` does)."""
     holder: Any = None
     mamba_layer_ids: list[int] = field(default_factory=list[int])
     decls: list[StateDecl] = field(default_factory=list[StateDecl])
@@ -60,17 +61,29 @@ class MambaPool:
     """The dtype keys the model declares the states in. Read here so that changing one reloads this
     unit, which ``core.deps`` refuses in place while it holds state (§5.5.5); what ``auto`` follows
     (the checkpoint's config) the weight store reads."""
+    configured: int = field(init=False, default=0)
+    """``state.gdn.slots``; 0: the holder's count."""
+
+    def __post_init__(self) -> None:
+        self.configured = self.size
+
+    def _count(self) -> int:
+        """The slots to hold, as ``state.kv_paged`` counts its pages: the holder's count may change
+        while this unit stays (weights of another size)."""
+        if self.holder is not None and self.holder.asleep:
+            return 1  # asleep (holder.sleep): whatever state.gdn.slots says
+        if self.configured:
+            return self.configured
+        return self.holder.items(KIND) if self.holder is not None else 0
 
     def declare(self, decls: Sequence[StateDecl]) -> None:
         decls = sorted(decls, key=lambda d: d.layer)
-        if decls == self.decls:
+        size = self._count() if decls else self.size
+        if decls == self.decls and size == self.size:
             return
-        if decls and self.holder is not None and self.holder.asleep:
-            self.size = 1  # asleep (holder.sleep): whatever state.gdn.slots says
-        if not self.size:
-            self.size = self.holder.items(KIND) if self.holder is not None else 0
-            if not self.size:
-                raise RuntimeError(f"{KIND}: no slot count: set state.gdn.slots, or size the states first (state.holder@1)")
+        if not size:
+            raise RuntimeError(f"{KIND}: no slot count: set state.gdn.slots, or size the states first (state.holder@1)")
+        self.size = size
         if any(d.kind != KIND or d.tensors != decls[0].tensors for d in decls):
             raise ValueError(f"{KIND} holds one state shape for every GDN layer")
         (conv_shape, conv_dtype), (temporal_shape, ssm_dtype) = decls[0].tensors["conv"], decls[0].tensors["temporal"]

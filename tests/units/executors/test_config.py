@@ -149,14 +149,22 @@ def test_changing_what_the_state_pools_are_built_from_rebuilds_them_in_place(key
         w.close()
 
 
-@pytest.mark.parametrize(("key", "value"), [("state.kv.dtype", "bf16"), ("state.gdn.conv_dtype", "bf16"),
-                                            ("state.kv.pages", 16)])
-def test_a_worker_rebuilt_for_new_state_config_generates_as_one_started_with_it(key: str, value: Any) -> None:
+BY_THE_HOLDER = {"state.kv.pages": 0, "state.gdn.slots": 0, "holder.cpu_bytes": 1 << 22}
+
+
+@pytest.mark.parametrize(("key", "value", "base"), [
+    ("state.kv.dtype", "bf16", {}), ("state.gdn.conv_dtype", "bf16", {}), ("state.kv.pages", 16, {}),
+    ("model.dtype", "bf16", BY_THE_HOLDER)])
+def test_a_worker_rebuilt_for_new_state_config_generates_as_one_started_with_it(
+        key: str, value: Any, base: dict[str, Any]) -> None:
     """The plan carried out on an empty worker: the next request's tokens equal those of a worker
-    built with the new value from the start, and the capacity follows the new pools."""
+    built with the new value from the start, and the capacity follows the new pools. ``model.dtype``
+    reloads neither store (their dtypes are ``auto``): they rebuild in place, and take the counts
+    the holder gives for the new item sizes, as a fresh worker's do (on a GPU the weights' size
+    moves the budget too; doc/framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md)."""
     prompt = [5, 17, 3, 44, 9, 2]
-    rebuilt, _ = worker()
-    fresh, _ = worker({key: value})
+    rebuilt, _ = worker(base)
+    fresh, _ = worker({**base, key: value})
     try:
         pa = plan_change(rebuilt, key, value)
         assert pa.reload is not None
