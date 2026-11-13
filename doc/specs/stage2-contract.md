@@ -44,9 +44,9 @@
 | 里程碑 | 内容 | 主要靠谁 |
 |---|---|---|
 | M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_eager` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
-| M2b | SM100 上的 TP1，换成真 kernel，仍然 eager，全模型和 HF 参照在容差内对齐 | 两边集成 |
-| M2c | decode graph：graph 和 eager 按下面的口径一致；能分片的变更在准备阶段按分桶切片重录，不能分片的按 §9.4 处理 | @gaow0007 为主 |
-| M2d | 前缀复用、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
+| M2b | TP1 换成真 kernel：FlashInfer 的 paged attention、SGLang 的 Triton GDN、每层的融合 kernel、KV 写入和槽列表，eager 和 decode graph 都用；真实结构的前 4 层和 HF 参照按下面的口径对齐，完整 64 层在 SM100 上服务（2026-11-13 改成实际做的） | 两边集成 |
+| M2c | TP1 的 decode graph：graph 和 eager 按下面的口径一致；变更在排空的引擎上做，graph 在暂停期内随 `core.plan` 的重载重录（[empty-apply.md](empty-apply.md)、[cuda-graph.md](cuda-graph.md)），不做准备阶段的分片重录（2026-11-13 改成实际做的） | @gaow0007 为主 |
+| M2d | 前缀复用（照 SGLang，[prefix-cache.md](prefix-cache.md)）、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
 
 2026-11-09：M2a 的链路跑通了（`tests/scenarios/test_m2a.py`，进 CI）。Qwen3.8-27B 真实结构的前 4 层在 RTX 4090 D 上和 HF 对齐，参照 kernel，fp32 逐字相同（`tests/gpu/`）。用的还是参照 kernel，不是 M2b 要的真 kernel；完整模型在 SM100 上的端到端验证交给 Devin，用同一套 `deploy/qwen38.py` 和 `tests/gpu/test_qwen38_serve.py`。
 
@@ -64,6 +64,19 @@
 下一步是 M2b、M2c、M2d。
 
 **2026-11-11：M2b 在 RTX 4090 D 上的部分。** SGLang `e838360` 的 GDN Triton kernel（`kernels.triton`）和 FlashInfer 的 paged attention（`kernels.flashinfer`）接进了 kernel 目录，eager 和 decode graph 都用；前 4 层在 fp32 下和 HF 逐 token 相同，bf16 按下面的口径。SM100 上才有的 kernel（FlashInfer 的 GDN、CuTe DSL、`trtllm_mha`）、完整模型和融合路径还没做。做法、数字和没做的见 [../evaluations/real-kernels-4090d.md](../evaluations/real-kernels-4090d.md)。
+
+**2026-11-13：M2b、M2c 完成**，按上表改过的描述。和原来的描述不一样的地方：
+- **M2b**：原来写的是"仍然 eager，全模型和 HF 参照在容差内对齐"。
+  - 真 kernel 在 eager 和 decode graph 上都用了（#51、#53）。
+  - 和 HF 的对照做在真实结构的前 4 层上：fp32 逐 token 相同，bf16 按下面的口径。`tests/gpu/` 的 8 个文件在 RTX 4090 D 和 SM100 上都通过（[../evaluations/real-kernels-kv-store-indices.md](../evaluations/real-kernels-kv-store-indices.md)）。
+  - 完整 64 层在 SM100 上测的是服务和吞吐：HTTP decode 是 SGLang 同族 kernel 配置的 92.7–100.9%，prefill 是 97.7–100.2%（[../evaluations/real-kernels-sm100.md](../evaluations/real-kernels-sm100.md)）。完整模型对 HF 的逐 token 对照没有单独记录。
+  - SM100 专有的 kernel（FlashInfer 的 GDN、CuTe DSL、`trtllm_mha`）不算在 M2b 里，是之后的性能工作。
+- **M2c**：原来写的是"能分片的变更在准备阶段按分桶切片重录"。
+  - [empty-apply.md](empty-apply.md) 让每次变更都在引擎为空时做，[cuda-graph.md](cuda-graph.md)（2026-11-10）据此改成在暂停期内重录，不再需要分片（#45）。
+  - SM100 上 12 组用例 graph 和 eager 的 token 相同。kernel 热更新以后的失效、重录和恢复服务有 GPU 测试（`tests/gpu/test_cuda_graph_apply.py`）。
+- **剩下 M2d**：
+  - 已经有的：流式输出、一步重叠（`sched.overlap`），五组对比里的三组（批量对单条、graph 对 eager、开重叠对不开）。
+  - 还没有的：前缀复用（计划见 [prefix-cache.md](prefix-cache.md)）、MTP 投机、多 rank 配置，以及"前缀命中对不命中""开投机对不开"两组对比。
 
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；
@@ -271,6 +284,8 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 ### 5.3 联合账本与内部状态池（调度宿主里，`ledger@1`）
 
+2026-11-13 更新：前缀缓存改成照 SGLang `e838360` 搬，见 [prefix-cache.md](prefix-cache.md)。本节的块哈希、`reusable` / `common_prefix`、快照与发布这套设计不再实现；末尾的账本验收测试按那份文档改写后继续用。
+
 2026-11-08 更新：以下是 M2d 前缀缓存的设计目标。池与联合准入算法归 `core.state.alloc` 实现所有，不预先要求拆成独立单元；共享 `AccountingPlugin` 已删除。需要独立替换插件时，再围绕实际交接提取必要接口。本 PR 只保留已有的 `common_prefix` 辅助算法，账本实现由后续 PR 提供。2026-11-08 更新：第 3 步接入了 #22 的不带前缀缓存的账本，调度器调用的最小调用集在 `core/contracts/ledger.py`。
 
 `core.sched` 调用状态单元 `core.state.alloc` 的 `ledger@1`，仍然是真实跨单元交接。M2a 接入时，将调度器实际需要的最小调用集定义到 `core.contracts`；本节的准入、预留/快照、发布、取消、延迟释放和退休语义继续约束它，随当期功能实现相应调用。每类池的 `reusable`、`declare`、`set_capacity` 等内部细节留在账本实现里。
@@ -329,7 +344,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 - `gdn.slots`：48 层 GDN，每层的 conv state `[槽, 10240, 3]` bf16 和 recurrent state `[槽, 48, 128, 128]` fp32。TP1 时每个请求约 147 MiB，256 个并发就是约 37 GiB（探针报告第 9 条）。槽位数在启动时由 `core.state.holder` 按显存预算确定，不要求在线扩槽位。
   - 2026-11-09 实现（#32）：照 SGLang 的分法。权重和状态池一共占设备的 `holder.mem_fraction`（`mem_fraction_static`，默认 0.85），状态池分到其中扣掉权重后剩下的部分，再按 `holder.state_ratio`（`mamba_full_memory_ratio`，默认 0.9）分给 GDN 槽，其余给 KV 页；`holder.max_slots`（`max_mamba_cache_size`）可以直接定槽数。CPU 上的预算是 `holder.cpu_bytes`。模型在分配完权重之后、两个存储单元分配之前统一定好各种状态的条目数，`state.kv.pages`、`state.gdn.slots` 配了具体数时以配置为准。代码在 `engine/core/state/holder/`，契约是 `storage.py` 的 `StateHolder`。
 - 前缀复用：GDN 状态只在块边界有快照。快照占同一个池里的槽位，打快照、恢复快照都是条目拷贝（`StateCopy`）。所以 `gdn.slots` 的 `reusable` 只能对齐到快照边界。
-- **快照只能在一步的末尾打**（2026-11-08，PR #19 评审）：
+- **快照只能在一步的末尾打**（2026-11-08，PR #19 评审；2026-11-13 被 [prefix-cache.md](prefix-cache.md) 取代：照 SGLang 从 chunk kernel 的中间状态取，chunk 怎么切都能存）：
   - GDN 的状态在一步之内原地往前推，`StateCopy(after)` 只拷得到这一行在这一步 chunk 末尾的状态。
   - 例：一个 256 token 的 chunk 跨过了 64、128、192。步末时这几处的状态已经没有了，不能把步末的状态当成它们存进缓存。
   - 规则：chunk 的末尾正好落在快照边界上才打快照，chunk 里面跨过的边界不打。
