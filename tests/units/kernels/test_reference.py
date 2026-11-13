@@ -20,9 +20,9 @@ torch.manual_seed(0)
 
 INVARIANT = {"embed.lookup@1", "kv.store@1", "attn.kv_indices@1", "attn.extend@1", "attn.decode@1",
              "attn.paged_extend@1", "attn.paged_decode@1", "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1",
-             "gdn.track_states@1"}
+             "gdn.track_states@1", "gdn.commit_states@1"}
 """Loop over sequences or only move data; checked bit for bit below (the paged attention through
-the native one, whose bits it gives).""" 
+the native one, whose bits it gives), ``gdn.commit_states@1`` in test_spec_reference.py.""" 
 
 
 def test_only_the_per_sequence_references_claim_batch_invariance() -> None:
