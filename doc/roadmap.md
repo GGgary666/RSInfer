@@ -58,7 +58,7 @@
 - 内容：按单元从 sglang、vLLM 搬过来，每个单元都带 PyTorch 参照实现和契约测试，可以大规模并行。包括：层、attention（full attention 和 GDN）、状态种类（paged KV、GDN recurrent / conv state）、权重存储、真实执行后端、cuda_sm100 平台、真 CUDA graph、调度逻辑和默认策略、固定长度投机、前缀复用、OpenAI 前端。
 - 验收：v0-plan 原来的 M2：全模型和 HF 参照在容差内对齐；快速测试层里“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致（最后一组 2026-11-07 加，见 [specs/stage2-contract.md](specs/stage2-contract.md) §4.4）；能服务流式请求。
 - 单元清单、接口、分工和里程碑：[specs/stage2-contract.md](specs/stage2-contract.md)。
-- 进度（2026-11-13）：M2a、M2b、M2c 完成，M2d 进行中；各里程碑按实际做的改过描述，见 [specs/stage2-contract.md](specs/stage2-contract.md) §1.3。前缀复用照 SGLang 搬，做完了（#59，[specs/prefix-cache.md](specs/prefix-cache.md)）；M2d 还剩 MTP 投机和多 rank 配置。
+- 进度（2026-11-13）：M2a、M2b、M2c 完成，M2d 进行中；各里程碑按实际做的改过描述，见 [specs/stage2-contract.md](specs/stage2-contract.md) §1.3。前缀复用照 SGLang 搬，做完了（#59，[specs/prefix-cache.md](specs/prefix-cache.md)）；MTP 投机也照 SGLang 搬了（[specs/mtp.md](specs/mtp.md)），SM100 上还没量；M2d 还剩多 rank 配置。
 
 ### 阶段 3：在真 GPU 上跑全变更机制
 

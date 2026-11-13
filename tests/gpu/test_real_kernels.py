@@ -280,8 +280,19 @@ def test_flashinfer_paged_attention_stays_within_its_definitions() -> None:
             operator.plan(indptr_of(new), *layout(rows, [p + n for p, n in zip(prefix, new, strict=True)]))
         close("attn.paged_extend@1", extend.run(q, k_cache, v_cache, scaling),
               want_extend.run(q, k_cache, v_cache, scaling))
-    with pytest.raises(ValueError, match="not replayed from a graph"):
-        ops.PagedExtend(workspace, *shape, buffers)
+    # a graph bucket of verify steps (doc/specs/mtp.md): D new tokens a lane, over fixed buffers
+    steps = 4
+    verify = {**buffers, "qo_indptr": torch.arange(size + 1, dtype=torch.int32, device=DEVICE) * steps}
+    bucket_extend = ops.PagedExtend(workspace, *shape, verify)
+    for rows, prefix in (([2, 5, 0, 0], [10, 20, 0, 0]), ([1, 2, 3, 4], [296, 1, 250, 7])):
+        q = torch.randn(size * steps, HEADS, HEAD_DIM, device=DEVICE, generator=gen).to(torch.bfloat16)
+        kv_indptr_cpu, kv_indptr, kv_indices = layout(rows, [p + steps for p in prefix], verify["kv_indices"])
+        verify["kv_indptr"].copy_(kv_indptr)
+        qo = torch.arange(size + 1, dtype=torch.int32) * steps
+        bucket_extend.plan(qo, kv_indptr_cpu, verify["kv_indptr"], kv_indices)
+        want_extend.plan(qo, kv_indptr_cpu, kv_indptr, kv_indices)
+        close("attn.paged_extend@1", bucket_extend.run(q, k_cache, v_cache, scaling),
+              want_extend.run(q, k_cache, v_cache, scaling))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -542,7 +553,8 @@ def test_graphs_that_are_refused_or_only_checked_leave_nothing_in_the_backends(c
         attn, gdn = w.service("layers.attn@1"), w.service("layers.gdn@1")
         assert w.service("plan@1").buckets("decode") == [2, 4]
         assert sorted(attn.paged.graph_metadata) == [2, 4] and sorted(gdn.graph_metadata) == [2, 4]
-        assert sorted(key for key in attn.paged.operators if key[0] == "graph") == [("graph", 2), ("graph", 4)]
+        assert sorted(key for key in attn.paged.operators if key[0] == "graph") == [("graph", 2, False),
+                                                                                     ("graph", 4, False)]
         assert not [name for name in (*attn.binding.buffers(), *gdn.binding.buffers()) if name.split(".")[-2] == "1"]
     finally:
         w.close()
