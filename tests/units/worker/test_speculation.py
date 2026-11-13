@@ -15,7 +15,7 @@ from core.contracts.columns import Column
 from core.contracts.requests import NewRequest
 from core.contracts.sampling import SamplingParams
 from tests.units.support.worker import hf_greedy, hf_model, mtp_weights, save_checkpoint, save_mtp, tiny_config
-from tests.units.worker.support import stack
+from tests.units.worker.support import Oracle, stack
 
 PROMPTS = {1: [(5 * i + 1) % 97 for i in range(30)], 2: [3, 4, 5], 3: [(7 * i + 2) % 97 for i in range(70)]}
 STEPS = 9
@@ -49,44 +49,6 @@ def test_speculative_decoding_generates_what_hf_generates(checkpoint: tuple[dict
         assert all(w.loop.failures == 0 for w in workers) and b.engine.loop.report().fault is None
         b.run_until(b.idle, timeout=10)
         assert b.engine.ledger.check() == []
-
-
-class Oracle:
-    """The draft model replaced: at position ``p`` after input ``S[p + 1]`` (the MTP layer's convention:
-    the token after the position) it drafts ``S[p + 2]``, the target's greedy token, of whichever
-    request ``S`` that is; wrong where ``p % WRONG_EVERY == WRONG_AT``. So steps accept every length."""
-
-    WRONG_EVERY, WRONG_AT = 7, 3
-
-    def __init__(self, sequences: dict[int, list[int]], vocab: int) -> None:
-        self.next: dict[tuple[int, int], int] = {}
-        for s in sequences.values():
-            for p in range(len(s) - 2):
-                assert self.next.setdefault((p, s[p + 1]), s[p + 2]) == s[p + 2], "two requests meet: pick others"
-        self.vocab = vocab
-
-    def __call__(self, input_ids: Any, positions: Any, hidden: Any, last_index: Any) -> tuple[Any, Any]:
-        import torch
-        rows = [(int(positions[i]), int(input_ids[i])) for i in last_index.tolist()]
-        drafts = [self.next.get(key, 0) for key in rows]
-        drafts = [(d + 1) % self.vocab if p % self.WRONG_EVERY == self.WRONG_AT else d
-                  for (p, _), d in zip(rows, drafts, strict=True)]
-        logits = torch.zeros(len(rows), self.vocab)
-        logits[torch.arange(len(rows)), torch.tensor(drafts)] = 1.0
-        return logits, hidden[last_index]
-
-    def counts(self, prompt: int, steps: int, draft_tokens: int) -> list[int]:
-        """What each step of a request of ``prompt`` tokens accepts: 1 for its prefill, then at ``L``
-        the drafts for ``L + 1 ..`` up to the first wrong one (the draft for ``q`` comes from position
-        ``q - 2``)."""
-        out, at = [1], prompt
-        while sum(out) < steps:
-            right = 0
-            while right < draft_tokens - 1 and (at + right + 1 - 2) % self.WRONG_EVERY != self.WRONG_AT:
-                right += 1
-            out.append(right + 1)
-            at += right + 1
-        return out
 
 
 def slow(worker: Any, seconds: float) -> None:
