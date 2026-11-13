@@ -1,6 +1,6 @@
 # 前缀复用：照 SGLang 搬（计划，2026-11-13）
 
-- 状态：计划，还没实现。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
+- 状态：计划，实现中（2026-11-13）。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
 - 来源：SGLang `e838360`，和 kernel 是同一个版本（`~/sglang-e838360/python/sglang/srt/`，下面的路径都相对于它）。Qwen3.5 结构在开重叠或 `page_size > 1` 时，SGLang 默认用的那一套：radix cache 加 mamba 状态的 `extra_buffer` 策略。
 - 取代：stage2-contract.md §5.3 前缀缓存的设计，也就是块哈希、`reusable` / `common_prefix`、快照与发布；还有 §5.4 的"快照只能在一步的末尾打"。和 §5.5 一样，改成严格照 SGLang。
 - 继续有效：§5.3 末尾的账本验收测试（按树的说法改写）、§5.5.4 的规则（共享页不续写、恢复到请求自己的可写状态）、§5.5.6 的 M2d 部分，以及五组对比里的"前缀命中对不命中"。
@@ -110,8 +110,8 @@
   - decode：搬 `track_mamba_states_all_layers` 进 `kernels.triton`，在最后一个 GDN 层之后发一次。
 - **参照实现**（CPU，进 CI）：`kernels.reference` 的 chunk 版（fla 的 naive 实现）也要给出中间状态。
 - **decode graph**：SGLang 在 graph 里做跟踪（mask 和目标放在固定 buffer 里）。
-  - 第一版不放进 graph：回放之后在图外发那一个拷贝 kernel，只在有行到了间隔的步才发。
-  - 量过以后再决定要不要搬进 graph。这是第一版和 SGLang 不一样的地方。
+  - 先做到能跑：回放之后在图外发那一个拷贝 kernel，只在有行到了间隔的步才发。
+  - 合进 master 之前搬进 graph，和 SGLang 一样（2026-11-13 用户定）。
 - **`worker.batch`**：不变。
   - 跟踪槽不进持久 batch 的表，每一步由计划给出。
   - 几行共享同一页，现在的检查不拒绝。
@@ -139,7 +139,9 @@
 
 ## 4. 默认开不开
 
-SGLang 默认开。建议第一版默认关；§5 的验收都过了以后改成默认开，和 SGLang 一致。
+默认开，和 SGLang 一致（2026-11-13 用户定）。`alloc.radix_cache = false` 关掉。
+
+GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）：开前缀缓存时，最大行数会被 GDN 槽数封顶。
 
 ## 5. 验收
 
@@ -166,7 +168,7 @@ SGLang 默认开。建议第一版默认关；§5 的验收都过了以后改成
 
 1. **账本**：树、跟踪槽、新接口。调度器先不用，只跑 CPU 测试。
 2. **worker**：跟踪（参照实现和 Triton 都做），测试对照单独算的状态。
-3. **调度器接上**：`alloc.radix_cache` 默认关，整个引擎的对比测试进 CI。
-4. **GPU 验收和性能**：都过了以后默认打开。
+3. **调度器接上**：`alloc.radix_cache` 默认开，整个引擎的对比测试进 CI。
+4. **GPU 验收和性能**：decode 的跟踪搬进 graph。
 
-每一步一个 PR，先在跑着的引擎上热改开发：改的都是单元，不碰框架本体（`engine/framework.toml` 里没有这些模块）。
+四步都在一个 PR 里（2026-11-13 用户定），叠在这份计划的 PR（#58）上：实现的 PR 先合进 #58，#58 再合进 master。先在跑着的引擎上热改开发：改的都是单元，不碰框架本体（`engine/framework.toml` 里没有这些模块）。
