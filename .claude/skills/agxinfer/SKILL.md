@@ -133,7 +133,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、投机解码（`mtp.md`：照 SGLang 的 MTP 和 EAGLE 链式验证，2026-11-13）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、投机解码（`mtp.md`：照 SGLang 的 MTP 和 EAGLE 链式验证，2026-11-13）、v1 多卡和多机的讨论记录（`v1-distributed.md`：未定，2026-11-13）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
@@ -228,6 +228,7 @@ $A control status                               # 也可以是 introspect（单�
 - 打开：冷启动 `serve --speculative-algorithm EAGLE`（还有 `--speculative-num-steps` 等，和 SGLang 同名，默认 3、1、4），或者在跑着的引擎上 `$A control apply --config '{"spec.algorithm": "eagle"}'`：调度宿主重载 `core.sched`、`core.state.alloc`，worker 重载模型、GDN 存储和后端、executor，几秒。关掉是把它改回 `""`。checkpoint 里要有 `mtp.*`；`$A checkpoint` 生成的有（随机的）。
 - 打开以后正常的现象：KV 页变少（草稿模型的那层 attention 也占页）、GDN 槽变少（验证要的中间状态先从预算里扣）；`core.plan` 录的是验证步的 graph（日志里 `"verify": true`），不录 decode 的。
 - 随机权重的 MTP 几乎什么都不接受，所以本机上开投机更慢，这是对的：4 层时 LM head 占满带宽（mtp.md §6.4）。要看接受多个 token 的路径，测试里用 `Oracle` 换掉 `models.qwen38` 实例的 `draft_forward`。
+- **验证步的 graph 有没有真在用**：用 `plan.cuda_graph = required`（`--cuda-graph required`）冷启动。graph 过期时，第一个验证步就报 `StaleGraph`，不会悄悄退回 eager；`tests/gpu/test_speculation.py` 也这样测。2026-11-13 的第一版里，graph 一录完就过期，`auto` 下全退回了 eager。我在 4090 D 上没查出来，是 Codex 在 SM100 上发现的（`doc/evaluations/mtp-sm100.md`），原因见下一节第 11 条。
 - 开投机前后文本不同时，先分清是 kernel 的数值还是 bug：用 fp32，并且两边都 `--set gdn.backend=reference --set attn.backend=reference`，再比。2026-11-13 就是这样查出开重叠时清掉刚 prefill 完的 GDN 状态那个 bug（只在 GPU 上、请求一个一个来时出现）。
 
 ### 撤回没成功、引擎要求恢复的时候
@@ -300,6 +301,11 @@ $A control status                               # 也可以是 introspect（单�
 8. **每次 apply 都要求引擎是空的**。临时代码和临时配置会改变引擎的身份，查完要改回去。
 9. **这条路径不代替测试。** 能复现的问题最后写成 pytest（`tests/gpu/` 或 `tests/units/`），提交前照常跑 pyright 和 pytest。
 10. 只试过 worker 里的单元（层、executor）。前端和调度宿主里没有这样试过。
+11. **检查本身可能让问题消失**（2026-11-13）。
+    - 检查写进哪个单元，apply 时那个单元和依赖它的单元就重载。
+    - 热改时状态单元保留着上次建的东西，所以重载走的初始化顺序和冷启动不一样。
+    - 例子：为了看验证步的 graph 有没有回放，我把打印写进了 `core.plan`。它重载时 batch 里投机用的表已经在了，重录的 graph 是好的，打印出来"在用"；冷启动时 graph 其实一直是过期的。
+    - 所以查"冷启动以后是什么样"，检查要写在不会让被查的单元重载的地方，或者带着检查冷启动。
 
 ### 哪些是正常的，哪些可能是 bug
 

@@ -70,6 +70,9 @@ class PersistentBatch:
     rows: dict[int, Row] = field(default_factory=dict[int, Row])
     tensors: dict[str, torch.Tensor] = field(default_factory=dict[str, torch.Tensor])
     allocated: list[Any] = field(default_factory=list[Any])
+    spec: tuple[int, int, str] | None = None
+    """What ``prepare_spec`` last made the speculation tables for."""
+    spec_buffers: list[Any] = field(default_factory=list[Any])
     generation: int = 0
     rebuilt: bool = True
     """Built, or left half changed by a step that failed (``invalidate``), and not yet given a full
@@ -194,10 +197,17 @@ class PersistentBatch:
         return {r: row.ids.get(kind, []) for r, row in self.rows.items()}
 
     def prepare_spec(self, draft_tokens: int, hidden_size: int, dtype: str) -> None:
-        if "spec.drafts" not in self.tensors:
-            self._alloc("spec.drafts", (self.max_rows + 1, draft_tokens - 1), "i64")
-            self._alloc("spec.hidden", (self.max_rows + 1, hidden_size), dtype)
-            self.generation += 1
+        """The speculation tables; kept when asked for the same again (a reloaded executor, or
+        ``core.plan`` before it), made again when ``spec.num_draft_tokens`` or the model changed."""
+        if self.spec == (draft_tokens, hidden_size, dtype):
+            return
+        for buf in self.spec_buffers:  # what graphs recorded over them went with the plan that had them
+            self.allocated.remove(buf)
+            self.platform.free(buf)
+        self._alloc("spec.drafts", (self.max_rows + 1, draft_tokens - 1), "i64")
+        self._alloc("spec.hidden", (self.max_rows + 1, hidden_size), dtype)
+        self.spec, self.spec_buffers = (draft_tokens, hidden_size, dtype), self.allocated[-2:]
+        self.generation += 1
 
     def committed(self, row: int) -> int | None:
         return self.rows[row].committed

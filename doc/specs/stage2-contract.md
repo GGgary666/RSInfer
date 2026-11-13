@@ -24,6 +24,8 @@
 
 多 rank 的 TP 配置放在阶段 2 的最后（M2d）。阶段 2 不做 DS 1017 专有的单元（`moe.*` 等）。
 
+2026-11-13 改（用户定）：阶段 2 不做多 rank 配置。TP 以后再说，多卡和多机放到 v1 里讨论（[v1-distributed.md](v1-distributed.md)）。
+
 ### 1.2 分工
 
 | | 负责 | 说明 |
@@ -46,7 +48,7 @@
 | M2a | 小尺寸、随机权重的 Qwen3.8 结构（例如 4 层：3 层 GDN + 1 层 full attention），参照 kernel，eager，在 `torch_eager` 上把前端 → 调度 → worker → 前端整条链路跑通，和同尺寸的 HF 参照逐 token 对齐 | @wutianyuan1 |
 | M2b | TP1 换成真 kernel：FlashInfer 的 paged attention、SGLang 的 Triton GDN、每层的融合 kernel、KV 写入和槽列表，eager 和 decode graph 都用；真实结构的前 4 层和 HF 参照按下面的口径对齐，完整 64 层在 SM100 上服务（2026-11-13 改成实际做的） | 两边集成 |
 | M2c | TP1 的 decode graph：graph 和 eager 按下面的口径一致；变更在排空的引擎上做，graph 在暂停期内随 `core.plan` 的重载重录（[empty-apply.md](empty-apply.md)、[cuda-graph.md](cuda-graph.md)），不做准备阶段的分片重录（2026-11-13 改成实际做的） | @gaow0007 为主 |
-| M2d | 前缀复用（照 SGLang，[prefix-cache.md](prefix-cache.md)）、MTP 投机、流式输出；五组对比；一步重叠；一种多 rank 配置 | @wutianyuan1 为主 |
+| M2d | 前缀复用（照 SGLang，[prefix-cache.md](prefix-cache.md)）、MTP 投机、流式输出；五组对比；一步重叠（2026-11-13 改：原来还有"一种多 rank 配置"，移出了阶段 2） | @wutianyuan1 为主 |
 
 2026-11-09：M2a 的链路跑通了（`tests/scenarios/test_m2a.py`，进 CI）。Qwen3.8-27B 真实结构的前 4 层在 RTX 4090 D 上和 HF 对齐，参照 kernel，fp32 逐字相同（`tests/gpu/`）。用的还是参照 kernel，不是 M2b 要的真 kernel；完整模型在 SM100 上的端到端验证交给 Devin，用同一套 `deploy/qwen38.py` 和 `tests/gpu/test_qwen38_serve.py`。
 
@@ -79,6 +81,10 @@
   - 还没有的：前缀复用（计划见 [prefix-cache.md](prefix-cache.md)）、MTP 投机、多 rank 配置，以及"前缀命中对不命中""开投机对不开"两组对比。
   - 2026-11-13 更新：前缀复用做完了（#59，默认开），CPU、4090 D 和 SM100 的完整 64 层上都验收过（[prefix-cache.md](prefix-cache.md) §7）；"前缀命中对不命中"这组对比也有了，五组里有了四组。还剩 MTP 投机、多 rank 配置和"开投机对不开"。
   - 2026-11-13 更新：MTP 投机做了（照 SGLang 的 EAGLE 链式，默认关，开重叠、temperature > 0、和前缀缓存一起都支持，[mtp.md](mtp.md)），CPU 和 4090 D 上验收过；"开投机对不开"这组对比也有了，五组都有了。SM100 上真 MTP 权重的接受长度和吞吐还没量。多 rank 配置由 Devin 做。
+  - 2026-11-13 更新：**M2d 到此为止（用户定）。**
+    - 多 rank 配置不做了：TP 以后再说，多卡和多机放到 v1 里一起讨论（[v1-distributed.md](v1-distributed.md)）。
+    - SM100 上真 MTP 权重的数有了（Codex，[../evaluations/mtp-sm100.md](../evaluations/mtp-sm100.md)）：开投机是不开的 1.69 / 1.36 / 1.09 倍（并发 1 / 4 / 8），是 SGLang 开投机的 88.8% / 90.6% / 70.7%。差距主要在 GDN 状态的提交，见 [mtp.md](mtp.md) §6.5。
+    - #61 合入以后阶段 2 结束。
 
 验收沿用 roadmap，另加一组对比（§4.4）：
 - 全模型和 HF 参照在容差内对齐；

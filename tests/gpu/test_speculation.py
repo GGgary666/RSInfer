@@ -44,7 +44,7 @@ def generate(checkpoint: Path, dtype: str, *, spec: bool, graphs: bool, oracle: 
     counts: dict[int, list[int]] = {rid: [] for rid in PROMPTS}
     platform = CudaGraphPlatform() if graphs else TorchEagerPlatform(cuda=True)
     worker: dict[str, Any] = {"model.dtype": dtype, "state.gdn.conv_dtype": dtype, "state.kv.pages": 1024,
-              "state.gdn.slots": 24, "plan.cuda_graph": "auto" if graphs else "off", **ROWS, **(SPEC if spec else {})}
+              "state.gdn.slots": 24, "plan.cuda_graph": "required" if graphs else "off", **ROWS, **(SPEC if spec else {})}
     try:
         with stack(cfg, checkpoint, overlap=True, token_budget=256, platform=platform,
                    sched={**ROWS, **(SPEC if spec else {})}, **worker) as (b, workers):

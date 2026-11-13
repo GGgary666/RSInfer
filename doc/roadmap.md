@@ -59,6 +59,10 @@
 - 验收：v0-plan 原来的 M2：全模型和 HF 参照在容差内对齐；快速测试层里“批量对单条”“前缀命中对不命中”“开投机对不开”“decode graph 对 eager”“开重叠对不开”五组对比完全一致（最后一组 2026-11-07 加，见 [specs/stage2-contract.md](specs/stage2-contract.md) §4.4）；能服务流式请求。
 - 单元清单、接口、分工和里程碑：[specs/stage2-contract.md](specs/stage2-contract.md)。
 - 进度（2026-11-13）：M2a、M2b、M2c 完成，M2d 进行中；各里程碑按实际做的改过描述，见 [specs/stage2-contract.md](specs/stage2-contract.md) §1.3。前缀复用照 SGLang 搬，做完了（#59，[specs/prefix-cache.md](specs/prefix-cache.md)）；MTP 投机也照 SGLang 搬了（[specs/mtp.md](specs/mtp.md)），SM100 上还没量；M2d 还剩多 rank 配置。
+- 2026-11-13 更新（用户定）：
+  - M2d 到 MTP 为止，多 rank 配置移出阶段 2，TP 以后再说。#61 合入以后阶段 2 结束，接着进入 v1 的开发。
+  - v1 的范围、多卡和多机怎么安排、DS 1017 怎么做，都还没定，讨论记录见 [specs/v1-distributed.md](specs/v1-distributed.md)。
+  - 阶段 3（验收写的是"TP1 和多 rank 配置"）到阶段 5 和 v1 怎么排，也还没定。
 
 ### 阶段 3：在真 GPU 上跑全变更机制
 
@@ -78,6 +82,7 @@
 
 - **v0.1**：按 modules.html ⑤ 页的 16 步，把 DS 1017（单机 DP8 + EP8）加到正在运行的 v0 上。
 - **v0.2**：按 modules.html ⑥ 页的 14 步，扩到两机 DP16 + EP16。
+- 2026-11-13 注：现在把这两步叫 v1、v2。v1 先做什么还在讨论（[specs/v1-distributed.md](specs/v1-distributed.md)）。
 
 ## 和 v0-plan 原里程碑的对应
 
