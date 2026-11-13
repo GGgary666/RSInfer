@@ -70,6 +70,9 @@ class PersistentBatch:
     rebuilt: bool = True
     """Built, or left half changed by a step that failed (``invalidate``), and not yet given a full
     delta: it refuses every other one (``Resync``)."""
+    tracks: dict[str, tuple[list[int], list[int], list[int]]] = field(
+        default_factory=dict[str, tuple[list[int], list[int], list[int]]])
+    """The step's ``StateOps.track`` per kind: rows, destination items, positions."""
 
     def __post_init__(self) -> None:
         # +1 padding row at index 0: padded batches read and write there harmlessly.
@@ -127,6 +130,12 @@ class PersistentBatch:
             offsets, ids = list(assign.offsets.values()), [int(x) for x in assign.ids.values()]
             for i, r in enumerate(int(x) for x in assign.rows.values()):
                 self._assign(r, assign.kind, ids[int(offsets[i]):int(offsets[i + 1])])
+        self.tracks = {t.kind: ([int(x) for x in t.rows.values()], [int(x) for x in t.dst.values()],
+                                [int(x) for x in t.upto.values()]) for t in state.track}
+
+    def track(self, kind: str) -> tuple[list[int], list[int], list[int]]:
+        """This step's ``StateTrack`` of ``kind``: rows, destination items, positions."""
+        return self.tracks.get(kind, ([], [], []))
 
     def _within_limits(self, delta: RowDelta, state: StateOps) -> None:
         """What ``apply`` cannot do, found before it changes anything: a row outside the batch,

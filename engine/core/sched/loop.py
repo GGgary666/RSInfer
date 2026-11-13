@@ -75,7 +75,9 @@ from core.contracts.records import (
     RowDelta,
     Sampled,
     StateAssign,
+    StateCopy,
     StateOps,
+    StateTrack,
     StepFailure,
 )
 from core.contracts.requests import ENDED_BY_CHANGE, REQUESTS, TOKENS, Requests, TokenEvents
@@ -109,10 +111,11 @@ class Request(Protocol):
 
     @property
     def input(self) -> Any: ...
+    computed: int
+    """Tokens computed so far; at admission, the prefix the cache holds (``Admitted.prefix``)."""
+
     @property
     def output_ids(self) -> Sequence[int]: ...
-    @property
-    def computed(self) -> int: ...
     @property
     def route(self) -> StreamAddress | None: ...
     @property
@@ -194,6 +197,9 @@ class Flight:
     samples: frozenset[int]
     """Rows whose chunk ends the prompt or decodes: the rows that sample."""
     since: float
+    prefills: frozenset[int] = frozenset()
+    """Rows that computed prompt tokens: what they computed enters the prefix cache once the step
+    retired (``Ledger.commit``)."""
     answers: dict[int, Answer] = field(default_factory=dict[int, Answer])
     void: bool = False
     """Sent after a step the workers refused (``Resync``): they refuse this one too."""
@@ -246,6 +252,12 @@ class Scheduler:
             raise ValueError("one plan writer and one result reader per rank")
         if settings.max_batch < 1 or settings.token_budget < 1:
             raise ValueError("sched.max_batch and sched.token_budget must be positive")
+        if settings.token_budget % ledger.align:
+            # A chunk that does not end its prompt ends on a page (_carry_out): a smaller budget
+            # never computes one. SGLang: chunked_prefill_size must be divisible by page_size.
+            raise ValueError(f"sched.token_budget = {settings.token_budget} must be a multiple of the prefix "
+                             f"cache's page, state.kv.page_size = {ledger.align} (as SGLang's "
+                             "chunked_prefill_size), or alloc.radix_cache = false")
         self.table, self.ledger, self.order, self.compose = table, ledger, order, compose
         self.requests, self.results = requests, list(results)
         self.plans = [Outbox(w) for w in plans]
@@ -449,6 +461,11 @@ class Scheduler:
             self.ledger.set_capacity(lowest)
         except ValueError as e:
             self._note(f"capacity {lowest} not taken: {e}")
+            return
+        cap = self.ledger.max_requests
+        if cap is not None and cap < self.settings.max_batch:
+            self._note(f"at most {cap} requests run at once, not sched.max_batch = {self.settings.max_batch}: "
+                       f"the prefix cache's slots per request (as SGLang's max_running_requests)")
 
     def _plans_moved(self, rank: int, gen: int) -> None:
         """Plans to ``rank`` now go over a new connection: to a new worker process, or the old
@@ -480,8 +497,24 @@ class Scheduler:
         steps sent there that it did not answer (their answers may never come)."""
         lost = {rid for rid, first in self.home.items() if rank in first and old(first[rank])}
         void = [f for f in self.flights if rank in f.written and old(f.written[rank]) and rank not in f.answers]
+        self.ledger.flush()  # a new worker: what the old one's stores held is gone
         for f in void:
             lost |= set(f.rows.values())
+        restarted = 0
+        for request in self.table.entries():
+            # Computed tokens but none of them went over the old connection: they came from the
+            # prefix cache, which was the old worker's too. It starts over from 0, as a request
+            # with nothing computed does (Antigravity, #59), or ends.
+            rid = request.input.request
+            if rid in lost or request.row is None or request.finished() or request.computed == 0:
+                continue
+            if self.ledger.restart(rid):
+                request.computed = 0
+                restarted += 1
+            else:
+                lost.add(rid)
+        if restarted:
+            self._note(f"{restarted} request(s) admitted from the prefix cache start over from position 0")
         self.full = True
         for f in self.flights:  # not given up: on their way to the new worker, which refuses them
             if f not in void and rank not in f.answers:
@@ -552,6 +585,10 @@ class Scheduler:
         events = self.table.sample(flight.epoch, self.identity(), kept)
         self.ledger.retire(flight.epoch)
         ready = self.table.retire(flight.epoch)
+        for row in flight.prefills:  # checkpoint_kv_cache
+            request = self.table.get(flight.rows[row])
+            if request is not None and not request.finished():
+                self.ledger.commit(request.input.request, request.prompt_tokens)
         self._emit(events, flight.epoch)
         for rid in ready:
             self._reap(rid)
@@ -781,7 +818,8 @@ class Scheduler:
         request = self.table.get(rid)
         if request is None or not request.reclaimable:
             return
-        self.ledger.release(rid, self.table.last_retired)
+        computed = [*request.prompt_tokens, *request.output_ids][:request.computed]
+        self.ledger.release(rid, self.table.last_retired, computed)
         if request.row is not None:
             self.removed.append(request.row)
         self.home.pop(rid, None)
@@ -850,14 +888,19 @@ class Scheduler:
         prefilling: list[Candidate] = []
         decoding: list[Candidate] = []
         used: set[int] = set()
-        for arrival, request in enumerate(self.table.entries()):
+        for request in self.table.entries():
             if request.row is not None:
                 used.add(request.row)
+        room = len(used) < self.settings.max_batch  # a waiting request can be admitted: where it starts
+        for arrival, request in enumerate(self.table.entries()):
             if request.finished():
                 continue
             rid = request.input.request
             prompt = len(request.prompt_tokens)
-            planned = request.computed + tokens.get(rid, 0) if request.row is not None else 0
+            if request.row is not None:
+                planned = request.computed + tokens.get(rid, 0)
+            else:
+                planned = self.ledger.match(rid, request.prompt_tokens) if room else 0
             output = len(request.output_ids) + samples.get(rid, 0)
             c = Candidate(rid, arrival, prompt, min(planned, prompt), output, request.input.max_tokens)
             if request.row is None:
@@ -929,6 +972,7 @@ class Scheduler:
                 self.ledger.cancel(rid, epoch)
             for request in step.admitted:
                 request.row = None
+                request.computed = 0
             raise
         return True
 
@@ -947,23 +991,39 @@ class Scheduler:
                 if why := self._too_long(extent):
                     self._error(request, why)
                     continue
-                got = self.ledger.admit(rid, extent, step.epoch)
+                # Where it would start now (an admission before it in this step may have evicted
+                # part of its prefix): a chunk that reaches no page does not run, and admitting it
+                # would only evict from the cache (Antigravity, #59; PrefillAdder checks first too).
+                if self._chunk(request, self.ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
+                    continue
+                got = self.ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
                 if got is None:
                     refused = True
                     continue
                 request.row = free.pop(0)
+                request.computed = planned = got.prefix  # the cached prefix is computed
                 step.admitted.append(request)
                 step.added.append(AddedRow(request.row, rid, request.input.sampling))
-                step.assign_all(request.row, got)
+                step.assign_all(request.row, got.items)
             row = request.row
             assert row is not None
-            extra = self.ledger.reserve(rid, planned + take.tokens, step.epoch)
+            n = take.tokens if kind == "decoding" else self._chunk(request, planned, take.tokens)
+            if n <= 0:
+                if kind == "waiting":
+                    self.ledger.cancel(rid, step.epoch)
+                    step.unadmit(request, free)
+                continue
+            extra = self.ledger.reserve(rid, planned + n, step.epoch)
             if extra is None:  # what step.epoch took for it is back in the ledger
                 if kind == "waiting":
                     step.unadmit(request, free)
                 continue
-            step.assign_all(row, extra)
-            step.rows[row], step.counts[row] = rid, take.tokens
+            step.assign_all(row, extra.items)
+            for state_kind, (src, dst) in extra.restore.items():
+                step.copies.setdefault(state_kind, []).append((row, src, dst))
+            for state_kind, (dst, upto) in extra.track.items():
+                step.track.setdefault(state_kind, []).append((row, dst, upto))
+            step.rows[row], step.counts[row] = rid, n
             step.positions.append(planned)
             if kind == "decoding":
                 previous = rid in in_flight  # its last run is still in flight: the worker has the token
@@ -973,11 +1033,23 @@ class Scheduler:
                 step.decodes += 1
             else:
                 step.from_previous.append(0)
-                step.tokens.extend(request.prompt_tokens[planned:planned + take.tokens])
+                step.tokens.extend(request.prompt_tokens[planned:planned + n])
                 step.prefills += 1
-            if planned + take.tokens >= len(request.prompt_tokens):
+                step.prefill_rows.add(row)
+            if planned + n >= len(request.prompt_tokens):
                 step.samples.add(row)
         return refused
+
+    def _chunk(self, request: Request, planned: int, tokens: int) -> int:
+        """Prompt tokens a take of ``tokens`` computes from ``planned``: no more than are left (an
+        admission may start further on than the view did). A chunk that does not end its prompt
+        ends on a page: the cache keeps whole pages (PrefillAdder: end = (prefix_len + extend_len)
+        // page_size * page_size). 0 or less: nothing runs."""
+        left = len(request.prompt_tokens) - planned
+        n = min(tokens, left)
+        if n < left:
+            n = (planned + n) // self.ledger.align * self.ledger.align - planned
+        return n
 
     def _send_plan(self, step: _Step) -> None:
         if self.full:
@@ -993,7 +1065,11 @@ class Scheduler:
                           Column.of("i32", step.positions), Column.of("i64", step.tokens),
                           Column.of("u8", step.from_previous), phase, 0)
         state = StateOps([StateAssign(kind, Column.of("i32", per_row), *ragged("i32", per_row.values()))
-                          for kind, per_row in step.assign.items()])
+                          for kind, per_row in step.assign.items()],
+                         [StateCopy(kind, "before", Column.of("i32", [c[1] for c in cs]),
+                                    Column.of("i32", [c[2] for c in cs])) for kind, cs in step.copies.items()],
+                         [StateTrack(kind, Column.of("i32", [t[0] for t in ts]), Column.of("i32", [t[1] for t in ts]),
+                                     Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()])
         delta = RowDelta(step.added, Column.of("i32", [] if self.full else self.removed), self.full)
         record = (RecordBuilder(STEP_PLAN, step.epoch).add(RowDelta.SECTION, delta)
                   .add(BatchPlan.SECTION, batch).add(StateOps.SECTION, state).build())
@@ -1001,7 +1077,8 @@ class Scheduler:
         now = self.clock()
         for rank, outbox in enumerate(self.plans):
             outbox.put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)), now, step.epoch)
-        self.flights.append(Flight(step.epoch, dict(step.rows), dict(step.counts), frozenset(step.samples), now))
+        self.flights.append(Flight(step.epoch, dict(step.rows), dict(step.counts), frozenset(step.samples), now,
+                                   frozenset(step.prefill_rows)))
         self.full = False
         self.removed.clear()
 
@@ -1018,6 +1095,11 @@ class _Step:
     added: list[AddedRow] = field(default_factory=list[AddedRow])
     assign: dict[str, dict[int, list[int]]] = field(default_factory=dict[str, dict[int, list[int]]])
     admitted: list[Request] = field(default_factory=list[Request])
+    copies: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict[str, list[tuple[int, int, int]]])
+    """kind -> (row, src, dst): cached states restored before the step."""
+    track: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict[str, list[tuple[int, int, int]]])
+    """kind -> (row, dst, upto): states the step keeps for the prefix cache."""
+    prefill_rows: set[int] = field(default_factory=set[int])
     prefills: int = 0
     decodes: int = 0
 
@@ -1030,6 +1112,7 @@ class _Step:
         row = request.row
         assert row is not None
         request.row = None
+        request.computed = 0
         self.admitted.remove(request)
         self.added = [a for a in self.added if a.row != row]
         for per_row in self.assign.values():

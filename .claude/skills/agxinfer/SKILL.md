@@ -56,7 +56,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 |---|---|
 | `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、出错不冻结（`loop.py`）；变更前排空（`drain.py`，`doc/specs/empty-apply.md`） |
 | `engine/policies/` | 决策点的策略单元：`fcfs`（`policy.order@1`）、`prefill_first`（`policy.compose@1`），接口在 `core/contracts/policy.py` |
-| `engine/core/state/alloc/` | 联合账本 `core.state.alloc`（`ledger@1`，接口在 `core/contracts/ledger.py`）；`prefix.py` 是账本内部的联合前缀匹配算法 |
+| `engine/core/state/alloc/` | 联合账本 `core.state.alloc`（`ledger@1`，接口在 `core/contracts/ledger.py`）：默认是 `radix.py` 的前缀缓存（照 SGLang 的 radix cache 加 mamba `extra_buffer`，`doc/specs/prefix-cache.md`），`alloc.radix_cache = false` 时是 `pool.py` 不带缓存的账本 |
 
 阶段 2 的文本前端：`engine/frontend/http/`、`tokenizer/`、`detok/` 是前端的三个单元（`frontend.http` 也是变更时引擎的门：变更期间新请求回 503，`api.py` 的 `Gate`），`frontend/interfaces.py`（它们之间的本地接口）和 `transport.py`（前端的两条记录流）是它们共用的库；`engine/sched/reqs/` 是调度宿主里的请求表状态单元 `sched.reqs`。来源、行为和运行方法见 `engine/frontend/README.md`。
 
@@ -104,6 +104,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
+  - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。
   - `test_real_kernels.py`：`kernels.triton`、`kernels.flashinfer` 的每个 solution 对照参照实现；`kernels.cuda` 的 KV 写入逐位对照参照实现（含回退路径）；worker 栈（4 层、bf16）上 `auto` 选真 kernel、graph 对 eager（同样行数的桶逐值比，带 padding 行的桶比 token）、graph 显存的计量冷启动和重载一致、被拒绝或只用来自检的 graph 不在 backend 里留东西、KV 和模型 dtype 不同时不选 FlashInfer、kernel 单元带请求重载、按名字点 backend。`conftest.py`：每个测试结束时记下它 import 的第三方模块，下一个测试开始时放回去。`tests/conftest.py` 的隔离会忘掉它们，而 FlashInfer 的原生依赖同一进程里不能 import 两次，CuTe DSL 的子模块重新 import 以后编译不了下一个 kernel。记录见 `doc/evaluations/real-kernels-4090d.md`、`real-kernels-fused.md` 和 `real-kernels-kv-store-indices.md`；SM100 上完整模型的结果在 `real-kernels-sm100.md`。

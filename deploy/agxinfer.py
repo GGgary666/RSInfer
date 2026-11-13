@@ -213,6 +213,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         # scheduler host
         "sched.workers": [WORKER], "sched.frontend_host": HOST, "sched.max_batch": args.max_rows,
         "sched.token_budget": args.token_budget, "sched.overlap": args.overlap,
+        "alloc.radix_cache": not args.disable_radix_cache,
         # worker
         "worker.scheduler": SCHED, "weights.path": weights,
         "state.kv.page_size": args.page_size, "state.kv.dtype": args.kv_dtype,
@@ -514,6 +515,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     sched.add_argument("--max-context", type=int, default=4096, help="tokens of one request, prompt and output")
     sched.add_argument("--token-budget", type=int, default=2048, help="prompt tokens per step")
     sched.add_argument("--overlap", action="store_true", help="one step of overlap (sched.overlap)")
+    sched.add_argument("--disable-radix-cache", action="store_true",
+                       help="no prefix cache (alloc.radix_cache = false), as SGLang's flag")
     e = s.add_argument_group("engine")
     e.add_argument("--host", "--bind", dest="host", default="127.0.0.1",
                    help="address the frontend (HTTP) listens on, e.g. 0.0.0.0 for every interface")

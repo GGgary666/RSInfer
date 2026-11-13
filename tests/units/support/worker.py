@@ -19,7 +19,7 @@ from core.common.manifest import load_manifest
 from core.common.result import Failed
 from core.context.config import ConfigEntry
 from core.contracts.columns import Column, ragged
-from core.contracts.records import AddedRow, BatchPlan, RowDelta, StateAssign, StateCopy, StateOps
+from core.contracts.records import AddedRow, BatchPlan, RowDelta, StateAssign, StateCopy, StateOps, StateTrack
 from core.contracts.sampling import SamplingParams
 from platforms.torch_eager import TorchEagerPlatform
 from tests.framework.support import PROC
@@ -189,7 +189,7 @@ class Driver:
             r.in_batch = r.previous = False
 
     def records(self, chunks: dict[int, int], copies: list[StateCopy] | None = None,
-                fresh_slots: bool = True) -> tuple[RowDelta, BatchPlan, StateOps]:
+                fresh_slots: bool = True, track: list[StateTrack] | None = None) -> tuple[RowDelta, BatchPlan, StateOps]:
         """``chunks``: row -> tokens to run this step, from where it stopped."""
         reqs = self.requests
         rows = list(chunks)
@@ -217,7 +217,7 @@ class Driver:
                 tokens += r.known[r.computed:r.computed + n]
         delta = RowDelta(added, Column.of("i32", [] if self.full else self.removed), self.full)
         state = StateOps([StateAssign(kind, Column.of("i32", list(m)), *ragged("i32", m.values()))
-                          for kind, m in assign.items() if m], copies or [])
+                          for kind, m in assign.items() if m], copies or [], track or [])
         decoding = all(chunks[row] == 1 and reqs[row].computed >= len(reqs[row].known) - 1 for row in rows)
         prefilling = all(reqs[row].computed + chunks[row] <= len(reqs[row].known) for row in rows)
         plan = BatchPlan(Column.of("i32", rows), Column.of("i32", list(chunks.values())),
@@ -226,9 +226,9 @@ class Driver:
         return delta, plan, state
 
     def step(self, chunks: dict[int, int], copies: list[StateCopy] | None = None,
-             fresh_slots: bool = True) -> Any:
+             fresh_slots: bool = True, track: list[StateTrack] | None = None) -> Any:
         executor = self.executor or self.worker.service("executor@1")
-        delta, plan, state = self.records(chunks, copies, fresh_slots)
+        delta, plan, state = self.records(chunks, copies, fresh_slots, track)
         self.epoch += 1
         result = executor.submit(self.epoch, delta, plan, state)
         if not hasattr(result, "finish"):

@@ -180,3 +180,22 @@ def test_a_worker_failure_while_the_change_waits_empties_the_engine_and_the_chan
         b.client.send([fresh])
         b.run_until(b.finished(2))
         assert b.client.outputs[2].error is None and b.engine.loop.fault is None
+
+
+def test_an_undone_change_drops_the_prefix_cache_as_a_committed_one_does() -> None:
+    """A change may rebuild the workers' state pools, then fail at a later unit and be undone: the
+    undo brings their code and config back, not the states the cache points at (Codex, #59)."""
+    prompt = list(range(1, 71))
+    with bed(token_budget=128, config={"alloc.radix_cache": True}) as b:
+        b.client.send([request(1, prompt, 2)])
+        b.run_until(b.finished(1))
+        b.run_until(b.idle)
+        assert b.engine.ledger.match(2, prompt) == 64  # the state at the checkpoint grid is cached
+        h = drain(b)
+        h.start_drain({"mode": "refuse", "gate": True})
+        assert h.drained()
+        h.abort()
+        assert b.engine.ledger.match(2, prompt) == 0
+        b.client.send([request(2, prompt, 2)])
+        b.run_until(b.finished(2))
+        assert b.client.outputs[2].error is None and b.idle() and b.errors() == []

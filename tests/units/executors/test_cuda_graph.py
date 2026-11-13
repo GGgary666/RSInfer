@@ -17,7 +17,7 @@ import torch
 from core.common.ids import InstanceId, UnitId
 from core.contracts.columns import Column
 from core.contracts.plan import PlanKey
-from core.contracts.records import BatchPlan, StateCopy
+from core.contracts.records import BatchPlan, StateCopy, StateTrack
 from core.plan.graph import Dependencies, GraphPlan, buckets
 from core.plan.unit import Plans
 from executors.pytorch.unit import check_plan
@@ -123,7 +123,8 @@ def test_auto_without_a_graph_platform_runs_eagerly_and_says_why() -> None:
                               "attn.decode@1": "torch_graph.attn.decode@1"},
             "layers.gdn@1": {"backend": "auto",
                              "gdn.qkvzba_conv1d_update@1": "reference.gdn.qkvzba_conv1d_update@1 (fallback)",
-                             "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)"}}
+                             "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)",
+                             "gdn.track_states@1": "reference.gdn.track_states@1 (fallback)"}}
         assert not plans.required and plans.buckets("decode") == []
     finally:
         w.close()
@@ -251,6 +252,30 @@ def test_a_captured_step_pads_with_the_padding_row_and_equals_the_eager_step(pai
         x, y = a.step(chunks), b.step(chunks)
         torch.testing.assert_close(y.logits, x.logits, rtol=2e-4, atol=2e-4)
     assert replays[-1] == 4
+
+
+def test_a_captured_step_keeps_states_for_the_prefix_cache_as_the_eager_one(pair: tuple[Worker, Worker]) -> None:
+    """``StateTrack`` in decode steps that replay (the mask and destinations are fixed buffers of the
+    bucket, the copy recorded with the step): the kept states are the eager worker's, and a bucket
+    that kept states in its last replay keeps none in the next one, which tracks nothing."""
+    eager, graph = pair
+    replays = with_graphs(graph, [1, 2, 4])
+    a, b = Driver(eager), Driver(graph)
+    for d in (a, b):
+        for row, prompt in ((0, [5, 17, 3]), (1, [9, 2, 8, 4, 7]), (2, [6, 1])):
+            d.add(row, prompt)
+
+    def track(rows: list[int], dst: list[int]) -> list[StateTrack]:
+        return [StateTrack("gdn.slots", Column.of("i32", rows), Column.of("i32", dst), Column.of("i32", [0] * len(rows)))]
+
+    rounds = [({0: 3, 1: 5, 2: 2}, []), ({1: 1}, track([1], [4])), ({2: 1}, []), ({0: 1, 2: 1}, track([2, 0], [5, 4])),
+              ({2: 1, 0: 1}, []), ({0: 1, 1: 1, 2: 1}, track([1], [5]))]
+    for chunks, tracked in rounds:
+        x, y = a.step(chunks, track=tracked), b.step(chunks, track=tracked)
+        torch.testing.assert_close(y.logits, x.logits, rtol=2e-4, atol=2e-4)
+        for u, v in zip(state(eager), state(graph), strict=True):
+            torch.testing.assert_close(u, v, rtol=2e-4, atol=2e-4)
+    assert replays == [1, 1, 2, 2, 4]  # every decode step replayed
 
 
 def test_graphs_whose_dependencies_moved_are_not_listed_and_required_refuses_the_step(pair: tuple[Worker, Worker]) -> None:

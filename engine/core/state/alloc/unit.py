@@ -1,4 +1,5 @@
-"""``ledger@1``: joint admission over every state kind, from #22.
+"""``ledger@1``: joint admission over every state kind, from #22, or, with ``alloc.radix_cache``
+(the default, as SGLang's), the prefix cache of ``radix.py`` (doc/specs/prefix-cache.md).
 
 Each kind's ``Pool`` keeps its own ids; a request is admitted only when every kind has what it
 needs, and what one kind gave is given back at once when another refuses (§5.3). No tensors and
@@ -12,9 +13,11 @@ from typing import Any
 
 import msgspec
 
+from core.contracts.ledger import Admitted, Reserved
 from core.contracts.state import StateDecl
 
 from .pool import Pool
+from .radix import RadixLedger
 
 
 class JointLedger:
@@ -27,6 +30,14 @@ class JointLedger:
         self.pools = {kind: Pool(decls) for kind, decls in grouped.items()}
         self.ready = False
 
+    @property
+    def align(self) -> int:
+        return 1
+
+    @property
+    def max_requests(self) -> int | None:
+        return None
+
     def set_capacity(self, items: Mapping[str, int]) -> None:
         if set(items) != set(self.pools):
             raise ValueError(f"capacities for {sorted(items)}, but the declared kinds are {sorted(self.pools)}")
@@ -37,7 +48,10 @@ class JointLedger:
     def fits(self, tokens: int) -> bool:
         return self.ready and all(pool.count(tokens) <= pool.capacity for pool in self.pools.values())
 
-    def admit(self, request: int, tokens: int, step: int) -> dict[str, list[int]] | None:
+    def match(self, request: int, prompt: Sequence[int]) -> int:
+        return 0
+
+    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int) -> Admitted | None:
         given: dict[str, list[int]] = {}
         for kind, pool in self.pools.items():
             admitted = pool.admit(request, [], 0, tokens, step)
@@ -45,9 +59,9 @@ class JointLedger:
                 self.cancel(request, step)
                 return None
             given[kind] = admitted.items
-        return given
+        return Admitted(0, given)
 
-    def reserve(self, request: int, upto: int, step: int) -> dict[str, list[int]] | None:
+    def reserve(self, request: int, upto: int, step: int) -> Reserved | None:
         given: dict[str, list[int]] = {}
         for kind, pool in self.pools.items():
             holding = pool.holdings[request]
@@ -57,7 +71,7 @@ class JointLedger:
                 return None
             pool.snapshot(request, upto, step)
             given[kind] = items
-        return given
+        return Reserved(given, {}, {})
 
     def items(self, request: int) -> dict[str, list[int]]:
         return {kind: list(pool.holdings[request].items) for kind, pool in self.pools.items()}
@@ -66,7 +80,16 @@ class JointLedger:
         for pool in self.pools.values():
             pool.cancel(request, step)
 
-    def release(self, request: int, last_step: int) -> None:
+    def commit(self, request: int, prompt: Sequence[int]) -> None:
+        pass
+
+    def restart(self, request: int) -> bool:
+        return False  # no request starts from a cache here
+
+    def flush(self) -> None:
+        pass
+
+    def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:
         for pool in self.pools.values():
             pool.release(request, last_step)
 
@@ -91,4 +114,8 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         declarations = msgspec.convert(config["alloc.states"], list[StateDecl])
         check_page_size(declarations, config["state.kv.page_size"])
-        ctx.provide("ledger@1", JointLedger(declarations))
+        if config["alloc.radix_cache"]:
+            ctx.provide("ledger@1", RadixLedger(declarations, track_interval=config["alloc.mamba_track_interval"],
+                                                max_states_per_path=config["alloc.mamba_max_states_per_path"]))
+        else:
+            ctx.provide("ledger@1", JointLedger(declarations))

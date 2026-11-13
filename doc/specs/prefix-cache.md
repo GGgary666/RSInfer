@@ -1,6 +1,6 @@
 # 前缀复用：照 SGLang 搬（计划，2026-11-13）
 
-- 状态：计划，实现中（2026-11-13）。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
+- 状态：实现了（2026-11-13，#59），CPU 和 4090 D 上验收过，SM100 还没有。属于 M2d（[stage2-contract.md](stage2-contract.md) §1.3）。
 - 来源：SGLang `e838360`，和 kernel 是同一个版本（`~/sglang-e838360/python/sglang/srt/`，下面的路径都相对于它）。Qwen3.5 结构在开重叠或 `page_size > 1` 时，SGLang 默认用的那一套：radix cache 加 mamba 状态的 `extra_buffer` 策略。
 - 取代：stage2-contract.md §5.3 前缀缓存的设计，也就是块哈希、`reusable` / `common_prefix`、快照与发布；还有 §5.4 的"快照只能在一步的末尾打"。和 §5.5 一样，改成严格照 SGLang。
 - 继续有效：§5.3 末尾的账本验收测试（按树的说法改写）、§5.5.4 的规则（共享页不续写、恢复到请求自己的可写状态）、§5.5.6 的 M2d 部分，以及五组对比里的"前缀命中对不命中"。
@@ -83,7 +83,7 @@
 | `mamba_cow_src_index`（forward 前拷） | 已有的 `StateCopy(before)` | 不改。`executors.pytorch` 已经照它恢复，并且不清这种槽 |
 | prefill 和 decode 的跟踪 | 新的 `StateOps.track` | contracts 加字段，见 §2.1 |
 | `checkpoint_kv_cache`、`on_release` | 结果回来、`retire` 之后的 `commit`；`release` | 账本新接口 |
-| `_calculate_mamba_ratio` | `core.state.holder` | 开前缀缓存时，按同样的比例给出最大行数 |
+| `_calculate_mamba_ratio` | 账本的 `max_requests`（实现时从 holder 挪到了账本，见 §7） | 开前缀缓存时，按同样的比例给出最多同时跑几个请求 |
 | `--disable-radix-cache`、`--mamba-track-interval`、`--mamba-max-states-per-path` | `alloc.radix_cache`、`alloc.mamba_track_interval`、`alloc.mamba_max_states_per_path` | startup 键，改了要排空、重载（普通变更） |
 
 ### 2.1 接口（`core.contracts`）
@@ -124,7 +124,7 @@
 - **结果回来**：`retire` 以后对这一步跑完的 prefill chunk 调 `commit`。请求结束时由 `release` 插树。
 - **淘汰**：账本在分不到条目时自己淘汰，调度器不用管。
 
-### 2.4 显存怎么分（`core.state.holder`）
+### 2.4 显存怎么分（实现在账本里，见 §7）
 
 - **怎么算**：开前缀缓存时，照 SGLang 用 GDN 槽数除以比例（开重叠 5，不开 4）当最大行数的上限，启动时报出来（SGLang 打 warning）。
 - **代价**：TP1 一个 GDN 槽约 147 MiB（stage2-contract.md §5.4）。SM100 上那次对比，状态池 92.44 GiB 分到 305 个槽（[real-kernels-sm100.md](../evaluations/real-kernels-sm100.md)）；开前缀缓存加重叠，最大行数就是 61，比那次用的 64 少。要 64 行就得多给 GDN 槽（`holder.state_ratio` 或 `holder.max_slots`），KV 页相应变少。
@@ -172,3 +172,89 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 4. **GPU 验收和性能**：decode 的跟踪搬进 graph。
 
 四步都在一个 PR 里（2026-11-13 用户定），叠在这份计划的 PR（#58）上：实现的 PR 先合进 #58，#58 再合进 master。先在跑着的引擎上热改开发：改的都是单元，不碰框架本体（`engine/framework.toml` 里没有这些模块）。
+
+## 7. 实现（2026-11-13，#59）
+
+### 7.1 东西在哪
+
+- **接口**：
+  - `core/contracts/ledger.py`：`match`、`admit(request, prompt, tokens, step)` 返回 `Admitted`（前缀长度和条目）、`reserve` 返回 `Reserved`（新条目、恢复、跟踪），以及 `commit`、`flush`、`restart`、`release(..., tokens)`、`align`、`max_requests`。`restart` 是 Antigravity 评审以后加的（2026-11-13），见 §7.2「换了 worker」。
+  - `records.py`：`StateTrack` 和 `StateOps.track`。
+  - `plan.py`：`PersistentBatch.track`。
+- **账本**（`core/state/alloc/radix.py`，`RadixTree` 和 `RadixLedger`）：
+  - `alloc.radix_cache` 默认开，`false` 时是原来 `pool.py` 不带缓存的账本。
+  - 另外两个键：`alloc.mamba_track_interval`（256）和 `alloc.mamba_max_states_per_path`（-1）。
+  - 原来按 §5.3 设计写的 `prefix.py`（`common_prefix`）和它的测试删了。
+- **调度器**（`core.sched`）：
+  - 等着的请求按缓存命中的长度算起点；接纳时从前缀开始，`request.computed` 就是前缀。
+  - 没写完提示词的 chunk 结束在页边界上；到不了一页的，等着的请求先不接纳（接纳可能要从缓存里淘汰）。
+  - 恢复和跟踪放进计划的 `StateOps`。
+  - 一步退役后对算了提示词的行调 `commit`；结束时把算过的 token 交给 `release`。
+- **worker**：
+  - `worker.batch` 记下这一步的 `StateTrack`；`state.gdn_slots` 给出全部层的池子（`pools()`）。
+  - `layers.gdn`：prefill 从 `h` 和输入里的 conv 窗口取；decode 在最后一个 GDN 层后发一个 kernel，eager 和 graph 都是，graph 的 mask 和目标是桶的固定 buffer。
+  - kernel 目录新定义 `gdn.track_states@1`：
+    - 参照实现不和 host 来回，能录进 graph：每个 lane 都写，没被选中的 lane 写到 padding 槽 0。
+    - Triton 版是 SGLang 的 `track_mamba_states_all_layers`，原样搬过来。
+  - `gdn.chunk_delta_rule@1` 的参照实现也给出 `h`，和 fla 一样。
+- **部署**：`deploy/agxinfer.py serve --disable-radix-cache`。
+
+### 7.2 和 SGLang 不一样的地方
+
+- **时机**：位置在一步退役时才往前走。所以回了 `Resync` 的步能撤回：它的跟踪不算数，恢复的拷贝下一步再发。SGLang 没有 `Resync`。
+- **跟踪槽**：总是两个，比例总是 5。`sched.overlap` 是 live 键，SGLang 在启动时按开不开重叠定。
+- **重复的页**：树里已经有的 token，请求自己的页不交给树，到请求结束才放。worker 的表只往后加，SGLang 是把树里的页写进请求那一行。
+- **prefill 末尾的 conv 状态**：从这一行自己的槽里拷，SGLang 从输入里取窗口。行比窗口长时两者相同，比窗口短时只有前者对。
+- **最多几个请求**：账本到了数就不再接纳；SGLang 是启动时把 `max_running_requests` 限住。超过 `sched.max_batch` 时调度器在日志里说。
+- **丢掉缓存**（`flush`）：每次提交的变更（排空的 `commit`，`refit` 也算）、每次撤回的变更（排空的 `abort`）和换了 worker 时都丢，比 SGLang 只在换权重时丢更保守。撤回也要丢：变更可能已经重建了状态池，后面的单元加载失败、撤回时旧单元重新加载，池子是空的（Codex，#59）。空闲时 worker 每秒重报一次 `Capacity`，数一样就什么也不动。
+- **淘汰**：没搬 `_cascade_evict`。中间节点只摘掉状态，留下 KV。
+- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。记下的命中只留给还在等的请求：接纳时、请求结束时（还没接纳就结束的也算）删掉，换一棵新树时全清，因为新树的版本号从 0 重新数（Codex，#59）。`flush` 时也全清，之后到树换掉为止什么都不命中（Antigravity，#59）。
+- **换了 worker**：已经从缓存接纳、但还没有一步经旧连接发出去的请求，起点来自旧 worker 的状态池，新 worker 没有。调度器让它从 0 重新算（`restart`：前缀的页换成它自己的，不恢复状态），和什么都没算过的请求一样；没有空页时它结束。SGLang 没有换 worker 这回事（Antigravity，#59）。
+- **token 预算**：开着缓存时，`sched.token_budget` 必须是 `state.kv.page_size` 的整数倍，否则调度器加载失败（启动时起不来，apply 时撤回）。不到最后的 chunk 要停在整页上，预算小于一页就永远算不了，请求一直挂着（Codex，#59）。SGLang 在启动时同样要求 `chunked_prefill_size % page_size == 0`，不管开不开缓存；我们关着缓存时 chunk 不对齐页，所以不要求。
+- **页大小**：和 SGLang 一样，页和 GDN kernel 的 chunk（64）必须一个整除另一个，`alloc.mamba_track_interval` 必须是页的整数倍，否则账本加载失败。不这样的话（比如页 96），存状态的位置不在 64 的倍数上，worker 拒绝这一步，引擎停止服务（Antigravity，#59）。
+- **接纳的顺序**：和 SGLang 的 `PrefillAdder` 一样，先看这一块到不到得了一页，到不了就不接纳。原来先接纳再截断，接纳时从缓存淘汰掉的东西白丢了（Antigravity，#59）。
+
+### 7.3 测试（CPU，进 CI）
+
+- **账本**：`tests/units/scheduler/test_radix.py`，12 条（评审以后）：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`、记下的命中只留给还在等的请求（换新树时也不串）。
+- **排空和配置**（Codex 在 #59 的评审，2026-11-13）：
+  - `tests/units/scheduler/test_drain.py::test_an_undone_change_drops_the_prefix_cache_as_a_committed_one_does`：撤回以后不再命中；
+  - `tests/units/scheduler/test_scheduling.py::test_with_the_prefix_cache_a_token_budget_that_is_not_a_multiple_of_the_page_is_refused`：开着缓存、预算 2、页 4 时调度器不加载，关着缓存时照常跑完。
+  - 三处修复各自拿掉，对应的测试都失败。
+- **Antigravity 在 #59 的评审**（2026-11-13）：
+  - `test_scheduling.py::test_a_request_admitted_from_the_cache_of_a_replaced_worker_starts_over_from_0`：先换连接的是计划，请求 2 从缓存的 64 开始，新 worker 拒绝这一步，再从 0 算，输出照常。不修时夹具 worker 发现它从 64 接着算、页是空的，这一步失败；
+  - `test_scheduling.py::test_a_waiting_request_whose_chunk_reaches_no_page_is_not_admitted_and_evicts_nothing`：预算只剩 2 个 token 给页为 4 的请求，不接纳它，缓存里的 3 个状态都在；
+  - `test_radix.py`：页 96、间隔 200 被拒；`flush` 以后不再给出之前记下的命中；`RadixTree` 自己初始化 `freed_states`；`restart`；
+  - `tests/units/worker/test_prefix_cache.py` 查命中时用各个请求自己的 id（原来都用 0，后两个直接拿了第一个记下的结果）；
+  - 五处修复各自拿掉，对应的测试都失败。
+- **worker**：`tests/units/executors/test_prefix_track.py`。
+  - 存下的状态和单独算到那里的相同，chunk 中间、chunk 末尾、decode 三种位置都测；
+  - 从存下的状态恢复、共享页再算 4 个 token：状态和 logits 是整个提示词的，不恢复的对照差得远；
+  - 不在 64 倍数上的位置被拒。
+- **graph 路径**：`tests/units/executors/test_cuda_graph.py::test_a_captured_step_keeps_states_for_the_prefix_cache_as_the_eager_one`，用替身录制器在 CPU 上回放。它还查一个桶上次回放存过状态、下次不存的情况：清 mask 那一步拿掉，这条就失败。
+- **端到端**：`tests/units/worker/test_prefix_cache.py`，真调度器加真 worker。
+  - 第一个请求结束、空闲 2.5 秒以后，另外三个请求从 64 开始，所有请求的输出都和 HF 逐 token 相同，开不开重叠都测。
+  - 按每次报 `Capacity` 就丢缓存的写法，这条失败；调度器不发恢复的拷贝，也失败。
+- **其余**：调度器那组测试用的 worker 是夹具，不算状态，所以在它们的台子上关着缓存（`tests/units/scheduler/support.py`）。
+- **恢复测试要只算几个 token**：随机权重下，GDN 状态几十个 token 就淡掉了，恢复以后算 36 个 token，什么都不恢复的对照也对得上。所以：
+  - worker 的恢复测试改成恢复后算 4 个 token，并带上这个对照；
+  - 端到端测试加了一个缓存后只剩 2 个 token 的请求，调度器不发恢复的拷贝时这条失败。
+
+### 7.4 GPU（2026-11-13，RTX 4090 D，4 层随机权重）
+
+在引擎上的过程见 [../rsi/2026-11-13-prefix-cache-on-a-live-engine.md](../rsi/2026-11-13-prefix-cache-on-a-live-engine.md)。
+
+- **热改上去**：从 master 起的引擎，一次 apply 换上 #59，2.4 秒提交。
+- **正确性**：fp32 下，命中和不命中逐字相同。bf16 下，存在 chunk 中间的状态是 bf16 的 `h`，和 SGLang 一样（它的 Triton GDN kernel 没有 fp32 快照），所以输出可能不同。
+  - 存下的状态离单独算到那里的 1.5e-2（conv）、2.4e-2（temporal），错一个 token 的对照 1.4、1.3；
+  - 恢复后算两个 token，状态离整个提示词的 2e-2，不恢复的对照 1.1。
+  - 这三项是 `tests/gpu/test_prefix_cache.py`。它还查了 graph 回放里存下的状态就是那一行的槽，和 eager 的相同，没被选中的槽一位不动。
+- **性能**：
+  - 共享约 3000 token 系统提示，命中时首 token 27–35 ms，关掉缓存 102–122 ms；
+  - 不命中时 decode 吞吐不变（169.2 / 1272.5 对 169.2 / 1270.4 token/s，1 和 8 并发）。
+- **GPU 测试**：9 个文件 53 项全过，包括缓存默认开着的 `test_qwen38_serve`。
+
+### 7.5 还没做的
+
+- SM100 上的 64 层模型，以及和 SGLang 同配置（共享系统提示的负载）的对比。
+- A/B/C。

@@ -395,7 +395,7 @@ def real_kernels(w: Worker, graphs: bool) -> None:
     assert gdn and all(s.startswith("triton.gdn.") for s in gdn), gdn
     assert resolved["decode"]["layers.gdn@1"] == {
         "backend": "auto", "gdn.qkvzba_conv1d_update@1": "triton.gdn.qkvzba_conv1d_update@1",
-        "gdn.packed_decode@1": "triton.gdn.packed_decode@1"}
+        "gdn.packed_decode@1": "triton.gdn.packed_decode@1", "gdn.track_states@1": "triton.gdn.track_states@1"}
     catalog = w.service("kernels.catalog@1")  # the layers' kernels are chosen at their first call
     for definition, shape, solution in (
             ("norm.gemma_rms@1", {"hidden": 5120}, "flashinfer.norm.gemma_rms@1"),

@@ -22,7 +22,7 @@ from typing import Any
 import torch
 
 from kernels.triton import causal_conv1d, elementwise, fused_gdn_gating as gdn_gating, fused_qk_rmsnorm_rope_gate
-from kernels.triton import kv_indices, triton_gdn_fused_proj
+from kernels.triton import kv_indices, mamba_track, triton_gdn_fused_proj
 from kernels.triton.fla import chunk, fused_recurrent, layernorm_gated
 
 # The ported kernels are untyped: their launchers are called as SGLang calls them.
@@ -35,6 +35,7 @@ _packed_decode: Any = fused_recurrent.fused_recurrent_gated_delta_rule_packed_de
 _fused_qk_gemma_rmsnorm_rope_gate: Any = fused_qk_rmsnorm_rope_gate.fused_qk_gemma_rmsnorm_rope_gate
 _fused_sigmoid_mul: Any = elementwise.fused_sigmoid_mul
 _create_flashinfer_kv_indices: Any = kv_indices.create_flashinfer_kv_indices_triton
+_track_mamba_states_all_layers: Any = mamba_track.track_mamba_states_all_layers
 
 
 def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, activation: str | None,
@@ -127,3 +128,10 @@ def create_flashinfer_kv_indices(req_to_token: torch.Tensor, req_pool_indices: t
     if rows:
         _create_flashinfer_kv_indices[(rows,)](req_to_token, req_pool_indices, page_kernel_lens, kv_indptr, None,
                                                kv_indices, req_to_token.stride(0), out_cache_loc)
+
+
+def track_states(conv: torch.Tensor, temporal: torch.Tensor, cache_indices: torch.Tensor, mask: torch.Tensor,
+                 dst: torch.Tensor) -> None:
+    """``gdn.track_states@1``: ``MambaAttnBackendBase._track_mamba_state_decode``, one launch for every
+    layer (``track_mamba_states_all_layers``)."""
+    _track_mamba_states_all_layers(conv, temporal, cache_indices, mask, dst, mask.shape[0])

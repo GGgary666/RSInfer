@@ -100,15 +100,17 @@ class RealWorker:
 
 @contextmanager
 def stack(hf_config: dict[str, Any], checkpoint: Path, *, ranks: int = 1, overlap: bool = False,
-          token_budget: int = 8, **worker: Any) -> Generator[tuple[Bed, list[RealWorker]]]:
-    """The scheduler host's units, ``ranks`` real workers and a client standing in for the frontend."""
+          token_budget: int = 8, sched: dict[str, Any] | None = None, **worker: Any
+          ) -> Generator[tuple[Bed, list[RealWorker]]]:
+    """The scheduler host's units, ``ranks`` real workers and a client standing in for the frontend.
+    ``sched``: config of the scheduler host's units; ``worker``: of the workers'."""
     directory = Directory()
     workers: list[RealWorker] = []
     client: Client | None = None
     engine: Engine | None = None
     try:
         engine = Engine(directory, ranks=ranks, overlap=overlap, max_batch=8, token_budget=token_budget,
-                        config={"batch.max_rows": 8, "batch.max_context_len": 64})
+                        config={"batch.max_rows": 8, "batch.max_context_len": 64, **(sched or {})})
         workers = [RealWorker(directory, r, hf_config, checkpoint, **worker) for r in range(ranks)]
         client = Client(directory)
         bed = Bed(engine, [], client)

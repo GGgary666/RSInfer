@@ -1,7 +1,7 @@
-"""The scheduler's calls to the joint ledger, ``ledger@1`` (stage2-contract.md §5.3).
+"""The scheduler's calls to the joint ledger, ``ledger@1`` (stage2-contract.md §5.3, prefix-cache.md).
 
-Only the calls ``core.sched`` makes today. The per-kind pools, prefix matching and the pools'
-own bookkeeping stay inside ``core.state.alloc``. Items are ids per state kind (``StateDecl.kind``);
+Only the calls ``core.sched`` makes today. The per-kind pools, the prefix tree and the pools' own
+bookkeeping stay inside ``core.state.alloc``. Items are ids per state kind (``StateDecl.kind``);
 the ledger never touches device memory.
 
 Steps are numbered by the scheduler (the record epoch) and retire in order: a step retires once
@@ -9,8 +9,31 @@ every rank answered it. With one step of overlap (§4.4) a request can be planne
 ``N + 1`` before step ``N`` retired.
 """
 
-from collections.abc import Mapping
-from typing import Protocol
+from collections.abc import Mapping, Sequence
+from typing import NamedTuple, Protocol
+
+
+class Admitted(NamedTuple):
+    """What admitting a request gave it."""
+
+    prefix: int
+    """Tokens of its prompt already computed, from the prefix cache: its first step starts there.
+    0 without a hit."""
+    items: dict[str, list[int]]
+    """Items per kind, in table order: the cached prefix's pages first."""
+
+
+class Reserved(NamedTuple):
+    """What one step of a request needs besides the items it holds."""
+
+    items: dict[str, list[int]]
+    """Items newly given per kind."""
+    restore: dict[str, tuple[int, int]]
+    """Per kind, ``(src, dst)``: copy the cached state ``src`` into the request's item ``dst``
+    before the step (a prefix hit; ``StateCopy(before)``)."""
+    track: dict[str, tuple[int, int]]
+    """Per kind, ``(dst, upto)``: the step writes the request's state at position ``upto`` into item
+    ``dst`` (``StateTrack``), for the prefix cache."""
 
 
 class Ledger(Protocol):
@@ -19,24 +42,48 @@ class Ledger(Protocol):
         """Whether the usable capacity of every state kind is known."""
         ...
 
+    @property
+    def align(self) -> int:
+        """A prefill chunk that does not end its prompt ends on a multiple of this many tokens
+        (the prefix cache keeps whole pages, as SGLang's ``PrefillAdder``); 1: anywhere."""
+        ...
+
+    @property
+    def max_requests(self) -> int | None:
+        """How many requests it holds at most at once (``None``: as many as fit). With the prefix
+        cache, the slot kinds' capacity over the slots SGLang counts per request."""
+        ...
+
     def set_capacity(self, items: Mapping[str, int]) -> None:
-        """Usable items per state kind, scratch excluded: the lowest any rank reported."""
+        """Usable items per state kind, scratch excluded: the lowest any rank reported. Reported again
+        while idle: the same numbers change nothing."""
+        ...
+
+    def flush(self) -> None:
+        """What the items hold may be gone or stale (a change committed, a worker was replaced): drop
+        the prefix cache (SGLang's ``flush_cache``). While requests still hold items, nothing is
+        matched or kept until the last of them ended, and then it is dropped."""
         ...
 
     def fits(self, tokens: int) -> bool:
         """Whether a request of ``tokens`` tokens fits the whole capacity, i.e. can ever be admitted."""
         ...
 
-    def admit(self, request: int, tokens: int, step: int) -> dict[str, list[int]] | None:
-        """Take every kind's items for ``tokens`` tokens, all or nothing, for a request first
-        planned in ``step``. Returns the items per kind; ``None``: some kind did not have them, and
-        nothing is held."""
+    def match(self, request: int, prompt: Sequence[int]) -> int:
+        """How much of ``prompt`` the prefix cache holds now: where the request would start. Takes
+        nothing."""
         ...
 
-    def reserve(self, request: int, upto: int, step: int) -> dict[str, list[int]] | None:
-        """``step`` computes the request's input up to position ``upto`` (exclusive). Returns the
-        items it newly needs per kind; ``None``: they are not there, and what ``step`` took for
-        the request is given back at once (as ``cancel``)."""
+    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int) -> Admitted | None:
+        """Take every kind's items for ``tokens`` tokens (prompt and output), the cached prefix of
+        ``prompt`` included, all or nothing, for a request first planned in ``step``. ``None``:
+        some kind did not have them, and nothing is held."""
+        ...
+
+    def reserve(self, request: int, upto: int, step: int) -> Reserved | None:
+        """``step`` computes the request's input up to position ``upto`` (exclusive). ``None``: what
+        it needs is not there, and what ``step`` took for the request is given back at once (as
+        ``cancel``)."""
         ...
 
     def items(self, request: int) -> dict[str, list[int]]:
@@ -47,9 +94,22 @@ class Ledger(Protocol):
         """Give back what ``step`` took for the request: the step is not sent with it."""
         ...
 
-    def release(self, request: int, last_step: int) -> None:
-        """The request is done. Its items return once ``last_step`` retired, not before: a step
-        still running may write them (§4.4 item 5)."""
+    def commit(self, request: int, prompt: Sequence[int]) -> None:
+        """A step that computed part of the request's prompt retired, and the request goes on: what
+        it computed enters the prefix cache (SGLang's ``checkpoint_kv_cache``)."""
+        ...
+
+    def restart(self, request: int) -> bool:
+        """After ``flush`` (a worker was replaced): the request, admitted from the prefix cache and
+        not run yet, computes its prompt again from position 0, on items of its own and with no
+        state to restore. ``False``: it cannot (no free items, or no cache to start over from), and
+        should end."""
+        ...
+
+    def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:
+        """The request is done; ``tokens`` are the ones it computed, prompt and output. Once
+        ``last_step`` retired, and not before (a step still running may write its items, §4.4
+        item 5), what it computed enters the prefix cache and its other items return."""
         ...
 
     def retire(self, step: int, ran: bool = True) -> None:

@@ -451,3 +451,70 @@ def test_admission_keeps_to_what_a_row_of_the_workers_holds() -> None:
         rows = {a.row for _, _, d in b.workers[0].fixture.plans_seen for a in d.added}
         assert rows <= {0, 1}
         check(b, fits)
+
+
+def test_with_the_prefix_cache_a_token_budget_that_is_not_a_multiple_of_the_page_is_refused() -> None:
+    """A chunk that does not end its prompt ends on a page: with a budget below a page none ever ran,
+    and a long request waited forever (Codex, #59). Refused when the scheduler loads, as SGLang
+    refuses a ``chunked_prefill_size`` that is not a multiple of ``page_size``; without the cache
+    chunks end anywhere."""
+    with pytest.raises(Exception, match=r"sched.token_budget = 2 must be a multiple of .*page_size = 4"):
+        with bed(token_budget=2, config={"alloc.radix_cache": True}):
+            pass
+    with bed(token_budget=2) as b:
+        r = request(1, list(range(1, 12)), 3)
+        b.client.send([r])
+        b.run_until(b.finished(1))
+        check(b, [r])
+
+
+def positions(b: Bed, rid: int, rank: int = 0) -> list[int]:
+    """Where each plan rank ``rank`` was sent started request ``rid``, run or refused."""
+    owner: dict[int, int] = {}
+    out: list[int] = []
+    for _, plan, delta in b.workers[rank].fixture.plans_seen:
+        for a in delta.added:
+            owner[a.row] = a.request
+        out += [int(p) for r, p in zip(plan.rows.values(), plan.positions.values(), strict=True)
+                if owner.get(int(r)) == rid]
+    return out
+
+
+def test_a_request_admitted_from_the_cache_of_a_replaced_worker_starts_over_from_0() -> None:
+    """Antigravity on #59: request 2 starts at request 1's cached 64 tokens, and its first step is
+    the first plan over the new worker's connection. The new worker has none of the old one's
+    stores, so request 2 starts over from 0, as a request with nothing computed does; from 64 the
+    fixture worker finds its pages and slot empty and fails the step."""
+    first = list(range(1, 71))
+    with bed(ranks=1, token_budget=128, config={"alloc.radix_cache": True}) as b:
+        b.client.send([request(1, first, 2)])
+        b.run_until(b.finished(1))
+        b.run_until(b.idle)
+        b.replace_worker(0, announce_after_s=1.0)  # the plans move first
+        later = request(2, [*first[:64], 99, 98], 3)
+        b.client.send([later])
+        b.run_until(b.finished(2))
+        assert b.client.outputs[2].error is None, b.client.outputs[2]
+        assert positions(b, 2)[:2] == [64, 0]  # refused from the cache, then run from 0
+        assert any("start over from position 0" in d for d in b.engine.loop.report().diagnostics)
+        check(b, [later])
+
+
+def test_a_waiting_request_whose_chunk_reaches_no_page_is_not_admitted_and_evicts_nothing() -> None:
+    """Antigravity on #59: request 30 leaves 2 tokens of the budget to request 31, which on pages
+    of 4 computes none of them. Admitting it anyway took pages from the cache (request 30 holds
+    the free ones), then gave them back with the cached states gone; once request 30 ended, there
+    were free pages for request 31."""
+    with bed(ranks=1, token_budget=64, capacity={"kv.paged": 64, "gdn.slots": 13},
+             config={"alloc.radix_cache": True}) as b:
+        ledger: Any = b.engine.ledger
+        for rid in (1, 2, 3):  # each leaves its state at 64 and 16 pages in the cache
+            b.client.send([request(rid, [rid * 100 + i for i in range(66)], 1)])
+            b.run_until(b.finished(rid))
+            b.run_until(b.idle)
+        assert len(ledger.tree.held()[1]) == 3 and len(ledger.free["kv.paged"]) == 16
+        both = [request(30, list(range(1000, 1062)), 1), request(31, list(range(2000, 2040)), 2)]
+        b.client.send(both)
+        b.run_until(b.finished(30, 31))
+        assert len(ledger.tree.held()[1]) == 3
+        check(b, both)

@@ -442,9 +442,11 @@ def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
 
 def torch_chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, g: torch.Tensor,
                                  beta: torch.Tensor, chunk_size: int = 64, initial_state: torch.Tensor | None = None,
-                                 output_final_state: bool = False, use_qk_l2norm_in_kernel: bool = False
+                                 output_final_state: bool = False, use_qk_l2norm_in_kernel: bool = False,
+                                 chunk_states: list[torch.Tensor] | None = None
                                  ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """fla's naive chunked gated delta rule; ``[B, T, H, D]`` in, state ``[B, H, K, V]``."""
+    """fla's naive chunked gated delta rule; ``[B, T, H, D]`` in, state ``[B, H, K, V]``. With
+    ``chunk_states``, appends the state before each chunk, as fla's chunk kernel returns ``h``."""
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = _l2norm(query, dim=-1, eps=1e-6)
@@ -501,6 +503,8 @@ def torch_chunk_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, value: 
         v_new = v_i - v_prime
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        if chunk_states is not None:
+            chunk_states.append(last_recurrent_state)
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
             + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
@@ -557,12 +561,14 @@ def torch_recurrent_gated_delta_rule(query: torch.Tensor, key: torch.Tensor, val
 
 def chunk_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
                            initial_state: torch.Tensor, initial_state_indices: torch.Tensor, cu_seqlens: torch.Tensor,
-                           use_qk_l2norm_in_kernel: bool = True) -> tuple[torch.Tensor, torch.Tensor, None]:
+                           use_qk_l2norm_in_kernel: bool = True) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``gdn.chunk_delta_rule@1``, the prefill rule ``TritonGDNKernel.extend`` calls:
     ``chunk_gated_delta_rule_update`` of the CPU test, on the pool ``initial_state``
     ``[slots, HV, V, K]`` at ``initial_state_indices``, updated in place. ``q``, ``k``
     ``[1, T, HK, K]``; ``v`` ``[1, T, HV, V]``; ``g``, ``beta`` ``[1, T, HV]``. Returns
-    ``(output [1, T, HV, V], final states [N, HV, V, K], None)``."""
+    ``(output [1, T, HV, V], final states [N, HV, V, K], h)``: ``h`` ``[1, chunks, HV, V, K]`` is the
+    state before each chunk of 64 tokens of each sequence, in order, as fla's ``h`` (what the prefix
+    cache keeps from inside a step, ``_track_mamba_state_extend``)."""
     idx = initial_state_indices.to(torch.long)
     num_heads, num_value_heads = q.shape[2], v.shape[2]
     initial_state_kv = initial_state[idx].transpose(-1, -2).contiguous()
@@ -571,19 +577,21 @@ def chunk_gated_delta_rule(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g:
         k = k.repeat_interleave(num_value_heads // num_heads, dim=2)
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state[idx])
+    states: list[torch.Tensor] = []
     start_q = 0
     for i in range(idx.shape[0]):
         end_q = int(cu_seqlens[i + 1])
         core_attn_outi, last_recurrent_state = torch_chunk_gated_delta_rule(
             query=q[:, start_q:end_q, :, :], key=k[:, start_q:end_q, :, :], value=v[:, start_q:end_q, :, :],
             g=g[:, start_q:end_q, :], beta=beta[:, start_q:end_q, :], initial_state=initial_state_kv[i],
-            output_final_state=True, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel)
+            output_final_state=True, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, chunk_states=states)
         output[:, start_q:end_q, :, :] = core_attn_outi
         assert last_recurrent_state is not None
         final_state[i] = last_recurrent_state.transpose(-1, -2).contiguous()
         start_q = end_q
     initial_state[idx] = final_state.to(initial_state.dtype)
-    return output, final_state, None
+    h = torch.stack([state.squeeze(0).transpose(-1, -2) for state in states]).unsqueeze(0)  # every row has a chunk
+    return output, final_state, h
 
 
 def fused_sigmoid_gating_delta_rule_update(A_log: torch.Tensor, dt_bias: torch.Tensor, q: torch.Tensor,
@@ -721,3 +729,16 @@ def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence
         return multinomial_with_seed(torch.log(probs), seed, pos).view(-1).to(torch.int32)
     return _top_k_top_p_sampling_from_probs_torch(
         probs, _on_device(ks, torch.int64, device), _on_device(top_ps, torch.float32, device), seed, pos)
+
+
+def track_states(conv: torch.Tensor, temporal: torch.Tensor, cache_indices: torch.Tensor, mask: torch.Tensor,
+                 dst: torch.Tensor) -> None:
+    """``gdn.track_states@1``: for each lane with ``mask`` set, copy every layer's conv and temporal
+    state from slot ``cache_indices[i]`` to slot ``dst[i]`` of the pools ``conv`` ``[layers, slots,
+    ...]`` and ``temporal`` (``track_mamba_states_all_layers``). Without a host round trip, so a
+    graph can hold it: every lane is written, a lane without ``mask`` its ``dst`` with what it holds;
+    those lanes name the padding slot 0, so lanes that share it write the same thing."""
+    src, to = cache_indices.long(), dst.long()
+    for pool in (conv, temporal):
+        keep = mask.view(1, -1, *([1] * (pool.dim() - 2)))
+        pool[:, to] = torch.where(keep, pool[:, src], pool[:, to])
