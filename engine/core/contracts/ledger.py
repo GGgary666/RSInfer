@@ -85,7 +85,7 @@ class Ledger(Protocol):
         it needs is not there, and what ``step`` took for the request is given back at once (as
         ``cancel``). ``speculative``: a decode step that verifies drafts (doc/specs/mtp.md): it
         writes up to ``upto`` at most, advances by what is accepted (``retire``), and a GDN state it
-        keeps for the prefix cache is at the boundary it crosses, if any (``StateTrack`` ``upto -1``)."""
+        keeps for the prefix cache is at the boundary it crosses, if any (``StateTrack`` ``upto -grid``)."""
         ...
 
     def items(self, request: int) -> dict[str, list[int]]:

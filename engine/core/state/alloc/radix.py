@@ -516,8 +516,8 @@ class RadixLedger:
             # mamba_track_indices); whether it crosses a boundary is known once it retired. Two in
             # flight share the slot: one step crosses at most one boundary (mamba_track_interval
             # >= num_draft_tokens), and two in a row do not (a boundary every decode_grid tokens).
-            track[GDN] = (h.track[h.next_idx], -1)
-            r.track, r.decode = (h.next_idx, -1), True
+            track[GDN] = (h.track[h.next_idx], -self.decode_grid)
+            r.track, r.decode = (h.next_idx, -self.decode_grid), True
             where = None
         else:
             where = self._track(h, start, upto)

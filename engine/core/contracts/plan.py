@@ -71,6 +71,33 @@ class PlanService(Protocol):
         """The plan for ``key``; ``LookupError`` if no such plan is ready."""
         ...
 
+    # Speculation (doc/specs/mtp.md): the forwards of a speculative step, eager. ``view`` is the
+    # step as the backends see it: a verify view is a decode plan with ``draft_tokens`` D and D
+    # tokens per row from where each row is; a draft view is a decode or prefill plan of the draft
+    # model's tokens, with ``draft_tokens`` 0.
+
+    def prefill_hidden(self, batch: PersistentBatch, plan: BatchPlan, input_ids: Tensor, positions: Tensor,
+                       last_index: Tensor) -> tuple[Tensor, Tensor]:
+        """``run`` for a prefill step that also returns every token's hidden state."""
+        ...
+
+    def verify(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor,
+               positions: Tensor) -> tuple[Tensor, Tensor]:
+        """The target model over each row's D tokens: logits and hidden states ``[rows * D, ...]``. The GDN
+        layers keep their states after each token in the intermediate buffers and change no row's state
+        but its conv window, which ``commit`` puts right."""
+        ...
+
+    def draft(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor, hidden: Tensor,
+              last_index: Tensor) -> tuple[Tensor, Tensor]:
+        """The draft model (``DraftModel.draft_forward``) after only the attention backend prepared ``view``."""
+        ...
+
+    def commit(self, steps: Tensor, track_steps: Tensor) -> None:
+        """After the last ``verify``: each lane's GDN state after its step ``steps[i]`` into its slot, after
+        ``track_steps[i]`` (``>= 0``) into its tracking slot (``GDNBackend.commit``)."""
+        ...
+
 
 class Backend(Protocol):
     """An attention or GDN backend (``layers.attn@1``, ``layers.gdn@1``), split the way SGLang
@@ -122,7 +149,7 @@ class AttentionBackend(Backend, Protocol):
         ...
 
 
-class GDNBackend(Backend, Protocol):
+class GDNBackend(Backend, Protocol):  # the verify step's commit is ``commit`` below
     """``layers.gdn@1``: gated delta net (SGLang's ``RadixLinearAttention`` and ``GDNAttnBackend``)."""
 
     def forward(self, layer: int, projected_qkvz: Tensor, projected_ba: Tensor, conv_weights: Tensor,
@@ -138,6 +165,12 @@ class GDNBackend(Backend, Protocol):
         store; the backend only reads them. Returns the core output ``[1, tokens, num_v_heads,
         head_v_dim]`` and ``z`` ``[tokens, num_v_heads, head_v_dim]``, which may be a view of
         ``projected_qkvz``; the gated RMSNorm with ``z`` and the output projection are the model's."""
+        ...
+
+    def commit(self, steps: Tensor, track_steps: Tensor) -> None:
+        """After a verify step (``prepare`` of a decode plan with ``draft_tokens``; doc/specs/mtp.md):
+        every layer's state after lane ``i``'s step ``steps[i]`` into the lane's slot, and where
+        ``track_steps[i] >= 0`` the state after that step into its ``StateTrack`` slot. On the device."""
         ...
 
 
@@ -192,4 +225,24 @@ class PersistentBatch(Protocol):
     def sampling(self, rows: Sequence[int]) -> list[SamplingParams]: ...
     def record(self, rows: Sequence[int], tokens: Tensor) -> None:
         """The tokens just sampled for ``rows``, which ``from_previous`` reads next."""
+        ...
+
+    # Speculation (doc/specs/mtp.md): ``spec.drafts`` ``[rows + 1, D - 1]`` and ``spec.hidden``
+    # ``[rows + 1, hidden]`` in ``binding``, a row's drafts for its next verify and the draft model's
+    # hidden state they continue from.
+
+    def prepare_spec(self, draft_tokens: int, hidden_size: int, dtype: str) -> None:
+        """Allocate the speculation tables (once; they keep their addresses)."""
+        ...
+
+    def committed(self, row: int) -> int | None:
+        """Where the row is, as its last speculative step left it (``None``: not since it was added)."""
+        ...
+
+    def has_drafts(self, row: int) -> bool:
+        """The row's ``spec.drafts`` and ``spec.hidden`` are its own, from its last step."""
+        ...
+
+    def speculated(self, rows: Sequence[int], committed: Sequence[int]) -> None:
+        """A speculative step left ``rows`` at ``committed`` with drafts for their next verify."""
         ...

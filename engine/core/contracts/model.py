@@ -89,6 +89,14 @@ class DraftModel(Model, Protocol):
     @property
     def draft_layer(self) -> int: ...
 
+    @property
+    def hidden_size(self) -> int: ...
+
+    @property
+    def dtype(self) -> str:
+        """The activations' dtype (``model.dtype``): the draft model's hidden states are in it."""
+        ...
+
     def forward_hidden(self, input_ids: Tensor, positions: Tensor, last_index: Tensor) -> tuple[Tensor, Tensor]:
         """``forward``, and every token's hidden state after the final norm ``[tokens, hidden]``
         (what SGLang's ``LogitsProcessor`` captures for the draft model)."""

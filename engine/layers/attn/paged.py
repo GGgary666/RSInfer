@@ -119,7 +119,7 @@ class PagedAttnBackend:
             self.kernels(m.table, KV_INDICES)(req_to_token, m.req_pool_indices, m.seq_lens, m.kv_indptr, m.kv_indices,
                                               m.out_cache_loc)
         else:
-            decode = plan.phase == "decode"
+            decode = plan.phase == "decode" and not plan.draft_tokens  # a verify step is an extend
             prefix = [int(p) for p in plan.positions.values()]
             extend = [int(n) for n in plan.num_tokens.values()]
             lengths = [p + n for p, n in zip(prefix, extend, strict=True)]

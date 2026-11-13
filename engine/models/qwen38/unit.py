@@ -157,6 +157,7 @@ class Qwen3_5ForCausalLM:
         decls = states(cfg, dtype, page_size, **(state_dtypes or {}))
         weights = params(cfg, dtype)
         self.draft_tokens, self.lanes = draft_tokens, lanes
+        self._dtype = dtype
         if draft_tokens:  # the draft model's one attention layer keeps its KV in the same pages
             kv = next(d for d in decls if d.kind == "kv.paged")
             decls.append(msgspec.structs.replace(kv, layer=cfg.num_hidden_layers))
@@ -196,6 +197,14 @@ class Qwen3_5ForCausalLM:
     @property
     def draft_layer(self) -> int:
         return self.cfg.num_hidden_layers
+
+    @property
+    def hidden_size(self) -> int:
+        return self.cfg.hidden_size
+
+    @property
+    def dtype(self) -> str:
+        return self._dtype
 
     # -------------------------------------------------------------- weights
 
@@ -388,22 +397,6 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.copy_(loaded_weight)
 
 
-def spec_draft_tokens(config: Any) -> int:
-    """``spec.num_draft_tokens`` when speculation is on, else 0; the keys checked as SGLang checks them
-    (doc/specs/mtp.md §2.1)."""
-    algorithm = config["spec.algorithm"]
-    if not algorithm:
-        return 0
-    if algorithm != "eagle":
-        raise ValueError(f"spec.algorithm = {algorithm!r}: only \"\" (off) and \"eagle\" (the MTP layer drafts)")
-    steps, topk, tokens = config["spec.num_steps"], config["spec.eagle_topk"], config["spec.num_draft_tokens"]
-    if topk != 1:
-        raise ValueError(f"spec.eagle_topk = {topk}: only a chain (1) is supported")
-    if steps < 1 or tokens != steps + 1:
-        raise ValueError(f"spec.num_draft_tokens = {tokens} must be spec.num_steps + 1 = {steps + 1} for a chain")
-    return tokens
-
-
 def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
     if path:
         with open(os.path.join(path, "config.json")) as f:
@@ -427,7 +420,8 @@ class Unit:
             "conv_dtype": state_dtype("state.gdn.conv_dtype", config["state.gdn.conv_dtype"], "bf16"),
             "ssm_dtype": state_dtype("state.gdn.ssm_dtype", config["state.gdn.ssm_dtype"],
                                      STATE_DTYPES.get(cfg.mamba_ssm_dtype, "f32"))}
-        draft_tokens = spec_draft_tokens(config)
+        # Speculation (doc/specs/mtp.md); executors.pytorch, which declares the keys, checks them.
+        draft_tokens = config["spec.num_draft_tokens"] if config["spec.algorithm"] else 0
         self.model = Qwen3_5ForCausalLM(cfg, dtype, config["state.kv.page_size"], services, state_dtypes,
                                         draft_tokens=draft_tokens, lanes=config["batch.max_rows"] if draft_tokens else 0)
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")

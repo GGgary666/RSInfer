@@ -25,7 +25,7 @@ import json
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -75,9 +75,13 @@ def resolution(platform: Any, states: Sequence[StateDecl],
 class Plans:
     """``plan@1``."""
 
-    def __init__(self, model: Any, backends: Sequence[Backend], required: bool = False) -> None:
+    def __init__(self, model: Any, backends: Sequence[Backend], required: bool = False, *,
+                 attention: Sequence[Backend] = (), gdn: Sequence[Backend] = ()) -> None:
         self.eager = EagerPlan(model, backends)
         self.required = required
+        self.attention, self.gdn = list(attention), list(gdn)
+        """The backends a draft forward prepares (the draft model has attention layers only), and those
+        that commit a verify step's GDN states."""
         self.resolved: Mapping[str, Any] = {}
         """The start-up record (``resolution``, and what became of the graphs)."""
         self.graphs: dict[int, GraphPlan] = {}
@@ -96,6 +100,31 @@ class Plans:
         if key.phase == "decode" and key.bucket in self.graphs:
             return self.graphs[key.bucket]
         raise LookupError(f"no {key.phase} graph of bucket {key.bucket} is ready")
+
+    # ------------------------------------------------------------ speculation (doc/specs/mtp.md)
+
+    def prefill_hidden(self, batch: PersistentBatch, plan: BatchPlan, input_ids: Tensor, positions: Tensor,
+                       last_index: Tensor) -> tuple[Tensor, Tensor]:
+        for backend in self.eager.backends:
+            backend.prepare(batch, plan, PlanKey("prefill", 0))
+        return self.eager.model.forward_hidden(input_ids, positions, last_index)
+
+    def verify(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor,
+               positions: Tensor) -> tuple[Tensor, Tensor]:
+        for backend in self.eager.backends:
+            backend.prepare(batch, view, PlanKey("decode", 0))
+        every = torch.arange(input_ids.shape[0], device=input_ids.device)
+        return self.eager.model.forward_hidden(input_ids, positions, every)
+
+    def draft(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor, hidden: Tensor,
+              last_index: Tensor) -> tuple[Tensor, Tensor]:
+        for backend in self.attention:
+            backend.prepare(batch, view, PlanKey(phase_of(view), 0))
+        return self.eager.model.draft_forward(input_ids, positions, hidden, last_index)
+
+    def commit(self, steps: Tensor, track_steps: Tensor) -> None:
+        for backend in self.gdn:
+            cast(Any, backend).commit(steps, track_steps)
 
     def close(self) -> None:
         """After the step stream and the consumers of the last logits are done. The graphs' pool
@@ -124,7 +153,9 @@ class Unit:
         self.stores = {kind: ctx.use(service) for kind, service in
                        (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
                        if any(d.kind == kind for d in model.assembly.states)}
-        self.plans = Plans(model, backends, required=mode == "required")
+        self.plans = Plans(model, backends, required=mode == "required",
+                           attention=[b for n, b in zip(names, backends, strict=True) if n == "layers.attn@1"],
+                           gdn=[b for n, b in zip(names, backends, strict=True) if n == "layers.gdn@1"])
         ctx.effect(lambda: self.plans.close, label="decode graphs")
         resolved = resolution(ctx.platform, model.assembly.states,
                               {name: b.resolve(model.assembly.states) for name, b in zip(names, backends, strict=True)})

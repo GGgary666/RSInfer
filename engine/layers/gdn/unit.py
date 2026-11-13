@@ -76,6 +76,11 @@ class Metadata:
     """The metadata of a graph bucket: fixed buffers, filled before each replay."""
     track: Track | None = None
     """The step's ``StateTrack`` rows (in a graph bucket always there, masked)."""
+    verify: bool = False
+    """A verify step (doc/specs/mtp.md): each row's ``steps`` tokens, states kept after each in the
+    intermediate buffers at the row's lane (``lanes``), committed after the acceptance (``commit``)."""
+    steps: int = 0
+    lanes: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -100,9 +105,11 @@ class Track:
 class GDNAttnBackend:
     """``layers.gdn@1``."""
 
-    def __init__(self, kernels: Kernels, states: Any, dtype: str) -> None:
+    def __init__(self, kernels: Kernels, states: Any, dtype: str, speculative: bool = False) -> None:
         self.kernels = kernels
         self.states = states
+        self.speculative = speculative
+        """Speculation is on (``spec.algorithm``): the verify step's kernels are resolved too."""
         self.dtype = dtype
         """The activations' dtype (``model.dtype``): some kernels take bf16 / fp16 only, and some want
         the conv state in the activations' dtype."""
@@ -122,9 +129,13 @@ class GDNAttnBackend:
         _, head_v_dim, head_k_dim = tensors["temporal"][0]
         shape = {"head_k_dim": head_k_dim, "head_v_dim": head_v_dim, "fp32": int(self.dtype == "f32"),
                  "conv_as_x": int(tensors["conv"][1] == self.dtype)}
+        decode = {"gdn.qkvzba_conv1d_update@1": shape, "gdn.packed_decode@1": shape, "gdn.track_states@1": shape}
+        if self.speculative:  # a verify step runs with the decode backend
+            decode |= {"gdn.verify_conv1d_update@1": shape, "gdn.verify_recurrent@1": shape,
+                       "gdn.commit_states@1": shape}
         return self.kernels.resolve({
             "prefill": {"gdn.conv1d_fn@1": shape, "gdn.gating@1": shape, "gdn.chunk_delta_rule@1": shape},
-            "decode": {"gdn.qkvzba_conv1d_update@1": shape, "gdn.packed_decode@1": shape, "gdn.track_states@1": shape}})
+            "decode": decode})
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         mapping = batch.binding.buffers()[f"slots.{KIND}"]
@@ -165,6 +176,15 @@ class GDNAttnBackend:
         prefix = on_device(torch.tensor(list(plan.positions.values()), dtype=torch.int64), device)
         bs = rows.shape[0]
         decode = plan.phase == "decode"
+        if decode and plan.draft_tokens:  # a verify step: SGLang's TARGET_VERIFY metadata
+            steps = plan.draft_tokens
+            lanes = self._decode_track(batch, plan, bs)
+            track = None if lanes is None else Track(on_device(torch.tensor(lanes[0]), device),
+                                                     on_device(torch.tensor(lanes[1], dtype=mapping.dtype), device))
+            self.forward_metadata = Metadata(
+                True, torch.arange(bs + 1, dtype=torch.int32, device=device) * steps, mapping[rows + 1], prefix > 0,
+                [steps] * bs, track=track, verify=True, steps=steps, lanes=torch.arange(bs, device=device))
+            return
         if decode:
             query_start_loc = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
         else:
@@ -263,6 +283,9 @@ class GDNAttnBackend:
         v_dim = num_v_heads * head_v_dim
         qkv_dim = q_dim + k_dim + v_dim
         cache_indices = m.mamba_cache_indices
+        if m.verify:
+            return self._verify(m, layer, projected_qkvz, projected_ba, conv_states, ssm_states, conv_weights, bias,
+                                activation, A_log, dt_bias, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
         if m.decode:
             phase = GRAPH if m.graph else "decode"
             mixed_qkv, z, b, a = self.kernels(phase, "gdn.qkvzba_conv1d_update@1")(
@@ -309,10 +332,52 @@ class GDNAttnBackend:
         return core_attn_out, z
 
 
+    def _verify(self, m: Metadata, layer: int, projected_qkvz: torch.Tensor, projected_ba: torch.Tensor,
+                conv_states: torch.Tensor, ssm_states: torch.Tensor, conv_weights: torch.Tensor,
+                bias: torch.Tensor | None, activation: str, A_log: torch.Tensor, dt_bias: torch.Tensor,
+                num_k_heads: int, num_v_heads: int, head_k_dim: int, head_v_dim: int
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``forward_extend`` in ``TARGET_VERIFY``: ``causal_conv1d_update`` over each row's tokens with
+        the intermediate conv windows, then ``target_verify`` (the gated delta rule keeping the state
+        after each token, the row's own left as it is)."""
+        assert m.lanes is not None
+        tokens, bs, steps = projected_qkvz.shape[0], m.mamba_cache_indices.shape[0], m.steps
+        q_dim = k_dim = num_k_heads * head_k_dim
+        qkv_dim = q_dim + k_dim + num_v_heads * head_v_dim
+        z = projected_qkvz[:, qkv_dim:].view(tokens, num_v_heads, head_v_dim)
+        b, a = projected_ba[:, :num_v_heads], projected_ba[:, num_v_heads:]
+        conv_window, kept = self.states.verify_buffers(layer)
+        x = projected_qkvz[:, :qkv_dim].reshape(bs, steps, qkv_dim).transpose(1, 2)
+        mixed_qkv = self.kernels("decode", "gdn.verify_conv1d_update@1")(
+            x, conv_states, conv_weights, bias, activation, m.mamba_cache_indices, conv_window, m.lanes)
+        mixed_qkv = mixed_qkv.transpose(1, 2).reshape(tokens, qkv_dim)
+        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, num_v_heads * head_v_dim], dim=-1)
+        out = self.kernels("decode", "gdn.verify_recurrent@1")(
+            A_log, dt_bias, query.reshape(1, tokens, num_k_heads, head_k_dim),
+            key.reshape(1, tokens, num_k_heads, head_k_dim), value.reshape(1, tokens, num_v_heads, head_v_dim),
+            a, b, ssm_states, m.mamba_cache_indices, kept, m.lanes, steps)
+        return out, z
+
+    def commit(self, steps: torch.Tensor, track_steps: torch.Tensor) -> None:
+        m = self.forward_metadata
+        if m is None or not m.verify or m.lanes is None:
+            raise RuntimeError("layers.gdn: commit after no verify step")
+        conv_pool, temporal_pool, _ = self.states.pools()
+        conv_window, kept = self.states.verify_pools()
+        dst = m.track.dst if m.track is not None and m.track.dst is not None else torch.zeros_like(m.mamba_cache_indices)
+        if m.track is not None and m.track.mask is not None:  # a lane without a tracking slot keeps nothing
+            track_steps = torch.where(m.track.mask, track_steps, torch.full_like(track_steps, -1))
+        else:
+            track_steps = torch.full_like(track_steps, -1)
+        self.kernels("decode", "gdn.commit_states@1")(conv_pool, temporal_pool, conv_window, kept, m.mamba_cache_indices,
+                                                       m.lanes, steps, dst, track_steps)
+
+
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "gdn")
-        ctx.provide("layers.gdn@1", GDNAttnBackend(kernels, ctx.use("state.gdn.slots@1"), config["model.dtype"]))
+        ctx.provide("layers.gdn@1", GDNAttnBackend(kernels, ctx.use("state.gdn.slots@1"), config["model.dtype"],
+                                                   speculative=bool(config["spec.algorithm"])))
 
 
 if TYPE_CHECKING:

@@ -23,6 +23,15 @@ class Sampler:
                                  [p.temperature for p in params], [p.top_p for p in params],
                                  [p.top_k for p in params], [p.seed or 0 for p in params], positions)
 
+    def accept(self, logits: torch.Tensor, drafts: torch.Tensor, params: Sequence[SamplingParams],
+               starts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """A verify step's tokens ``[rows, D]`` and accepted lengths ``[rows]`` (``spec.accept@1``,
+        doc/specs/mtp.md): ``logits`` ``[rows, D, vocab]``, ``drafts`` ``[rows, D - 1]``, ``starts`` each
+        row's length before the step."""
+        return self.catalog.call("spec.accept@1", {"vocab": logits.shape[-1]}, logits, drafts,
+                                 [p.temperature for p in params], [p.top_p for p in params],
+                                 [p.top_k for p in params], [p.seed or 0 for p in params], starts)
+
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:

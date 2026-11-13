@@ -1070,11 +1070,15 @@ class Scheduler:
                 if not previous:
                     step.tokens.append(request.output_ids[-1])
                 step.decodes += 1
+                step.next_tokens.append(-1)
             else:
                 step.from_previous.append(0)
                 step.tokens.extend(request.prompt_tokens[planned:planned + n])
                 step.prefills += 1
                 step.prefill_rows.add(row)
+                # the draft model's extend takes the token after the chunk (BatchPlan.next_tokens)
+                step.next_tokens.append(request.prompt_tokens[planned + n] if planned + n < len(request.prompt_tokens)
+                                        else -1)
             if planned + n >= len(request.prompt_tokens):
                 step.samples.add(row)
         return refused
@@ -1103,7 +1107,8 @@ class Scheduler:
         counts = [1 if row in step.speculative else n for row, n in step.counts.items()]
         batch = BatchPlan(Column.of("i32", step.rows), Column.of("i32", counts),
                           Column.of("i32", step.positions), Column.of("i64", step.tokens),
-                          Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens)
+                          Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens,
+                          Column.of("i64", step.next_tokens if self.settings.draft_tokens else []))
         state = StateOps([StateAssign(kind, Column.of("i32", per_row), *ragged("i32", per_row.values()))
                           for kind, per_row in step.assign.items()],
                          [StateCopy(kind, "before", Column.of("i32", [c[1] for c in cs]),
@@ -1141,6 +1146,7 @@ class _Step:
     """kind -> (row, dst, upto): states the step keeps for the prefix cache."""
     prefill_rows: set[int] = field(default_factory=set[int])
     speculative: set[int] = field(default_factory=set[int])
+    next_tokens: list[int] = field(default_factory=list[int])
     prefills: int = 0
     decodes: int = 0
 

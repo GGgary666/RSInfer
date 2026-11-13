@@ -239,13 +239,13 @@ def test_a_request_admitted_from_the_cache_restarts_from_0_on_pages_of_its_own()
 
 
 def test_a_speculative_step_keeps_its_state_only_where_its_accepted_tokens_cross_a_boundary() -> None:
-    """doc/specs/mtp.md: every speculative decode step carries the next tracking slot with ``upto -1``;
+    """doc/specs/mtp.md: every speculative decode step carries the next tracking slot with ``upto -grid``;
     the retired step's accepted length says whether it crossed (SGLang's ``_verify_commit_step_indices``)."""
     led = ledger(track_interval=64)
     prompt = list(range(100, 160))  # 60 tokens: no prefill checkpoint
     run(led, 1, prompt, 1, 60, admit=120)
     r = led.reserve(1, 64, 2, speculative=True)
-    assert r is not None and r.track[GDN][1] == -1
+    assert r is not None and r.track[GDN][1] == -64  # at the multiple of 64 it crosses
     slot = r.track[GDN][0]
     with pytest.raises(ValueError, match="accepted length"):
         led.retire(2)

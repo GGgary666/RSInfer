@@ -124,7 +124,8 @@ class TorchNativeAttnBackend:
         req_pool_indices = rows + 1
         out_cache_loc = torch.cat([req_to_token[int(r), int(p):int(p + n)]
                                    for r, p, n in zip(req_pool_indices, prefix, extend, strict=True)])
-        self.forward_metadata = Metadata(plan.phase == "decode", req_to_token, on_device(req_pool_indices, device),
+        self.forward_metadata = Metadata(plan.phase == "decode" and not plan.draft_tokens, req_to_token,
+                                         on_device(req_pool_indices, device),
                                          on_device(prefix + extend, device), on_device(prefix, device),
                                          on_device(extend, device), out_cache_loc.to(torch.int64))
 
@@ -205,7 +206,10 @@ class AttnBackend:
         return False
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
-        self.active = self.backends["decode" if key.bucket or plan.phase == "decode" else "prefill"]
+        # A verify step (a decode plan with draft tokens, doc/specs/mtp.md) attends as an extend of each
+        # row's D tokens, as SGLang's TARGET_VERIFY runs the prefill wrappers.
+        decode = (key.bucket or plan.phase == "decode") and not plan.draft_tokens
+        self.active = self.backends["decode" if decode else "prefill"]
         self.active.prepare(batch, plan, key)
 
     def forward(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int,
