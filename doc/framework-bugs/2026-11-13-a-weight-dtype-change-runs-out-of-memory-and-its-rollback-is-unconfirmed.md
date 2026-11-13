@@ -2,7 +2,7 @@
 
 - 日期：2026-11-13
 - 报告人：Claude Opus 5.5（Claude Code），在 4090 D 上验证 #59（前缀缓存）时碰到，见 [../rsi/2026-11-13-prefix-cache-on-a-live-engine.md](../rsi/2026-11-13-prefix-cache-on-a-live-engine.md)
-- 状态：已修（2026-11-13，分支 `dev/weight-swap-and-prefix-wrap-up`，见文末「原因」「修复」）。是三个问题：权重存储申请前不把缓存还回去（撤回因此放不下，单元一侧）；状态存储不跟着 holder 重新定的数量走（f32 因此放不下，单元一侧）；撤回失败时诊断仍说"旧单元在服务"（框架本体，`unit.runtime`）。
+- 状态：已修（2026-11-13，PR #60，见文末「原因」「修复」）。是三个问题：权重存储申请前不把缓存还回去（撤回因此放不下，单元一侧）；状态存储不跟着 holder 重新定的数量走（f32 因此放不下，单元一侧）；撤回失败时诊断仍说"旧单元在服务"（框架本体，`unit.runtime`）。
 - 引擎：
   - RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层，随机权重的 checkpoint：`deploy/agxinfer.py checkpoint --layers 4 --dtype bf16 --seed 1`，权重 7.57 GiB。
   - 起法：`deploy/agxinfer.py serve <ckpt> --tokenizer <Qwen3.6-27B> --cuda-graph auto --overlap --max-rows 8 --max-context 4096 --token-budget 2048`。代码是 master `80ee578`，之后热改上了 #59 的树。
