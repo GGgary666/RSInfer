@@ -76,6 +76,7 @@ $A stop
   - 前端两次响应之间最长的沉默，也是这个时长。
   - 变更的执行时限（`change.execute_timeout_s`，默认 3600 秒）不会比它短：`wake` 在执行阶段重读权重，启动要多久它就可能要多久。给的值超过 3600 时，执行时限跟着放长。
 - `--overlap`：一步重叠（`sched.overlap`）。
+- `--disable-radix-cache`：关掉前缀缓存（`alloc.radix_cache = false`，和 SGLang 同名）。默认开，照 SGLang 的 radix cache 加 mamba `extra_buffer`（`doc/specs/prefix-cache.md`）；开着时同时在跑的请求数不超过 GDN 槽数除以 5。
 - `--gpu`：worker 用哪张卡（物理编号）。不给时取 `CUDA_VISIBLE_DEVICES` 的第一张，没设就是 0。节点代理只按拓扑设卡，所以靠 `CUDA_VISIBLE_DEVICES` 选卡时也是经这里生效。
 - `--device cpu`：整个引擎跑在 CPU 上（`tests/scenarios/test_m2a.py` 就是这样跑的）。
 - `--set 键=值`：没有专门参数的配置键，可以重复。

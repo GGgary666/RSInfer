@@ -23,6 +23,7 @@ SOLUTIONS: tuple[tuple[str, str, bool, tuple[tuple[str, int], ...]], ...] = (
     ("attn.qk_norm_rope_gate@1", "fused_qk_gemma_rmsnorm_rope_gate", True, (("fp32", 0),)),
     ("act.sigmoid_mul@1", "fused_sigmoid_mul", True, ()),
     ("attn.kv_indices@1", "create_flashinfer_kv_indices", True, ()),
+    ("gdn.track_states@1", "track_states", True, ()),
 )
 """(definition, function in ``ops``, capturable, the shape keys it fits one value of). The prefill
 conv and the chunked delta rule read sequence lengths on the host, so a graph would freeze them. A

@@ -99,6 +99,12 @@ class MambaPool:
     def capacity(self) -> int:
         return self.size
 
+    def pools(self) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """``conv`` and ``temporal`` of every layer, ``[layers, size + 1, ...]``, and the last GDN layer:
+        what ``track_mamba_states_all_layers`` copies, once that layer ran (``_track_pools``)."""
+        conv, temporal = self._tensors()
+        return conv, temporal, self.mamba_layer_ids[-1]
+
     def scratch(self) -> Sequence[int]:
         return [-1]
 

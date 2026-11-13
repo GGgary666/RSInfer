@@ -14,4 +14,7 @@ drain_on_reload = true
 config = ["state.kv.page_size"]
 
 [config]
-"alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them. This first ledger takes request pages and request slots, without prefix snapshots." }
+"alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them: request pages and request slots." }
+"alloc.radix_cache" = { type = "bool", default = true, binding = "startup", doc = "The prefix cache (SGLang's radix cache with the mamba extra_buffer strategy, doc/specs/prefix-cache.md); false is SGLang's --disable-radix-cache. Needs kv.paged pages and gdn.slots slots." }
+"alloc.mamba_track_interval" = { type = "int", default = 256, binding = "startup", doc = "SGLang's --mamba-track-interval: a decoding request keeps its GDN state for the prefix cache every this many tokens (rounded to the checkpoint grid)." }
+"alloc.mamba_max_states_per_path" = { type = "int", default = -1, binding = "startup", doc = "SGLang's --mamba-max-states-per-path: GDN states the prefix cache keeps on one path from the root; -1, no limit." }

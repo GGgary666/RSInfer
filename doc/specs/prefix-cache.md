@@ -83,7 +83,7 @@
 | `mamba_cow_src_index`（forward 前拷） | 已有的 `StateCopy(before)` | 不改。`executors.pytorch` 已经照它恢复，并且不清这种槽 |
 | prefill 和 decode 的跟踪 | 新的 `StateOps.track` | contracts 加字段，见 §2.1 |
 | `checkpoint_kv_cache`、`on_release` | 结果回来、`retire` 之后的 `commit`；`release` | 账本新接口 |
-| `_calculate_mamba_ratio` | `core.state.holder` | 开前缀缓存时，按同样的比例给出最大行数 |
+| `_calculate_mamba_ratio` | 账本的 `max_requests`（实现时从 holder 挪到了账本，见 §7） | 开前缀缓存时，按同样的比例给出最多同时跑几个请求 |
 | `--disable-radix-cache`、`--mamba-track-interval`、`--mamba-max-states-per-path` | `alloc.radix_cache`、`alloc.mamba_track_interval`、`alloc.mamba_max_states_per_path` | startup 键，改了要排空、重载（普通变更） |
 
 ### 2.1 接口（`core.contracts`）
@@ -124,7 +124,7 @@
 - **结果回来**：`retire` 以后对这一步跑完的 prefill chunk 调 `commit`。请求结束时由 `release` 插树。
 - **淘汰**：账本在分不到条目时自己淘汰，调度器不用管。
 
-### 2.4 显存怎么分（`core.state.holder`）
+### 2.4 显存怎么分（实现在账本里，见 §7）
 
 - **怎么算**：开前缀缓存时，照 SGLang 用 GDN 槽数除以比例（开重叠 5，不开 4）当最大行数的上限，启动时报出来（SGLang 打 warning）。
 - **代价**：TP1 一个 GDN 槽约 147 MiB（stage2-contract.md §5.4）。SM100 上那次对比，状态池 92.44 GiB 分到 305 个槽（[real-kernels-sm100.md](../evaluations/real-kernels-sm100.md)）；开前缀缓存加重叠，最大行数就是 61，比那次用的 64 少。要 64 行就得多给 GDN 槽（`holder.state_ratio` 或 `holder.max_slots`），KV 页相应变少。
@@ -172,3 +172,56 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 4. **GPU 验收和性能**：decode 的跟踪搬进 graph。
 
 四步都在一个 PR 里（2026-11-13 用户定），叠在这份计划的 PR（#58）上：实现的 PR 先合进 #58，#58 再合进 master。先在跑着的引擎上热改开发：改的都是单元，不碰框架本体（`engine/framework.toml` 里没有这些模块）。
+
+## 7. 实现（2026-11-13，#59）
+
+### 7.1 东西在哪
+
+- **接口**：
+  - `core/contracts/ledger.py`：`match`、`admit(request, prompt, tokens, step)` 返回 `Admitted`（前缀长度和条目）、`reserve` 返回 `Reserved`（新条目、恢复、跟踪），以及 `commit`、`flush`、`release(..., tokens)`、`align`、`max_requests`。
+  - `records.py`：`StateTrack` 和 `StateOps.track`。
+  - `plan.py`：`PersistentBatch.track`。
+- **账本**（`core/state/alloc/radix.py`，`RadixTree` 和 `RadixLedger`）：
+  - `alloc.radix_cache` 默认开，`false` 时是原来 `pool.py` 不带缓存的账本。
+  - 另外两个键：`alloc.mamba_track_interval`（256）和 `alloc.mamba_max_states_per_path`（-1）。
+  - 原来按 §5.3 设计写的 `prefix.py`（`common_prefix`）和它的测试删了。
+- **调度器**（`core.sched`）：
+  - 等着的请求按缓存命中的长度算起点；接纳时从前缀开始，`request.computed` 就是前缀。
+  - 没写完提示词的 chunk 结束在页边界上。
+  - 恢复和跟踪放进计划的 `StateOps`。
+  - 一步退役后对算了提示词的行调 `commit`；结束时把算过的 token 交给 `release`。
+- **worker**：
+  - `worker.batch` 记下这一步的 `StateTrack`；`state.gdn_slots` 给出全部层的池子（`pools()`）。
+  - `layers.gdn`：prefill 从 `h` 和输入里的 conv 窗口取；decode 在最后一个 GDN 层后发一个 kernel，eager 和 graph 都是，graph 的 mask 和目标是桶的固定 buffer。
+  - kernel 目录新定义 `gdn.track_states@1`：
+    - 参照实现不和 host 来回，能录进 graph：每个 lane 都写，没被选中的 lane 写到 padding 槽 0。
+    - Triton 版是 SGLang 的 `track_mamba_states_all_layers`，原样搬过来。
+  - `gdn.chunk_delta_rule@1` 的参照实现也给出 `h`，和 fla 一样。
+- **部署**：`deploy/agxinfer.py serve --disable-radix-cache`。
+
+### 7.2 和 SGLang 不一样的地方
+
+- **时机**：位置在一步退役时才往前走。所以回了 `Resync` 的步能撤回：它的跟踪不算数，恢复的拷贝下一步再发。SGLang 没有 `Resync`。
+- **跟踪槽**：总是两个，比例总是 5。`sched.overlap` 是 live 键，SGLang 在启动时按开不开重叠定。
+- **重复的页**：树里已经有的 token，请求自己的页不交给树，到请求结束才放。worker 的表只往后加，SGLang 是把树里的页写进请求那一行。
+- **prefill 末尾的 conv 状态**：从这一行自己的槽里拷，SGLang 从输入里取窗口。行比窗口长时两者相同，比窗口短时只有前者对。
+- **最多几个请求**：账本到了数就不再接纳；SGLang 是启动时把 `max_running_requests` 限住。超过 `sched.max_batch` 时调度器在日志里说。
+- **丢掉缓存**（`flush`）：每次提交的变更（排空的 `commit`，`refit` 也算）和换了 worker 时都丢，比 SGLang 只在换权重时丢更保守。空闲时 worker 每秒重报一次 `Capacity`，数一样就什么也不动。
+- **淘汰**：没搬 `_cascade_evict`。中间节点只摘掉状态，留下 KV。
+- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。
+
+### 7.3 测试（CPU，进 CI）
+
+- **账本**：`tests/units/scheduler/test_radix.py`，9 条：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`。
+- **worker**：`tests/units/executors/test_prefix_track.py`。
+  - 存下的状态和单独算到那里的相同，chunk 中间、chunk 末尾、decode 三种位置都测；
+  - 从存下的状态恢复、共享页继续生成，和算整个提示词逐 token 相同；
+  - 不在 64 倍数上的位置被拒。
+- **graph 路径**：`tests/units/executors/test_cuda_graph.py::test_a_captured_step_keeps_states_for_the_prefix_cache_as_the_eager_one`，用替身录制器在 CPU 上回放。它还查一个桶上次回放存过状态、下次不存的情况：清 mask 那一步拿掉，这条就失败。
+- **端到端**：`tests/units/worker/test_prefix_cache.py`，真调度器加真 worker。第一个请求结束、空闲 2.5 秒以后，另外两个请求从 64 开始，三个请求的输出都和 HF 逐 token 相同，开不开重叠都测。按每次报 `Capacity` 就丢缓存的写法，这条失败。
+- **其余**：调度器那组测试用的 worker 是夹具，不算状态，所以在它们的台子上关着缓存（`tests/units/scheduler/support.py`）。
+
+### 7.4 还没做的
+
+- GPU 上的验收（§5）：Triton 跟踪 kernel 在真 graph 里、4090 D 4 层、SM100 64 层、和 SGLang 同配置比性能。
+- A/B/C。

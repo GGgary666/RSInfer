@@ -40,7 +40,8 @@ def test_the_start_up_log_says_what_runs_in_each_phase(capsys: pytest.CaptureFix
         assert logged["decode"]["layers.gdn@1"] == {
             "backend": "auto",
             "gdn.qkvzba_conv1d_update@1": "reference.gdn.qkvzba_conv1d_update@1 (fallback)",
-            "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)"}
+            "gdn.packed_decode@1": "reference.gdn.packed_decode@1 (fallback)",
+            "gdn.track_states@1": "reference.gdn.track_states@1 (fallback)"}
     finally:
         w.close()
 

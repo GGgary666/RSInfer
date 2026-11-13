@@ -180,6 +180,12 @@ class PersistentBatch(Protocol):
         limits (its rows, the tokens one row holds) raises and changes nothing: the scheduler
         admitted what this worker cannot hold, which a full delta would not mend."""
         ...
+
+    def track(self, kind: str) -> tuple[list[int], list[int], list[int]]:
+        """The step's ``StateTrack`` of ``kind`` (rows, destination items, positions), for the
+        backends' ``prepare``."""
+        ...
+
     def ids(self, kind: str) -> Mapping[int, Sequence[int]]:
         """Host-side item ids per row, for the backends' ``prepare``."""
         ...

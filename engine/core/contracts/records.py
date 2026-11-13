@@ -98,12 +98,25 @@ class StateCopy(msgspec.Struct, frozen=True):
     dst: Column
 
 
+class StateTrack(msgspec.Struct, frozen=True):
+    """For the prefix cache (prefix-cache.md, SGLang's ``mamba_track_*``): row ``rows[i]`` writes its
+    state at position ``upto[i]`` (exclusive; inside this step's input or at its end) into item
+    ``dst[i]``. A position inside the input is a multiple of the kind's chunk (64 tokens for GDN)
+    from where the row starts in this step."""
+
+    kind: str
+    rows: Column
+    dst: Column
+    upto: Column
+
+
 class StateOps(msgspec.Struct, frozen=True):
     """Every state kind's part of a step plan, in one section."""
 
     SECTION: ClassVar[str] = "state.ops@1"
     assign: list[StateAssign] = []
     copy: list[StateCopy] = []
+    track: list[StateTrack] = []
 
 
 # ------------------------------------------------------------------ worker -> scheduler

@@ -18,11 +18,13 @@ SLOTS = StateDecl("gdn.slots", 1, {}, "slot")
 def test_joint_admission_gives_back_what_one_kind_took_when_another_refuses() -> None:
     ledger = JointLedger([PAGES, SLOTS])
     ledger.set_capacity({"kv.paged": 4, "gdn.slots": 0})
-    assert ledger.admit(7, 32, 1) is None
+    assert ledger.admit(7, [], 32, 1) is None
     assert ledger.pools["kv.paged"].holdings == {} and len(ledger.pools["kv.paged"].free) == 4
     ledger.set_capacity({"kv.paged": 4, "gdn.slots": 1})
-    assigned = ledger.admit(8, 17, 1)
-    assert assigned is not None and len(assigned["kv.paged"]) == 2 and len(assigned["gdn.slots"]) == 1
+    admitted = ledger.admit(8, [], 17, 1)
+    assert admitted is not None and admitted.prefix == 0
+    assigned = admitted.items
+    assert len(assigned["kv.paged"]) == 2 and len(assigned["gdn.slots"]) == 1
     assert ledger.check() == []
 
 
@@ -50,10 +52,10 @@ def test_release_waits_for_the_last_step_but_cancel_undoes_only_the_unsent_one()
 def test_a_step_not_run_puts_the_position_back_and_keeps_the_items() -> None:
     ledger = JointLedger([PAGES, SLOTS])
     ledger.set_capacity({"kv.paged": 4, "gdn.slots": 2})
-    assigned = ledger.admit(7, 48, 1)
-    assert assigned is not None and ledger.reserve(7, 8, 1) is not None
+    admitted = ledger.admit(7, [], 48, 1)
+    assert admitted is not None and ledger.reserve(7, 8, 1) is not None
     ledger.retire(1, ran=False)
-    assert ledger.items(7) == assigned
+    assert ledger.items(7) == admitted.items
     assert all(pool.holdings[7].position == 0 for pool in ledger.pools.values())
     ledger.release(7, 1)
     assert ledger.check() == [] and all(not pool.holdings for pool in ledger.pools.values())
@@ -64,7 +66,7 @@ def test_with_overlap_the_second_refused_step_does_not_move_the_request_forward(
     step 3 back must not leave the request at the end of step 2, which did not run either."""
     ledger = JointLedger([PAGES, SLOTS])
     ledger.set_capacity({"kv.paged": 8, "gdn.slots": 2})
-    assert ledger.admit(7, 64, 1) is not None and ledger.reserve(7, 16, 1) is not None
+    assert ledger.admit(7, [], 64, 1) is not None and ledger.reserve(7, 16, 1) is not None
     ledger.retire(1)
     assert ledger.reserve(7, 17, 2) is not None and ledger.reserve(7, 18, 3) is not None
     ledger.retire(2, ran=False)
@@ -103,7 +105,7 @@ def test_a_pool_shrinks_only_while_it_holds_nothing() -> None:
     workers may then report fewer items (a new dtype, another holder budget)."""
     ledger = JointLedger([PAGES, SLOTS])
     ledger.set_capacity({"kv.paged": 8, "gdn.slots": 4})
-    assert ledger.admit(1, 20, 1) is not None
+    assert ledger.admit(1, [], 20, 1) is not None
     with pytest.raises(ValueError, match="shrinks only while it holds nothing"):
         ledger.set_capacity({"kv.paged": 4, "gdn.slots": 4})
     ledger.cancel(1, 1)

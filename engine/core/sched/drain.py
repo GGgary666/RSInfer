@@ -72,9 +72,12 @@ class Drain:
 
     def commit(self) -> None:
         """The change may have rebuilt the workers' stores with another size: plan again once each
-        rank sent its ``Capacity`` under the new identity (Codex, Antigravity, #42)."""
+        rank sent its ``Capacity`` under the new identity (Codex, Antigravity, #42). What the stores
+        hold may be gone or stale too (another kernel, weights read again or refit): the prefix
+        cache goes, as SGLang flushes it when the weights change."""
         self._open()
         self.loop.capacity_wanted = set(range(len(self.loop.results)))
+        self.loop.ledger.flush()
 
     def abort(self) -> None:
         self._open()

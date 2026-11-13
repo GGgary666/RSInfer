@@ -238,7 +238,9 @@ class Engine:
             "alloc.states": msgspec.json.decode(msgspec.json.encode(DECLS)), "sched.workers": msgspec.to_builtins(list(WORKERS[:ranks])),
             "sched.frontend_host": str(CLIENT), "sched.max_batch": max_batch, "sched.token_budget": token_budget,
             "sched.overlap": overlap, "sched.idle_wait_s": 0.002, "sched.frontend_timeout_s": 30.0,
-            "sched.quiesce_timeout_s": 30.0, "state.kv.page_size": PAGE, **(config or {})}
+            "sched.quiesce_timeout_s": 30.0, "state.kv.page_size": PAGE,
+            # The fixture workers compute no state; the prefix cache with them: test_prefix_cache.py.
+            "alloc.radix_cache": False, **(config or {})}
         owners = [*self.units, *(UnitSpec(load_manifest(ENGINE / path / "unit.toml").unwrap()) for path in READ)]
         self.config = {key: ConfigEntry(unit.id, decl, values.get(key, decl.default))
                        for unit in owners for key, decl in unit.manifest.config.items()}
@@ -302,8 +304,11 @@ class Bed:
         return lambda: all(self.client.outputs[r].finished is not None for r in rids)
 
     def idle(self) -> bool:
-        """No request left and every item back in the ledger."""
-        ledger = self.engine.ledger
+        """No request left and every item back in the ledger (or, with the prefix cache, in its tree)."""
+        ledger: Any = self.engine.ledger
+        if not hasattr(ledger, "pools"):  # RadixLedger
+            return not list(self.engine.table.entries()) and not self.engine.loop.flights and \
+                not ledger.holdings and ledger.check() == []
         return not list(self.engine.table.entries()) and not self.engine.loop.flights and \
             all(len(p.free) == p.capacity and not p.holdings for p in ledger.pools.values())
 
