@@ -17,4 +17,6 @@ services = ["state.weights@1", "state.holder@1", "state.kv.paged@1", "state.gdn.
 "model.dtype" = { type = "str", default = "bf16", binding = "startup", doc = "Parameter and activation dtype: bf16, f16, f32" }
 
 [reads]
-config = ["state.kv.page_size", "state.kv.dtype", "state.gdn.conv_dtype", "state.gdn.ssm_dtype"]
+config = ["state.kv.page_size", "state.kv.dtype", "state.gdn.conv_dtype", "state.gdn.ssm_dtype",
+          # speculation: the MTP layer as the draft model (doc/specs/mtp.md)
+          "spec.algorithm", "spec.num_steps", "spec.eagle_topk", "spec.num_draft_tokens", "batch.max_rows"]

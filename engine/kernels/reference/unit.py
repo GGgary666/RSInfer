@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.contracts.kernels import Definition, Implementation, KernelFn, Solution, Tolerance
-from kernels.reference import ops
+from kernels.reference import ops, spec
 from kernels.reference.paged import PagedDecode, PagedExtend
 
 LOOSE = Tolerance(atol=2e-2, rtol=2e-2)
@@ -56,6 +56,19 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
      "masked lane's slot to its tracking slot (track_mamba_states_all_layers)", ops.track_states, Tolerance(), True),
     ("sample.seeded@1", "Sampler: greedy, or top-k/top-p drawn from (seed, position)", ops.sample, Tolerance(),
      False),
+    # Speculative decoding (doc/specs/mtp.md)
+    ("gdn.verify_conv1d_update@1", "a verify step's causal conv1d over each row's D tokens, the window after each "
+     "kept in the intermediate buffer (causal_conv1d_update with intermediate_conv_window)",
+     spec.verify_conv1d_update, LOOSE, False),
+    ("gdn.verify_recurrent@1", "a verify step's gated delta rule over each row's D tokens, the state after each "
+     "kept in the intermediate buffer and the row's own left as it is (fused_sigmoid_gating_delta_rule_update, "
+     "disable_state_update)", spec.verify_recurrent, LOOSE, False),
+    ("gdn.commit_states@1", "every layer's state after a row's accepted step into its slot, and the one at a "
+     "tracking boundary into the tracking slot (scatter_mamba_states_after_mtp_verify)", spec.commit_states,
+     Tolerance(), True),
+    ("spec.accept@1", "the drafts a chain verify accepts: greedy, or target-only speculative sampling with coins "
+     "from (seed, position) (verify_tree_greedy, tree_speculative_sampling_target_only)", spec.accept, Tolerance(),
+     False),
 )
 """(definition, what it computes, reference function, tolerance a solution is held to, batch
 invariant). Batch invariant are the references that loop over sequences or only move data; the
@@ -63,7 +76,7 @@ others run one torch op over the whole batch (ops module docstring)."""
 
 
 HOST_DEPENDENT = frozenset({"attn.extend@1", "attn.decode@1", "attn.paged_extend@1", "attn.paged_decode@1",
-                            "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1", "sample.seeded@1"})
+                            "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1", "sample.seeded@1", "spec.accept@1"})
 """The references that read lengths or offsets on the host (a loop over sequences, a seed per row):
 a graph would freeze what they read, so these are not capturable; the others are."""
 

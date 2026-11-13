@@ -79,3 +79,25 @@ class Model(Protocol):
         """``input_ids``, ``positions`` ``[tokens]``; logits ``[rows, vocab]`` at ``last_index``,
         each row's last token."""
         ...
+
+
+class DraftModel(Model, Protocol):
+    """``model@1`` with speculation on (doc/specs/mtp.md): the target model, and its MTP layer as the
+    draft model (SGLang's ``Qwen3_5ForCausalLMMTP``), which shares its embedding and LM head and
+    keeps its KV in the same pages, as layer ``draft_layer``."""
+
+    @property
+    def draft_layer(self) -> int: ...
+
+    def forward_hidden(self, input_ids: Tensor, positions: Tensor, last_index: Tensor) -> tuple[Tensor, Tensor]:
+        """``forward``, and every token's hidden state after the final norm ``[tokens, hidden]``
+        (what SGLang's ``LogitsProcessor`` captures for the draft model)."""
+        ...
+
+    def draft_forward(self, input_ids: Tensor, positions: Tensor, hidden: Tensor, last_index: Tensor
+                      ) -> tuple[Tensor, Tensor]:
+        """The draft model on ``input_ids`` with ``hidden`` ``[tokens, hidden]``, the target's hidden
+        states or its own last ones: logits ``[rows, vocab]`` and its hidden state after its final
+        norm ``[rows, hidden]``, both at ``last_index``. Of the backends only ``layers.attn@1`` is
+        prepared for it. ``hidden`` is given up: a norm may write over it."""
+        ...

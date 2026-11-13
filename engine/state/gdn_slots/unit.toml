@@ -14,3 +14,7 @@ services = ["state.gdn.slots@1"]
 
 [requires]
 services = ["state.holder@1"]
+
+[reads]
+# Speculation keeps a verify step's states after each token, per lane (doc/specs/mtp.md).
+config = ["spec.algorithm", "spec.num_draft_tokens", "batch.max_rows"]

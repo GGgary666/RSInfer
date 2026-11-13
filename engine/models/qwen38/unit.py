@@ -17,11 +17,13 @@ by the executor. The residual stream is ``GemmaRMSNorm``'s fused add (``forward_
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 from typing import Any
 
+import msgspec
 import torch
 
 from core.contracts.model import Assembly, WeightDecl
@@ -41,6 +43,34 @@ STACKED_PARAMS_MAPPING: tuple[tuple[str, str, str | int | tuple[int, ...]], ...]
     ("in_proj_ba.", "in_proj_b.", 0),
     ("in_proj_ba.", "in_proj_a.", 1),
 )
+
+
+def attention_params(cfg: Qwen3_5TextConfig, dtype: str, p: str) -> list[WeightDecl]:
+    """A full-attention decoder layer's parameters under the prefix ``p``."""
+    d = Dims.of(cfg)
+    h = cfg.hidden_size
+    q_heads = cfg.num_attention_heads * (1 + cfg.attn_output_gate)
+    return [WeightDecl(p + "qkv_proj.weight", ((q_heads + 2 * cfg.num_key_value_heads) * cfg.head_dim, h), dtype),
+            WeightDecl(p + "o_proj.weight", (h, d.q_size), dtype),
+            WeightDecl(p + "q_norm.weight", (cfg.head_dim,), dtype), WeightDecl(p + "k_norm.weight", (cfg.head_dim,), dtype)]
+
+
+def mlp_params(cfg: Qwen3_5TextConfig, dtype: str, p: str) -> list[WeightDecl]:
+    h = cfg.hidden_size
+    return [WeightDecl(p + "mlp.gate_up_proj.weight", (2 * cfg.intermediate_size, h), dtype),
+            WeightDecl(p + "mlp.down_proj.weight", (h, cfg.intermediate_size), dtype),
+            WeightDecl(p + "input_layernorm.weight", (h,), dtype), WeightDecl(p + "post_attention_layernorm.weight", (h,), dtype)]
+
+
+def mtp_params(cfg: Qwen3_5TextConfig, dtype: str) -> list[WeightDecl]:
+    """``Qwen3_5ForCausalLMMTP``'s own parameters, under ``mtp.`` (its checkpoint names, with SGLang's
+    fused ``qkv_proj`` and ``gate_up_proj``): ``fc``, the two norms before it, one full-attention
+    decoder layer and the final norm. The embedding and the LM head are the target's."""
+    h = cfg.hidden_size
+    return [WeightDecl("mtp.fc.weight", (h, 2 * h), dtype), WeightDecl("mtp.pre_fc_norm_embedding.weight", (h,), dtype),
+            WeightDecl("mtp.pre_fc_norm_hidden.weight", (h,), dtype),
+            *attention_params(cfg, dtype, "mtp.layers.0."), *mlp_params(cfg, dtype, "mtp.layers.0."),
+            WeightDecl("mtp.norm.weight", (h,), dtype)]
 
 
 def params(cfg: Qwen3_5TextConfig, dtype: str) -> list[WeightDecl]:
@@ -76,6 +106,8 @@ def params(cfg: Qwen3_5TextConfig, dtype: str) -> list[WeightDecl]:
     return out
 
 
+DTYPE_BYTES = MappingProxyType({"bf16": 2, "f16": 2, "f32": 4})
+
 STATE_DTYPES = MappingProxyType({"bf16": "bf16", "bfloat16": "bf16", "f16": "f16", "float16": "f16", "f32": "f32",
                                   "float32": "f32"})
 """The state dtypes stage 2 keeps, in the platform's names and SGLang's."""
@@ -110,10 +142,11 @@ def states(cfg: Qwen3_5TextConfig, dtype: str, page_size: int, *, kv_dtype: str 
 
 
 class Qwen3_5ForCausalLM:
-    """``model@1``."""
+    """``model@1``; with ``draft_tokens`` (speculation on, doc/specs/mtp.md) also the draft model, its
+    MTP layer (``DraftModel``)."""
 
     def __init__(self, cfg: Qwen3_5TextConfig, dtype: str, page_size: int, services: Mapping[str, Any],
-                 state_dtypes: Mapping[str, str] | None = None) -> None:
+                 state_dtypes: Mapping[str, str] | None = None, *, draft_tokens: int = 0, lanes: int = 0) -> None:
         self.cfg, self.dims = cfg, Dims.of(cfg)
         s = services
         self.weights, self.kv, self.gdn_states = s["state.weights@1"], s["state.kv.paged@1"], s["state.gdn.slots@1"]
@@ -121,9 +154,15 @@ class Qwen3_5ForCausalLM:
         self.linear, self.embedding, self.norm = s["layers.linear@1"], s["layers.embedding@1"], s["layers.norm@1"]
         self.rope, self.act, self.attn, self.gdn = (s["layers.rope@1"], s["layers.activation@1"], s["layers.attn@1"],
                                                     s["layers.gdn@1"])
+        decls = states(cfg, dtype, page_size, **(state_dtypes or {}))
+        weights = params(cfg, dtype)
+        self.draft_tokens, self.lanes = draft_tokens, lanes
+        if draft_tokens:  # the draft model's one attention layer keeps its KV in the same pages
+            kv = next(d for d in decls if d.kind == "kv.paged")
+            decls.append(msgspec.structs.replace(kv, layer=cfg.num_hidden_layers))
+            weights += mtp_params(cfg, dtype)
         self._assembly = Assembly(["layers.attn@1" if k == "attention" else "layers.gdn@1"
-                                   for k in cfg.layers_block_type], states(cfg, dtype, page_size, **(state_dtypes or {})),
-                                  params(cfg, dtype))
+                                   for k in cfg.layers_block_type], decls, weights)
         self._views: list[Any] = []
         self._cached: tuple[int, list[Mapping[str, torch.Tensor]]] = (-1, [])
 
@@ -136,12 +175,27 @@ class Qwen3_5ForCausalLM:
         self.weights.declare(a.weights)
         # The pools are sized from what is left once the weights are allocated (state.holder@1).
         weights = self.weights.bind("").buffers().values()
-        self.holder.size(a.states, sum(t.numel() * t.element_size() for t in weights))
+        self.holder.size(a.states, sum(t.numel() * t.element_size() for t in weights) + self.scratch_bytes())
         self.kv.declare([s for s in a.states if s.kind == "kv.paged"])
         self.gdn_states.declare([s for s in a.states if s.kind == "gdn.slots"])
         self.weights.load()
         self._views = [self.weights.bind(f"model.layers.{i}.") for i in range(self.cfg.num_hidden_layers)]
         self._views.append(self.weights.bind(""))
+        if self.draft_tokens:
+            self._views += [self.weights.bind("mtp."), self.weights.bind("mtp.layers.0.")]
+
+    def scratch_bytes(self) -> int:
+        """What speculation keeps besides the states, from the same budget: the GDN states after each
+        token of a verify step, per lane (``state.gdn_slots``'s intermediate buffers)."""
+        if not self.draft_tokens:
+            return 0
+        per_step = sum(math.prod(shape) * DTYPE_BYTES[dtype] for d in self._assembly.states if d.kind == "gdn.slots"
+                       for shape, dtype in d.tensors.values())
+        return per_step * self.lanes * self.draft_tokens
+
+    @property
+    def draft_layer(self) -> int:
+        return self.cfg.num_hidden_layers
 
     # -------------------------------------------------------------- weights
 
@@ -152,7 +206,7 @@ class Qwen3_5ForCausalLM:
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "mtp" in name:
+            if "mtp" in name and not (self.draft_tokens and name.startswith("mtp.")):
                 continue
             if "visual" in name:
                 continue
@@ -215,9 +269,46 @@ class Qwen3_5ForCausalLM:
     # -------------------------------------------------------------- forward
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
+        return self._logits(self._hidden(input_ids, positions)[last_index])
+
+    def forward_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor
+                       ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self._hidden(input_ids, positions)
+        return self._logits(hidden[last_index]), hidden
+
+    def _logits(self, pruned_states: torch.Tensor) -> torch.Tensor:
+        """``LogitsProcessor``: the LM head on each row's last hidden state."""
+        top = self._layer_weights()[self.cfg.num_hidden_layers]
+        return self.embedding.logits(pruned_states, top["model.embed_tokens.weight" if self.cfg.tie_word_embeddings
+                                                         else "lm_head.weight"])
+
+    def draft_forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden: torch.Tensor,
+                      last_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``Qwen3_5ForCausalLMMTP.forward``: ``fc`` over the normed embedding and the normed hidden
+        state, its one decoder layer (``Qwen3_5AttentionDecoderLayer``, KV as ``draft_layer``), its
+        final norm, the shared LM head."""
+        eps = self.cfg.rms_norm_eps
+        weights = self._layer_weights()
+        top, mtp, layer = weights[self.cfg.num_hidden_layers], weights[-2], weights[-1]
+        embeds = self.norm.gemma_rms(self.embedding.embed(input_ids, top["model.embed_tokens.weight"]),
+                                     mtp["pre_fc_norm_embedding.weight"], eps)
+        hidden = self.norm.gemma_rms(hidden, mtp["pre_fc_norm_hidden.weight"], eps)
+        hidden_states = self.linear.forward(torch.cat([embeds, hidden], dim=-1), mtp["fc.weight"])
+        residual = hidden_states
+        hidden_states = self.norm.gemma_rms(hidden_states, layer["input_layernorm.weight"], eps)
+        hidden_states = self.self_attention(self.draft_layer, positions, hidden_states, layer)
+        hidden_states, residual = self.norm.gemma_rms(hidden_states, layer["post_attention_layernorm.weight"], eps,
+                                                      residual)
+        hidden_states = self.mlp(hidden_states, layer)
+        hidden_states, _ = self.norm.gemma_rms(hidden_states, mtp["norm.weight"], eps, residual)
+        pruned = hidden_states[last_index]
+        return self._logits(pruned), pruned
+
+    def _hidden(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The decoder over the step's tokens: every token's hidden state after the final norm."""
         cfg, eps = self.cfg, self.cfg.rms_norm_eps
         weights = self._layer_weights()
-        top = weights[-1]
+        top = weights[cfg.num_hidden_layers]
         hidden_states = self.embedding.embed(input_ids, top["model.embed_tokens.weight"])
         residual: torch.Tensor | None = None
         for layer_id, kind in enumerate(cfg.layers_block_type):
@@ -235,10 +326,7 @@ class Qwen3_5ForCausalLM:
                                                           residual)
             hidden_states = self.mlp(hidden_states, w)
         hidden_states, _ = self.norm.gemma_rms(hidden_states, top["model.norm.weight"], eps, residual)
-        # LogitsProcessor: the last token of each sequence, then the LM head
-        pruned_states = hidden_states[last_index]
-        lm_head = top["model.embed_tokens.weight" if cfg.tie_word_embeddings else "lm_head.weight"]
-        return self.embedding.logits(pruned_states, lm_head)
+        return hidden_states
 
     def mlp(self, x: torch.Tensor, w: Mapping[str, torch.Tensor]) -> torch.Tensor:
         """``Qwen2MoeMLP``: ``gate_up_proj``, ``SiluAndMul``, ``down_proj``."""
@@ -300,6 +388,22 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.copy_(loaded_weight)
 
 
+def spec_draft_tokens(config: Any) -> int:
+    """``spec.num_draft_tokens`` when speculation is on, else 0; the keys checked as SGLang checks them
+    (doc/specs/mtp.md §2.1)."""
+    algorithm = config["spec.algorithm"]
+    if not algorithm:
+        return 0
+    if algorithm != "eagle":
+        raise ValueError(f"spec.algorithm = {algorithm!r}: only \"\" (off) and \"eagle\" (the MTP layer drafts)")
+    steps, topk, tokens = config["spec.num_steps"], config["spec.eagle_topk"], config["spec.num_draft_tokens"]
+    if topk != 1:
+        raise ValueError(f"spec.eagle_topk = {topk}: only a chain (1) is supported")
+    if steps < 1 or tokens != steps + 1:
+        raise ValueError(f"spec.num_draft_tokens = {tokens} must be spec.num_steps + 1 = {steps + 1} for a chain")
+    return tokens
+
+
 def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
     if path:
         with open(os.path.join(path, "config.json")) as f:
@@ -323,7 +427,9 @@ class Unit:
             "conv_dtype": state_dtype("state.gdn.conv_dtype", config["state.gdn.conv_dtype"], "bf16"),
             "ssm_dtype": state_dtype("state.gdn.ssm_dtype", config["state.gdn.ssm_dtype"],
                                      STATE_DTYPES.get(cfg.mamba_ssm_dtype, "f32"))}
-        self.model = Qwen3_5ForCausalLM(cfg, dtype, config["state.kv.page_size"], services, state_dtypes)
+        draft_tokens = spec_draft_tokens(config)
+        self.model = Qwen3_5ForCausalLM(cfg, dtype, config["state.kv.page_size"], services, state_dtypes,
+                                        draft_tokens=draft_tokens, lanes=config["batch.max_rows"] if draft_tokens else 0)
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")
         self.model.start()
         ctx.provide("model@1", self.model)

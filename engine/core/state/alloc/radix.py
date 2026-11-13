@@ -563,6 +563,10 @@ class RadixLedger:
         self._flush_if_idle()
 
     def retire(self, step: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> None:
+        missing = [request for (epoch, request), r in self.reservations.items()
+                   if epoch == step and ran and r.speculative and (advanced is None or request not in advanced)]
+        if missing:  # before anything changes
+            raise ValueError(f"speculative step {step} retired without the accepted length of requests {missing}")
         for key, r in list(self.reservations.items()):
             epoch, request = key
             if epoch != step:
@@ -570,8 +574,7 @@ class RadixLedger:
             del self.reservations[key]
             h = self.holdings[request]
             if ran and r.speculative:
-                if advanced is None or request not in advanced:
-                    raise ValueError(f"speculative step {step} retired without request {request}'s accepted length")
+                assert advanced is not None
                 start, end = h.committed, h.committed + advanced[request]
                 if r.track is not None and start // self.decode_grid != end // self.decode_grid:
                     # _verify_commit_step_indices: the worker kept the state at the boundary
