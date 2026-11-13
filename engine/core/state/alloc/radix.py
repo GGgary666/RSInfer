@@ -97,6 +97,8 @@ class RadixTree:
         self.clock = itertools.count(1)
         self.version = 0
         """Bumped on every change a match could see."""
+        self.freed_states: list[int] = []
+        """States ``mamba_max_states_per_path`` took off a path, for the ledger to free."""
 
     # ---------------------------------------------------------------- reading
 
@@ -221,8 +223,6 @@ class RadixTree:
             n.state = None
             excess -= 1
 
-    freed_states: list[int]
-
     # ---------------------------------------------------------------- eviction
 
     def _evictable_leaf(self, n: Node) -> bool:
@@ -331,6 +331,13 @@ class RadixLedger:
             raise ValueError("alloc.mamba_track_interval must be positive, alloc.mamba_max_states_per_path -1 "
                              "(no limit) or positive")
         self.page = pages.pop()
+        if max(FLA_CHUNK, self.page) % min(FLA_CHUNK, self.page):  # SGLang's mamba_cache_chunk_size_of
+            # Else a state would be kept where the GDN kernels have none (Antigravity, #59).
+            raise ValueError(f"state.kv.page_size = {self.page}: with the prefix cache, it or the GDN kernels' "
+                             f"chunk ({FLA_CHUNK}) must divide the other (as SGLang's), or alloc.radix_cache = false")
+        if track_interval % self.page:  # SGLang's mamba_hook
+            raise ValueError(f"alloc.mamba_track_interval = {track_interval} must be a multiple of "
+                             f"state.kv.page_size = {self.page} (as SGLang's)")
         self.chunk = max(FLA_CHUNK, self.page)
         """``mamba_cache_chunk_size``."""
         self.grid = math.lcm(self.chunk, self.page)
@@ -355,9 +362,7 @@ class RadixLedger:
     def _new_tree(self) -> RadixTree:
         self.matches.clear()  # a new tree counts its versions from 0 again
         self.matches_version = -1
-        tree = RadixTree(self.page, self.max_states_per_path)
-        tree.freed_states = []
-        return tree
+        return RadixTree(self.page, self.max_states_per_path)
 
     @property
     def align(self) -> int:
@@ -394,6 +399,7 @@ class RadixLedger:
 
     def flush(self) -> None:
         self.stale = True
+        self.matches.clear()  # nothing is matched from now on (Antigravity, #59)
         self._flush_if_idle()
 
     def _flush_if_idle(self) -> None:
@@ -599,6 +605,28 @@ class RadixLedger:
         donated, h.track[h.last_idx] = h.track[h.last_idx], new[0]
         if not self._insert(h, prompt, length, donated):
             self.free[GDN].extend([donated])
+
+    def restart(self, request: int) -> bool:
+        """The cache's pages where the request has its own, the root its anchor, nothing to restore:
+        as admitted without a hit. Steps still in flight for it retire as not run (the new worker
+        refuses them), which leaves its position at 0."""
+        h = self.holdings.get(request)
+        if h is None:
+            return False
+        shared = [i for i, p in enumerate(h.pages) if p not in h.own]
+        fresh = self._take(KV, len(shared))  # the anchor is still locked: its pages are not evicted
+        if fresh is None:
+            return False
+        for i, p in zip(shared, fresh, strict=True):
+            h.pages[i] = p
+        h.own.update(fresh)
+        self.tree.unlock(h.anchor)
+        self._restored(h)
+        h.anchor = self.tree.root
+        self.tree.lock(h.anchor)
+        h.position, h.branching, h.restored, h.restore_step = 0, None, True, None
+        h.last_seqlen = h.prev_seqlen = None
+        return True
 
     def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:
         self.matches.pop(request, None)  # it may end while still waiting

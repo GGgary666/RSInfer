@@ -99,6 +99,13 @@ class Ledger(Protocol):
         it computed enters the prefix cache (SGLang's ``checkpoint_kv_cache``)."""
         ...
 
+    def restart(self, request: int) -> bool:
+        """After ``flush`` (a worker was replaced): the request, admitted from the prefix cache and
+        not run yet, computes its prompt again from position 0, on items of its own and with no
+        state to restore. ``False``: it cannot (no free items, or no cache to start over from), and
+        should end."""
+        ...
+
     def release(self, request: int, last_step: int, tokens: Sequence[int] = ()) -> None:
         """The request is done; ``tokens`` are the ones it computed, prompt and output. Once
         ``last_step`` retired, and not before (a step still running may write its items, §4.4

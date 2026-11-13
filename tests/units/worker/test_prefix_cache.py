@@ -46,14 +46,15 @@ def test_a_request_that_begins_with_a_computed_prompt_starts_from_the_cache_and_
     with stack(checkpoint[0], checkpoint[1], overlap=overlap, token_budget=128,
                sched={"alloc.radix_cache": True, **CONFIG},
                **{**CONFIG, "state.kv.pages": 160, "state.gdn.slots": 20}) as (b, workers):
-        assert b.engine.ledger.match(0, LATER[2]) == 0
+        assert b.engine.ledger.match(2, LATER[2]) == 0
         b.client.send(greedy(FIRST))
         b.run_until(b.finished(*FIRST), timeout=60)
         b.run_until(b.idle, timeout=10)
         until = time.monotonic() + 2.5  # idle: the workers say their capacity again (worker.announce_every_s)
         b.run_until(lambda: time.monotonic() > until, timeout=10)
         # the first prompt's state at 64 (the checkpoint grid) is cached; both later ones start there
-        assert [b.engine.ledger.match(0, p) for p in LATER.values()] == [64, 64, 64]
+        # each under its own id: a match is kept per waiting request (Antigravity, #59)
+        assert [b.engine.ledger.match(rid, p) for rid, p in LATER.items()] == [64, 64, 64]
         b.client.send(greedy(LATER))
         b.run_until(b.finished(*LATER), timeout=60)
         assert {rid: b.client.outputs[rid].tokens for rid in want} == want

@@ -83,6 +83,9 @@ class JointLedger:
     def commit(self, request: int, prompt: Sequence[int]) -> None:
         pass
 
+    def restart(self, request: int) -> bool:
+        return False  # no request starts from a cache here
+
     def flush(self) -> None:
         pass
 

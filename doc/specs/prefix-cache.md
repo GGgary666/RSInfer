@@ -178,7 +178,7 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 ### 7.1 东西在哪
 
 - **接口**：
-  - `core/contracts/ledger.py`：`match`、`admit(request, prompt, tokens, step)` 返回 `Admitted`（前缀长度和条目）、`reserve` 返回 `Reserved`（新条目、恢复、跟踪），以及 `commit`、`flush`、`release(..., tokens)`、`align`、`max_requests`。
+  - `core/contracts/ledger.py`：`match`、`admit(request, prompt, tokens, step)` 返回 `Admitted`（前缀长度和条目）、`reserve` 返回 `Reserved`（新条目、恢复、跟踪），以及 `commit`、`flush`、`restart`、`release(..., tokens)`、`align`、`max_requests`。`restart` 是 Antigravity 评审以后加的（2026-11-13），见 §7.2「换了 worker」。
   - `records.py`：`StateTrack` 和 `StateOps.track`。
   - `plan.py`：`PersistentBatch.track`。
 - **账本**（`core/state/alloc/radix.py`，`RadixTree` 和 `RadixLedger`）：
@@ -187,7 +187,7 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
   - 原来按 §5.3 设计写的 `prefix.py`（`common_prefix`）和它的测试删了。
 - **调度器**（`core.sched`）：
   - 等着的请求按缓存命中的长度算起点；接纳时从前缀开始，`request.computed` 就是前缀。
-  - 没写完提示词的 chunk 结束在页边界上。
+  - 没写完提示词的 chunk 结束在页边界上；到不了一页的，等着的请求先不接纳（接纳可能要从缓存里淘汰）。
   - 恢复和跟踪放进计划的 `StateOps`。
   - 一步退役后对算了提示词的行调 `commit`；结束时把算过的 token 交给 `release`。
 - **worker**：
@@ -208,16 +208,25 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
 - **最多几个请求**：账本到了数就不再接纳；SGLang 是启动时把 `max_running_requests` 限住。超过 `sched.max_batch` 时调度器在日志里说。
 - **丢掉缓存**（`flush`）：每次提交的变更（排空的 `commit`，`refit` 也算）、每次撤回的变更（排空的 `abort`）和换了 worker 时都丢，比 SGLang 只在换权重时丢更保守。撤回也要丢：变更可能已经重建了状态池，后面的单元加载失败、撤回时旧单元重新加载，池子是空的（Codex，#59）。空闲时 worker 每秒重报一次 `Capacity`，数一样就什么也不动。
 - **淘汰**：没搬 `_cascade_evict`。中间节点只摘掉状态，留下 KV。
-- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。记下的命中只留给还在等的请求：接纳时、请求结束时（还没接纳就结束的也算）删掉，换一棵新树时全清，因为新树的版本号从 0 重新数（Codex，#59）。
+- **匹配**：每一轮规划都给等着的请求算一次命中，有空行时才算，同一版树只算一次。记下的命中只留给还在等的请求：接纳时、请求结束时（还没接纳就结束的也算）删掉，换一棵新树时全清，因为新树的版本号从 0 重新数（Codex，#59）。`flush` 时也全清，之后到树换掉为止什么都不命中（Antigravity，#59）。
+- **换了 worker**：已经从缓存接纳、但还没有一步经旧连接发出去的请求，起点来自旧 worker 的状态池，新 worker 没有。调度器让它从 0 重新算（`restart`：前缀的页换成它自己的，不恢复状态），和什么都没算过的请求一样；没有空页时它结束。SGLang 没有换 worker 这回事（Antigravity，#59）。
 - **token 预算**：开着缓存时，`sched.token_budget` 必须是 `state.kv.page_size` 的整数倍，否则调度器加载失败（启动时起不来，apply 时撤回）。不到最后的 chunk 要停在整页上，预算小于一页就永远算不了，请求一直挂着（Codex，#59）。SGLang 在启动时同样要求 `chunked_prefill_size % page_size == 0`，不管开不开缓存；我们关着缓存时 chunk 不对齐页，所以不要求。
+- **页大小**：和 SGLang 一样，页和 GDN kernel 的 chunk（64）必须一个整除另一个，`alloc.mamba_track_interval` 必须是页的整数倍，否则账本加载失败。不这样的话（比如页 96），存状态的位置不在 64 的倍数上，worker 拒绝这一步，引擎停止服务（Antigravity，#59）。
+- **接纳的顺序**：和 SGLang 的 `PrefillAdder` 一样，先看这一块到不到得了一页，到不了就不接纳。原来先接纳再截断，接纳时从缓存淘汰掉的东西白丢了（Antigravity，#59）。
 
 ### 7.3 测试（CPU，进 CI）
 
-- **账本**：`tests/units/scheduler/test_radix.py`，10 条：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`、记下的命中只留给还在等的请求（换新树时也不串）。
+- **账本**：`tests/units/scheduler/test_radix.py`，12 条（评审以后）：命中前缀、分叉点、结束时的 decode 检查点、`Resync`、重叠时两个跟踪槽、淘汰不碰在用的前缀、5 个槽一个请求、坏配置、`flush`、记下的命中只留给还在等的请求（换新树时也不串）。
 - **排空和配置**（Codex 在 #59 的评审，2026-11-13）：
   - `tests/units/scheduler/test_drain.py::test_an_undone_change_drops_the_prefix_cache_as_a_committed_one_does`：撤回以后不再命中；
   - `tests/units/scheduler/test_scheduling.py::test_with_the_prefix_cache_a_token_budget_that_is_not_a_multiple_of_the_page_is_refused`：开着缓存、预算 2、页 4 时调度器不加载，关着缓存时照常跑完。
   - 三处修复各自拿掉，对应的测试都失败。
+- **Antigravity 在 #59 的评审**（2026-11-13）：
+  - `test_scheduling.py::test_a_request_admitted_from_the_cache_of_a_replaced_worker_starts_over_from_0`：先换连接的是计划，请求 2 从缓存的 64 开始，新 worker 拒绝这一步，再从 0 算，输出照常。不修时夹具 worker 发现它从 64 接着算、页是空的，这一步失败；
+  - `test_scheduling.py::test_a_waiting_request_whose_chunk_reaches_no_page_is_not_admitted_and_evicts_nothing`：预算只剩 2 个 token 给页为 4 的请求，不接纳它，缓存里的 3 个状态都在；
+  - `test_radix.py`：页 96、间隔 200 被拒；`flush` 以后不再给出之前记下的命中；`RadixTree` 自己初始化 `freed_states`；`restart`；
+  - `tests/units/worker/test_prefix_cache.py` 查命中时用各个请求自己的 id（原来都用 0，后两个直接拿了第一个记下的结果）；
+  - 五处修复各自拿掉，对应的测试都失败。
 - **worker**：`tests/units/executors/test_prefix_track.py`。
   - 存下的状态和单独算到那里的相同，chunk 中间、chunk 末尾、decode 三种位置都测；
   - 从存下的状态恢复、共享页再算 4 个 token：状态和 logits 是整个提示词的，不恢复的对照差得远；

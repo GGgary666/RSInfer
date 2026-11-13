@@ -500,6 +500,21 @@ class Scheduler:
         self.ledger.flush()  # a new worker: what the old one's stores held is gone
         for f in void:
             lost |= set(f.rows.values())
+        restarted = 0
+        for request in self.table.entries():
+            # Computed tokens but none of them went over the old connection: they came from the
+            # prefix cache, which was the old worker's too. It starts over from 0, as a request
+            # with nothing computed does (Antigravity, #59), or ends.
+            rid = request.input.request
+            if rid in lost or request.row is None or request.finished() or request.computed == 0:
+                continue
+            if self.ledger.restart(rid):
+                request.computed = 0
+                restarted += 1
+            else:
+                lost.add(rid)
+        if restarted:
+            self._note(f"{restarted} request(s) admitted from the prefix cache start over from position 0")
         self.full = True
         for f in self.flights:  # not given up: on their way to the new worker, which refuses them
             if f not in void and rank not in f.answers:
@@ -976,6 +991,11 @@ class Scheduler:
                 if why := self._too_long(extent):
                     self._error(request, why)
                     continue
+                # Where it would start now (an admission before it in this step may have evicted
+                # part of its prefix): a chunk that reaches no page does not run, and admitting it
+                # would only evict from the cache (Antigravity, #59; PrefillAdder checks first too).
+                if self._chunk(request, self.ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
+                    continue
                 got = self.ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
                 if got is None:
                     refused = True
@@ -987,16 +1007,12 @@ class Scheduler:
                 step.assign_all(request.row, got.items)
             row = request.row
             assert row is not None
-            n = take.tokens
-            if kind != "decoding" and planned + n < len(request.prompt_tokens):
-                # A chunk that does not end its prompt ends on a page: the cache keeps whole
-                # pages (PrefillAdder: end = (prefix_len + extend_len) // page_size * page_size).
-                n = (planned + n) // self.ledger.align * self.ledger.align - planned
-                if n <= 0:
-                    if kind == "waiting":
-                        self.ledger.cancel(rid, step.epoch)
-                        step.unadmit(request, free)
-                    continue
+            n = take.tokens if kind == "decoding" else self._chunk(request, planned, take.tokens)
+            if n <= 0:
+                if kind == "waiting":
+                    self.ledger.cancel(rid, step.epoch)
+                    step.unadmit(request, free)
+                continue
             extra = self.ledger.reserve(rid, planned + n, step.epoch)
             if extra is None:  # what step.epoch took for it is back in the ledger
                 if kind == "waiting":
@@ -1023,6 +1039,17 @@ class Scheduler:
             if planned + n >= len(request.prompt_tokens):
                 step.samples.add(row)
         return refused
+
+    def _chunk(self, request: Request, planned: int, tokens: int) -> int:
+        """Prompt tokens a take of ``tokens`` computes from ``planned``: no more than are left (an
+        admission may start further on than the view did). A chunk that does not end its prompt
+        ends on a page: the cache keeps whole pages (PrefillAdder: end = (prefix_len + extend_len)
+        // page_size * page_size). 0 or less: nothing runs."""
+        left = len(request.prompt_tokens) - planned
+        n = min(tokens, left)
+        if n < left:
+            n = (planned + n) // self.ledger.align * self.ledger.align - planned
+        return n
 
     def _send_plan(self, step: _Step) -> None:
         if self.full:

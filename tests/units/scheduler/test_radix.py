@@ -6,11 +6,15 @@ from __future__ import annotations
 import pytest
 
 from core.contracts.state import StateDecl
-from core.state.alloc.radix import GDN, KV, RadixLedger
+from core.state.alloc.radix import GDN, KV, RadixLedger, RadixTree
 
 PAGE = 16
 DECLS = [StateDecl(KV, 0, {"k": ((PAGE, 1, 8), "bf16")}, "request", tokens_per_item=PAGE),
          StateDecl(GDN, 1, {"s": ((8, 8), "f32")}, "slot")]
+
+
+def paged(page: int) -> list[StateDecl]:
+    return [StateDecl(KV, 0, {"k": ((page, 1, 8), "bf16")}, "request", tokens_per_item=page), DECLS[1]]
 
 
 def ledger(pages: int = 64, slots: int = 20, **kw: int) -> RadixLedger:
@@ -146,6 +150,13 @@ def test_a_bad_configuration_is_refused() -> None:
         RadixLedger([DECLS[0]])
     with pytest.raises(ValueError, match="mamba_max_states_per_path"):
         RadixLedger(DECLS, max_states_per_path=0)
+    # As SGLang's (Antigravity, #59): a page of 96 would keep a state at 96, where the GDN
+    # kernels have none (the worker refuses it and the engine stops).
+    with pytest.raises(ValueError, match="must divide the other"):
+        RadixLedger(paged(96), track_interval=192)
+    with pytest.raises(ValueError, match="mamba_track_interval = 200 must be a multiple"):
+        RadixLedger(paged(16), track_interval=200)
+    assert RadixLedger(paged(128)).grid == 128 and RadixLedger(paged(32)).grid == 64
 
 
 def test_a_flush_drops_the_cache_once_no_request_holds_items_and_a_repeated_capacity_keeps_it() -> None:
@@ -156,6 +167,7 @@ def test_a_flush_drops_the_cache_once_no_request_holds_items_and_a_repeated_capa
     led.set_capacity({KV: 64, GDN: 20})  # an idle worker says it again
     assert led.match(2, a) == 192
     assert led.admit(2, a, 210, 2) is not None
+    assert led.match(3, a) == 192
     led.flush()  # a change committed while request 2 still holds a's prefix
     assert led.match(3, a) == 0 and led.admit(3, a, 210, 2) is not None and led.holdings[3].position == 0
     led.retire(2)
@@ -190,3 +202,37 @@ def test_a_match_is_kept_only_while_its_request_waits_and_only_on_its_own_tree()
     led.commit(1002, a)
     led.release(1002, 1002, a)
     assert led.tree.version == version and led.match(9, a) == 192
+
+
+def test_a_tree_frees_the_states_past_the_limit_of_a_path_on_its_own() -> None:
+    tree = RadixTree(PAGE, max_states_per_path=1)
+    a = list(range(64))
+    tree.insert(a[:32], [0, 1], 7)
+    tree.insert(a, [0, 1, 2, 3], 8)
+    assert tree.freed_states == [7] and tree.match(a).prefix == 64
+
+
+def test_a_request_admitted_from_the_cache_restarts_from_0_on_pages_of_its_own() -> None:
+    """A worker was replaced before the request ran (Antigravity, #59): the cached prefix it
+    started from is gone with the old worker's stores."""
+    led = ledger()
+    a = list(range(200))
+    run(led, 1, a, 1, 200, admit=210)
+    led.commit(1, a)
+    led.release(1, 1, a)
+    got = led.admit(2, a, 210, 2)
+    assert got is not None and got.prefix == 192
+    r = led.reserve(2, 200, 2)
+    assert r is not None and r.restore  # sent with the step the new worker refuses
+    led.flush()
+    tree_pages = set(led.tree.held()[0])
+    assert led.restart(2) and led.restart(3) is False
+    led.retire(2, ran=False)
+    h = led.holdings[2]
+    assert h.position == 0 and not (set(h.pages) & tree_pages) and set(h.pages) == h.own
+    again = led.reserve(2, 200, 3)
+    assert again is not None and not again.restore
+    led.retire(3)
+    led.release(2, 3, a)
+    assert not led.holdings and led.check() == [] and led.tree.held() == ([], [])
+    assert len(led.free[KV]) == 64 and len(led.free[GDN]) == 20
