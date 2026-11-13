@@ -89,12 +89,31 @@ class Oracle:
         return out
 
 
-@pytest.mark.parametrize(("overlap", "cache"), [(False, False), (True, False), (False, True), (True, True)])
+def slow(worker: Any, seconds: float) -> None:
+    """The worker's steps take ``seconds`` more, as a GPU's do: the scheduler plans the next step
+    (overlap) before the last one's answer is back, so a row's plan position is only where it is
+    at least, 0 for its first decode while its prefill is still on its way."""
+    import time
+    executor = worker.loop.executor
+    submit = executor.submit
+
+    def later(*args: Any) -> Any:
+        out = submit(*args)
+        time.sleep(seconds)
+        return out
+
+    executor.submit = later
+
+
+@pytest.mark.parametrize(("overlap", "cache", "slowly"), [(False, False, False), (True, False, False),
+                                                          (False, True, False), (True, True, False),
+                                                          (True, False, True), (True, True, True)])
 def test_drafts_the_target_accepts_give_its_tokens_whatever_length_each_step_accepts(
-        checkpoint: tuple[dict[str, Any], Path, Any], overlap: bool, cache: bool) -> None:
+        checkpoint: tuple[dict[str, Any], Path, Any], overlap: bool, cache: bool, slowly: bool) -> None:
     """With drafts mostly right, steps accept 1 to D tokens: the GDN states committed at each length,
     the KV written past what was accepted and written over next, the rows moving by more than one
-    token while the next step is planned (overlap), and the prefix cache tracking inside a step."""
+    token while the next step is planned (overlap; ``slowly``: before the step before it answered),
+    and the prefix cache tracking inside a step."""
     steps = 24
     want = {rid: hf_greedy(checkpoint[2], p, steps)[0] for rid, p in PROMPTS.items()}
     oracle = Oracle({rid: [*PROMPTS[rid], *want[rid]] for rid in PROMPTS}, checkpoint[0]["vocab_size"])
@@ -104,6 +123,8 @@ def test_drafts_the_target_accepts_give_its_tokens_whatever_length_each_step_acc
                **{**SPEC, **CONFIG, "state.kv.pages": 160, "state.gdn.slots": 20}) as (b, workers):
         for w in workers:
             w.call(lambda w: setattr(cast(Any, w.runtime).instance("models.qwen38").model, "draft_forward", oracle))
+            if slowly:
+                w.call(lambda w: slow(w, 0.02))
         table: Any = b.engine.table
         sample = table.sample
 
@@ -113,9 +134,11 @@ def test_drafts_the_target_accepts_give_its_tokens_whatever_length_each_step_acc
             return sample(epoch, identity, sampled)
 
         table.sample = counting
-        b.client.send([NewRequest(rid, Column.of("i64", p), SamplingParams(temperature=0.0, seed=rid), steps)
-                       for rid, p in PROMPTS.items()])
-        b.run_until(b.finished(*PROMPTS), timeout=120)
+        new = [NewRequest(rid, Column.of("i64", p), SamplingParams(temperature=0.0, seed=rid), steps)
+               for rid, p in PROMPTS.items()]
+        for batch in ([[r] for r in new] if slowly else [new]):  # one by one: a decode right after its prefill
+            b.client.send(batch)
+            b.run_until(b.finished(*(r.request for r in batch)), timeout=120)
         assert {rid: b.client.outputs[rid].tokens for rid in want} == want
         expected = {rid: oracle.counts(len(p), steps, SPEC["spec.num_draft_tokens"]) for rid, p in PROMPTS.items()}
         assert {rid: c[:len(expected[rid])] for rid, c in counts.items()} == expected  # with overlap, a step more

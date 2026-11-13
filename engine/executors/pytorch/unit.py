@@ -184,10 +184,12 @@ class PyTorchExecutor:
         # mamba_clear_indices: a row that starts from position 0 has no state yet (its conv runs
         # without an initial state); a row restored from a snapshot or continuing keeps its items.
         restored = {(c.kind, int(d)) for c in state.copy if c.when == "before" for d in c.dst.values()}
+        # A from_previous row goes on from its last step: with speculation its plan position is only
+        # where it is at least, 0 while its prefill is still in flight (doc/specs/mtp.md).
+        starting = [r for r, p, f in zip(rows, positions, plan.from_previous.values(), strict=True) if p == 0 and not f]
         for kind, store in self.stores.items():
             ids = self.batch.ids(kind)
-            fresh = [i for r, p in zip(rows, positions, strict=True) if p == 0 for i in ids.get(r, [])
-                     if (kind, i) not in restored]
+            fresh = [i for r in starting for i in ids.get(r, []) if (kind, i) not in restored]
             if fresh:
                 store.clear(fresh)
         self._copies(state, "before")
