@@ -58,6 +58,45 @@ def triton() -> Any:
     return ops
 
 
+
+@pytest.mark.parametrize(("dtype", "ssm_dtype"), [(torch.bfloat16, torch.float32), (torch.float32, torch.float32)])
+def test_triton_gdn_verify_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,
+                                                                 ssm_dtype: torch.dtype) -> None:
+    """A verify step (doc/specs/mtp.md): five rows of D = 4 tokens at scattered slots. The conv keeps
+    the window after each token and leaves the row's state after all four; the delta rule keeps the
+    state after each token and leaves the row's own untouched."""
+    from kernels.reference import spec as ref_spec
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    rand: Callable[..., torch.Tensor] = lambda *shape: torch.randn(*shape, device=DEVICE, generator=gen)
+    rows, steps = 5, 4
+    n = rows * steps
+    weight = (0.3 * rand(CONV_DIM, WIDTH)).to(dtype)
+    conv0 = (0.5 * rand(9, CONV_DIM, WIDTH - 1)).to(dtype)
+    slots = torch.tensor([3, 1, 7, 5, 2], device=DEVICE, dtype=torch.int32)
+    lanes = torch.arange(rows, device=DEVICE)
+    x = rand(rows, steps, CONV_DIM).to(dtype).transpose(1, 2)  # as a verify step's projection is laid out
+    conv_ref, conv_tri = conv0.clone(), conv0.clone()
+    win_ref = torch.zeros(rows, steps, CONV_DIM, WIDTH - 1, device=DEVICE, dtype=dtype)
+    win_tri = win_ref.clone()
+    close("gdn.verify_conv1d_update@1", triton.verify_conv1d_update(x, conv_tri, weight, None, "silu", slots, win_tri, lanes),
+          ref_spec.verify_conv1d_update(x, conv_ref, weight, None, "silu", slots, win_ref, lanes))
+    assert torch.equal(win_tri, win_ref) and torch.equal(conv_tri, conv_ref)
+
+    q, k, v = (rand(1, n, HK, K).to(dtype), rand(1, n, HK, K).to(dtype), rand(1, n, HV, V).to(dtype))
+    A_log, dt_bias = 0.5 * rand(HV), 0.5 * rand(HV)
+    ba = rand(n, 2 * HV).to(dtype)
+    b, a = ba[:, :HV], ba[:, HV:]  # views of the projection, as the backend hands them over
+    ssm0 = (0.1 * rand(9, HV, V, K)).to(ssm_dtype)
+    ssm_ref, ssm_tri = ssm0.clone(), ssm0.clone()
+    kept_ref = torch.zeros(rows, steps, HV, V, K, device=DEVICE, dtype=ssm_dtype)
+    kept_tri = kept_ref.clone()
+    close("gdn.verify_recurrent@1",
+          triton.verify_recurrent(A_log, dt_bias, q, k, v, a, b, ssm_tri, slots, kept_tri, lanes, steps),
+          ref_spec.verify_recurrent(A_log, dt_bias, q, k, v, a, b, ssm_ref, slots, kept_ref, lanes, steps))
+    close("gdn.verify_recurrent@1", kept_tri, kept_ref)
+    assert torch.equal(ssm_tri, ssm0) and torch.equal(ssm_ref, ssm0)
+
 @pytest.mark.parametrize(("dtype", "ssm_dtype"), [(torch.bfloat16, torch.float32), (torch.bfloat16, torch.bfloat16),
                                                   (torch.float32, torch.float32)])
 def test_triton_gdn_decode_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,

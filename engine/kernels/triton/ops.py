@@ -135,3 +135,37 @@ def track_states(conv: torch.Tensor, temporal: torch.Tensor, cache_indices: torc
     """``gdn.track_states@1``: ``MambaAttnBackendBase._track_mamba_state_decode``, one launch for every
     layer (``track_mamba_states_all_layers``)."""
     _track_mamba_states_all_layers(conv, temporal, cache_indices, mask, dst, mask.shape[0])
+
+
+# ------------------------------------------------------------------ speculation (doc/specs/mtp.md)
+
+
+def verify_conv1d_update(x: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
+                         activation: str | None, conv_state_indices: torch.Tensor,
+                         intermediate_conv_window: torch.Tensor, intermediate_state_indices: torch.Tensor
+                         ) -> torch.Tensor:
+    """``gdn.verify_conv1d_update@1``: ``causal_conv1d_update`` with ``intermediate_conv_window``, as
+    ``GDNAttnBackend.forward_extend`` calls it in ``TARGET_VERIFY``."""
+    from kernels.triton.causal_conv1d import causal_conv1d_update
+
+    return causal_conv1d_update(x, conv_state, weight, bias, activation, conv_state_indices=conv_state_indices,
+                                intermediate_conv_window=intermediate_conv_window,
+                                intermediate_state_indices=intermediate_state_indices)
+
+
+def verify_recurrent(A_log: torch.Tensor, dt_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                     a: torch.Tensor, b: torch.Tensor, ssm_states: torch.Tensor, cache_indices: torch.Tensor,
+                     intermediate_states: torch.Tensor, intermediate_state_indices: torch.Tensor, cache_steps: int,
+                     use_qk_l2norm_in_kernel: bool = True) -> torch.Tensor:
+    """``gdn.verify_recurrent@1``: ``TritonGDNKernel.target_verify``, i.e.
+    ``fused_sigmoid_gating_delta_rule_update`` with ``disable_state_update`` and the intermediate states,
+    each row ``cache_steps`` tokens."""
+    from kernels.triton.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+
+    rows = cache_indices.shape[0]
+    cu_seqlens = torch.arange(rows + 1, dtype=torch.int32, device=q.device) * cache_steps
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log, a, dt_bias, 1.0, 20.0, q, k, v, b, ssm_states, cache_indices, cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, disable_state_update=True,
+        intermediate_states_buffer=intermediate_states, intermediate_state_indices=intermediate_state_indices)
+
