@@ -13,6 +13,7 @@ import torch
 
 from kernels import ds1017_formats as formats
 from kernels.ds1017 import ops
+from tests.units.support.ds1017 import expert_stacks
 
 BF16 = torch.bfloat16
 
@@ -165,9 +166,10 @@ def test_the_experts_run_on_every_token_with_zero_weight_sum_what_the_chosen_exp
     weights, indices = ops.moe_gate(x, rand(4, 64, seed=1, scale=0.2), torch.zeros(4), 2, 1.5)
     w = experts()
     w1, s1, w2, s2, w3, s3 = w
-    chosen = ops.moe_experts(x, weights, indices, w1, s1, w2, s2, w3, s3, 10.0)
+    stacks = expert_stacks(w1, s1, w2, s2, w3, s3)
+    chosen = ops.moe_experts(x, weights, indices, *stacks, 10.0)
     assert chosen.dtype == torch.float32 and bool(chosen.any())
-    assert torch.equal(ops.moe_experts_masked(x, weights, indices, w1, s1, w2, s2, w3, s3, 10.0), chosen)
+    assert torch.equal(ops.moe_experts_masked(x, weights, indices, *stacks, 10.0), chosen)
     # One token through its two experts by hand: the gate branch clamped from above, the up branch on both sides.
     t = 5
     xq = ops.fake_quant_fp8(x[t:t + 1]).double()

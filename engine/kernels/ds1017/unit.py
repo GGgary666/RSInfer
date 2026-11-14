@@ -1,7 +1,10 @@
 """``kernels.ds1017``: the definitions DeepSeek-V4.1 (DS 1017) needs beyond Qwen3.8's, each with its
 PyTorch reference solution (``ops``, after the reference implementation shipped with the checkpoint;
-doc/specs/v1-ds1017.md). Other kernel units add faster solutions of the same definitions
-(``kernels.tilelang``: that implementation's own TileLang kernels)."""
+doc/specs/v1-ds1017.md). Other kernel units add faster solutions of the same definitions:
+``kernels.tilelang``, that implementation's own TileLang kernels, and ``kernels.deepinfer``, the
+kernel libraries DeepInfer runs. Two of the latter round at another place than that implementation
+does (the routed experts' SwiGLU; an FP4 value exactly between two): a tolerance here does not cover
+that, ``kernels/deepinfer/ops.py`` says where and how much, and its tests compare accordingly."""
 
 from __future__ import annotations
 
@@ -16,6 +19,10 @@ LOOSE = Tolerance(atol=2e-2, rtol=2e-2)
 TileLang GEMMs against the references: 1 to 3% of the elements, one unit in the last place)."""
 TIGHT = Tolerance(atol=1e-5, rtol=1e-5)
 """For fp32 results: another exp or sigmoid."""
+MIXED = Tolerance(atol=1e-3, rtol=2e-3)
+"""For the Hyper-Connections coefficients: they come from a product with the whole stream, which
+DeepInfer's kernel computes in TF32 (10 bits of each factor's mantissa): 2e-4 to 5e-4 from the fp32
+reference on a GPU, on coefficients of order 1."""
 CHAINED = Tolerance(atol=8e-2, rtol=8e-2)
 """For the routed experts: two quantized GEMMs with a rounding to FP8 between them, summed over a
 token's experts. A unit in the last place of the first product can move the second's input to the
@@ -42,7 +49,7 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("ds.sparse_attn@1", "attention of each query over the keys it lists by index, the latent both key and "
      "value, with a sink in the denominator", ops.sparse_attn, LOOSE, True),
     ("ds.hc_mixes@1", "a sublayer's Hyper-Connections coefficients from the residual stream (Sinkhorn)",
-     ops.hc_mixes, TIGHT, True),
+     ops.hc_mixes, MIXED, True),
     ("ds.hc_pre@1", "the stream's copies into one sublayer input", ops.hc_pre, LOOSE, True),
     ("ds.hc_post@1", "a sublayer's output back to the stream's copies", ops.hc_post, LOOSE, True),
     ("ds.moe_gate@1", "MoE routing: sqrtsoftplus scores, top-k by biased score, normalized weights",

@@ -22,7 +22,8 @@ NAME = "ds1017"
 SERVED_NAME = "DeepSeek-V4.1-Flash"
 ARCHITECTURES = frozenset({"DeepseekV41ForCausalLM"})
 MODEL_TYPES = frozenset({"deepseek_v41", "deepseek_v41_text"})
-WORKER_ONLY = frozenset({"models.ds1017", "layers.ds1017", "state.swa_slots", "kernels.ds1017", "kernels.tilelang"})
+WORKER_ONLY = frozenset({"models.ds1017", "layers.ds1017", "state.swa_slots", "kernels.ds1017", "kernels.tilelang",
+                         "kernels.deepinfer"})
 """Worker units of this family alone: a worker serving another family does not load them."""
 
 

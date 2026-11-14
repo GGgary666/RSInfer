@@ -7,14 +7,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from deploy.models import ds1017 as recipe
+from kernels import ds1017_formats as formats
 from models.ds1017_config import DSConfig, engram_layout
 from tests.units.support.worker import Driver, Worker
 
-DS_UNITS = ("core.kernels", "kernels.reference", "kernels.ds1017", "kernels.tilelang", "core.state.weights",
+DS_UNITS = ("core.kernels", "kernels.reference", "kernels.ds1017", "kernels.tilelang", "kernels.deepinfer",
+            "core.state.weights",
             "core.state.holder", "state.kv_paged", "state.swa_slots", "worker.batch", "layers.embedding", "layers.sampler",
             "layers.ds1017", "models.ds1017", "core.plan", "executors.pytorch")
 PAGE_SIZE = 4
+
+
+def expert_stacks(w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor, w3: torch.Tensor,
+                  s3: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Experts' matrices and scales, each stacked over the experts as the checkpoint has them, in the
+    model's layout: ``w1`` over ``w3``, ``w2``, and their scales packed (``formats.pack_scales``)."""
+    return (torch.cat([w1, w3], dim=1), formats.pack_scales(torch.cat([s1, s3], dim=1)), w2, formats.pack_scales(s2))
 
 
 def tiny_config(**kw: Any) -> dict[str, Any]:

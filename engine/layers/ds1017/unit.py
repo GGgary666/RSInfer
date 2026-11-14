@@ -170,7 +170,8 @@ class Layers:
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         # A named backend solves what it has a kernel for; the rest runs as ``auto`` would.
-        return self.kernels.resolve({phase: {name: {} for name in DEFINITIONS} for phase in ("prefill", "decode")},
+        shape = {"heads": self.cfg.num_attention_heads, "head_dim": self.cfg.head_dim}
+        return self.kernels.resolve({phase: {name: shape for name in DEFINITIONS} for phase in ("prefill", "decode")},
                                     shared=frozenset(DEFINITIONS))
 
     def k(self, definition: str) -> KernelFn:
@@ -348,7 +349,7 @@ class Layers:
         return torch.cat(hashes, dim=-1) + self.constant("engram.offsets", device)
 
     def linear_fp8(self, x: torch.Tensor, w: Weights, name: str) -> torch.Tensor:
-        return self.k("ds.linear_fp8@1")(x, w[name + ".weight"], w[name + ".scale"])
+        return self.k("ds.linear_fp8@1")(x, w[name + ".weight"], w[name + ".scale"], w[name + ".packed"])
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self.k("ds.linear@1")(x, weight)
@@ -381,8 +382,8 @@ class Layers:
         cfg = self.cfg
         weights, indices = self.k("ds.moe_gate@1")(x, w["ffn.gate.weight"], w["ffn.gate.bias"], cfg.num_experts_per_tok,
                                                     cfg.routed_scaling_factor)
-        y = self.k("ds.moe_experts@1")(x, weights, indices, *(w[f"ffn.experts.{m}.{part}"] for m in ("w1", "w2", "w3")
-                                                              for part in ("weight", "scale")), cfg.swiglu_limit)
+        y = self.k("ds.moe_experts@1")(x, weights, indices, w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"],
+                                       w["ffn.experts.w2.weight"], w["ffn.experts.w2.packed"], cfg.swiglu_limit)
         gate = self.linear_fp8(x, w, "ffn.shared_experts.w1").float()
         up = self.linear_fp8(x, w, "ffn.shared_experts.w3").float()
         if cfg.swiglu_limit > 0:

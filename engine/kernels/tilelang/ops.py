@@ -22,6 +22,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from kernels.ds1017_formats import unpack_scales
 from kernels.tilelang import kernel as K  # pyright: ignore[reportUnknownVariableType]
 
 E8M0 = torch.float8_e8m0fnu
@@ -67,7 +68,8 @@ def _gemm_fp4(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> tor
     return c
 
 
-def linear_fp8(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def linear_fp8(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, packed: torch.Tensor | None = None
+               ) -> torch.Tensor:
     return _gemm_fp8(x, weight, scale)
 
 
@@ -145,18 +147,20 @@ def hc_mixes(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch
     return pre[0], post[0], comb[0]
 
 
-def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor,
-                w2: torch.Tensor, s2: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor, limit: float) -> torch.Tensor:
+def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor, p13: torch.Tensor,
+                w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
     y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    inter = w13.shape[1] // 2
     chosen: list[Any] = torch.unique(indices).tolist()
     for i in chosen:
         rows, top = torch.where(indices == i)
         xi = x[rows]
-        gate = _gemm_fp4(xi, w1[i], s1[i]).float()
-        up = _gemm_fp4(xi, w3[i], s3[i]).float()
+        s13 = unpack_scales(p13[i], 2 * inter, -(-w13.shape[2] * 2 // BLOCK))
+        gate = _gemm_fp4(xi, w13[i, :inter], s13[:inter]).float()
+        up = _gemm_fp4(xi, w13[i, inter:], s13[inter:]).float()
         if limit > 0:
             up = torch.clamp(up, min=-limit, max=limit)
             gate = torch.clamp(gate, max=limit)
         hidden = weights[rows, top, None] * (F.silu(gate) * up)
-        y[rows] += _gemm_fp4(hidden.to(x.dtype), w2[i], s2[i])
+        y[rows] += _gemm_fp4(hidden.to(x.dtype), w2[i], unpack_scales(p2[i], w2.shape[1], -(-inter // BLOCK)))
     return y

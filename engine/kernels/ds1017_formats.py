@@ -10,6 +10,11 @@ Byte layouts (the checkpoint's): an FP8 weight ``[N, K]`` of e4m3 bytes with ue8
 ``[ceil(N / 32), ceil(K / 32)]``; an FP4 weight ``[N, K / 2]`` bytes, two e2m1 values a byte, the
 low nibble first, with ue8m0 scales ``[N, K / 32]``; an Engram table ``[rows, K]`` of e4m3 bytes with
 ue8m0 scales ``[rows, K / 32]``.
+
+The layout a GEMM kernel reads its weight's scales in (``pack_scales``; DeepGEMM's on SM 10.0, which
+DeepInfer keeps beside each weight): one scale per row and 32 values, four ue8m0 exponents to an
+int32, column-major. The model keeps the FP8 weights' block scales in it beside the checkpoint's, and
+the experts' scales in it only.
 """
 
 from __future__ import annotations
@@ -87,6 +92,36 @@ def dequant_fp4(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     w = weight.to(torch.int32)
     values = torch.stack([table[w & 0xF], table[(w >> 4) & 0xF]], dim=-1).flatten(-2)
     return values * _table("e8m0", weight.device)[scale.to(torch.int32)].repeat_interleave(BLOCK, -1)
+
+
+def packed_shape(n: int, k: int) -> tuple[int, int, int]:
+    """The shape of ``pack_scales``' result for a weight ``[n, k]``."""
+    return -(-k // (4 * BLOCK)), -(-n // 4) * 4, 4
+
+
+def pack_scales(rows: torch.Tensor) -> torch.Tensor:
+    """A weight's scales by row ``[..., N, K / 32]`` (ue8m0 bytes) to ``[..., K / 128, N, 4]`` bytes:
+    as int32 ``[..., K / 128, N]`` one word holds four consecutive exponents of a row (the first in
+    the low byte), stored column by column. Rows are padded to a multiple of 4 and exponents to a
+    multiple of 4 with the exponent of 1."""
+    n, k32 = rows.shape[-2:]
+    padded = torch.nn.functional.pad(rows, (0, -k32 % 4, 0, -n % 4), value=127)
+    return padded.unflatten(-1, (-1, 4)).transpose(-3, -2).contiguous()
+
+
+def unpack_scales(packed: torch.Tensor, n: int, k32: int) -> torch.Tensor:
+    """``pack_scales`` undone: ``[..., n, k32]`` bytes."""
+    return packed.transpose(-3, -2).flatten(-2)[..., :n, :k32]
+
+
+def packed_words(packed: torch.Tensor, n: int) -> torch.Tensor:
+    """``pack_scales``' bytes as the int32 ``[..., n, K / 128]`` a kernel takes: a view, row stride 1."""
+    return packed.view(torch.int32).squeeze(-1).transpose(-2, -1)[..., :n, :]
+
+
+def block_rows(scale: torch.Tensor, n: int) -> torch.Tensor:
+    """An FP8 weight's 32 x 32 block scales ``[N / 32, K / 32]`` as one row of scales per weight row."""
+    return scale.repeat_interleave(BLOCK, dim=-2)[..., :n, :]
 
 
 def rope_table(dim: int, positions: int, original: int, base: float, factor: float, beta_fast: int,

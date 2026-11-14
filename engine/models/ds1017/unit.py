@@ -7,9 +7,13 @@ without the draft layers (doc/specs/v1-ds1017.md).
 
 What moved: the parameters are declared to ``state.weights@1`` under the checkpoint's names, in the
 checkpoint's bytes where it is quantized (FP8 weights and their ue8m0 scales, FP4 experts, the Engram
-tables: ``u8``), the routed experts of a layer stacked into one tensor per matrix; ``load_weights``
-does what that implementation's ``convert.py`` does for one rank (``wo_a`` dequantized to bf16, the
-head and the pooling compressors' projections in fp32). The layers are ``layers.ds1017``, which the
+tables: ``u8``); ``load_weights`` does what that implementation's ``convert.py`` does for one rank
+(``wo_a`` dequantized to bf16, the head and the pooling compressors' projections in fp32). Beside
+that, as DeepInfer lays weights out for its GEMM kernels: a layer's routed experts are two stacks,
+each expert's ``w1`` over its ``w3`` (one product gives a SwiGLU's two inputs) and ``w2``; the
+experts' scales are kept as a GEMM kernel reads them (``formats.pack_scales``), and so are each FP8
+weight's, beside the checkpoint's block scales. They are declared tensors filled by ``load_weights``,
+so a ``refit`` writes them again. The layers are ``layers.ds1017``, which the
 executor prepares for the step; the residual stream is ``hc_mult`` copies ``[tokens, hc, dim]``.
 """
 
@@ -34,14 +38,17 @@ SKIPPED = ("mtp.", "vision.", "aligner.", "image_")
 
 
 def fp8(name: str, out: int, into: int) -> list[WeightDecl]:
-    """An FP8 weight ``[out, into]`` and its 32 x 32 block scales, both as the checkpoint's bytes."""
+    """An FP8 weight ``[out, into]`` and its 32 x 32 block scales, both as the checkpoint's bytes, and
+    the scales as a GEMM kernel reads them."""
     return [WeightDecl(name + ".weight", (out, into), "u8"),
-            WeightDecl(name + ".scale", (-(-out // 32), -(-into // 32)), "u8")]
+            WeightDecl(name + ".scale", (-(-out // 32), -(-into // 32)), "u8"),
+            WeightDecl(name + ".packed", formats.packed_shape(out, into), "u8")]
 
 
 def params(cfg: DSConfig) -> list[WeightDecl]:
     """The backbone's parameters, by the checkpoint's names; the routed experts of a layer as
-    ``ffn.experts.w1.weight`` ``[experts, ...]`` and so on."""
+    ``ffn.experts.w13.weight`` ``[experts, 2 * inter, dim / 2]`` (``w1`` over ``w3``) and
+    ``ffn.experts.w2.weight``, each with its ``packed`` scales."""
     dim, hd, heads, inter, experts = (cfg.hidden_size, cfg.head_dim, cfg.num_attention_heads,
                                       cfg.moe_intermediate_size, cfg.n_routed_experts)
     mix = (2 + cfg.hc_mult) * cfg.hc_mult
@@ -69,10 +76,11 @@ def params(cfg: DSConfig) -> list[WeightDecl]:
                     w(p + "attn.indexer.weights_proj.weight", cfg.index_n_heads, dim)]
         out += [w(p + "attn_norm.weight", dim), w(p + "ffn_norm.weight", dim),
                 w(p + "ffn.gate.weight", experts, dim, fmt="f32"), w(p + "ffn.gate.bias", experts, fmt="f32")]
-        for m, (n, k) in (("w1", (inter, dim)), ("w2", (dim, inter)), ("w3", (inter, dim))):
+        for m, (n, k) in (("w13", (2 * inter, dim)), ("w2", (dim, inter))):
             out += [w(p + f"ffn.experts.{m}.weight", experts, n, k // 2, fmt="u8"),
-                    w(p + f"ffn.experts.{m}.scale", experts, n, k // 32, fmt="u8"),
-                    *fp8(p + f"ffn.shared_experts.{m}", n, k)]
+                    w(p + f"ffn.experts.{m}.packed", experts, *formats.packed_shape(n, k), fmt="u8")]
+        for m, (n, k) in (("w1", (inter, dim)), ("w2", (dim, inter)), ("w3", (inter, dim))):
+            out += fp8(p + f"ffn.shared_experts.{m}", n, k)
         for which in ("attn", "ffn"):
             out += [w(p + f"hc_{which}_fn", mix, cfg.hc_mult * dim, fmt="f32"), w(p + f"hc_{which}_base", mix, fmt="f32"),
                     w(p + f"hc_{which}_scale", 3, fmt="f32")]
@@ -151,18 +159,27 @@ class DeepseekV41ForCausalLM:
         """``convert.py`` for one rank, into the declared tensors: quantized tensors as their bytes, a
         layer's experts into their stacks, ``wo_a`` dequantized, everything else cast."""
         loaded: set[str] = set()
-        stacked: dict[str, int] = {}
+        stacked: dict[str, set[tuple[int, str, str]]] = {}
         halves: dict[str, torch.Tensor] = {}
+        inter = self.cfg.moe_intermediate_size
         for raw, tensor in weights:
             name = checkpoint_name(raw)
             if name.startswith(SKIPPED) or name.endswith("bias_vl"):
                 continue
             expert = EXPERT.fullmatch(name)
             if expert:
-                target = f"{expert[1]}.{expert[3]}.{expert[4]}"
-                if target in params_dict and int(expert[2]) < params_dict[target].shape[0]:
-                    params_dict[target][int(expert[2])].copy_(as_bytes(tensor))
-                    stacked[target] = stacked.get(target, 0) + 1
+                # w1 is the upper half of the ``w13`` stack, w3 the lower; a scale goes in packed.
+                index, matrix, part = int(expert[2]), expert[3], expert[4]
+                stack = f"{expert[1]}.{'w2' if matrix == 'w2' else 'w13'}"
+                target = f"{stack}.{'weight' if part == 'weight' else 'packed'}"
+                if target in params_dict and index < params_dict[target].shape[0]:
+                    rows = slice(inter, 2 * inter) if matrix == "w3" else slice(0, tensor.shape[0])
+                    data = as_bytes(tensor)
+                    if part == "weight":
+                        params_dict[target][index, rows].copy_(data)
+                    else:
+                        params_dict[target][index, :, rows].copy_(formats.pack_scales(data)[:, :data.shape[0]])
+                    stacked.setdefault(stack, set()).add((index, matrix, part))
                 continue
             if name.endswith(("attn.wo_a.weight", "attn.wo_a.scale")):
                 target = name.rsplit(".", 1)[0] + ".weight"
@@ -186,10 +203,19 @@ class DeepseekV41ForCausalLM:
                 raise ValueError(f"{raw} is {tuple(tensor.shape)} in the checkpoint, {tuple(param.shape)} in the config")
             param.copy_(as_bytes(tensor) if param.dtype == torch.uint8 else tensor.to(param.dtype))
             loaded.add(name)
-        for target, count in stacked.items():
-            if count != params_dict[target].shape[0]:
-                raise ValueError(f"the checkpoint has {count} of the {params_dict[target].shape[0]} experts of {target}")
-            loaded.add(target)
+            packed = params_dict.get(name[:-len("scale")] + "packed") if name.endswith(".scale") else None
+            if packed is not None:
+                packed.copy_(formats.pack_scales(formats.block_rows(param, packed.shape[1])))
+                loaded.add(name[:-len("scale")] + "packed")
+        for stack, seen in stacked.items():
+            experts = params_dict[stack + ".weight"].shape[0]
+            for matrix in (("w2",) if stack.endswith("w2") else ("w1", "w3")):
+                count = len({index for index, m, part in seen if m == matrix and part == "weight"}
+                            & {index for index, m, part in seen if m == matrix and part == "scale"})
+                if count != experts:
+                    raise ValueError(f"the checkpoint has {count} of the {experts} experts of "
+                                     f"{stack.rsplit('.', 1)[0]}.{matrix}")
+            loaded.update((stack + ".weight", stack + ".packed"))
         return loaded
 
     def wants_weight(self, raw: str) -> bool:

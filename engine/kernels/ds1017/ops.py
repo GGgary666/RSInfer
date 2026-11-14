@@ -52,6 +52,7 @@ import torch
 import torch.nn.functional as F
 
 from kernels.ds1017_formats import (BLOCK, FP4_MAX, FP8_MAX, dequant_fp4, dequant_fp8, round_scale, to_fp4,
+                                    unpack_scales,
                                     to_fp8)
 
 MATMUL_BYTES = 64 << 20
@@ -113,8 +114,10 @@ def matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.view(*x.shape[:-1], n)
 
 
-def linear_fp8(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """``x @ weight.T`` with ``x`` quantized to FP8 per 32 and an FP8 ``weight``; in ``x``'s dtype."""
+def linear_fp8(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, packed: torch.Tensor | None = None
+               ) -> torch.Tensor:
+    """``x @ weight.T`` with ``x`` quantized to FP8 per 32 and an FP8 ``weight``; in ``x``'s dtype.
+    ``packed`` is the same scales as a GEMM kernel reads them (``pack_scales``), which this does not."""
     return matmul(fake_quant_fp8(x), dequant_fp8(weight, scale)).to(x.dtype)
 
 
@@ -232,39 +235,56 @@ def moe_gate(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, topk: in
 
 
 def _expert(xq: torch.Tensor, weights: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor,
-            s2: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor, limit: float, dtype: torch.dtype) -> torch.Tensor:
-    """``Expert.forward`` on activations already quantized (``xq`` fp32): SwiGLU with the clamps."""
+            s2: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor, limit: float, dtype: torch.dtype,
+            direct: bool = False) -> torch.Tensor:
+    """``Expert.forward`` on activations already quantized (``xq`` fp32): SwiGLU with the clamps.
+    ``direct``: the SwiGLU's result is quantized from fp32, not from its rounding to ``dtype``."""
     gate = matmul(xq, dequant_fp4(w1, s1)).to(dtype).float()
     up = matmul(xq, dequant_fp4(w3, s3)).to(dtype).float()
     if limit > 0:
         up = up.clamp(-limit, limit)
         gate = gate.clamp(max=limit)
-    hidden = (weights * (each(F.silu, gate) * up)).to(dtype)
-    return matmul(fake_quant_fp8(hidden), dequant_fp4(w2, s2)).to(dtype)
+    hidden = weights * (each(F.silu, gate) * up)
+    return matmul(fake_quant_fp8(hidden if direct else hidden.to(dtype)), dequant_fp4(w2, s2)).to(dtype)
 
 
-def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor,
-                w2: torch.Tensor, s2: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor, limit: float) -> torch.Tensor:
+def _halves(w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, i: int
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expert ``i``'s three matrices and their scales by row, from the stacks."""
+    inter = w13.shape[1] // 2
+    s13 = unpack_scales(p13[i], w13.shape[1], -(-w13.shape[2] * 2 // BLOCK))
+    s2 = unpack_scales(p2[i], w2.shape[1], -(-w2.shape[2] * 2 // BLOCK))
+    return w13[i, :inter], s13[:inter], w2[i], s2, w13[i, inter:], s13[inter:]
+
+
+def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor, p13: torch.Tensor,
+                w2: torch.Tensor, p2: torch.Tensor, limit: float, *, direct: bool = False) -> torch.Tensor:
     """The routed experts' sum ``[tokens, dim]`` fp32: each chosen expert on the tokens that chose it, in
-    the experts' order. The weights are stacked over the experts (``w1`` ``[experts, inter, dim / 2]``...)."""
+    the experts' order. The weights are stacked over the experts: ``w13`` ``[experts, 2 * inter, dim / 2]``
+    is each expert's ``w1`` over its ``w3``, ``w2`` ``[experts, dim, inter / 2]``; ``p13`` and ``p2`` are
+    their scales as ``pack_scales`` lays them out.
+
+    ``direct`` is not part of the definition: it computes what DeepInfer's kernels compute, which
+    quantize the SwiGLU's fp32 result where the reference implementation rounds it to bf16 first
+    (about one value in sixteen then lands on the next FP8 value). The tests of those kernels compare
+    with it."""
     y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     xq = fake_quant_fp8(x).float()
     for i in torch.unique(indices).tolist():
         rows, top = torch.where(indices == i)
-        y[rows] += _expert(xq[rows], weights[rows, top, None], w1[i], s1[i], w2[i], s2[i], w3[i], s3[i], limit, x.dtype)
+        y[rows] += _expert(xq[rows], weights[rows, top, None], *_halves(w13, p13, w2, p2, i), limit, x.dtype, direct)
     return y
 
 
-def moe_experts_masked(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w1: torch.Tensor,
-                       s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
-                       limit: float) -> torch.Tensor:
+def moe_experts_masked(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
+                       p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
     """``moe_experts`` with fixed shapes: every expert runs on every token, with weight 0 where the token
     did not choose it, which adds exactly 0."""
     y = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     xq = fake_quant_fp8(x).float()
-    for i in range(w1.shape[0]):
+    for i in range(w13.shape[0]):
         chosen = total(weights * (indices == i)).unsqueeze(-1)
-        y += _expert(xq, chosen, w1[i], s1[i], w2[i], s2[i], w3[i], s3[i], limit, x.dtype)
+        y += _expert(xq, chosen, *_halves(w13, p13, w2, p2, i), limit, x.dtype)
     return y
 
 

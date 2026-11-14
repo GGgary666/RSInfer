@@ -30,7 +30,7 @@ from platforms.cuda_graph import CudaGraphPlatform
 from tests.gpu.support import free_gpu
 from tests.gpu.support_ds1017 import reference_greedy, reference_model, small_config, worker
 from tests.units.support.ds1017 import checkpoint as make_checkpoint
-from tests.units.support.ds1017 import driver
+from tests.units.support.ds1017 import driver, expert_stacks
 
 CONTEXT = 1024
 ROWS: dict[str, Any] = {"batch.max_context_len": CONTEXT, "state.kv.pages": 1024, "state.swa.slots": 6, "batch.max_rows": 4}
@@ -98,7 +98,8 @@ def inputs(name: str) -> tuple[Any, ...]:
         case "ds.fake_quant_fp4@1":
             return (rand(70, 128), 16, True)
         case "ds.linear_fp8@1":
-            return (rand(70, 1024), *fp8(2048, 1024))
+            data, scale = fp8(2048, 1024)
+            return (rand(70, 1024), data, scale, formats.pack_scales(formats.block_rows(scale, 2048)))
         case "ds.linear@1":
             return (rand(70, 1024), rand(128, 1024, scale=1 / 32, dtype=f32))
         case "ds.grouped_linear@1":
@@ -127,7 +128,8 @@ def inputs(name: str) -> tuple[Any, ...]:
             for n, k in ((1024, 1024), (1024, 1024), (1024, 1024)):
                 pairs = [formats.quantize_fp4(torch.randn(n, k, generator=g) * k ** -0.5) for _ in range(8)]
                 stacks += [torch.stack([p[0] for p in pairs]).cuda(), torch.stack([p[1] for p in pairs]).cuda()]
-            return (x, weights, indices, *stacks, 10.0)
+            w1, s1, w2, s2, w3, s3 = stacks
+            return (x, weights, indices, *expert_stacks(w1, s1, w2, s2, w3, s3), 10.0)
         case "ds.pool@1":
             return (rand(70, 2, 128, dtype=f32), rand(70, 2, 128, dtype=f32))
         case "ds.engram_gate@1":

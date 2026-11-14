@@ -7,12 +7,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors.torch import save_file
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 from core.common.ids import Identity, UnitId
 from core.common.manifest import load_manifest
@@ -33,6 +31,11 @@ WORKER_UNITS = ("core.kernels", "kernels.reference", "kernels.torch_graph", "ker
                 "layers.activation", "layers.sampler", "layers.attn", "layers.gdn", "models.qwen38", "core.plan",
                 "executors.pytorch")
 PAGE_SIZE = 4
+
+if TYPE_CHECKING:  # HF's Qwen classes: imported where they are used, so the DS 1017 tests, which share
+    # this module, also run where transformers has no Qwen3.5 (DeepInfer's environment on the SM100)
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 
 class FailingAlloc:
@@ -67,11 +70,15 @@ def tiny_config(**kw: Any) -> Qwen3_5TextConfig:
         "linear_num_value_heads": 4, "linear_key_head_dim": 8, "linear_value_head_dim": 12,
         "linear_conv_kernel_dim": 4, "max_position_embeddings": 128,
         "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5}}
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
     return Qwen3_5TextConfig(**{**args, **kw})
 
 
 def hf_model(cfg: Qwen3_5TextConfig, seed: int = 0) -> Qwen3_5ForCausalLM:
     """HF's initialization, with noise on every vector so that a misplaced norm weight shows."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
     torch.manual_seed(seed)
     model = Qwen3_5ForCausalLM(cfg).eval()
     with torch.no_grad():

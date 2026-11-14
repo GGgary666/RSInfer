@@ -140,14 +140,27 @@ def test_the_checkpoint_formats_are_loaded_as_the_layers_read_them(model: tuple[
     for file in sorted(model[1].glob("*.safetensors")):
         saved |= load_file(str(file))
     weights = worker.service("state.weights@1").bind("").buffers()
-    # A layer's experts in one tensor per matrix, in the checkpoint's bytes.
-    stack = weights["layers.2.ffn.experts.w2.weight"]
-    assert stack.dtype == torch.uint8 and stack.shape == (4, 64, 32)
+    # A layer's experts in two stacks of the checkpoint's bytes: each expert's w1 over its w3, and w2;
+    # their scales as a GEMM kernel reads them, which unpacks to the checkpoint's.
+    stack, both = weights["layers.2.ffn.experts.w2.weight"], weights["layers.2.ffn.experts.w13.weight"]
+    assert stack.dtype == torch.uint8 and stack.shape == (4, 64, 32) and both.shape == (4, 128, 32)
+    packed2, packed13 = weights["layers.2.ffn.experts.w2.packed"], weights["layers.2.ffn.experts.w13.packed"]
+    assert packed2.shape == (4, 1, 64, 4) and packed13.shape == (4, 1, 128, 4)
     for e in range(4):
-        assert torch.equal(stack[e], saved[f"layers.2.ffn.experts.{e}.w2.weight"].view(torch.uint8))
-        assert torch.equal(weights["layers.2.ffn.experts.w2.scale"][e], saved[f"layers.2.ffn.experts.{e}.w2.scale"].view(torch.uint8))
-    # FP8 weights as bytes with their scales; wo_a dequantized; the head and the pooling compressor in fp32.
+        def of(name: str) -> torch.Tensor:
+            return saved[f"layers.2.ffn.experts.{e}.{name}"].view(torch.uint8)
+
+        assert torch.equal(stack[e], of("w2.weight")) and torch.equal(both[e], torch.cat([of("w1.weight"), of("w3.weight")]))
+        assert torch.equal(formats.unpack_scales(packed2[e], 64, 2), of("w2.scale"))
+        assert torch.equal(formats.unpack_scales(packed13[e], 128, 2), torch.cat([of("w1.scale"), of("w3.scale")]))
+    # FP8 weights as bytes with their scales, and the scales by row, packed; wo_a dequantized; the head
+    # and the pooling compressor in fp32.
     assert torch.equal(weights["layers.0.attn.wq_b.weight"], saved["layers.0.attn.wq_b.weight"].view(torch.uint8))
+    scale, packed = weights["layers.0.attn.wq_b.scale"], weights["layers.0.attn.wq_b.packed"]
+    n = weights["layers.0.attn.wq_b.weight"].shape[0]
+    assert torch.equal(formats.unpack_scales(packed, n, scale.shape[1]), scale.repeat_interleave(32, 0)[:n])
+    words = formats.packed_words(packed, n)
+    assert words.dtype == torch.int32 and words.shape == (n, packed.shape[0]) and words.stride(0) == 1
     wo_a = formats.dequant_fp8(saved["layers.3.attn.wo_a.weight"].view(torch.uint8), saved["layers.3.attn.wo_a.scale"].view(torch.uint8))
     assert torch.equal(weights["layers.3.attn.wo_a.weight"], wo_a.to(torch.bfloat16)) and "layers.3.attn.wo_a.scale" not in weights
     assert weights["head.weight"].dtype == torch.float32 and torch.equal(weights["head.weight"], saved["head.weight"].float())
