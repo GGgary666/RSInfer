@@ -84,6 +84,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
+需要在 SM100 上运行实验时，使用 [sm100-eval skill](../sm100-eval/SKILL.md) 和 `.github/scripts/gpu_job_runner.py` 客户端提交、查看日志并回收结果。
 
 ### `tests/`
 
