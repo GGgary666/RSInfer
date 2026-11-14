@@ -200,15 +200,17 @@ def test_what_the_layers_store(worker: DSWorker) -> None:
     paged = {d.layer: d for d in decls if d.kind == "kv.paged"}
     slots = {d.layer: d for d in decls if d.kind == "swa.slots"}
     assert sorted(paged) == [1, 3] and sorted(slots) == [0, 1, 2, 3, 4, 5]
-    assert paged[1].tensors == {"kv": ((4, 32), "bf16"), "ik": ((4, 32), "bf16")} and paged[1].tokens_per_item == 4
-    assert slots[0].tensors == {"ring": ((8, 32), "bf16")}
+    # Bytes in DeepInfer's cache formats: an FP4 latent of 32 is 16 bytes and 2 scales, an FP4 key 16 and 1,
+    # an FP8 window KV 32 and 1.
+    assert paged[1].tensors == {"kv": ((4, 18), "u8"), "ik": ((4, 17), "u8")} and paged[1].tokens_per_item == 4
+    assert slots[0].tensors == {"ring": ((8, 33), "u8")}
     assert set(slots[1].tensors) == {"ring", "ckv", "cscore", "tail"} and slots[1].tensors["tail"] == ((3,), "i64")
     assert set(slots[3].tensors) == {"ring"}  # one latent per token: no group to fill
     model = worker.service("model@1")
     assert set(model.stores) == {"kv.paged", "swa.slots"} and list(model.backends) == ["layers.ds1017@1"]
     assert worker.service("executor@1").capacity().items == {"kv.paged": 64, "swa.slots": 6}
     kv = worker.service("state.kv.paged@1")
-    assert sorted(kv.tensors) == [1, 3] and kv.k_buffer == {} and kv.bind(3).buffers()["ik"].shape == (65 * 4, 32)
+    assert sorted(kv.tensors) == [1, 3] and kv.k_buffer == {} and kv.bind(3).buffers()["ik"].shape == (65 * 4, 17)
 
 
 def test_a_config_the_layers_cannot_run_is_refused() -> None:

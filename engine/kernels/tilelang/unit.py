@@ -14,7 +14,8 @@ from core.contracts.kernels import Implementation, Solution
 
 BACKEND = "tilelang"
 
-SOLUTIONS = ("ds.fake_quant_fp8@1", "ds.fake_quant_fp4@1", "ds.linear_fp8@1", "ds.sparse_attn@1", "ds.hc_mixes@1",
+SOLUTIONS = ("ds.fake_quant_fp8@1", "ds.fake_quant_fp4@1", "ds.linear_fp8@1", "ds.sparse_attn@1", "ds.cache_attn@1",
+             "ds.hc_mixes@1",
              "ds.moe_experts@1", "ds.linear@1", "ds.grouped_linear@1", "ds.index_score@1", "ds.moe_gate@1",
              "ds.rms_norm@1", "ds.hc_pre@1", "ds.hc_post@1", "ds.pool@1", "ds.engram_gate@1", "ds.top@1")
 """The definitions it solves; the function in ``ops`` has the definition's name. From ``ds.linear@1`` on

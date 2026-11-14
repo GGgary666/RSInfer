@@ -14,6 +14,7 @@ from typing import Any
 import msgspec
 
 from core.contracts.state import StateDecl
+from kernels.ds1017_formats import BLOCK, LATENT_BLOCK
 
 KV_KIND, SLOT_KIND = "kv.paged", "swa.slots"
 
@@ -146,20 +147,23 @@ class DSConfig(msgspec.Struct, frozen=True):
 
 
 def states(cfg: DSConfig, page_size: int) -> list[StateDecl]:
-    """What each layer stores, in the reference layout (values a quantized form holds exactly, kept
-    as bf16): per KV source layer the compressed latents ``kv`` and the indexer's keys ``ik``, paged, a
-    latent at the slot of the first token it stands for; per layer a slot with the window's ring, for
-    a source that compresses by more than one the group still filling (``ckv``, ``cscore``), and at
-    the first Engram layer the last tokens an n-gram reaches back to (``tail``)."""
+    """What each layer stores, as bytes in DeepInfer's KV cache formats (``formats``' records; its
+    kernels read them): per KV source layer the compressed latents ``kv`` (FP4 records) and the
+    indexer's keys ``ik`` (FP4, a page's values and then its scales), paged, a latent at the slot of
+    the first token it stands for; per layer a slot with the window's ring (FP8 records), for a source
+    that compresses by more than one the group still filling (``ckv``, ``cscore``), and at the first
+    Engram layer the last tokens an n-gram reaches back to (``tail``)."""
     out: list[StateDecl] = []
     engram_first = min(cfg.engram_layer_ids) if cfg.engram_layer_ids else -1
     for layer in range(cfg.num_hidden_layers):
         ratio, source = cfg.ratio(layer), layer in cfg.kv_source_layer_ids
         if source:
-            out.append(StateDecl(KV_KIND, layer, {"kv": ((page_size, cfg.head_dim), "bf16"),
-                                                  "ik": ((page_size, cfg.index_head_dim), "bf16")},
+            latent = cfg.head_dim // 2 + cfg.head_dim // LATENT_BLOCK
+            key = cfg.index_head_dim // 2 + cfg.index_head_dim // BLOCK
+            out.append(StateDecl(KV_KIND, layer, {"kv": ((page_size, latent), "u8"), "ik": ((page_size, key), "u8")},
                                  "request", tokens_per_item=page_size))
-        slot: dict[str, tuple[tuple[int, ...], str]] = {"ring": ((cfg.sliding_window, cfg.head_dim), "bf16")}
+        slot: dict[str, tuple[tuple[int, ...], str]] = {
+            "ring": ((cfg.sliding_window, cfg.head_dim + cfg.head_dim // BLOCK), "u8")}
         if source and ratio > 1:
             slot |= {"ckv": ((ratio, cfg.head_dim), "f32"), "cscore": ((ratio, cfg.head_dim), "f32")}
         if layer == engram_first and cfg.engram_max_ngram_size > 1:

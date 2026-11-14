@@ -11,6 +11,12 @@ Byte layouts (the checkpoint's): an FP8 weight ``[N, K]`` of e4m3 bytes with ue8
 low nibble first, with ue8m0 scales ``[N, K / 32]``; an Engram table ``[rows, K]`` of e4m3 bytes with
 ue8m0 scales ``[rows, K / 32]``.
 
+The records the states hold (DeepInfer's KV cache formats, which its kernels read): a window KV
+``[D + D / 32]`` bytes, ``D`` e4m3 values and then their ue8m0 scales, one per 32; a compressed latent
+``[D / 2 + D / 16]`` bytes, ``D`` e2m1 values (two a byte, the low nibble first) and then their e4m3
+scales, one per 16; an indexer's key as ``D / 2`` bytes of e2m1 values and ``D / 32`` ue8m0 scales,
+which a page keeps in two sections, every key's values and then every key's scales (``key_sections``).
+
 The layout a GEMM kernel reads its weight's scales in (``pack_scales``; DeepGEMM's on SM 10.0, which
 DeepInfer keeps beside each weight): one scale per row and 32 values, four ue8m0 exponents to an
 int32, column-major. The model keeps the FP8 weights' block scales in it beside the checkpoint's, and
@@ -179,12 +185,62 @@ def quantize_rows_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return _fp8_bytes(to_fp8((blocks / scale).clamp(-FP8_MAX, FP8_MAX)).flatten(-2)), _e8m0_bytes(scale.squeeze(-1))
 
 
+def _fp4_bytes(q: torch.Tensor) -> torch.Tensor:
+    """e2m1 values (as ``to_fp4`` gives them) ``[..., K]`` to bytes ``[..., K / 2]``, the low nibble first."""
+    a = q.abs()
+    code = torch.where(a < 2, a * 2, torch.where(a < 4, a + 2, a / 2 + 4)).to(torch.int32) | (torch.signbit(q).to(torch.int32) << 3)
+    return (code[..., 0::2] | (code[..., 1::2] << 4)).to(torch.uint8)
+
+
+LATENT_BLOCK = 16
+"""A compressed latent has one (e4m3) scale per 16 values."""
+
+
+def pack_kv(values: torch.Tensor) -> torch.Tensor:
+    """Window KV ``[..., D]`` to their records ``[..., D + D / 32]``: FP8 per 32 with power-of-two
+    scales. Of values ``fake_quant_fp8`` gave, the record holds exactly those values."""
+    data, scale = quantize_rows_fp8(values)
+    return torch.cat([data, scale], dim=-1)
+
+
+def unpack_kv(records: torch.Tensor) -> torch.Tensor:
+    """``pack_kv``'s records back to fp32 ``[..., D]``."""
+    dim = records.shape[-1] * BLOCK // (BLOCK + 1)
+    return dequant_rows_fp8(records[..., :dim], records[..., dim:])
+
+
+def pack_latent(values: torch.Tensor) -> torch.Tensor:
+    """Compressed latents ``[..., D]`` to their records ``[..., D / 2 + D / 16]``: FP4 per 16 with e4m3
+    scales (``fp4_act_quant`` with an e4m3 scale). Of values that quantizer gave, exactly those values."""
+    blocks = values.float().unflatten(-1, (-1, LATENT_BLOCK))
+    scale = to_fp8((blocks.abs().amax(-1, keepdim=True).clamp_min(6 * 2.0 ** -9) / FP4_MAX).clamp_max(FP8_MAX))
+    q = to_fp4((blocks / scale).clamp(-FP4_MAX, FP4_MAX)).flatten(-2)
+    return torch.cat([_fp4_bytes(q), _fp8_bytes(scale.squeeze(-1))], dim=-1)
+
+
+def unpack_latent(records: torch.Tensor) -> torch.Tensor:
+    """``pack_latent``'s records back to fp32 ``[..., D]``."""
+    half = records.shape[-1] * LATENT_BLOCK // (LATENT_BLOCK + 2)
+    table = _table("fp4", records.device)
+    w = records[..., :half].to(torch.int32)
+    values = torch.stack([table[w & 0xF], table[(w >> 4) & 0xF]], dim=-1).flatten(-2)
+    scales = _table("fp8", records.device)[records[..., half:].to(torch.int32)]
+    return values * scales.repeat_interleave(LATENT_BLOCK, -1)
+
+
+def key_sections(cache: torch.Tensor, page: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The indexer keys' cache ``[slots, dim / 2 + dim / 32]`` bytes as its pages hold it: the values
+    ``[pages, page, dim / 2]`` and the scales ``[pages, page, dim / 32]`` of each page's keys (views).
+    A key's values and scales are ``quantize_fp4``'s; ``dequant_fp4`` reads them."""
+    blocks = cache.view(cache.shape[0] // page, -1)
+    return (blocks[:, :page * (dim // 2)].unflatten(1, (page, dim // 2)),
+            blocks[:, page * (dim // 2):].unflatten(1, (page, dim // BLOCK)))
+
+
 def quantize_fp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """An fp32 weight ``[N, K]`` to FP4 bytes ``[N, K / 2]`` (low nibble first) and its scales' bytes
     ``[N, K / 32]``."""
     blocks = weight.float().unflatten(-1, (-1, BLOCK))
     scale = round_scale(blocks.abs().amax(-1, keepdim=True).clamp_min(6 * 2.0 ** -126), 1 / FP4_MAX)
     q = to_fp4((blocks / scale).clamp(-FP4_MAX, FP4_MAX)).flatten(-2)
-    a = q.abs()
-    code = torch.where(a < 2, a * 2, torch.where(a < 4, a + 2, a / 2 + 4)).to(torch.int32) | (torch.signbit(q).to(torch.int32) << 3)
-    return (code[..., 0::2] | (code[..., 1::2] << 4)).to(torch.uint8), _e8m0_bytes(scale.squeeze(-1))
+    return _fp4_bytes(q), _e8m0_bytes(scale.squeeze(-1))

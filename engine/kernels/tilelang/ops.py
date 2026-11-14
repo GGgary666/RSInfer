@@ -22,7 +22,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from kernels.ds1017_formats import unpack_scales
+from kernels.ds1017_formats import unpack_kv, unpack_latent, unpack_scales
 from kernels.tilelang import kernel as K  # pyright: ignore[reportUnknownVariableType]
 
 E8M0 = torch.float8_e8m0fnu
@@ -137,6 +137,20 @@ def sparse_attn(q: torch.Tensor, source: torch.Tensor, idx: torch.Tensor, sink: 
     out = K.sparse_attn(_bf16(q).unsqueeze(0), _bf16(source).unsqueeze(0), sink, idx.to(torch.int32).contiguous().unsqueeze(0),
                         scale)
     return out[0]
+
+
+def cache_attn(q: torch.Tensor, window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+               latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float) -> torch.Tensor:
+    """The reference implementation attends to values: the records are read out of the caches (their
+    values are exactly what was quantized into them) and listed in the order they were listed in."""
+    keys = unpack_kv(window.flatten(0, 1)[window_idx.clamp_min(0)])
+    valid = window_idx >= 0
+    if latents is not None and latent_idx is not None:
+        keys = torch.cat([keys, unpack_latent(latents.flatten(0, 1)[latent_idx.clamp_min(0)])], dim=1)
+        valid = torch.cat([valid, latent_idx >= 0], dim=1)
+    tokens, count = valid.shape
+    listed = torch.where(valid, torch.arange(count, device=q.device) + count * torch.arange(tokens, device=q.device)[:, None], -1)
+    return sparse_attn(q, keys.to(q.dtype).reshape(-1, keys.shape[-1]), listed, sink, scale)
 
 
 def hc_mixes(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_eps: float,

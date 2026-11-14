@@ -206,3 +206,41 @@ def test_the_rotary_table_rotates_and_rotates_back() -> None:
     assert torch.equal(turned[..., :16], x[..., :16]) and torch.equal(turned[0], x[0])  # position 0 turns nothing
     assert not torch.allclose(turned[1:, :, 16:], x[1:, :, 16:])
     assert torch.allclose(ops.rope(turned, freqs, 16, True), x, atol=1e-5)
+
+
+def test_the_caches_records_hold_exactly_what_was_quantized_into_them() -> None:
+    x = (rand(5, 64) * torch.exp(rand(5, 1, seed=3) * 3)).to(BF16)
+    kv, latent, key = ops.fake_quant_fp8(x), ops.fake_quant_fp4(x, 16, True), ops.fake_quant_fp4(x, 32, False)
+    records = formats.pack_kv(kv)
+    assert records.dtype == torch.uint8 and records.shape == (5, 64 + 2) and torch.equal(formats.unpack_kv(records), kv.float())
+    records = formats.pack_latent(latent)
+    assert records.shape == (5, 32 + 4) and torch.equal(formats.unpack_latent(records), latent.float())
+    data, scales = formats.quantize_fp4(key)
+    assert data.shape == (5, 32) and scales.shape == (5, 2) and torch.equal(formats.dequant_fp4(data, scales), key.float())
+    # A page of the keys' cache: every key's values, then every key's scales.
+    cache = torch.zeros(3 * 4, 34, dtype=torch.uint8)
+    values, exponents = formats.key_sections(cache, 4, 64)
+    values[1, 2], exponents[1, 2] = data[0], scales[0]
+    page = cache.view(3, -1)[1]
+    assert torch.equal(page[2 * 32:3 * 32], data[0]) and torch.equal(page[4 * 32 + 2 * 2:4 * 32 + 3 * 2], scales[0])
+    assert int(cache.view(3, -1)[[0, 2]].sum()) == 0 and int((page != 0).sum()) == int((data[0] != 0).sum() + (scales[0] != 0).sum())
+
+
+def test_attention_in_the_caches_is_attention_on_what_they_hold() -> None:
+    q, sink = rand(6, 4, 64, scale=0.3).to(BF16), rand(4, seed=5)
+    kv = ops.fake_quant_fp8(rand(2 * 8, 64, seed=1, scale=0.3).to(BF16))
+    latent = ops.fake_quant_fp4(rand(12, 64, seed=2, scale=0.3).to(BF16), 16, True)
+    window, latents = formats.pack_kv(kv).view(2, 8, -1), formats.pack_latent(latent).view(1, 12, -1)
+    g = torch.Generator().manual_seed(0)
+    window_idx = torch.stack([torch.randperm(16, generator=g)[:8] for _ in range(6)])
+    window_idx[0, :6] = -1
+    latent_idx = torch.stack([torch.randperm(12, generator=g)[:5] for _ in range(6)])
+    latent_idx[2, 3:] = -1
+    got = ops.cache_attn(q, window, window_idx, latents, latent_idx, sink, 0.125)
+    keys = torch.cat([kv[window_idx.clamp_min(0)], latent[latent_idx.clamp_min(0)]], dim=1)
+    there = torch.cat([window_idx >= 0, latent_idx >= 0], dim=1)
+    listed = torch.where(there, torch.arange(13) + 13 * torch.arange(6)[:, None], -1)
+    assert torch.equal(got, ops.sparse_attn(q, keys.reshape(-1, 64), listed, sink, 0.125)) and bool(got.any())
+    alone = ops.cache_attn(q, window, window_idx, None, None, sink, 0.125)
+    listed = torch.where(window_idx >= 0, torch.arange(8) + 8 * torch.arange(6)[:, None], -1)
+    assert torch.equal(alone, ops.sparse_attn(q, kv[window_idx.clamp_min(0)].reshape(-1, 64), listed, sink, 0.125))

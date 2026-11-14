@@ -48,6 +48,9 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
      True),
     ("ds.sparse_attn@1", "attention of each query over the keys it lists by index, the latent both key and "
      "value, with a sink in the denominator", ops.sparse_attn, LOOSE, True),
+    ("ds.cache_attn@1", "the same attention over keys listed by their record in the states' caches (the "
+     "window's FP8 records, the latents' FP4 records), read as bytes", ops.cache_attn, LOOSE, True),
+    ("ds.pack_kv@1", "window KV quantized to FP8 per 32 into the records the ring holds", ops.pack_kv, EXACT, True),
     ("ds.hc_mixes@1", "a sublayer's Hyper-Connections coefficients from the residual stream (Sinkhorn)",
      ops.hc_mixes, MIXED, True),
     ("ds.hc_pre@1", "the stream's copies into one sublayer input", ops.hc_pre, LOOSE, True),

@@ -147,6 +147,40 @@ def sparse_attn(q: torch.Tensor, source: torch.Tensor, idx: torch.Tensor, sink: 
                                           source.shape[-1], sink)[0]
 
 
+def pack_kv(x: torch.Tensor) -> torch.Tensor:
+    """TileKernels' cast and its scales' bytes behind it: a record is 512 e4m3 values and 16 exponents."""
+    data, scales = _cast(_rows(x), row_major=True)
+    return torch.cat([data.view(torch.uint8), scales.contiguous().view(torch.uint8)], dim=-1).view(*x.shape[:-1], -1)
+
+
+def _listed(idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """A list of records ``[tokens, keys]`` with the missing ones last, as FlashMLA's decode kernel
+    takes it: "none" after them up to a whole number of blocks; and how many are there."""
+    listed = F.pad(idx.to(torch.int32), (0, -idx.shape[1] % KEY_BLOCK), value=-1)
+    return listed.unsqueeze(1), (idx >= 0).sum(-1).to(torch.int32)
+
+
+def cache_attn(q: torch.Tensor, window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+               latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float) -> torch.Tensor:
+    """FlashMLA's decode kernel, which reads the caches' bytes: the window's FP8 records as its main
+    cache, the latents' FP4 records as its extra one. It takes the records that are there first: the
+    window's list is turned around (its missing ones come first), the latents' is as it is. A query's
+    result does not depend on the others in the step (``enable_batch_invariant``)."""
+    if not q.shape[0]:
+        return q.clone()
+    main, count = _listed(window_idx.flip(-1))
+    extra = extra_idx = extra_count = None
+    if latents is not None and latent_idx is not None:
+        extra = latents.unsqueeze(2)
+        extra_idx, extra_count = _listed(latent_idx)
+    out, _ = flash_mla.flash_mla_with_kvcache(
+        q.unsqueeze(1).contiguous(), window.unsqueeze(2), None, None, q.shape[-1], flash_mla.get_mla_metadata()[0],
+        softmax_scale=scale, causal=False, is_fp8_kvcache=True, indices=main, attn_sink=sink, extra_k_cache=extra,
+        extra_indices_in_kvcache=extra_idx, topk_length=count, extra_topk_length=extra_count,
+        enable_batch_invariant=True)
+    return out[:, 0]
+
+
 def hc_mixes(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_eps: float,
              iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``mhc_pre_norm_fn``, ``mhc_pre_split_mixes`` and ``sinkhorn_normalize``."""

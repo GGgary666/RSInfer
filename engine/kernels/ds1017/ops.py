@@ -51,8 +51,9 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from kernels.ds1017_formats import pack_kv as formats_pack_kv
 from kernels.ds1017_formats import (BLOCK, FP4_MAX, FP8_MAX, dequant_fp4, dequant_fp8, round_scale, to_fp4,
-                                    unpack_scales,
+                                    unpack_kv, unpack_latent, unpack_scales,
                                     to_fp8)
 
 MATMUL_BYTES = 64 << 20
@@ -190,6 +191,38 @@ def sparse_attn(q: torch.Tensor, source: torch.Tensor, idx: torch.Tensor, sink: 
         out = out * decay[..., None] + total(weights.to(q.dtype).float()[..., None] * kv[:, None, :, :], dim=2)
     norm = norm + each(torch.exp, sink - high)
     return (out / norm[..., None]).to(q.dtype)
+
+
+def pack_kv(x: torch.Tensor) -> torch.Tensor:
+    """Window KV ``[tokens, D]`` to the records the ring holds (``formats.pack_kv``): FP8 per 32 with
+    power-of-two scales, the values ``fake_quant_fp8`` gives, as bytes."""
+    return formats_pack_kv(x)
+
+
+def cached_keys(window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+                latent_idx: torch.Tensor | None, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """What ``cache_attn`` attends to, read out of the caches: every token's keys ``[tokens, keys, dim]``
+    in ``dtype`` (its window's records, then its latents) and which of them are there."""
+    keys = unpack_kv(window.flatten(0, 1)[window_idx.clamp_min(0)])
+    valid = window_idx >= 0
+    if latents is not None and latent_idx is not None:
+        keys = torch.cat([keys, unpack_latent(latents.flatten(0, 1)[latent_idx.clamp_min(0)])], dim=1)
+        valid = torch.cat([valid, latent_idx >= 0], dim=1)
+    return keys.to(dtype), valid
+
+
+def cache_attn(q: torch.Tensor, window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+               latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float) -> torch.Tensor:
+    """``sparse_attn`` on keys still in the states' caches, as their bytes: ``window`` ``[blocks, size,
+    D + D / 32]`` holds window KV records (``formats.pack_kv``), ``latents`` ``[blocks, size,
+    D / 2 + D / 16]`` compressed latents (``formats.pack_latent``) or is None; ``window_idx`` and
+    ``latent_idx`` ``[tokens, keys]`` list each query's records by number (block * size + offset, -1
+    for none), as a decode step has them: of the window the missing ones first, of the latents the
+    missing ones last. ``[tokens, heads, dim]``."""
+    keys, valid = cached_keys(window, window_idx, latents, latent_idx, q.dtype)
+    tokens, count = valid.shape
+    listed = torch.where(valid, torch.arange(count, device=q.device) + count * torch.arange(tokens, device=q.device)[:, None], -1)
+    return sparse_attn(q, keys.reshape(-1, keys.shape[-1]), listed, sink, scale)
 
 
 def hc_mixes(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_eps: float,

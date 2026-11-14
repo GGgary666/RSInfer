@@ -111,6 +111,13 @@ def inputs(name: str) -> tuple[Any, ...]:
         case "ds.sparse_attn@1":
             idx = torch.randint(-1, 400, (70, 190), generator=g).cuda()
             return (rand(70, 16, 128, scale=0.3), rand(400, 128, scale=0.3), idx, rand(16, dtype=f32), 128 ** -0.5)
+        case "ds.cache_attn@1":
+            window = formats.pack_kv(rand(6 * 32, 128, scale=0.3)).view(6, 32, -1)
+            latents = formats.pack_latent(rand(400, 128, scale=0.3)).view(1, 400, -1)
+            return (rand(70, 16, 128, scale=0.3), window, torch.randint(-1, 6 * 32, (70, 32), generator=g).cuda(), latents,
+                    torch.randint(-1, 400, (70, 158), generator=g).cuda(), rand(16, dtype=f32), 128 ** -0.5)
+        case "ds.pack_kv@1":
+            return (rand(70, 128),)
         case "ds.hc_mixes@1":
             return (rand(70, 4, 1024), rand(24, 4096, scale=1 / 64, dtype=f32), 1 + rand(3, scale=0.2, dtype=f32),
                     rand(24, scale=0.5, dtype=f32), 1e-20, 20, 1e-6)

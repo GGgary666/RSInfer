@@ -73,6 +73,21 @@ def inputs(case: str, tokens: int = TOKENS, seed: int = 0) -> tuple[Any, ...]:
             idx[0, 5:] = -1
             return (rand(g, t, HEADS, HEAD_DIM, scale=0.3), rand(g, 900, HEAD_DIM, scale=0.3), idx.cuda(),
                     rand(g, HEADS, dtype=F32), HEAD_DIM ** -0.5)
+        case "ds.cache_attn@1" | "ds.cache_attn@1 window":
+            # As a decode step lists them: a window's records oldest first, the missing ones before
+            # them; of the latents the ones reached first.
+            window = formats.pack_kv(rand(g, 6 * 128, HEAD_DIM, scale=0.3)).view(6, 128, -1)
+            latents = formats.pack_latent(rand(g, 900, HEAD_DIM, scale=0.3)).view(60, 15, -1)  # pages of latents
+            held = torch.randint(1, 129, (t,), generator=g)
+            at = torch.arange(128) - 128 + held[:, None]
+            window_idx = torch.where(at >= 0, (torch.arange(t) % 6)[:, None] * 128 + at, -1)
+            latent_idx = torch.stack([torch.randperm(900, generator=g)[:470] for _ in range(t)])
+            latent_idx[torch.arange(470) >= torch.randint(0, 471, (t, 1), generator=g)] = -1
+            alone = case.endswith("window")
+            return (rand(g, t, HEADS, HEAD_DIM, scale=0.3), window, window_idx.cuda(), None if alone else latents,
+                    None if alone else latent_idx.cuda(), rand(g, HEADS, dtype=F32), HEAD_DIM ** -0.5)
+        case "ds.pack_kv@1":
+            return (rand(g, t, HEAD_DIM) * torch.exp(rand(g, t, 1, dtype=F32) * 3).to(BF16),)
         case "ds.hc_mixes@1":
             return (rand(g, t, HC, DIM), rand(g, 24, HC * DIM, scale=1 / 64, dtype=F32),
                     1 + rand(g, 3, scale=0.2, dtype=F32), rand(g, 24, scale=0.5, dtype=F32), 1e-6, 20, 1e-6)
@@ -102,7 +117,8 @@ def inputs(case: str, tokens: int = TOKENS, seed: int = 0) -> tuple[Any, ...]:
             raise KeyError(case)
 
 
-CASES = [name for name, _, _ in SOLUTIONS] + ["ds.fake_quant_fp4@1 e4m3", "ds.linear@1 fp32", "ds.top@1 bf16"]
+CASES = [name for name, _, _ in SOLUTIONS] + ["ds.fake_quant_fp4@1 e4m3", "ds.linear@1 fp32", "ds.top@1 bf16",
+                                               "ds.cache_attn@1 window"]
 
 
 def close(case: str, got: Any, want: Any, args: tuple[Any, ...]) -> None:

@@ -21,6 +21,7 @@ SOLUTIONS: tuple[tuple[str, str, dict[str, list[int]]], ...] = (
     ("ds.rms_norm@1", "tile_kernels", {}),
     # FlashMLA's kernels are built for these.
     ("ds.sparse_attn@1", "flash_mla", {"heads": [64, 128], "head_dim": [512]}),
+    ("ds.cache_attn@1", "flash_mla", {"heads": [64, 128], "head_dim": [512]}), ("ds.pack_kv@1", "tile_kernels", {}),
     ("ds.hc_mixes@1", "tile_kernels", {}), ("ds.hc_pre@1", "tile_kernels", {}), ("ds.hc_post@1", "tile_kernels", {}),
     ("ds.moe_gate@1", "tile_kernels", {}), ("ds.moe_experts@1", "deep_gemm", {}), ("ds.top@1", "deep_select", {}),
     ("ds.engram_gate@1", "tile_kernels", {}),
