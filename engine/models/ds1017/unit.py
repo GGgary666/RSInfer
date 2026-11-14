@@ -27,6 +27,7 @@ from core.contracts.model import Assembly, WeightDecl
 from kernels import ds1017_formats as formats
 from models.ds1017_config import KV_KIND, SLOT_KIND, DSConfig, states
 
+LAYER = re.compile(r"layers\.(\d+)\.")
 EXPERT = re.compile(r"(layers\.\d+\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scale)")
 SKIPPED = ("mtp.", "vision.", "aligner.", "image_")
 """Checkpoint tensors the text model without draft layers does not read."""
@@ -190,6 +191,15 @@ class DeepseekV41ForCausalLM:
                 raise ValueError(f"the checkpoint has {count} of the {params_dict[target].shape[0]} experts of {target}")
             loaded.add(target)
         return loaded
+
+    def wants_weight(self, raw: str) -> bool:
+        """Whether ``load_weights`` reads the checkpoint tensor ``raw``: the weight store does not read
+        the others (the layers a cut config leaves out, the draft layers, vision)."""
+        name = checkpoint_name(raw)
+        if name.startswith(SKIPPED) or name.endswith("bias_vl"):
+            return False
+        layer = LAYER.match(name)
+        return layer is None or int(layer[1]) < self.cfg.num_hidden_layers
 
     def _layer_weights(self) -> list[Mapping[str, torch.Tensor]]:
         generation = self.weights.bind("").generation

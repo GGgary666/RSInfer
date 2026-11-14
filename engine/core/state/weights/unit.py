@@ -47,12 +47,16 @@ def safetensors_files(path: str) -> list[str]:
     return files
 
 
-def safetensors_weights_iterator(hf_weights_files: Sequence[str]) -> Iterator[tuple[str, torch.Tensor]]:
-    """Iterate over the weights in the model safetensor files."""
+def safetensors_weights_iterator(hf_weights_files: Sequence[str], wants: Callable[[str], bool] | None = None
+                                 ) -> Iterator[tuple[str, torch.Tensor]]:
+    """Iterate over the weights in the model safetensor files; with ``wants``, only over the tensors
+    whose names it takes, the others not read (a model cut to its first layers on a checkpoint of
+    hundreds of GiB)."""
     for st_file in hf_weights_files:
         with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:  # pyright: ignore[reportUnknownMemberType]
             for name in f.keys():  # noqa: SIM118
-                yield name, f.get_tensor(name)
+                if wants is None or wants(name):
+                    yield name, f.get_tensor(name)
 
 
 def initialize_dummy_weights(params: Mapping[str, torch.Tensor], low: float = -1e-3, high: float = 1e-3,
@@ -153,7 +157,9 @@ class WeightStore:
             loaders = self.loaders.items()
             if len(loaders) != 1:
                 raise RuntimeError(f"weights need exactly one registered loader, got {len(loaders)}")
-            loaded = loaders[0](safetensors_weights_iterator(safetensors_files(path)), self.tensors)
+            # A loader that is a model's method may say which checkpoint tensors it reads (``wants_weight``).
+            wants = getattr(getattr(loaders[0], "__self__", None), "wants_weight", None)
+            loaded = loaders[0](safetensors_weights_iterator(safetensors_files(path), wants), self.tensors)
             missing = sorted(set(self.decls) - loaded)
             if missing:
                 raise RuntimeError(f"the checkpoint at {path} has no weights for {missing[:8]}")

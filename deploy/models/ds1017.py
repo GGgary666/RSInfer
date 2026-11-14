@@ -140,9 +140,10 @@ def token_map(cfg: dict[str, Any]) -> list[int]:
     return [i % size for i in range(t["vocab_size"])] if size else []
 
 
-def write(cfg: dict[str, Any], out: Path, seed: int) -> int:
-    """A random checkpoint of ``cfg`` in ``out``: the tensors, ``config.json``, and the token map
-    Engram hashes over (``engram_token_map.json``), which a real checkpoint derives from its tokenizer."""
+def write(cfg: dict[str, Any], out: Path, seed: int, stand_in_map: bool = True) -> int:
+    """A random checkpoint of ``cfg`` in ``out``: the tensors, ``config.json``, and, with
+    ``stand_in_map``, a token map for Engram to hash over (``engram_token_map.json``) in place of the
+    one a real checkpoint derives from its tokenizer."""
     from safetensors.torch import save_file
 
     tensors = random_tensors(cfg, seed)
@@ -156,7 +157,7 @@ def write(cfg: dict[str, Any], out: Path, seed: int) -> int:
         index |= {n: file for n in part}
     (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": index}, indent=1))
     (out / "config.json").write_text(json.dumps(cfg, indent=1))
-    lookup = token_map(cfg)
+    lookup = token_map(cfg) if stand_in_map else []
     if lookup:
         (out / "engram_token_map.json").write_text(json.dumps(lookup))
     return sum(v.numel() * v.element_size() for v in tensors.values())
@@ -170,8 +171,9 @@ def checkpoint(args: argparse.Namespace) -> int:
     if args.layers:
         cfg = cut(cfg, args.layers)
     out = args.out.resolve()
-    size = write(cfg, out, args.seed)
     tokenizer = (args.tokenizer or source).resolve()
+    # With a tokenizer the engine derives the token map from it, as for a real checkpoint.
+    size = write(cfg, out, args.seed, stand_in_map=not (tokenizer / "tokenizer.json").is_file())
     for name in TOKENIZER_FILES:
         if (tokenizer / name).is_file() and tokenizer != out:
             shutil.copy(tokenizer / name, out / name)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors.torch import load_file
+from safetensors import safe_open
 
 from models.ds1017_config import DSConfig, engram_layout
 from platforms.torch_eager import TorchEagerPlatform
@@ -47,6 +47,19 @@ def small_config(layers: int = 8, **kw: Any) -> dict[str, Any]:
     return {"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41", "text_config": text}
 
 
+def real_shapes_config(**kw: Any) -> dict[str, Any]:
+    """The released model's shapes (5120 wide, 64 heads of 512, its ranks, window, indexer and
+    candidate sizes) in 6 layers with 8 experts each and small Engram tables: every kind of layer, and
+    the kernels at the shapes they serve. Its attention kernel needs an SM 10.0 card."""
+    return small_config(
+        layers=6, hidden_size=5120, moe_intermediate_size=2304, num_attention_heads=64, head_dim=512,
+        qk_rope_head_dim=64, q_lora_rank=1280, o_lora_rank=1024, n_routed_experts=8, num_experts_per_tok=6,
+        compress_ratios=[0, 2, 2, 1, 1, 1], kv_source_layer_ids=[1, 3], index_source_layer_ids=[1, 3, 5],
+        index_n_heads=32, index_head_dim=128, index_topk=512, candidate_source_layer_id=3, candidate_topk_blocks=2048,
+        candidate_block_size=8, engram_layer_ids=[1, 4], engram_n_heads=8, engram_head_dim=256,
+        rope_scaling={"factor": 16, "beta_fast": 32, "beta_slow": 1, "original_max_position_embeddings": 65536}, **kw)
+
+
 def _load(name: str) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location(name, REFERENCE / f"{name}.py")
     assert spec is not None and spec.loader is not None
@@ -72,14 +85,16 @@ def reference_modules() -> tuple[Any, Any]:
     return _load("model"), engram
 
 
-def reference_model(checkpoint: Path, max_seq_len: int, rows: int = 1) -> Any:
+def reference_model(checkpoint: Path, max_seq_len: int, rows: int = 1, cfg: dict[str, Any] | None = None) -> Any:
     """The reference ``Transformer`` on the checkpoint, loaded as its ``convert.py`` prepares one rank:
-    ``wo_a`` dequantized to bf16, the experts viewed as FP4. The compressed token map comes from the
-    checkpoint's ``engram_token_map.json`` instead of a tokenizer."""
+    ``wo_a`` dequantized to bf16, the experts viewed as FP4. ``cfg``: the config to build, the
+    checkpoint's cut to its first layers (only their tensors are read); default the checkpoint's. The
+    compressed token map is the checkpoint's ``engram_token_map.json``, or built from its tokenizer."""
     model, engram = reference_modules()
     from kernels import ds1017_formats as ops
+    from models.ds1017_config import compressed_token_map
 
-    t = json.loads((checkpoint / "config.json").read_text())["text_config"]
+    t = (cfg or json.loads((checkpoint / "config.json").read_text()))["text_config"]
     rope = t["rope_scaling"]
     args = model.ModelArgs(
         max_batch_size=rows, max_seq_len=max_seq_len, temperature=0, dtype="fp8", expert_dtype="fp4",
@@ -101,7 +116,12 @@ def reference_model(checkpoint: Path, max_seq_len: int, rows: int = 1) -> Any:
         engram_vocab_size=t["engram_vocab_size"], engram_n_heads=t["engram_n_heads"],
         engram_head_dim=t["engram_head_dim"], engram_pad_id=t["engram_pad_token_id"],
         engram_compressed_vocab_size=t["engram_compressed_vocab_size"], vision_n_layers=0, dspark_block_size=0)
-    lookup = json.loads((checkpoint / "engram_token_map.json").read_text())
+    if (checkpoint / "engram_token_map.json").is_file():
+        lookup = json.loads((checkpoint / "engram_token_map.json").read_text())
+    else:
+        from tokenizers import Tokenizer
+
+        lookup, _ = compressed_token_map(Tokenizer.from_file(str(checkpoint / "tokenizer.json")))
     engram.build_compressed_token_map = lambda tokenizer: (lookup, max(lookup) + 1)  # pyright: ignore[reportUnknownLambdaType]
     previous = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)  # as its generate.py: the model's activations and bf16 parameters
@@ -111,8 +131,14 @@ def reference_model(checkpoint: Path, max_seq_len: int, rows: int = 1) -> Any:
     finally:
         torch.set_default_dtype(previous)
     state: dict[str, torch.Tensor] = {}
+    layers = t["num_hidden_layers"]
     for file in sorted(checkpoint.glob("*.safetensors")):
-        state |= load_file(str(file))
+        with safe_open(str(file), framework="pt", device="cpu") as f:  # pyright: ignore[reportUnknownVariableType]
+            for name in f.keys():  # noqa: SIM118
+                layer = name.split(".")[1] if name.startswith("layers.") else "-1"
+                if not name.startswith(("mtp.", "vision.", "aligner.", "image_")) and not name.endswith("bias_vl") \
+                        and int(layer) < layers:
+                    state[name] = f.get_tensor(name)
     for name in [n for n in state if n.endswith("attn.wo_a.weight")]:
         scale = state.pop(name[:-len("weight")] + "scale")
         state[name] = ops.dequant_fp8(state[name].view(torch.uint8), scale.view(torch.uint8)).to(torch.bfloat16)
