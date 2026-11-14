@@ -86,6 +86,10 @@
 - **v0.1**：按 modules.html ⑤ 页的 16 步，把 DS 1017（单机 DP8 + EP8）加到正在运行的 v0 上。
 - **v0.2**：按 modules.html ⑥ 页的 14 步，扩到两机 DP16 + EP16。
 - 2026-11-13 注：现在把这两步叫 v1、v2。v1 先做什么还在讨论（[specs/v1-distributed.md](specs/v1-distributed.md)）。
+- 2026-11-14 注（用户定）：
+  - #61 已合入，阶段 2 结束。
+  - v1 是 DS 1017（DeepSeek-V4.1-Flash-1017），一个实例 4 张卡，DP4 + EP4；不做视觉，多机先不做。
+  - 不必照 ⑤ 页的 16 步走。盘点和计划见 [specs/v1-ds1017.md](specs/v1-ds1017.md)。
 
 ## 和 v0-plan 原里程碑的对应
 
