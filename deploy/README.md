@@ -7,7 +7,7 @@
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
   - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`）；前缀缓存对它是关着的。
   - 两族模型的单元都提供 `model@1`，一个 worker 只装一族：`serve` 在拓扑里把 worker 的单元列出来，去掉别的 recipe 独有的（`WORKER_ONLY`）。
-- 引擎进程只从引擎的源码和 Python 环境里 import。有 kernel 库装在环境外面时（比如 `tilelang` 用 `pip install --target` 放在一边），用环境变量 `AGXINFER_PYTHONPATH` 给出它的目录。
+- 引擎进程只从引擎的快照和 Python 环境里 import（节点代理把每个进程的 `PYTHONPATH` 设成快照目录）。所以 `tilelang` 这类 kernel 库要装进跑引擎的那个 Python 环境里；用 `pip install --target` 放在一边的，引擎进程看不到，`kernels.tilelang` 就什么都不注册，层用参照 kernel。
 
 ## 命令
 
