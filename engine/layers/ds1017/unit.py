@@ -8,27 +8,31 @@ of ``Block``. The kernels are the catalog's (``ds.*``), fixed per phase at start
 
 What moved. That implementation keeps one cache row per batch row, all rows at the same position,
 prefilled in one piece from position 0. Here the rows are the persistent batch's, each at its own
-position, a step runs any number of tokens of each, and the caches are the stores':
+position, a step runs any number of tokens of each, and the caches are the stores', in DeepInfer's
+byte formats (``kernels.ds1017_formats``), which its kernels read:
 
-- The window KV is a ring per request and layer (``state.swa.slots@1``, ``ring``): position ``p`` at
-  ``p % window``.
+- The window KV is a ring per request and layer (``state.swa.slots@1``, ``ring``, one page of
+  ``window`` FP8 records): position ``p`` at entry ``p % window``.
 - Compressed latents and the indexer's keys are paged (``state.kv.paged@1``, ``kv`` and ``ik`` of the
-  source layer): the latent of tokens ``[j * ratio, (j + 1) * ratio)`` at the token slot of position
-  ``j * ratio``.
-- A group still filling (``ckv``, ``cscore``) and the tokens an n-gram reaches back to (``tail``) are
-  in the request's slot.
+  source layer), ``page_size / ratio`` a page: the latent of tokens ``[j * ratio, (j + 1) * ratio)``
+  at row ``slot(j * ratio) / ratio``, ``slot`` the token slot.
+- A group still filling (``cstate``: score and KV of each member) and the tokens an n-gram reaches
+  back to (``tail``) are in the request's slot.
 
-A step's keys are taken into one tensor per layer, ``[tokens, keys, dim]``, and the attention kernel
-attends over that; the order of a token's keys is that implementation's (the window oldest first,
-then the chosen latents by position), which its kernel's result depends on in the last bit.
+The order of a token's keys is that implementation's (the window oldest first, then the chosen
+latents by position), which its attention kernel's result depends on in the last bit.
 
-Two ways to lay a step out (``prepare``):
+Two ways to lay a step out (``prepare``), as DeepInfer's decode and prefill:
 
 - A decode step (one token per row) derives everything on the device from the rows' table indices
-  and positions, with fixed shapes: a graph records it. A graph bucket scores the indexer over
-  ``batch.max_context_len`` positions, an eager step over the longest row's.
+  and positions, with fixed shapes: a graph records it. It attends in the caches
+  (``ds.cache_attn@1``) and the indexer reads the keys through the rows' pages
+  (``ds.index_topk_paged@1``). A graph bucket scores the indexer over ``batch.max_context_len``
+  positions, an eager step over the longest row's.
 - Any other step is laid out on the host (``Layout``): rows of any length from any position, a
-  compression group completed by tokens of an earlier step, the indexer row by row.
+  compression group completed by tokens of an earlier step. Its layers load what they attend to out
+  of the caches into one source (the window's earlier keys, the latents of its rows: load segments)
+  and the indexer scores ranges of the loaded keys (``ds.index_topk@1``).
 """
 
 from __future__ import annotations
@@ -40,7 +44,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from core.contracts.kernels import KernelFn
 from core.contracts.plan import GRAPH, PersistentBatch, PlanKey
@@ -50,15 +53,18 @@ from kernels import ds1017_formats as formats
 from layers.solutions import Kernels
 from models.ds1017_config import SLOT_KIND, DSConfig, compressed_token_map, engram_layout
 
-DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.fake_quant_fp4@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grouped_linear@1",
-               "ds.index_score@1", "ds.rms_norm@1", "ds.rope@1", "ds.sparse_attn@1", "ds.cache_attn@1", "ds.pack_kv@1",
-               "ds.hc_mixes@1",
-               "ds.hc_pre@1",
-               "ds.hc_post@1", "ds.moe_gate@1", "ds.moe_experts@1", "ds.pool@1", "ds.engram_gate@1", "ds.silu@1",
-               "ds.top@1")
+PREFILL_ONLY = frozenset({"ds.transform@1", "ds.load_values@1", "ds.load_keys@1", "ds.index_topk@1", "ds.compress@1",
+                          "ds.sparse_attn@1"})
+"""What only a step laid out on the host runs."""
+DECODE_ONLY = frozenset({"ds.cache_attn@1", "ds.index_topk_paged@1", "ds.compress_decode@1"})
+"""What only a decode step runs: a graph records these, not the others."""
 
-KEY_BYTES = 192 << 20
-"""A step's attention runs this many bytes of keys at a time (``[tokens, keys, dim]`` in bf16)."""
+DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grouped_linear@1", "ds.rms_norm@1",
+               "ds.rope@1", "ds.sparse_attn@1", "ds.cache_attn@1", "ds.transform@1", "ds.store_cache@1",
+               "ds.load_values@1", "ds.load_keys@1", "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk_paged@1",
+               "ds.compress@1", "ds.compress_decode@1", "ds.hc_mixes@1", "ds.hc_pre@1", "ds.hc_post@1",
+               "ds.moe_gate@1", "ds.moe_experts@1", "ds.shared_expert@1", "ds.engram_gate@1",
+               "ds.engram_hash@1")
 
 Weights = Mapping[str, torch.Tensor]
 
@@ -71,19 +77,31 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @dataclass(frozen=True)
-class Group:
-    """One compression ratio above 1 in a step laid out on the host."""
+class Latents:
+    """One compression ratio in a step laid out on the host: where its rows' latents are, and what the
+    compressor (above one) needs."""
 
-    members: torch.Tensor
-    """``[groups, ratio]``: each completed group's members, as token indices of the step."""
-    from_state: torch.Tensor
-    """``[groups, ratio]`` bool: the member is a token of an earlier step, in the request's slot."""
-    token: torch.Tensor
-    """``[groups]``: a token of the group's row (for its slot and its row)."""
+    segments: torch.Tensor
+    """``[n, 4]`` int32 load segments of the rows' latents, in step order (``kernels.ds1017_compose``)."""
+    total: int
+    width: int
+    """The most latents a row has after the step."""
+    ks: torch.Tensor
+    """``[tokens]``: where its row's latents begin among the loaded ones; ``ke`` how many it reaches past that."""
+    ke: torch.Tensor
+    seq_token: torch.Tensor
+    """``[rows]``: a token of each row (its first). The rest is the compressor's metadata, as DeepInfer's."""
+    cu_q: torch.Tensor
+    cu_k: torch.Tensor
+    cu_c: torch.Tensor
+    c_seq: torch.Tensor
+    """``[entries]``: the row of each compressed entry; a row reserves at least one."""
     first: torch.Tensor
-    """``[groups]``: the position of the group's first token: where its latent is kept and rotated."""
-    left: torch.Tensor
-    """Token indices of the tokens whose group this step does not complete: into the slot."""
+    """``[entries]``: the position of an entry's first token (0 for a reserved one)."""
+    real: torch.Tensor
+    """``[entries]``: the entry is a group this step completes."""
+    entry_token: torch.Tensor
+    """``[entries]``: a token of the entry's row."""
 
 
 @dataclass(frozen=True)
@@ -94,17 +112,15 @@ class Layout:
     """``[tokens]``: each token's row in the batch's tables."""
     start: torch.Tensor
     """``[tokens]``: the position its row's tokens of this step begin at."""
-    window: torch.Tensor
-    """``[tokens, width]``: each token's window key positions, oldest first; ``valid`` says which exist."""
-    valid: torch.Tensor
-    chunk: torch.Tensor
-    """``[tokens, width]``: the token index of a window key computed in this step; ``in_chunk`` says which."""
-    in_chunk: torch.Tensor
+    ring_segments: torch.Tensor
+    """``[rows with earlier tokens, 4]``: each such row's ring, loaded whole (the window's earlier keys)."""
+    ring_total: int
+    window_index: torch.Tensor
+    """``[tokens, window]``: each token's window keys, oldest first, as indices into the layer's source
+    (the loaded rings, then this step's tokens); ``-1`` for none."""
     keep: torch.Tensor
     """Token indices of the tokens still in their row's window after the step: into the ring."""
-    groups: Mapping[int, Group]
-    spans: Sequence[tuple[int, int, int, int]]
-    """Per row: its first token index and one past its last, its table row, its position after the step."""
+    latents: Mapping[int, Latents]
     ngram: torch.Tensor
     """``[tokens, n]``: for look-back ``s``, the token index holding position ``p - s`` (``ngram_from``
     0), or the index in the row's tail (1), or nothing before the sequence starts (2)."""
@@ -114,22 +130,6 @@ class Layout:
     tail: torch.Tensor
     """``[rows, n - 1]``: the same for the tail a row keeps after the step, most recent token first."""
     tail_from: torch.Tensor
-
-
-def candidate_blocks(scores: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block: int, top: KernelFn
-                     ) -> torch.Tensor:
-    """``select_candidate_blocks``: level one of the two-level top-k. ``scores`` ``[..., latents]`` with
-    what a query cannot reach at -inf, ``lens`` ``[..., 1]`` how many it reaches; a bool mask shaped
-    like ``scores`` of the ``topk_blocks`` best blocks (``top`` picks them), the one with the newest
-    latent always kept."""
-    width = scores.size(-1)
-    per_block = F.pad(scores, (0, -width % block), value=-torch.inf).unflatten(-1, (-1, block)).amax(dim=-1)
-    count = per_block.size(-1)
-    newest = (lens - 1) // block
-    per_block = per_block.masked_fill(torch.arange(count, device=scores.device) == newest, torch.inf)
-    best = top(per_block, min(topk_blocks, count))
-    keep = torch.zeros_like(per_block, dtype=torch.bool).scatter_(-1, best, per_block.gather(-1, best) > -torch.inf)
-    return keep.repeat_interleave(block, dim=-1)[..., :width]
 
 
 class Layers:
@@ -172,9 +172,15 @@ class Layers:
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         # A named backend solves what it has a kernel for; the rest runs as ``auto`` would.
-        shape = {"heads": self.cfg.num_attention_heads, "head_dim": self.cfg.head_dim}
-        return self.kernels.resolve({phase: {name: shape for name in DEFINITIONS} for phase in ("prefill", "decode")},
-                                    shared=frozenset(DEFINITIONS))
+        cfg, page = self.cfg, self.kv.page_size
+        ratios = {r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r}
+        # DeepGEMM's paged indexer takes blocks of 32, 64 or 128 keys: a page holds page / ratio.
+        blocks = {page // r for r in ratios}
+        shape = {"heads": cfg.num_attention_heads, "head_dim": cfg.head_dim, "index_head_dim": cfg.index_head_dim,
+                 "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0}
+        calls = {"prefill": {name: shape for name in DEFINITIONS if name not in DECODE_ONLY},
+                 "decode": {name: shape for name in DEFINITIONS if name not in PREFILL_ONLY}}
+        return self.kernels.resolve(calls, shared=frozenset(DEFINITIONS))
 
     def k(self, definition: str) -> KernelFn:
         return self.kernels(self.table, definition)
@@ -239,25 +245,65 @@ class Layers:
         in_chunk = keys >= tok_p0[:, None]
         chunk = (tok_base[:, None] + keys - tok_p0[:, None]).clamp(0, int(n.sum()) - 1)
         keep = torch.nonzero(pos > end - w).flatten()
+        # The rings of the rows with earlier tokens are loaded whole, one after the other.
+        earlier = [i for i, p in enumerate(starts) if p > 0]
+        ring_base = torch.zeros(len(rows), dtype=torch.int64)
+        ring_base[earlier] = torch.arange(len(earlier)) * w
+        ring_total = len(earlier) * w
+        tok_seq = torch.repeat_interleave(torch.arange(len(rows)), n)
+        window_index = torch.where(valid, torch.where(in_chunk, ring_total + chunk, ring_base[tok_seq][:, None] + keys % w),
+                                   -1)
+        slot_table = self.batch_tables[f"slots.{SLOT_KIND}"]
+        ring_rows = on_device(torch.tensor([rows[i] for i in earlier], dtype=torch.int64), device)
+        ring_segments = torch.stack([slot_table[ring_rows].long(), torch.zeros_like(ring_rows),
+                                     torch.full_like(ring_rows, w), on_device(ring_base[earlier], device)], dim=1).int()
 
-        groups: dict[int, Group] = {}
-        for ratio in sorted({r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r > 1}):
-            members, from_state, token, first = [], [], [], []
-            for b, c, p in zip(base.tolist(), counts, starts, strict=True):
-                for g in range(p // ratio, (p + c) // ratio):  # groups whose last member is in this step
-                    at = torch.arange(g * ratio, (g + 1) * ratio)
-                    earlier = at < p
-                    members.append(torch.where(earlier, at % ratio, b + at - p))
-                    from_state.append(earlier)
-                    token.append(b)
-                    first.append(g * ratio)
-            left = torch.nonzero(pos >= ((end + 1) // ratio) * ratio).flatten()
-            shape = (0, ratio)
-            groups[ratio] = Group(
-                on_device(torch.stack(members) if members else torch.zeros(shape, dtype=torch.int64), device),
-                on_device(torch.stack(from_state) if from_state else torch.zeros(shape, dtype=torch.bool), device),
-                on_device(torch.tensor(token, dtype=torch.int64), device),
-                on_device(torch.tensor(first, dtype=torch.int64), device), on_device(left, device))
+        latents: dict[int, Latents] = {}
+        table = self.batch_tables["req_to_token"]
+        page = self.kv.page_size
+        for ratio in sorted({r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r}):
+            entries = page // ratio
+            seg_row: list[int] = []
+            seg_col: list[int] = []
+            seg_rest: list[tuple[int, int, int]] = []
+            ks, ke = torch.zeros(len(pos), dtype=torch.int64), torch.zeros(len(pos), dtype=torch.int64)
+            c_seq: list[int] = []
+            first: list[int] = []
+            real: list[bool] = []
+            cu_c = [0]
+            base_k = 0
+            width = 0
+            for i, (b, c, p, r) in enumerate(zip(base.tolist(), counts, starts, rows, strict=True)):
+                count = (p + c) // ratio
+                for j in range(-(-count // entries)):
+                    seg_row.append(r)
+                    seg_col.append(j * page)
+                    seg_rest.append((0, min(entries, count - j * entries), base_k + j * entries))
+                ks[b:b + c] = base_k
+                ke[b:b + c] = base_k + (pos[b:b + c] + 1) // ratio
+                groups = list(range(p // ratio, (p + c) // ratio))
+                reserved = max(len(groups), 1)
+                c_seq += [i] * reserved
+                first += [g * ratio for g in groups] + [0] * (reserved - len(groups))
+                real += [True] * len(groups) + [False] * (reserved - len(groups))
+                cu_c.append(cu_c[-1] + reserved)
+                base_k += count
+                width = max(width, count)
+            seg_rows = on_device(torch.tensor(seg_row, dtype=torch.int64), device)
+            seg_cols = on_device(torch.tensor(seg_col, dtype=torch.int64), device)
+            rest = on_device(torch.tensor(seg_rest, dtype=torch.int64).view(-1, 3), device)
+            segments = torch.cat([(table[seg_rows, seg_cols].long() // page)[:, None], rest], dim=1).int()
+            c_seq_t = torch.tensor(c_seq, dtype=torch.int64)
+
+            def put(values: list[Any] | torch.Tensor, dtype: torch.dtype = torch.int64) -> torch.Tensor:
+                return on_device(values if isinstance(values, torch.Tensor) else torch.tensor(values, dtype=dtype), device)
+
+            latents[ratio] = Latents(
+                segments=segments, total=base_k, width=width, ks=put(ks), ke=put(ke), seq_token=put(base),
+                cu_q=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(n, 0)])),
+                cu_k=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(p0 + n, 0)])),
+                cu_c=put(cu_c), c_seq=put(c_seq_t), first=put(first), real=put(real, torch.bool),
+                entry_token=put(base[c_seq_t]))
 
         # Engram: an n-gram ending at p looks back to p - s; the row's tail holds what earlier steps ran.
         ng = max(cfg.engram_max_ngram_size, 1)
@@ -269,13 +315,11 @@ class Layers:
         tail_from = torch.where(after < 0, 2, torch.where(after >= p0[:, None], 0, 1))
         tail = torch.where(tail_from == 0, base[:, None] + after - p0[:, None], p0[:, None] - 1 - after)
 
-        spans = [(int(b), int(b) + c, r, p + c) for b, c, r, p in zip(base.tolist(), counts, rows, starts, strict=True)]
-
         def dev(t: torch.Tensor) -> torch.Tensor:
             return on_device(t, device)
 
-        return Layout(rows=dev(tok_row), start=dev(tok_p0), window=dev(keys), valid=dev(valid), chunk=dev(chunk),
-                      in_chunk=dev(in_chunk), keep=dev(keep), groups=groups, spans=spans, ngram=dev(ngram.clamp_min(0)),
+        return Layout(rows=dev(tok_row), start=dev(tok_p0), ring_segments=ring_segments, ring_total=ring_total,
+                      window_index=dev(window_index), keep=dev(keep), latents=latents, ngram=dev(ngram.clamp_min(0)),
                       ngram_from=dev(ngram_from), last=dev(base + n - 1), tail=dev(tail.clamp_min(0)),
                       tail_from=dev(tail_from))
 
@@ -285,12 +329,13 @@ class Layers:
         key = f"{name}@{device}"
         if key not in self.constants:
             cfg = self.cfg
-            if name in ("rope.window", "rope.compress"):
-                compress = name == "rope.compress"
-                value = formats.rope_table(
+            if name in ("cos_sin.window", "cos_sin.compress"):
+                compress = name == "cos_sin.compress"
+                freqs = formats.rope_table(
                     cfg.qk_rope_head_dim, self.max_context_len, cfg.rope_original_seq_len if compress else 0,
                     cfg.compress_rope_theta if compress else cfg.rope_theta, cfg.rope_factor, cfg.rope_beta_fast,
                     cfg.rope_beta_slow, device)
+                value = torch.cat([freqs.real, freqs.imag], dim=-1).contiguous()  # DeepInfer's cos_sin_cache
             elif name == "token_map":
                 if self.token_map_host is None:
                     raise RuntimeError("Engram needs the compressed token map: a tokenizer.json or an "
@@ -302,10 +347,6 @@ class Layers:
                                       "engram.multipliers": multipliers}[name], dtype=torch.int64, device=device)
             self.constants[key] = value
         return self.constants[key]
-
-    def freqs(self, layer: int, positions: torch.Tensor) -> torch.Tensor:
-        table = self.constant("rope.compress" if self.cfg.ratio(layer) else "rope.window", positions.device)
-        return table[positions]
 
     # ------------------------------------------------------------------ the forward
 
@@ -341,14 +382,8 @@ class Layers:
             kept = tail[row_slot[:, None], lay.tail.clamp_max(ng - 2)]
             tail[row_slot] = torch.where(lay.tail_from == 0, compressed[lay.tail.clamp_max(compressed.shape[0] - 1)],
                                          torch.where(lay.tail_from == 1, kept, pad))
-        products = tokens.unsqueeze(1) * self.constant("engram.multipliers", device)
-        rolling = products[..., 0]
-        primes = self.constant("engram.primes", device)
-        hashes: list[torch.Tensor] = []
-        for i in range(1, ng):
-            rolling = torch.bitwise_xor(rolling, products[..., i])
-            hashes.append(rolling.unsqueeze(-1) % primes[:, i - 1])
-        return torch.cat(hashes, dim=-1) + self.constant("engram.offsets", device)
+        return self.k("ds.engram_hash@1")(tokens, self.constant("engram.multipliers", device),
+                                          self.constant("engram.primes", device), self.constant("engram.offsets", device))
 
     def linear_fp8(self, x: torch.Tensor, w: Weights, name: str) -> torch.Tensor:
         return self.k("ds.linear_fp8@1")(x, w[name + ".weight"], w[name + ".scale"], w[name + ".packed"])
@@ -386,188 +421,160 @@ class Layers:
                                                     cfg.routed_scaling_factor)
         y = self.k("ds.moe_experts@1")(x, weights, indices, w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"],
                                        w["ffn.experts.w2.weight"], w["ffn.experts.w2.packed"], cfg.swiglu_limit)
-        gate = self.linear_fp8(x, w, "ffn.shared_experts.w1").float()
-        up = self.linear_fp8(x, w, "ffn.shared_experts.w3").float()
-        if cfg.swiglu_limit > 0:
-            up = up.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)
-            gate = gate.clamp(max=cfg.swiglu_limit)
-        y = y + self.linear_fp8((self.k("ds.silu@1")(gate) * up).to(x.dtype), w, "ffn.shared_experts.w2")
+        y = y + self.k("ds.shared_expert@1")(x, *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2")
+                                                  for part in ("weight", "scale", "packed")), cfg.swiglu_limit)
         return y.to(x.dtype)
 
     # ------------------------------------------------------------------ attention
 
+    def cos_sin(self, layer: int, device: torch.device) -> torch.Tensor:
+        """The layer's rotary table as cosines and sines (``ds.rope@1``)."""
+        return self.constant("cos_sin.compress" if self.cfg.ratio(layer) else "cos_sin.window", device)
+
     def attention(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``Attention.forward`` on a layer's normed input ``[tokens, dim]``."""
         cfg, step = self.cfg, self.step
-        heads, dim, rd = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim
+        heads, dim, rd, eps = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim, cfg.rms_norm_eps
         pos, slot = step["pos"], step["slot"]
-        freqs = self.freqs(layer, pos)
-        rope, quant8 = self.k("ds.rope@1"), self.k("ds.fake_quant_fp8@1")
+        table = self.cos_sin(layer, pos.device)
+        rope = self.k("ds.rope@1")
 
         qr = self.norm(self.linear_fp8(x, w, "attn.wq_a"), w["attn.q_norm.weight"])
-        q = rope(self.linear_fp8(qr, w, "attn.wq_b").unflatten(-1, (heads, dim)), freqs, rd)
-        kv = rope(self.norm(self.linear_fp8(x, w, "attn.wkv"), w["attn.kv_norm.weight"]), freqs, rd)
-        pack = self.k("ds.pack_kv@1")
-
-        ring = self.slots.bind(layer).buffers()["ring"]  # records of the window's KV (formats.pack_kv)
+        q = rope(self.linear_fp8(qr, w, "attn.wq_b").unflatten(-1, (heads, dim)), table, pos, rd)
+        kv = self.linear_fp8(x, w, "attn.wkv")
+        ring = self.slots.bind(layer).buffers()["ring"]  # [slots, window, record]: a page a request
         win = cfg.sliding_window
         sink = w["attn.attn_sink"]
+        store = self.k("ds.store_cache@1")
         if self.layout is None:
             # A decode step attends in the caches: the token's own record goes into the ring first,
             # then its window is the ring's records at the positions up to its own, oldest first.
-            ring[slot, pos % win] = pack(kv)
+            store(kv, w["attn.kv_norm.weight"], eps, table, pos, rd, ring.flatten(0, 1), slot * win + pos % win, "fp8", win)
             at = pos[:, None] - win + 1 + torch.arange(win, device=pos.device)
             window = torch.where(at >= 0, slot[:, None] * win + at % win, -1)
             latents = chosen = None
             if cfg.ratio(layer):
-                source, taken, reached = self._compressed(layer, x, qr, w)
-                # The latents' cache by its pages (a record's number is its token slot either way):
-                # FlashMLA addresses a block's bytes with 32 bits.
-                latents, chosen = source.unflatten(0, (-1, self.kv.page_size)), torch.where(reached, taken, -1)
+                latents, chosen = self._compressed(layer, x, qr, w)
             o = self.k("ds.cache_attn@1")(q, ring, window, latents, chosen, sink, dim ** -0.5)
-            tokens = o.shape[0]
         else:
+            # A step laid out on the host attends over one source of keys, as DeepInfer's prefill does:
+            # the window's earlier keys loaded out of the rings, this step's own, the latents loaded.
+            # The ring is read before this step's keys go into it (they may take the same entries).
             lay = self.layout
-            kv = quant8(kv, 32)  # the chunk's own keys are attended to as values
-            held = formats.unpack_kv(ring[slot[:, None], lay.window % win]).to(kv.dtype)
-            keys = torch.where(lay.in_chunk[..., None], kv[lay.chunk], held)
-            valid = lay.valid
-            ring[slot[lay.keep], pos[lay.keep] % win] = pack(kv[lay.keep])
+            kv = self.k("ds.transform@1")(kv, w["attn.kv_norm.weight"], eps, table, pos, rd, "fp8")
+            held = (self.k("ds.load_values@1")(ring.flatten(0, 1), win, lay.ring_segments, lay.ring_total, "fp8")
+                    if lay.ring_total else kv[:0])
+            store(kv[lay.keep], None, eps, None, None, 0, ring.flatten(0, 1),
+                  slot[lay.keep] * win + pos[lay.keep] % win, "fp8", win)
+            parts, idx = [held, kv], lay.window_index
             if cfg.ratio(layer):
-                source, taken, reached = self._compressed(layer, x, qr, w)
-                keys = torch.cat([keys, formats.unpack_latent(source[taken]).to(kv.dtype)], dim=1)
-                valid = torch.cat([valid, reached], dim=1)
-            attend = self.k("ds.sparse_attn@1")
-            tokens, count = valid.shape
-            idx = torch.where(valid, torch.arange(count, device=valid.device), -1)
-            per = max(1, KEY_BYTES // (count * dim * 2))
-            parts = [attend(q[a:a + per], keys[a:a + per].reshape(-1, dim),
-                            torch.where(idx[a:a + per] >= 0, idx[a:a + per]
-                                        + count * torch.arange(min(per, tokens - a), device=idx.device)[:, None], -1),
-                            sink, dim ** -0.5) for a in range(0, tokens, per)]
-            o = parts[0] if len(parts) == 1 else torch.cat(parts)
-        o = rope(o, freqs, rd, True)
+                latents, chosen = self._compressed(layer, x, qr, w)
+                parts.append(latents)
+                idx = torch.cat([idx, torch.where(chosen >= 0, chosen + lay.ring_total + kv.shape[0], -1)], dim=1)
+            o = self.k("ds.sparse_attn@1")(q, torch.cat(parts), idx, sink, dim ** -0.5)
+        o = rope(o, table, pos, rd, True)
 
         # wo_a projects each group's heads on their own, on o quantized.
         groups = cfg.o_groups
-        o = quant8(o.reshape(tokens, groups, -1), 32)
+        o = self.k("ds.fake_quant_fp8@1")(o.reshape(o.shape[0], groups, -1), 32)
         o = self.k("ds.grouped_linear@1")(o, w["attn.wo_a.weight"].view(groups, cfg.o_lora_rank, -1))
         return self.linear_fp8(o.flatten(1), w, "attn.wo_b")
 
     def _compressed(self, layer: int, x: torch.Tensor, qr: torch.Tensor, w: Weights
-                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``Attention._compress_kv``: the source layer's latents ``[slots, dim]``, and per token the
-        token slots of the latents it attends to with which of them it reaches. A source layer
-        compresses first; an index source chooses, and the layers after it take its choice."""
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``Attention._compress_kv``. A source layer compresses first; an index source chooses, and the
+        layers after it take its choice. In a decode step: the source layer's latent cache by its pages
+        ``[pages, entries, record]`` and per token its chosen latents as rows of it; in a step laid out
+        on the host: the latents of the step's rows loaded ``[latents, dim]`` and the chosen ones as
+        indices into them. ``-1``: none."""
         cfg, step = self.cfg, self.step
         ratio, source = cfg.ratio(layer), cfg.kv_source(layer)
         pool = self.kv.bind(source).buffers()
+        entries = self.kv.page_size // ratio
         if layer == source:
-            self._compress(layer, x, w, pool)
+            self._compress(layer, x, w, pool, entries)
         if layer == cfg.index_source(layer):
-            step["chosen", ratio] = self._index(layer, x, qr, w, self._keys(pool))
-        taken, reached = step["chosen", ratio]
-        return pool["kv"], taken, reached
+            step["chosen", ratio] = self._index(layer, x, qr, w, pool["ik"], entries)
+        chosen = step["chosen", ratio]
+        if self.layout is None:
+            return pool["kv"].unflatten(0, (-1, entries)), chosen
+        lat = self.layout.latents[ratio]
+        if not lat.total:
+            return pool["kv"].new_zeros(0, cfg.head_dim, dtype=x.dtype), chosen
+        return self.k("ds.load_values@1")(pool["kv"], entries, lat.segments, lat.total, "latent"), chosen
 
-    def _keys(self, pool: Weights) -> tuple[torch.Tensor, torch.Tensor]:
-        """The indexer keys' cache as its pages hold it: every key's values, then every key's scales."""
-        return formats.key_sections(pool["ik"], self.kv.page_size, self.cfg.index_head_dim)
-
-    def _compress(self, layer: int, x: torch.Tensor, w: Weights, pool: Weights) -> None:
-        """``Compressor.forward`` and what follows a completed group: its latent rotated and quantized
-        into ``kv``, and the indexer's key of it into ``ik``, at the slot of the group's first token."""
+    def _compress(self, layer: int, x: torch.Tensor, w: Weights, pool: Weights, entries: int) -> None:
+        """``Compressor.forward_store_kv_cache`` and the index keys of ``MQA.store_index_kv``: the
+        latents of the groups this step completes, normed, rotated at their first position and
+        quantized into ``kv``; the indexer's key of each (from the latent before rotation) into ``ik``.
+        A latent's row is its first token's slot over the ratio."""
         cfg, step = self.cfg, self.step
-        ratio, rd = cfg.ratio(layer), cfg.qk_rope_head_dim
-        pos, slot, rows = step["pos"], step["slot"], step["rows"]
+        ratio, rd, eps = cfg.ratio(layer), cfg.qk_rope_head_dim, cfg.rms_norm_eps
+        pos, rows = step["pos"], step["rows"]
         table = self.batch_tables["req_to_token"]
         linear = self.k("ds.linear@1")
         if ratio == 1:
-            latent = self.norm(linear(x, w["attn.compressor.wkv.weight"]), w["attn.compressor.norm.weight"])
-            dest, first = step["tok_slot"], pos
+            pre = linear(x, w["attn.compressor.wkv.weight"])
+            first, dest = pos, step["tok_slot"]
         else:
-            state = self.slots.bind(layer).buffers()
+            state = self.slots.bind(layer).buffers()["cstate"]
             xf = x.float()
             kv, score = linear(xf, w["attn.compressor.wkv.weight"]), linear(xf, w["attn.compressor.wgate.weight"])
             if self.layout is None:
-                at = pos % ratio
-                state["ckv"][slot, at], state["cscore"][slot, at] = kv, score
-                members, scores = state["ckv"][slot], state["cscore"][slot]
+                pre = self.k("ds.compress_decode@1")(score, kv, state, step["slot"], pos + 1, ratio)
                 first = pos + 1 - ratio
-                # A group still filling yields nothing: its latent goes to the padding slot.
-                dest = torch.where((pos + 1) % ratio == 0, table[rows, first.clamp_min(0)].long(), 0)
+                # A group still filling yields nothing: its row is -1, stored nowhere.
+                dest = torch.where((pos + 1) % ratio == 0, table[rows, first.clamp_min(0)].long() // ratio, -1)
             else:
-                g = self.layout.groups[ratio]
-                group_slot = slot[g.token]
-                members = torch.where(g.from_state[..., None], state["ckv"][group_slot[:, None], g.members.clamp_max(ratio - 1)],
-                                      kv[g.members.clamp_max(kv.shape[0] - 1)])
-                scores = torch.where(g.from_state[..., None],
-                                     state["cscore"][group_slot[:, None], g.members.clamp_max(ratio - 1)],
-                                     score[g.members.clamp_max(kv.shape[0] - 1)])
-                state["ckv"][slot[g.left], pos[g.left] % ratio] = kv[g.left]
-                state["cscore"][slot[g.left], pos[g.left] % ratio] = score[g.left]
-                first = g.first
-                if not first.numel():  # no group completed in this step
+                lat = self.layout.latents[ratio]
+                if not lat.c_seq.numel():
                     return
-                dest = table[rows[g.token], first].long()
-            pooled = self.k("ds.pool@1")(members, scores)
-            latent = self.norm(pooled.to(x.dtype), w["attn.compressor.norm.weight"])
-        freqs = self.freqs(layer, first.clamp_min(0))
-        rope, quant4 = self.k("ds.rope@1"), self.k("ds.fake_quant_fp4@1")
-        # The indexer's key comes from the latent before it is rotated: before the cache takes it.
-        key = self.norm(linear(latent, w["attn.indexer.wk.weight"]), w["attn.indexer.k_norm.weight"])
-        page = self.kv.page_size
-        data, scales = self._keys(pool)
-        data[dest // page, dest % page], scales[dest // page, dest % page] = formats.quantize_fp4(
-            quant4(rope(key, freqs, rd), 32, False))
-        pool["kv"][dest] = formats.pack_latent(quant4(rope(latent, freqs, rd), 16, True))
+                pre = self.k("ds.compress@1")(score, kv, state, step["slot"][lat.seq_token], lat.cu_q, lat.cu_k,
+                                              lat.cu_c, lat.c_seq, ratio)
+                first = lat.first
+                dest = torch.where(lat.real, table[rows[lat.entry_token], first].long() // ratio, -1)
+        freqs = self.cos_sin(layer, pos.device)
+        store = self.k("ds.store_cache@1")
+        latent = store(pre, w["attn.compressor.norm.weight"], eps, freqs, first.clamp_min(0), rd, pool["kv"], dest,
+                       "latent", entries, True)
+        store(linear(latent, w["attn.indexer.wk.weight"]), w["attn.indexer.k_norm.weight"], eps, freqs, first.clamp_min(0),
+              rd, pool["ik"], dest, "key", entries)
 
-    def _index(self, layer: int, x: torch.Tensor, qr: torch.Tensor, w: Weights, keys: tuple[torch.Tensor, torch.Tensor]
-               ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``Indexer.forward``: per token the ``index_topk`` best latents of its row, in position order,
-        as token slots, and which of them the token reaches."""
+    def _index(self, layer: int, x: torch.Tensor, qr: torch.Tensor, w: Weights, keys: torch.Tensor, entries: int
+               ) -> torch.Tensor:
+        """``MQA.forward``: per token the ``index_topk`` best latents of its row it reaches, ascending by
+        position (in a decode step as cache rows, else as indices into the step's loaded latents),
+        ``-1`` after them. A candidate source also chooses the candidate blocks the layers after it
+        score in."""
         cfg, step = self.cfg, self.step
         ratio, rd, h, d = cfg.ratio(layer), cfg.qk_rope_head_dim, cfg.index_n_heads, cfg.index_head_dim
         pos, rows = step["pos"], step["rows"]
-        table = self.batch_tables["req_to_token"]
-        q = self.k("ds.rope@1")(self.linear_fp8(qr, w, "attn.indexer.wq_b").unflatten(-1, (h, d)),
-                               self.freqs(layer, pos), rd)
-        q = self.k("ds.fake_quant_fp4@1")(q, 32, False)
+        q = self.linear_fp8(qr, w, "attn.indexer.wq_b").unflatten(-1, (h, d))
+        q_data, q_scales = self.k("ds.quant_index_q@1")(q, self.cos_sin(layer, pos.device), pos, rd)
         weights = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"]) * (d ** -0.5 * h ** -0.5)
-        lens = ((pos + 1) // ratio)[:, None]
         source, uses = layer == cfg.candidate_source_layer_id, 0 <= cfg.candidate_source_layer_id < layer
-
-        def choose(q: torch.Tensor, weights: torch.Tensor, lens: torch.Tensor, slots: torch.Tensor, which: Any
-                   ) -> tuple[torch.Tensor, torch.Tensor]:
-            """One set of queries against the ``slots`` ``[queries or 1, latents]`` of their row."""
-            count = slots.shape[-1]
+        mode = "source" if source else "user" if uses else "dense"
+        candidates = step.get("candidates") if uses else None
+        blocks, block = cfg.candidate_topk_blocks, cfg.candidate_block_size
+        if self.layout is None:
+            # Every row's pages up to the longest context the batch takes: a kernel compiled for that
+            # width serves every step (DeepInfer passes its model's longest length); the scores are
+            # over the first ``width`` positions.
+            width = self.extent[ratio]
             page = self.kv.page_size
-            held = formats.dequant_fp4(keys[0][slots // page, slots % page], keys[1][slots // page, slots % page])
-            score = self.k("ds.index_score@1")(q, held.to(q.dtype), weights)
-            score = score.masked_fill(torch.arange(count, device=score.device) >= lens, -torch.inf)
-            if source:
-                step["candidates", which] = candidate_blocks(score, lens, cfg.candidate_topk_blocks,
-                                                             cfg.candidate_block_size, self.k("ds.top@1"))
-            elif uses:
-                score = score.masked_fill(~step["candidates", which], -torch.inf)
-            best = self.k("ds.top@1")(score, min(cfg.index_topk, count)).sort(dim=-1).values
-            return best, best < lens
-
-        if self.layout is None:  # every row at once, over one extent
-            count = self.extent[ratio]
-            slots = table[rows][:, 0:count * ratio:ratio].long()
-            best, reached = choose(q[:, None], weights[:, None], lens[:, None], slots, None)
-            best, reached = best[:, 0], reached[:, 0]
-            return slots.gather(1, best), reached
-        taken: list[torch.Tensor] = []
-        ok: list[torch.Tensor] = []
-        for a, b, row, after in self.layout.spans:  # each row over its own latents
-            slots = table[row, 0:(after // ratio) * ratio:ratio].long()
-            best, reached = choose(q[None, a:b], weights[None, a:b], lens[None, a:b], slots[None], row)
-            taken.append(slots[best[0]])
-            ok.append(reached[0])
-        width = max(t.shape[1] for t in taken)
-        return (torch.cat([F.pad(t, (0, width - t.shape[1])) for t in taken]),
-                torch.cat([F.pad(t, (0, width - t.shape[1])) for t in ok]))
+            pages = self.batch_tables["req_to_token"][rows][:, ::page] // page
+            chosen, picked = self.k("ds.index_topk_paged@1")(q_data, q_scales, weights, keys, entries, pages,
+                                                             (pos + 1) // ratio, width, min(cfg.index_topk, width),
+                                                             mode, candidates, blocks, block)
+        else:
+            lat = self.layout.latents[ratio]
+            k_data, k_scales = self.k("ds.load_keys@1")(keys, entries, lat.segments, lat.total, d)
+            chosen, picked = self.k("ds.index_topk@1")(q_data, q_scales, weights, k_data, k_scales, lat.ks, lat.ke,
+                                                       self.max_context_len // ratio, min(cfg.index_topk, lat.width),
+                                                       mode, candidates, blocks, block)
+        if source:
+            step["candidates"] = picked
+        return chosen
 
 
 def token_map(path: str, cfg: DSConfig) -> list[int] | None:

@@ -29,6 +29,7 @@ from kernels import ds1017_formats as formats
 from platforms.cuda_graph import CudaGraphPlatform
 from tests.gpu.support import free_gpu
 from tests.gpu.support_ds1017 import reference_greedy, reference_model, small_config, worker
+from tests.gpu.support_ds1017_cases import SMALL, cases, compare, observe
 from tests.units.support.ds1017 import checkpoint as make_checkpoint
 from tests.units.support.ds1017 import driver, expert_stacks
 
@@ -116,8 +117,6 @@ def inputs(name: str) -> tuple[Any, ...]:
             latents = formats.pack_latent(rand(400, 128, scale=0.3)).view(1, 400, -1)
             return (rand(70, 16, 128, scale=0.3), window, torch.randint(-1, 6 * 32, (70, 32), generator=g).cuda(), latents,
                     torch.randint(-1, 400, (70, 158), generator=g).cuda(), rand(16, dtype=f32), 128 ** -0.5)
-        case "ds.pack_kv@1":
-            return (rand(70, 128),)
         case "ds.hc_mixes@1":
             return (rand(70, 4, 1024), rand(24, 4096, scale=1 / 64, dtype=f32), 1 + rand(3, scale=0.2, dtype=f32),
                     rand(24, scale=0.5, dtype=f32), 1e-20, 20, 1e-6)
@@ -137,6 +136,8 @@ def inputs(name: str) -> tuple[Any, ...]:
                 stacks += [torch.stack([p[0] for p in pairs]).cuda(), torch.stack([p[1] for p in pairs]).cuda()]
             w1, s1, w2, s2, w3, s3 = stacks
             return (x, weights, indices, *expert_stacks(w1, s1, w2, s2, w3, s3), 10.0)
+        case "ds.silu@1":
+            return (rand(70, 1024, dtype=f32),)
         case "ds.pool@1":
             return (rand(70, 2, 128, dtype=f32), rand(70, 2, 128, dtype=f32))
         case "ds.engram_gate@1":
@@ -152,10 +153,20 @@ def test_the_references_are_within_tolerance_of_the_reference_implementations_ke
     try:
         catalog = w.service("kernels.catalog@1")
         compared: list[str] = []
+        over_caches = cases(SMALL, lambda name: catalog.resolve(f"tilelang.{name}"))
         for definition in (d for d in catalog.definitions() if d.name.startswith("ds.")):
             solution = f"tilelang.{definition.name}"
             if solution not in catalog.solutions(definition.name):
                 continue  # elementwise, or the same torch call: one solution for both
+            mine = [c for c in over_caches if c.split()[0] == definition.name]
+            if mine:  # a composition over the caches: on what it returns and what it writes
+                for case in mine:
+                    report = compare(case, observe(case, catalog.resolve(definition.reference), over_caches[case]),
+                                     observe(case, catalog.resolve(solution), over_caches[case]), definition.tolerance,
+                                     ties=2e-3)
+                    print(report)
+                compared.append(definition.name)
+                continue
             args = inputs(definition.name)
             want: Any = catalog.resolve(solution)(*args)
             got: Any = catalog.resolve(definition.reference)(*args)
@@ -169,7 +180,7 @@ def test_the_references_are_within_tolerance_of_the_reference_implementations_ke
                     torch.testing.assert_close(a.float(), b.float(), atol=tolerance.atol, rtol=tolerance.rtol,
                                                msg=lambda m, name=definition.name: f"{name}: {m}")
             compared.append(definition.name)
-        assert len(compared) >= 15, compared
+        assert len(compared) >= 25, compared
     finally:
         w.close()
         free_gpu()

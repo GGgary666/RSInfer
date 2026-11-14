@@ -44,13 +44,29 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("ds.grouped_linear@1", "each group's values through that group's own matrix", ops.grouped_linear, LOOSE, True),
     ("ds.index_score@1", "the indexer's scores of each query against its row's keys", ops.index_score, SUMMED, True),
     ("ds.rms_norm@1", "RMS norm in fp32, scaled by the weight", ops.rms_norm, LOOSE, True),
-    ("ds.rope@1", "rotation of the last rotary values by the tokens' rows of a frequency table", ops.rope, LOOSE,
+    ("ds.rope@1", "rotation of the last rotary values at the tokens' positions of a cos/sin table", ops.rope, LOOSE,
      True),
     ("ds.sparse_attn@1", "attention of each query over the keys it lists by index, the latent both key and "
      "value, with a sink in the denominator", ops.sparse_attn, LOOSE, True),
     ("ds.cache_attn@1", "the same attention over keys listed by their record in the states' caches (the "
      "window's FP8 records, the latents' FP4 records), read as bytes", ops.cache_attn, LOOSE, True),
-    ("ds.pack_kv@1", "window KV quantized to FP8 per 32 into the records the ring holds", ops.pack_kv, EXACT, True),
+    ("ds.transform@1", "norm, rotation and a record format's quantization of rows, as values", ops.transform, LOOSE,
+     True),
+    ("ds.store_cache@1", "rows normed, rotated, quantized and stored as records of a cache; the normed rows on "
+     "request", ops.store_cache, LOOSE, True),
+    ("ds.load_values@1", "window KV or latent records of a paged cache, by load segments, as values", ops.load_values,
+     EXACT, True),
+    ("ds.load_keys@1", "indexer key records of a paged cache, by load segments, as bytes and scales", ops.load_keys,
+     EXACT, True),
+    ("ds.quant_index_q@1", "the indexer's queries rotated and quantized to FP4 per 32, as bytes and scales",
+     ops.quant_index_q, LOOSE, True),
+    ("ds.index_topk@1", "the indexer's choice for queries over ranges of loaded keys (prefill), with candidate "
+     "blocks", ops.index_topk, EXACT, True),
+    ("ds.index_topk_paged@1", "the indexer's choice for queries over their rows' pages (decode), as cache rows",
+     ops.index_topk_paged, EXACT, True),
+    ("ds.compress@1", "the groups a prefill completes, pooled, with the requests' rings", ops.compress, TIGHT, True),
+    ("ds.compress_decode@1", "a decoded token into its ring, and the group it completes pooled", ops.compress_decode,
+     TIGHT, True),
     ("ds.hc_mixes@1", "a sublayer's Hyper-Connections coefficients from the residual stream (Sinkhorn)",
      ops.hc_mixes, MIXED, True),
     ("ds.hc_pre@1", "the stream's copies into one sublayer input", ops.hc_pre, LOOSE, True),
@@ -64,13 +80,18 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("ds.pool@1", "a compression group's members pooled by the softmax of their scores", ops.pool, TIGHT, True),
     ("ds.engram_gate@1", "an Engram lookup's value added to the stream's copies through a gate", ops.engram_gate,
      LOOSE, True),
+    ("ds.shared_expert@1", "the shared expert: its w1 over w3 (FP8), the clamped SwiGLU, w2", ops.shared_expert,
+     CHAINED, True),
+    ("ds.engram_hash@1", "Engram's n-gram hashes: rows of each Engram layer's tables", ops.engram_hash, EXACT, True),
 )
 """(definition, doc, reference, tolerance, batch invariant). Every reference sums in a fixed order and
 multiplies a row on its own (``ops.total``, ``ops.matmul``), so a token's result does not depend on
 the rest of the step."""
 
-HOST_DEPENDENT = frozenset({"ds.moe_experts@1"})
-"""References that read the host (which experts the tokens chose): not capturable."""
+HOST_DEPENDENT = frozenset({"ds.moe_experts@1", "ds.index_topk@1", "ds.compress@1", "ds.load_values@1",
+                            "ds.load_keys@1"})
+"""References that read the host or have shapes the values decide (which experts the tokens chose,
+the rows of a prefill): not capturable. Those of prefill only run in steps no graph records."""
 
 
 def reference_id(definition: str) -> str:

@@ -40,6 +40,7 @@ import torch  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 
 from deploy.models.hf import cut, read_config  # noqa: E402
+from kernels import ds1017_formats as formats  # noqa: E402
 from kernels.ds1017 import ops as reference_ops  # noqa: E402
 from platforms.cuda_graph import CudaGraphPlatform  # noqa: E402
 from tests.gpu.support import free_gpu  # noqa: E402
@@ -62,13 +63,30 @@ def shadow(w: Any, against: str, stats: dict[str, dict[str, float]]) -> None:
         other = catalog.resolve(other_id)
 
         def call(*a: Any) -> Any:
-            out, want = fn(*a), other(*a)
-            got: list[torch.Tensor] = list(out) if isinstance(out, tuple) else [out]
-            ref: list[torch.Tensor] = list(want) if isinstance(want, tuple) else [want]
+            if definition == "ds.store_cache@1":  # it writes the cache: compared in tests/gpu, not here
+                return fn(*a)
+            # The compressor writes its ring: the other kernel gets a copy of it (it is small).
+            b = tuple(x.clone() if i == 2 and definition.startswith("ds.compress") else x for i, x in enumerate(a))
+            want = other(*b)
+            out = fn(*a)
+            got: list[torch.Tensor] = [t for t in (out if isinstance(out, tuple) else (out,)) if t is not None]
+            ref: list[torch.Tensor] = [t for t in (want if isinstance(want, tuple) else (want,)) if t is not None]
             entry = stats.setdefault(definition, {"calls": 0, "worst": 0.0, "unequal": 0.0, "other_choices": 0})
             entry["calls"] += 1
             if not got[0].numel():
                 return out
+            if definition in ("ds.index_topk@1", "ds.index_topk_paged@1"):  # the latents chosen, as sets
+                shared = total = 0
+                for x, y in zip(got[0].tolist(), ref[0].tolist(), strict=True):
+                    sx, sy = {v for v in x if v >= 0}, {v for v in y if v >= 0}
+                    shared, total = shared + len(sx & sy), total + max(len(sx), len(sy))
+                entry["unequal"] = max(entry["unequal"], 1 - shared / max(total, 1))
+                return out
+            if definition == "ds.quant_index_q@1":  # FP4 bytes and scales: compared as the values they hold
+                got, ref = [formats.dequant_fp4(got[0], got[1])], [formats.dequant_fp4(ref[0], ref[1])]
+            if definition == "ds.compress_decode@1":  # a token that completes no group pools nothing defined
+                complete = a[4] % a[5] == 0
+                got, ref = [got[0][complete]], [ref[0][complete]]
             if definition == "ds.top@1":  # the values chosen, whichever of equal ones
                 got = [a[0].gather(-1, got[0]).sort(dim=-1).values.nan_to_num(neginf=-1e30)]
                 ref = [a[0].gather(-1, ref[0]).sort(dim=-1).values.nan_to_num(neginf=-1e30)]
@@ -78,6 +96,8 @@ def shadow(w: Any, against: str, stats: dict[str, dict[str, float]]) -> None:
                 entry["other_choices"] += int((gi.gather(1, go) != ri.gather(1, ro)).any(-1).sum())
                 got, ref = [gw.gather(1, go)], [rw.gather(1, ro)]
             for g, r in zip(got, ref, strict=True):
+                if not g.numel():
+                    continue
                 g, r = g.float(), r.float()
                 entry["worst"] = max(entry["worst"], float((g - r).abs().max() / r.abs().max().clamp_min(1e-12)))
                 entry["unequal"] = max(entry["unequal"], float((g != r).float().mean()))
@@ -179,8 +199,10 @@ def main() -> int:
     for name in args.backends.split(","):
         backend, _, graph = name.partition("+")
         backend, _, variant = backend.partition("~")
-        config = {"dsv4.backend": backend, "batch.max_context_len": args.context, "state.kv.pages": 2048,
-                  "state.swa.slots": 2, "batch.max_rows": 2, "holder.mem_fraction": 0.95,
+        # Pages of 128 tokens, DeepInfer's blocks: its paged indexer takes 64 or 128 latents a page.
+        config = {"dsv4.backend": backend, "batch.max_context_len": args.context, "state.kv.page_size": 128,
+                  "state.kv.pages": -(-args.context // 128) * 4, "state.swa.slots": 2, "batch.max_rows": 2,
+                  "holder.mem_fraction": 0.95,
                   "plan.cuda_graph": "required" if graph else "off"}
         started = time.time()
         try:

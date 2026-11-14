@@ -201,11 +201,15 @@ def test_the_rotary_table_rotates_and_rotates_back() -> None:
     yarn = formats.rope_table(16, 40, 8, 160000.0, 16, 32, 1, torch.device("cpu"))
     assert not torch.allclose(yarn, formats.rope_table(16, 40, 0, 160000.0, 16, 32, 1, torch.device("cpu")))
     x = rand(6, 2, 32)
-    freqs = table[torch.tensor([0, 1, 5, 9, 20, 39])]
-    turned = ops.rope(x, freqs, 16)
+    positions = torch.tensor([0, 1, 5, 9, 20, 39])
+    turned = ops.rotate(x, table[positions], 16)
     assert torch.equal(turned[..., :16], x[..., :16]) and torch.equal(turned[0], x[0])  # position 0 turns nothing
     assert not torch.allclose(turned[1:, :, 16:], x[1:, :, 16:])
-    assert torch.allclose(ops.rope(turned, freqs, 16, True), x, atol=1e-5)
+    assert torch.allclose(ops.rotate(turned, table[positions], 16, True), x, atol=1e-5)
+    # The same rotation from a table of cosines and sines (DeepInfer's cos_sin_cache) and the positions.
+    cos_sin = torch.cat([table.real, table.imag], dim=-1)
+    assert torch.equal(ops.rope(x, cos_sin, positions, 16), turned)
+    assert torch.equal(ops.rope(turned, cos_sin, positions, 16, True), ops.rotate(turned, table[positions], 16, True))
 
 
 def test_the_caches_records_hold_exactly_what_was_quantized_into_them() -> None:

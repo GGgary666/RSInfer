@@ -21,7 +21,15 @@ SOLUTIONS: tuple[tuple[str, str, dict[str, list[int]]], ...] = (
     ("ds.rms_norm@1", "tile_kernels", {}),
     # FlashMLA's kernels are built for these.
     ("ds.sparse_attn@1", "flash_mla", {"heads": [64, 128], "head_dim": [512]}),
-    ("ds.cache_attn@1", "flash_mla", {"heads": [64, 128], "head_dim": [512]}), ("ds.pack_kv@1", "tile_kernels", {}),
+    ("ds.cache_attn@1", "flash_mla", {"heads": [64, 128], "head_dim": [512]}),
+    # DeepInfer's own TileLang operators (tilelang_ops), and DeepGEMM's indexer kernels with DeepSelect.
+    ("ds.rope@1", "deepinfer", {}), ("ds.transform@1", "deepinfer", {}), ("ds.store_cache@1", "deepinfer", {}),
+    ("ds.load_values@1", "deepinfer", {}), ("ds.load_keys@1", "deepinfer", {}),
+    ("ds.quant_index_q@1", "deepinfer", {}),
+    ("ds.index_topk@1", "deep_gemm", {"index_head_dim": [64, 128]}),
+    ("ds.index_topk_paged@1", "deep_gemm", {"index_head_dim": [64, 128], "index_block": [32, 64, 128]}),
+    ("ds.compress@1", "deepinfer", {}), ("ds.compress_decode@1", "deepinfer", {}),
+    ("ds.shared_expert@1", "tile_kernels", {}), ("ds.engram_hash@1", "tile_kernels", {}),
     ("ds.hc_mixes@1", "tile_kernels", {}), ("ds.hc_pre@1", "tile_kernels", {}), ("ds.hc_post@1", "tile_kernels", {}),
     ("ds.moe_gate@1", "tile_kernels", {}), ("ds.moe_experts@1", "deep_gemm", {}), ("ds.top@1", "deep_select", {}),
     ("ds.engram_gate@1", "tile_kernels", {}),
@@ -31,9 +39,9 @@ SOLUTIONS: tuple[tuple[str, str, dict[str, list[int]]], ...] = (
 has the definition's name. A CUDA graph may record every one of them (their launches are on torch's
 current stream; tests/gpu/test_ds1017_deepinfer.py replays each) but ``HOST_DEPENDENT``."""
 
-HOST_DEPENDENT = frozenset({"ds.moe_experts@1"})
-"""Which read the device back: the routed experts size their rows to the step's tokens. A captured
-step runs ``FIXED`` instead."""
+HOST_DEPENDENT = frozenset({"ds.moe_experts@1", "ds.index_topk@1", "ds.compress@1"})
+"""Which read the device back: the routed experts size their rows to the step's tokens (a captured
+step runs ``FIXED`` instead); the indexer and the compressor of a prefill (no graph records one)."""
 FIXED = "deepinfer.fixed.ds.moe_experts@1"
 
 

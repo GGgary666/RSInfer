@@ -5,7 +5,7 @@
 - `agxinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
 - `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
-  - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`）；前缀缓存对它是关着的。
+  - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`）；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；前缀缓存对它是关着的。
   - 两族模型的单元都提供 `model@1`，一个 worker 只装一族：`serve` 在拓扑里把 worker 的单元列出来，去掉别的 recipe 独有的（`WORKER_ONLY`）。
 - 引擎进程只从引擎的快照和 Python 环境里 import（节点代理把每个进程的 `PYTHONPATH` 设成快照目录）。所以 `tilelang` 和 DeepInfer 的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）要装进跑引擎的那个 Python 环境里（SM100 上是 `source /workspace/gpu-env/deepinfer-env.sh`）；用 `pip install --target` 放在一边的，引擎进程看不到，`kernels.tilelang` 就什么都不注册，层用参照 kernel。
 

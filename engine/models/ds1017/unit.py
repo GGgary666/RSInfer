@@ -10,7 +10,8 @@ checkpoint's bytes where it is quantized (FP8 weights and their ue8m0 scales, FP
 tables: ``u8``); ``load_weights`` does what that implementation's ``convert.py`` does for one rank
 (``wo_a`` dequantized to bf16, the head and the pooling compressors' projections in fp32). Beside
 that, as DeepInfer lays weights out for its GEMM kernels: a layer's routed experts are two stacks,
-each expert's ``w1`` over its ``w3`` (one product gives a SwiGLU's two inputs) and ``w2``; the
+each expert's ``w1`` over its ``w3`` (one product gives a SwiGLU's two inputs) and ``w2``, and the
+shared expert's ``w1`` over its ``w3`` likewise; the
 experts' scales are kept as a GEMM kernel reads them (``formats.pack_scales``), and so are each FP8
 weight's, beside the checkpoint's block scales. They are declared tensors filled by ``load_weights``,
 so a ``refit`` writes them again. The layers are ``layers.ds1017``, which the
@@ -33,6 +34,7 @@ from models.ds1017_config import KV_KIND, SLOT_KIND, DSConfig, states
 
 LAYER = re.compile(r"layers\.(\d+)\.")
 EXPERT = re.compile(r"(layers\.\d+\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scale)")
+SHARED = re.compile(r"(layers\.\d+\.ffn\.shared_experts)\.(w[13])\.(weight|scale)")
 SKIPPED = ("mtp.", "vision.", "aligner.", "image_")
 """Checkpoint tensors the text model without draft layers does not read."""
 
@@ -79,8 +81,8 @@ def params(cfg: DSConfig) -> list[WeightDecl]:
         for m, (n, k) in (("w13", (2 * inter, dim)), ("w2", (dim, inter))):
             out += [w(p + f"ffn.experts.{m}.weight", experts, n, k // 2, fmt="u8"),
                     w(p + f"ffn.experts.{m}.packed", experts, *formats.packed_shape(n, k), fmt="u8")]
-        for m, (n, k) in (("w1", (inter, dim)), ("w2", (dim, inter)), ("w3", (inter, dim))):
-            out += fp8(p + f"ffn.shared_experts.{m}", n, k)
+        # The shared expert's w1 over its w3, as DeepInfer's shared_gate_up_proj (one GEMM).
+        out += [*fp8(p + "ffn.shared_experts.w13", 2 * inter, dim), *fp8(p + "ffn.shared_experts.w2", dim, inter)]
         for which in ("attn", "ffn"):
             out += [w(p + f"hc_{which}_fn", mix, cfg.hc_mult * dim, fmt="f32"), w(p + f"hc_{which}_base", mix, fmt="f32"),
                     w(p + f"hc_{which}_scale", 3, fmt="f32")]
@@ -180,6 +182,23 @@ class DeepseekV41ForCausalLM:
                     else:
                         params_dict[target][index, :, rows].copy_(formats.pack_scales(data)[:, :data.shape[0]])
                     stacked.setdefault(stack, set()).add((index, matrix, part))
+                continue
+            shared = SHARED.fullmatch(name)
+            if shared:  # w1 is the upper half of w13, w3 the lower; a scale's rows and its packed rows too
+                target = f"{shared[1]}.w13"
+                if target + ".weight" in params_dict:
+                    lower = shared[2] == "w3"
+                    data = as_bytes(tensor)
+                    if shared[3] == "weight":
+                        params_dict[target + ".weight"][inter * lower:inter * (lower + 1)].copy_(data)
+                    else:
+                        blocks = inter // formats.BLOCK
+                        params_dict[target + ".scale"][blocks * lower:blocks * (lower + 1)].copy_(data)
+                        params_dict[target + ".packed"][:, inter * lower:inter * (lower + 1)].copy_(
+                            formats.pack_scales(formats.block_rows(data, inter)))
+                    halves[f"{target}.{shared[2]}.{shared[3]}"] = data[:0]
+                    if all(f"{target}.{m}.{part}" in halves for m in ("w1", "w3") for part in ("weight", "scale")):
+                        loaded.update((target + ".weight", target + ".scale", target + ".packed"))
                 continue
             if name.endswith(("attn.wo_a.weight", "attn.wo_a.scale")):
                 target = name.rsplit(".", 1)[0] + ".weight"

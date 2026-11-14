@@ -67,4 +67,5 @@ class DSWorker(Worker):
 
 
 def driver(worker: Worker) -> Driver:
-    return Driver(worker, slot_kind="swa.slots", page_size=PAGE_SIZE)
+    """The scheduler's records for the worker, with the pages its KV store holds."""
+    return Driver(worker, slot_kind="swa.slots", page_size=worker.service("state.kv.paged@1").page_size)

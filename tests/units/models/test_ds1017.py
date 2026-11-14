@@ -161,6 +161,17 @@ def test_the_checkpoint_formats_are_loaded_as_the_layers_read_them(model: tuple[
     assert torch.equal(formats.unpack_scales(packed, n, scale.shape[1]), scale.repeat_interleave(32, 0)[:n])
     words = formats.packed_words(packed, n)
     assert words.dtype == torch.int32 and words.shape == (n, packed.shape[0]) and words.stride(0) == 1
+    # The shared expert's w1 over its w3, with their block scales and those scales packed.
+    w13 = weights["layers.2.ffn.shared_experts.w13.weight"]
+    one = saved["layers.2.ffn.shared_experts.w1.weight"].view(torch.uint8)
+    three = saved["layers.2.ffn.shared_experts.w3.weight"].view(torch.uint8)
+    assert torch.equal(w13, torch.cat([one, three]))
+    s1 = saved["layers.2.ffn.shared_experts.w1.scale"].view(torch.uint8)
+    s3 = saved["layers.2.ffn.shared_experts.w3.scale"].view(torch.uint8)
+    assert torch.equal(weights["layers.2.ffn.shared_experts.w13.scale"], torch.cat([s1, s3]))
+    both = torch.cat([formats.block_rows(s1, one.shape[0]), formats.block_rows(s3, three.shape[0])])
+    assert torch.equal(formats.unpack_scales(weights["layers.2.ffn.shared_experts.w13.packed"], w13.shape[0], both.shape[1]),
+                       both)
     wo_a = formats.dequant_fp8(saved["layers.3.attn.wo_a.weight"].view(torch.uint8), saved["layers.3.attn.wo_a.scale"].view(torch.uint8))
     assert torch.equal(weights["layers.3.attn.wo_a.weight"], wo_a.to(torch.bfloat16)) and "layers.3.attn.wo_a.scale" not in weights
     assert weights["head.weight"].dtype == torch.float32 and torch.equal(weights["head.weight"], saved["head.weight"].float())
@@ -201,16 +212,19 @@ def test_what_the_layers_store(worker: DSWorker) -> None:
     slots = {d.layer: d for d in decls if d.kind == "swa.slots"}
     assert sorted(paged) == [1, 3] and sorted(slots) == [0, 1, 2, 3, 4, 5]
     # Bytes in DeepInfer's cache formats: an FP4 latent of 32 is 16 bytes and 2 scales, an FP4 key 16 and 1,
-    # an FP8 window KV 32 and 1.
-    assert paged[1].tensors == {"kv": ((4, 18), "u8"), "ik": ((4, 17), "u8")} and paged[1].tokens_per_item == 4
+    # an FP8 window KV 32 and 1. A page of 4 tokens holds 2 latents at a ratio of 2, 4 at a ratio of 1.
+    assert paged[1].tensors == {"kv": ((2, 18), "u8"), "ik": ((2, 17), "u8")} and paged[1].tokens_per_item == 4
+    assert paged[3].tensors == {"kv": ((4, 18), "u8"), "ik": ((4, 17), "u8")}
     assert slots[0].tensors == {"ring": ((8, 33), "u8")}
-    assert set(slots[1].tensors) == {"ring", "ckv", "cscore", "tail"} and slots[1].tensors["tail"] == ((3,), "i64")
+    assert set(slots[1].tensors) == {"ring", "cstate", "tail"} and slots[1].tensors["tail"] == ((3,), "i64")
+    assert slots[1].tensors["cstate"] == ((2, 2, 32), "f32")  # each member's score, then its KV
     assert set(slots[3].tensors) == {"ring"}  # one latent per token: no group to fill
     model = worker.service("model@1")
     assert set(model.stores) == {"kv.paged", "swa.slots"} and list(model.backends) == ["layers.ds1017@1"]
     assert worker.service("executor@1").capacity().items == {"kv.paged": 64, "swa.slots": 6}
     kv = worker.service("state.kv.paged@1")
     assert sorted(kv.tensors) == [1, 3] and kv.k_buffer == {} and kv.bind(3).buffers()["ik"].shape == (65 * 4, 17)
+    assert kv.bind(1).buffers()["kv"].shape == (65 * 2, 18)
 
 
 def test_a_config_the_layers_cannot_run_is_refused() -> None:

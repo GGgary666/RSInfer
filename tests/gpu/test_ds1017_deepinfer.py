@@ -18,6 +18,7 @@ from kernels.deepinfer import ops
 from kernels.deepinfer.unit import HOST_DEPENDENT, SOLUTIONS
 from kernels.ds1017 import ops as reference
 from kernels.ds1017.unit import DEFINITIONS
+from tests.gpu.support_ds1017_cases import DECODE, REAL, cases, compare, observe, view
 from tests.units.support.ds1017 import expert_stacks
 
 DIM, HEADS, HEAD_DIM, INTER, EXPERTS, TOPK, HC, TOKENS = 5120, 64, 512, 2304, 32, 6, 4, 70
@@ -117,8 +118,13 @@ def inputs(case: str, tokens: int = TOKENS, seed: int = 0) -> tuple[Any, ...]:
             raise KeyError(case)
 
 
-CASES = [name for name, _, _ in SOLUTIONS] + ["ds.fake_quant_fp4@1 e4m3", "ds.linear@1 fp32", "ds.top@1 bf16",
-                                               "ds.cache_attn@1 window"]
+OVER_CACHES = ("ds.rope@1", "ds.transform@1", "ds.store_cache@1", "ds.load_values@1", "ds.load_keys@1",
+               "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk_paged@1", "ds.compress@1", "ds.compress_decode@1",
+               "ds.shared_expert@1", "ds.engram_hash@1")
+"""The definitions over the caches: their cases are ``support_ds1017_cases``'."""
+CASES = [name for name, _, _ in SOLUTIONS if name not in OVER_CACHES] + [
+    "ds.fake_quant_fp4@1 e4m3", "ds.linear@1 fp32", "ds.top@1 bf16", "ds.cache_attn@1 window"]
+ROWS_ONLY = tuple(name for name, _, _ in SOLUTIONS if name not in OVER_CACHES)
 
 
 def close(case: str, got: Any, want: Any, args: tuple[Any, ...]) -> None:
@@ -189,7 +195,7 @@ logits are torch's fp32 product."""
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("case", [name for name, _, _ in SOLUTIONS if name not in ("ds.index_score@1",)])
+@pytest.mark.parametrize("case", [name for name in ROWS_ONLY if name not in ("ds.index_score@1",)])
 def test_a_tokens_result_does_not_depend_on_the_rest_of_the_step(case: str) -> None:
     """One token alone against the same token among 70: printed for every kernel, required of
     ``ROW_INVARIANT``."""
@@ -208,7 +214,7 @@ def test_a_tokens_result_does_not_depend_on_the_rest_of_the_step(case: str) -> N
 
 
 @pytest.mark.timeout(1800)
-@pytest.mark.parametrize("case", [name for name, _, _ in SOLUTIONS])
+@pytest.mark.parametrize("case", ROWS_ONLY)
 def test_a_library_kernel_replays_from_a_graph_on_new_inputs(case: str) -> None:
     """A kernel recorded in a CUDA graph on one set of tensors, then replayed after other values were
     written into them (weights too), against the kernel run on those values."""
@@ -240,4 +246,67 @@ def test_a_library_kernel_replays_from_a_graph_on_new_inputs(case: str) -> None:
 
 CAPTURABLE = tuple(name for name, _, _ in SOLUTIONS)
 """Every one: the routed experts (``HOST_DEPENDENT``) as their fixed-row form."""
-assert HOST_DEPENDENT == {"ds.moe_experts@1"}
+assert {"ds.moe_experts@1"} <= HOST_DEPENDENT
+
+
+REFERENCE = {name: getattr(reference, name.split(".", 1)[1].split("@")[0]) for name in OVER_CACHES}
+MINE = {name: getattr(ops, name.split(".", 1)[1].split("@")[0]) for name in OVER_CACHES}
+
+
+def _real(seed: int = 17) -> dict[str, tuple[Any, ...]]:
+    return cases(REAL, lambda name: REFERENCE[name], seed)
+
+
+@pytest.fixture(scope="module")
+def real() -> dict[str, tuple[Any, ...]]:
+    return _real()
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("case", [  # the case names of support_ds1017_cases (known without a GPU)
+    "ds.rope@1", "ds.rope@1 inverse", "ds.transform@1", "ds.store_cache@1 fp8", "ds.store_cache@1 fp8 values",
+    "ds.store_cache@1 latent", "ds.store_cache@1 key", "ds.load_values@1 latent", "ds.load_values@1 fp8",
+    "ds.load_keys@1", "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk@1 source", "ds.index_topk@1 user",
+    "ds.index_topk_paged@1", "ds.index_topk_paged@1 source", "ds.index_topk_paged@1 user", "ds.compress@1",
+    "ds.compress_decode@1", "ds.shared_expert@1", "ds.engram_hash@1"])
+def test_deepinfers_operators_compute_what_the_references_compute(case: str, real: dict[str, tuple[Any, ...]]) -> None:
+    """DeepInfer's TileLang operators, DeepGEMM's indexer kernels and DeepSelect, against the references,
+    at the released shapes: on what they return and what they write into the caches."""
+    name = case.split()[0]
+    # The shared expert's SwiGLU is quantized from fp32 here: against the reference's rounding to bf16
+    # first, about one value in sixteen is the next FP8 one (as the routed experts', ops' docstring).
+    ties = 5e-2 if name == "ds.shared_expert@1" else 5e-3
+    report = compare(case, observe(case, MINE[name], real[case]), observe(case, REFERENCE[name], real[case]),
+                     TOLERANCE[name], min_overlap=0.95, ties=ties)
+    print(report)
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize("case", DECODE)
+def test_deepinfers_decode_operators_replay_from_a_graph_on_new_inputs(case: str) -> None:
+    """What a decode step runs of them, recorded on one set of tensors and replayed after other values
+    were written into them, against the operators run on those values."""
+    name = case.split()[0]
+    fn = MINE[name]
+    static, fresh = _real(17)[case], _real(18)[case]
+    static = tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in static)
+    graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    with torch.cuda.stream(stream):  # warm on the stream it is recorded on (DeepGEMM keeps a workspace a stream)
+        fn(*tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in static))
+    torch.cuda.synchronize()
+    problem = ""
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            out = fn(*static)
+        for held, new in zip(static, fresh, strict=True):
+            if isinstance(held, torch.Tensor):
+                held.copy_(new)
+        graph.replay()
+        torch.cuda.synchronize()
+        got, want = view(case, out, static), observe(case, fn, fresh)
+        if not all(torch.equal(a, b) for a, b in zip(got, want, strict=True)):
+            problem = "replay differs"
+    except Exception as e:  # a kernel that reads the device during capture, or launches off the stream
+        problem = f"{type(e).__name__}: {str(e)[:300]}"
+    print(f"{case}: {'replays from a graph' if not problem else 'NOT CAPTURABLE: ' + problem}")
+    assert not problem

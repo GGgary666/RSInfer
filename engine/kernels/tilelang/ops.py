@@ -22,6 +22,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from kernels import ds1017_compose as compose
 from kernels.ds1017_formats import unpack_kv, unpack_latent, unpack_scales
 from kernels.tilelang import kernel as K  # pyright: ignore[reportUnknownVariableType]
 
@@ -104,6 +105,10 @@ def hc_post(y: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
     return out.type_as(y)
 
 
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return F.silu(x)
+
+
 def pool(members: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
     return (members * scores.softmax(dim=1)).sum(dim=1)
 
@@ -178,3 +183,87 @@ def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w
         hidden = weights[rows, top, None] * (F.silu(gate) * up)
         y[rows] += _gemm_fp4(hidden.to(x.dtype), w2[i], unpack_scales(p2[i], w2.shape[1], -(-inter // BLOCK)))
     return y
+
+
+# ---------------------------------------------------------------- the compositions over the caches
+
+def rotate(x: torch.Tensor, freqs: torch.Tensor, rotary: int, inverse: bool = False) -> torch.Tensor:
+    """``apply_rotary_emb`` on the last ``rotary`` values (the reference implementation rotates in
+    place; here a new tensor, the same values)."""
+    tail = torch.view_as_complex(x[..., -rotary:].float().unflatten(-1, (-1, 2)))
+    f = freqs.conj() if inverse else freqs
+    f = f.view(f.shape[0], *([1] * (tail.dim() - 2)), f.shape[-1])
+    out = x.clone()
+    out[..., -rotary:] = torch.view_as_real(tail * f).flatten(-2).to(x.dtype)
+    return out
+
+
+PIECES = compose.Pieces(rms_norm=rms_norm, rotate=rotate, fake_quant_fp8=fake_quant_fp8, fake_quant_fp4=fake_quant_fp4,
+                        index_score=index_score, top=top, pool=pool, linear_fp8=linear_fp8, silu=silu)
+"""This implementation's kernels and torch calls, for ``kernels.ds1017_compose``: its norms, its
+quantizers, its einsum and sum for the indexer's scores, ``topk``, its pooling."""
+
+
+def rope(x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int, inverse: bool = False
+         ) -> torch.Tensor:
+    return compose.rope(PIECES, x, cos_sin, positions, rotary, inverse)
+
+
+def transform(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
+              positions: torch.Tensor | None, rotary: int, fmt: str) -> torch.Tensor:
+    return compose.transform(PIECES, x, norm, eps, cos_sin, positions, rotary, fmt)
+
+
+def store_cache(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
+                positions: torch.Tensor | None, rotary: int, cache: torch.Tensor, rows: torch.Tensor, fmt: str,
+                entries: int, normed: bool = False) -> torch.Tensor | None:
+    return compose.store_cache(PIECES, x, norm, eps, cos_sin, positions, rotary, cache, rows, fmt, entries, normed)
+
+
+def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str) -> torch.Tensor:
+    return compose.load_values(cache, entries, segments, total, fmt)
+
+
+def load_keys(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, dim: int
+              ) -> tuple[torch.Tensor, torch.Tensor]:
+    return compose.load_keys(cache, entries, segments, total, dim)
+
+
+def quant_index_q(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    return compose.quant_index_q(PIECES, q, cos_sin, positions, rotary)
+
+
+def index_topk(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, k_data: torch.Tensor,
+               k_scales: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, longest: int, topk: int, mode: str,
+               candidates: torch.Tensor | None, topk_blocks: int, block: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    return compose.index_topk(PIECES, q_data, q_scales, weights, k_data, k_scales, ks, ke, longest, topk, mode,
+                              candidates, topk_blocks, block)
+
+
+def index_topk_paged(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, cache: torch.Tensor,
+                     entries: int, block_table: torch.Tensor, lens: torch.Tensor, width: int, topk: int, mode: str,
+                     candidates: torch.Tensor | None, topk_blocks: int, block: int
+                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    return compose.index_topk_paged(PIECES, q_data, q_scales, weights, cache, entries, block_table, lens, width, topk,
+                                    mode, candidates, topk_blocks, block)
+
+
+def compress(score: torch.Tensor, kv: torch.Tensor, state: torch.Tensor, seq_slot: torch.Tensor, cu_q: torch.Tensor,
+             cu_k: torch.Tensor, cu_c: torch.Tensor, c_seq: torch.Tensor, ratio: int) -> torch.Tensor:
+    return compose.compress(PIECES, score, kv, state, seq_slot, cu_q, cu_k, cu_c, c_seq, ratio)
+
+
+def compress_decode(score: torch.Tensor, kv: torch.Tensor, state: torch.Tensor, slot: torch.Tensor,
+                    context_lens: torch.Tensor, ratio: int) -> torch.Tensor:
+    return compose.compress_decode(PIECES, score, kv, state, slot, context_lens, ratio)
+
+
+def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor,
+                  s2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
+    return compose.shared_expert(PIECES, x, w13, s13, p13, w2, s2, p2, limit)
+
+
+def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor
+                ) -> torch.Tensor:
+    return compose.engram_hash(tokens, multipliers, primes, offsets)

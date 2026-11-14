@@ -9,7 +9,9 @@ and page 0 is the scratch item ``-1``.
 
 Qwen3.8's full-attention layers declare ``k`` and ``v`` ``[page_size, kv_heads, head_dim]``. DS 1017's
 layers that produce compressed KV declare the latent ``kv`` and the indexer's key ``ik`` (2026-11-14):
-a latent stands for ``ratio`` tokens and is kept at the slot of the first of them.
+a latent stands for ``ratio`` tokens, so a page holds ``page_size / ratio`` of them, as DeepInfer's
+cache does (a tensor declared ``[entries, ...]`` with ``entries`` dividing ``page_size``): the buffer
+is ``[(pages + 1) * entries, ...]``, entry ``e`` of page ``p`` at row ``p * entries + e``.
 """
 
 from __future__ import annotations
@@ -117,6 +119,10 @@ class KVPool:
         for d in decls:
             if d.kind != KIND or d.tokens_per_item != self.page_size:
                 raise ValueError(f"{KIND} holds pages of {self.page_size} tokens, not {d.kind} {d.tokens_per_item}")
+            for name, (shape, _) in d.tensors.items():
+                if not shape or self.page_size % shape[0]:
+                    raise ValueError(f"{KIND}: layer {d.layer}'s {name} has {shape[:1]} entries a page, which does not "
+                                     f"divide a page of {self.page_size} tokens")
             if self.decls.get(d.layer) != d:
                 changed.append(d)
         for d in changed:
@@ -127,8 +133,7 @@ class KVPool:
             torch.cuda.empty_cache()
         for d in changed:
             # The padded page (slot 0's page) absorbs dummy padded-token writes.
-            total_slots = self.size + self.page_size
-            bufs = {name: self.platform.alloc(0, 0, shape=(total_slots, *shape[1:]), dtype=dtype)
+            bufs = {name: self.platform.alloc(0, 0, shape=((self.pages + 1) * shape[0], *shape[1:]), dtype=dtype)
                     for name, (shape, dtype) in d.tensors.items()}
             self.allocated[d.layer] = list(bufs.values())
             self.tensors[d.layer] = {name: self.platform.tensor(buf) for name, buf in bufs.items()}
@@ -143,19 +148,21 @@ class KVPool:
     def scratch(self) -> Sequence[int]:
         return [-1]
 
-    def slots(self, items: Sequence[int]) -> torch.Tensor:
-        """The token slots of ``items``, in order, on the device of the buffers."""
+    def slots(self, items: Sequence[int], entries: int = 0) -> torch.Tensor:
+        """The rows of ``items``, in order, on the device of the buffers: their token slots, or with
+        ``entries`` the rows of a tensor holding that many entries a page."""
+        per = entries or self.page_size
         first = next(iter(self.tensors.values()), None)
         device = next(iter(first.values())).device if first else torch.device("cpu")
-        return on_device(((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
-                          + torch.arange(self.page_size)).flatten(), device)
+        return on_device(((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * per
+                          + torch.arange(per)).flatten(), device)
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
-        """``move_kv_cache`` by page: every layer's ``buffer[dst slots] = buffer[src slots]``."""
-        src_loc, tgt_loc = self.slots(src), self.slots(dst)
-        for tensors in self.tensors.values():
-            for buffer in tensors.values():
-                buffer[tgt_loc] = buffer[src_loc]
+        """``move_kv_cache`` by page: every layer's ``buffer[dst rows] = buffer[src rows]``."""
+        for layer, tensors in self.tensors.items():
+            for name, buffer in tensors.items():
+                per = self.decls[layer].tensors[name][0][0]
+                buffer[self.slots(dst, per)] = buffer[self.slots(src, per)]
 
     def clear(self, items: Sequence[int]) -> None:
         """Nothing: attention reads only the slots a request wrote (SGLang never zeroes KV)."""

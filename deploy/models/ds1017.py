@@ -20,6 +20,8 @@ from deploy.models.hf import TOKENIZER_FILES, cut, read_config
 
 NAME = "ds1017"
 SERVED_NAME = "DeepSeek-V4.1-Flash"
+PAGE_SIZE = 128
+"""``--page-size`` by default: DeepInfer's block of tokens: a page holds 64 latents at a ratio of 2, as its kernels take them."""
 ARCHITECTURES = frozenset({"DeepseekV41ForCausalLM"})
 MODEL_TYPES = frozenset({"deepseek_v41", "deepseek_v41_text"})
 WORKER_ONLY = frozenset({"models.ds1017", "layers.ds1017", "state.swa_slots", "kernels.ds1017", "kernels.tilelang",
@@ -33,7 +35,7 @@ def matches(cfg: dict[str, Any]) -> bool:
 
 def add_arguments(group: argparse._ArgumentGroup) -> None:
     group.add_argument("--ds-backend", default="auto", help="dsv4.backend: the layers' kernels (auto, reference, "
-                       "tilelang)")
+                       "tilelang, deepinfer)")
 
 
 def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[str, Any]:

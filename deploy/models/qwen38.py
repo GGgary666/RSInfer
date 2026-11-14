@@ -20,6 +20,8 @@ from deploy.models.hf import TOKENIZER_FILES, cut, read_config, text_config
 
 NAME = "qwen38"
 SERVED_NAME = "Qwen3.8-27B"
+PAGE_SIZE = 16
+"""``--page-size`` by default: SGLang's page size here."""
 ARCHITECTURES = frozenset({"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"})
 MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
 WORKER_ONLY = frozenset({"models.qwen38", "layers.attn", "layers.gdn", "layers.linear", "layers.norm", "layers.rope",

@@ -53,3 +53,23 @@ SM100 只能通过任务服务用，一个任务从提交到开始跑要几十�
 
 - 第一次起会话时引擎没起来：`core.plan` 录 graph 时 FlashMLA 报块的字节跨度超过 int32（规格 9.3 的"一个坑"）。会话脚本把各进程的日志留在了结果包里，从 `engine.log` 里直接看到了报错。
 - 没有发现更新机制的问题。框架本体没有改。
+
+## 追加（2026-11-14 夜）：DeepInfer 自己的算子和 DeepGEMM 的 indexer
+
+对应规格 9.4。做法照旧：本地写参照和 TileLang 的组合、CPU 测试和本地 GPU 上对官方逐位，再到 SM100 的跟分支任务上对 DeepInfer 的算子，最后起引擎会话。
+
+在跑着的引擎上（真权重前 8 层，经 HTTP，任务 `20261114T180148Z-af52ce33`）：
+
+| 做了什么 | 结果 |
+|---|---|
+| 冷启动，`--cuda-graph auto` | 所有 definition 都选 `deepinfer`，graph 桶 1、2、4、8 |
+| 发一个短提示词（"Hello"） | worker 失败：DeepInfer 的 `load_keys` 在 0 行时 reshape 出错。引擎停止服务，之后的请求回 400，说明里写着 worker 的错误 |
+| 改 `kernels/deepinfer/ops.py`（0 行直接返回），`apply --source` | 3 秒提交，引擎恢复服务（身份变了，调度器清掉故障），没有重启 |
+| 关 graph、切 `tilelang`、改回来 | 都热提交；graph 和 eager 文本相同；`tilelang` 的文本和这一轮改动之前相同 |
+
+- 这是这个阶段第一次在 SM100 上靠热改修好一个让 worker 失败的 bug：会话任务的检查脚本可以随提交换，所以先推了一个只发一个请求、打印 worker 日志的检查，看到错误，再推修复。
+- 撞到的几件事都是"DeepInfer 只走一种形状，我们走了另一种"：
+  - top-k 不是 512 时，TileLang 的候选恢复要求行跨度是 8 的倍数，`convert_kv_index` 在 300 宽时编不出来；
+  - TileLang 的 kernel 按宽度编译，eager decode 每步宽度不同就每步重编（9 秒一步）；
+  - DeepGEMM 的稀疏 indexer 元数据在每个 stream 上第一次用时要清零一块工作区，graph 录制时不许做，所以要先在录制用的 stream 上热身（平台的 `warmup` 本来就是这样）。
+- 没有发现更新机制的问题，框架本体没有改。

@@ -149,10 +149,10 @@ class DSConfig(msgspec.Struct, frozen=True):
 def states(cfg: DSConfig, page_size: int) -> list[StateDecl]:
     """What each layer stores, as bytes in DeepInfer's KV cache formats (``formats``' records; its
     kernels read them): per KV source layer the compressed latents ``kv`` (FP4 records) and the
-    indexer's keys ``ik`` (FP4, a page's values and then its scales), paged, a latent at the slot of
-    the first token it stands for; per layer a slot with the window's ring (FP8 records), for a source
-    that compresses by more than one the group still filling (``ckv``, ``cscore``), and at the first
-    Engram layer the last tokens an n-gram reaches back to (``tail``)."""
+    indexer's keys ``ik`` (FP4, a page's values and then its scales), paged, ``page_size / ratio``
+    of them a page; per layer a slot with the window's ring (FP8 records), for a source that
+    compresses by more than one the group still filling (``cstate``), and at the first Engram layer
+    the last tokens an n-gram reaches back to (``tail``)."""
     out: list[StateDecl] = []
     engram_first = min(cfg.engram_layer_ids) if cfg.engram_layer_ids else -1
     for layer in range(cfg.num_hidden_layers):
@@ -160,12 +160,13 @@ def states(cfg: DSConfig, page_size: int) -> list[StateDecl]:
         if source:
             latent = cfg.head_dim // 2 + cfg.head_dim // LATENT_BLOCK
             key = cfg.index_head_dim // 2 + cfg.index_head_dim // BLOCK
-            out.append(StateDecl(KV_KIND, layer, {"kv": ((page_size, latent), "u8"), "ik": ((page_size, key), "u8")},
+            per = page_size // ratio  # DeepInfer's block_size // ratio
+            out.append(StateDecl(KV_KIND, layer, {"kv": ((per, latent), "u8"), "ik": ((per, key), "u8")},
                                  "request", tokens_per_item=page_size))
         slot: dict[str, tuple[tuple[int, ...], str]] = {
             "ring": ((cfg.sliding_window, cfg.head_dim + cfg.head_dim // BLOCK), "u8")}
-        if source and ratio > 1:
-            slot |= {"ckv": ((ratio, cfg.head_dim), "f32"), "cscore": ((ratio, cfg.head_dim), "f32")}
+        if source and ratio > 1:  # DeepInfer's ca_state: each member's score, then its KV
+            slot["cstate"] = ((ratio, 2, cfg.head_dim), "f32")
         if layer == engram_first and cfg.engram_max_ngram_size > 1:
             slot["tail"] = ((cfg.engram_max_ngram_size - 1,), "i64")
         out.append(StateDecl(SLOT_KIND, layer, slot, "slot"))

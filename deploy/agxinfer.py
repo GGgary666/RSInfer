@@ -190,6 +190,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     model = Path(args.model).resolve()
     cfg = read_config(model)
     recipe = recipe_for(cfg)
+    args.page_size = args.page_size or recipe.PAGE_SIZE
     # The worker runs the units of its model's family: those only another family runs stay out (two
     # model units would both provide model@1).
     others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
@@ -511,7 +512,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
                    "CUDA_VISIBLE_DEVICES, else 0)")
     d.add_argument("--mem-fraction", type=float, default=0.85, help="device share of weights and states "
                    "(holder.mem_fraction; SGLang's --mem-fraction-static)")
-    d.add_argument("--page-size", type=int, default=16)
+    d.add_argument("--page-size", type=int, default=0,
+                   help="tokens a KV page (default: the model family's, 16 for Qwen, 128 for DS 1017)")
     d.add_argument("--kv-dtype", default="auto", help="state.kv.dtype (SGLang's --kv-cache-dtype)")
     d.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
     d.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")

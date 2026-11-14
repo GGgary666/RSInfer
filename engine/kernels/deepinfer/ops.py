@@ -12,15 +12,18 @@ references of ``kernels.ds1017``), beyond the order a sum is accumulated in:
 - ``moe_experts``: the SwiGLU's result is quantized to FP8 from fp32. The reference implementation
   rounds it to bf16 first, which moves about one value in sixteen to the next FP8 value; the routed
   experts' sum then differs by a few percent of its largest element.
+- ``shared_expert``: the same for the shared expert's SwiGLU.
 - ``hc_mixes``: the product with the stream's copies is a TF32 GEMM (``tf32_hc_prenorm_gemm``), so the
   coefficients agree to about 1e-4, not to fp32's last bits.
 - ``fake_quant_fp4`` with an e4m3 scale (the compressed KV): TileKernels multiplies by the scale's
   reciprocal where the reference implementation divides by the scale, so a value exactly halfway
   between two FP4 values lands on the other one: about one element in 2000, one FP4 step apart.
 
-Three definitions have no kernel here yet and are the torch calls a GPU runs as they stand (``silu``,
-``pool``, ``index_score``): the libraries' indexer and compressor kernels read the states in
-DeepInfer's byte layouts, which the engine does not keep yet.
+Three definitions are torch calls as they stand (``silu``, ``pool``, ``index_score``): the layers do not
+call the last two any more; the indexer and the compressor are ``index_topk``, ``index_topk_paged``,
+``compress`` and ``compress_decode``, with DeepInfer's own TileLang operators (``tilelang_ops``,
+vendored from DeepInfer) and DeepGEMM's indexer kernels, as ``index_attn.py`` and ``compress.py`` of
+``v4_modules`` call them.
 
 The weights arrive as the checkpoint's bytes (``uint8``); a weight's scales as
 ``formats.pack_scales`` lays them out, which is what DeepGEMM reads on SM 10.0. Activations are bf16.
@@ -30,6 +33,9 @@ The weights arrive as the checkpoint's bytes (``uint8``); a weight's scales as
 
 from __future__ import annotations
 
+from types import MappingProxyType
+from typing import cast
+
 import deep_gemm
 import flash_mla
 import tile_kernels
@@ -37,6 +43,23 @@ import torch
 import torch.nn.functional as F
 from deep_select import interface as deep_select
 
+from kernels.deepinfer.tilelang_ops.cache_common import FP4_INDEX_KV_FORMAT, V41_FORMAT, V41_FP4_FORMAT, KVCacheFormat
+from kernels.deepinfer.tilelang_ops.candidate_blocks import (
+    candidate_block_max,
+    get_candidate_compact_lens,
+    restore_candidate_indices_inplace,
+)
+from kernels.deepinfer.tilelang_ops.compress import compress_and_update_state_decode, compress_and_update_state_prefill
+from kernels.deepinfer.tilelang_ops.flash_mla_utils import convert_kv_index
+from kernels.deepinfer.tilelang_ops.fused_transform import (
+    CastArgs,
+    KVCacheOutArgs,
+    NormArgs,
+    RopeArgs,
+    fused_norm_rope_hadamard_cast_store_kvcache,
+)
+from kernels.deepinfer.tilelang_ops.load_paged_kv_cache import load_paged_kv_cache
+from kernels.deepinfer.tilelang_ops.store_kv_cache import store_kv_cache
 from kernels.ds1017_formats import BLOCK, packed_words
 
 E4M3 = torch.float8_e4m3fn
@@ -145,12 +168,6 @@ def sparse_attn(q: torch.Tensor, source: torch.Tensor, idx: torch.Tensor, sink: 
     listed = F.pad(idx.to(torch.int32), (0, -idx.shape[1] % KEY_BLOCK), value=-1)
     return flash_mla.flash_mla_sparse_fwd(q.contiguous(), source.unsqueeze(1), listed.unsqueeze(1), scale,
                                           source.shape[-1], sink)[0]
-
-
-def pack_kv(x: torch.Tensor) -> torch.Tensor:
-    """TileKernels' cast and its scales' bytes behind it: a record is 512 e4m3 values and 16 exponents."""
-    data, scales = _cast(_rows(x), row_major=True)
-    return torch.cat([data.view(torch.uint8), scales.contiguous().view(torch.uint8)], dim=-1).view(*x.shape[:-1], -1)
 
 
 def _listed(idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -319,3 +336,267 @@ def engram_gate(x: torch.Tensor, kv: torch.Tensor, q_weight: torch.Tensor, k_wei
     fused = tile_kernels.engram.fused_weight(q_weight, k_weight)
     return tile_kernels.engram.engram_gate_fwd(x.contiguous(), kv.contiguous().view(tokens, hc + 1, dim), fused, eps,
                                                1e-6, save_for_backward=False)[0]
+
+
+# ---------------------------------------------------------------- the definitions over the caches
+
+FORMATS = MappingProxyType({"fp8": V41_FORMAT, "latent": V41_FP4_FORMAT, "key": FP4_INDEX_KV_FORMAT})
+"""The record formats (``kernels.ds1017_compose``) as DeepInfer's cache formats."""
+
+INDEX_ROW_BYTES = 2 << 30
+"""How many bytes of indexer logits a prefill computes at a time (``DEEPINFER_INDEX_ATTN_MEMORY_LIMIT``)."""
+
+
+def _layout(fmt: str) -> KVCacheFormat:
+    return FORMATS[fmt]
+
+
+def _paged(cache: torch.Tensor, entries: int) -> torch.Tensor:
+    """A cache ``[rows, bytes]`` as DeepInfer's ``[blocks, entries, 1, bytes]``."""
+    return cache.view(-1, entries, 1, cache.shape[-1])
+
+
+def _cast_args(fmt: str, back: bool = False) -> CastArgs:
+    layout = _layout(fmt)
+    return CastArgs(layout.quantized_dtype, layout.elements_per_sf, round_sf=layout.sf_format != "e4m3",  # pyright: ignore
+                    sf_format=layout.sf_format, cast_back=back)  # pyright: ignore
+
+
+def _rope(cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int, dim: int, inverse: bool = False) -> RopeArgs:
+    """DeepInfer's RoPE of the last ``rotary`` values, pairs of neighbours (not NeoX's halves)."""
+    return RopeArgs(positions.contiguous(), cos_sin, rotary, False, offset=dim - rotary, conjugate=inverse)
+
+
+def rope(x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int, inverse: bool = False
+         ) -> torch.Tensor:
+    if not x.shape[0]:
+        return x.clone()
+    rows = x.reshape(x.shape[0], -1, x.shape[-1]).contiguous()
+    out = fused_norm_rope_hadamard_cast_store_kvcache(rows, rope_args=_rope(cos_sin, positions, rotary, x.shape[-1], inverse))
+    return cast(torch.Tensor, out).view(x.shape)
+
+
+def transform(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
+              positions: torch.Tensor | None, rotary: int, fmt: str) -> torch.Tensor:
+    """The fused operator with ``cast_back``: the prefill's window KV (``_prepare_swa_kv``)."""
+    if not x.shape[0]:
+        return x.clone()
+    return cast(torch.Tensor, fused_norm_rope_hadamard_cast_store_kvcache(
+        x.contiguous(), norm_args=None if norm is None else NormArgs(norm, eps),
+        rope_args=None if cos_sin is None or positions is None else _rope(cos_sin, positions, rotary, x.shape[-1]),
+        cast_args=_cast_args(fmt, back=True)))
+
+
+def store_cache(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
+                positions: torch.Tensor | None, rotary: int, cache: torch.Tensor, rows: torch.Tensor, fmt: str,
+                entries: int, normed: bool = False) -> torch.Tensor | None:
+    """The fused operator into a cache (``KVCacheOutArgs``), or ``store_kv_cache`` for rows that need
+    neither a norm nor a rotation (a prefill's window KV, transformed already)."""
+    out = torch.empty_like(x) if normed else None
+    if not x.shape[0]:
+        return out
+    slots = rows.to(torch.int32).contiguous()
+    paged = _paged(cache, entries)
+    if norm is None and cos_sin is None:
+        store_kv_cache(x.contiguous(), paged, slots, layout=_layout(fmt))
+        return out
+    fused_norm_rope_hadamard_cast_store_kvcache(
+        x.contiguous(), norm_args=None if norm is None else NormArgs(norm, eps),
+        rope_args=None if cos_sin is None or positions is None else _rope(cos_sin, positions, rotary, x.shape[-1]),
+        cast_args=_cast_args(fmt), out_args=KVCacheOutArgs(paged, slots, out=out, out_stage="norm", layout=_layout(fmt)))
+    return out
+
+
+def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str) -> torch.Tensor:
+    if not total:
+        return torch.empty(0, _layout(fmt).num_elements, dtype=torch.bfloat16, device=cache.device)
+    result = load_paged_kv_cache(_paged(cache, entries), segments.to(torch.int32).contiguous(), total, layout=_layout(fmt))
+    return result.bf16_data  # pyright: ignore
+
+
+def load_keys(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, dim: int
+              ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not total:
+        return (torch.empty(0, dim // 2, dtype=torch.uint8, device=cache.device),
+                torch.empty(0, dim // BLOCK, dtype=torch.uint8, device=cache.device))
+    result = load_paged_kv_cache(_paged(cache, entries), segments.to(torch.int32).contiguous(), total,
+                                 layout=FP4_INDEX_KV_FORMAT)
+    data, scales = result.quantized_data, result.sf_data
+    return data.view(torch.uint8), scales.contiguous().view(torch.uint8).view(total, -1)  # pyright: ignore
+
+
+def quant_index_q(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``MQA._quantize_q``: rotation and FP4 in one operator."""
+    n, heads, dim = q.shape
+    if not n:
+        return (torch.empty(0, heads, dim // 2, dtype=torch.uint8, device=q.device),
+                torch.empty(0, heads, dim // BLOCK, dtype=torch.uint8, device=q.device))
+    data, scales = cast(tuple[torch.Tensor, torch.Tensor], fused_norm_rope_hadamard_cast_store_kvcache(
+        q.contiguous(), rope_args=_rope(cos_sin, positions, rotary, dim), cast_args=_cast_args("key")))
+    return data.view(torch.uint8), scales.contiguous().view(torch.uint8).view(n, heads, -1)
+
+
+def _weights(weights: torch.Tensor) -> torch.Tensor:
+    """``_align_mqa_weights``: rows 16-byte aligned for DeepGEMM's loads."""
+    per = 16 // weights.element_size()
+    if weights.stride(0) % per == 0 and weights.stride(-1) == 1:
+        return weights
+    out = torch.zeros(weights.shape[0], -(-weights.shape[1] // per) * per, dtype=weights.dtype, device=weights.device)
+    return out[:, :weights.shape[1]].copy_(weights)
+
+
+def _q(data: torch.Tensor, scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The FP4 queries as DeepGEMM takes them: packed values, and a word of four exponents a head."""
+    return data.view(torch.int8), scales.contiguous().view(torch.int32).squeeze(-1)
+
+
+def _top(scores: torch.Tensor, k: int, end: torch.Tensor, offset: torch.Tensor | None = None) -> torch.Tensor:
+    """DeepSelect's top-k as the indexer calls it: indices ascending, ``-1`` after the valid ones."""
+    return deep_select.topk(scores, k, sorted=False, end=end, indices_type=torch.int32, sorted_index=True,
+                            output_idx_offset=offset, idx_oob_fill_value=-1, return_value=False)[1]
+
+
+def _aligned(idx: torch.Tensor) -> torch.Tensor:
+    """``idx`` with rows that start at multiples of 8 entries, as the candidate kernels take them:
+    DeepInfer's top-k is always 512 wide, this one as wide as the step's longest row reaches."""
+    if idx.stride(0) % 8 == 0 and idx.stride(1) == 1:
+        return idx
+    out = torch.empty(idx.shape[0], -(-idx.shape[1] // 8) * 8, dtype=idx.dtype, device=idx.device)[:, :idx.shape[1]]
+    return out.copy_(idx)
+
+
+def _padded(idx: torch.Tensor) -> torch.Tensor:
+    """``idx`` with none after it up to a multiple of 128 entries, rows aligned: the TileLang kernels
+    after the top-k lay a row out over 128 threads and are compiled for its length (DeepInfer's is
+    always 512)."""
+    return _aligned(F.pad(idx, (0, -idx.shape[1] % 128), value=-1))
+
+
+def _candidates(logits: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block: int) -> torch.Tensor:
+    """``MQA._topk_candidate_block``."""
+    scores, valid = candidate_block_max(logits, lens, block)
+    return _top(scores, topk_blocks, valid)
+
+
+def index_topk(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, k_data: torch.Tensor,
+               k_scales: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, longest: int, topk: int, mode: str,
+               candidates: torch.Tensor | None, topk_blocks: int, block: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``MQA._topk_prefill``: DeepGEMM's logits over the loaded keys (``fp8_fp4_mqa_logits``, or over the
+    candidate blocks only with ``fp8_fp4_sparse_mqa_logits``), DeepSelect's top-k, query chunk by
+    query chunk."""
+    n, device = q_data.shape[0], q_data.device
+    out = torch.full((n, topk), -1, dtype=torch.int64, device=device)
+    picked = torch.full((n, topk_blocks), -1, dtype=torch.int64, device=device) if mode == "source" else None
+    if not n or not k_data.shape[0] or not topk:
+        return out, picked
+    q = _q(q_data, q_scales)
+    kv = (k_data.view(torch.int8), k_scales.contiguous().view(torch.int32).squeeze(-1))
+    w = _weights(weights)
+    ks32, ke32 = ks.to(torch.int32).contiguous(), ke.to(torch.int32).contiguous()
+    klen = ke32 - ks32
+    width = max(longest, 1)  # the logits' width: one compiled candidate kernel for every step (max_kv_len)
+    chunk = max(8, min(8192, INDEX_ROW_BYTES // (width * 2) // 8 * 8))
+    for a in range(0, n, chunk):
+        c = slice(a, min(a + chunk, n))
+        qc = (q[0][c], q[1][c])
+        if mode == "user":
+            assert candidates is not None
+            cand = candidates[c].to(torch.int32).contiguous()
+            meta = deep_gemm.get_sparse_mqa_logits_metadata(ks32[c], ke32[c], kv[0].shape[0],
+                                                            cand + torch.div(ks32[c], block, rounding_mode="floor")[:, None],
+                                                            qc[0].dtype, block, use_unaligned_ks=True)
+            logits = deep_gemm.fp8_fp4_sparse_mqa_logits(qc, kv, w[c], meta, cand.shape[1], block, use_unaligned_ks=True)
+            idx = _padded(_top(logits, topk, get_candidate_compact_lens(cand, klen[c].contiguous(), block)))
+            restore_candidate_indices_inplace(idx, _aligned(cand), block, ks32[c])
+            idx = idx[:, :topk]
+        else:
+            logits = deep_gemm.fp8_fp4_mqa_logits(qc, kv, w[c], ks32[c], ke32[c], max_seqlen_k=width)
+            if picked is not None:
+                picked[c] = _candidates(logits, klen[c].contiguous(), topk_blocks, block).long()
+            idx = _top(logits, topk, klen[c].contiguous(), ks32[c])
+        out[c] = idx.long()
+    return out, picked
+
+
+def index_topk_paged(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, cache: torch.Tensor,
+                     entries: int, block_table: torch.Tensor, lens: torch.Tensor, width: int, topk: int, mode: str,
+                     candidates: torch.Tensor | None, topk_blocks: int, block: int
+                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``MQA._topk_decode``: DeepGEMM's paged logits (``fp8_fp4_paged_mqa_logits``, or
+    ``fp8_fp4_paged_sparse_mqa_logits`` over the candidate blocks), DeepSelect's top-k, and
+    ``convert_kv_index`` to cache rows. Nothing here reads the device back: a graph records it."""
+    n, device = q_data.shape[0], q_data.device
+    picked: torch.Tensor | None = None
+    if not n or not topk:
+        return torch.full((n, topk), -1, dtype=torch.int64, device=device), picked
+    q = _q(q_data, q_scales)
+    q = (q[0][:, None], q[1][:, None])
+    paged = _paged(cache, entries)
+    lens32 = lens.to(torch.int32).contiguous()
+    table = block_table.to(torch.int32).contiguous()
+    indices = torch.arange(n, dtype=torch.int32, device=device)
+    w = _weights(weights)
+    if mode == "user":
+        assert candidates is not None
+        cand = candidates.to(torch.int32).contiguous()
+        meta = deep_gemm.get_paged_sparse_mqa_logits_metadata(lens32, table, indices, entries, cand, q[0].dtype, block)
+        logits = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(q, paged, w, meta, cand.shape[1], block)
+        valid = get_candidate_compact_lens(cand, lens32, block)
+        idx = _padded(_top(logits, topk, valid))
+        restore_candidate_indices_inplace(idx, _aligned(cand), block)
+        idx = idx[:, :topk]
+    else:
+        meta = deep_gemm.get_paged_mqa_logits_metadata(lens32[:, None], entries, deep_gemm.get_num_sms(), indices=indices)
+        # As wide as the pages given (the batch's longest context): one compiled kernel for every step.
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(q, paged, w, lens32[:, None], table, meta, table.shape[1] * entries,
+                                                    indices=indices)
+        if mode == "source":
+            picked = _candidates(logits, lens32, topk_blocks, block).long()
+        valid = lens32
+        idx = _top(logits, topk, valid).contiguous()
+    # convert_kv_index lays a row out over 128 threads: DeepInfer's lists are 512 long; a shorter one is
+    # padded with none (an entry past the valid ones stays none).
+    idx = F.pad(idx, (0, -topk % 128), value=-1)[:, None].contiguous()
+    convert_kv_index(idx, entries, valid[:, None].contiguous(), table)
+    return idx[:, 0, :topk].long(), picked
+
+
+def compress(score: torch.Tensor, kv: torch.Tensor, state: torch.Tensor, seq_slot: torch.Tensor, cu_q: torch.Tensor,
+             cu_k: torch.Tensor, cu_c: torch.Tensor, c_seq: torch.Tensor, ratio: int) -> torch.Tensor:
+    def i32(t: torch.Tensor) -> torch.Tensor:
+        return t.to(torch.int32).contiguous()
+
+    return compress_and_update_state_prefill(score.contiguous(), kv.contiguous(), state, i32(seq_slot), i32(c_seq),
+                                             i32(cu_q), i32(cu_k), i32(cu_c), ratio)
+
+
+def compress_decode(score: torch.Tensor, kv: torch.Tensor, state: torch.Tensor, slot: torch.Tensor,
+                    context_lens: torch.Tensor, ratio: int) -> torch.Tensor:
+    return compress_and_update_state_decode(score.contiguous(), kv.contiguous(), state, slot.to(torch.int32).contiguous(),
+                                            context_lens.to(torch.int32).contiguous(), 1, ratio)
+
+
+def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor,
+                  s2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
+    """``DeepseekMoE.shared_forward``: one GEMM over ``w1`` and ``w3`` (``shared_gate_up_proj``), TileKernels'
+    SwiGLU with the FP8 cast, the GEMM of ``w2`` on what it cast. The SwiGLU is quantized from fp32 (as
+    the routed experts' are here, see the module's docstring)."""
+    rows = _rows(x)
+    gate_up = linear_fp8(rows, w13, s13, p13)
+    if not rows.shape[0]:
+        return torch.empty(*x.shape[:-1], w2.shape[0], dtype=BF16, device=x.device)
+    hidden = tile_kernels.quant.swiglu_forward_and_per_token_cast(
+        gate_up.contiguous(), fmt="e4m3", num_per_channels=BLOCK, round_sf=True, use_packed_ue8m0=True,
+        use_tma_aligned_col_major_sf=True, clamp_value=limit if limit > 0 else None)
+    out = _out(rows.shape[0], w2.shape[0], BF16, x.device)
+    deep_gemm.fp8_fp4_gemm_nt(hidden, (w2.view(E4M3), packed_words(p2, w2.shape[0])), out, None, recipe=(1, 1, BLOCK))
+    return out.reshape(*x.shape[:-1], w2.shape[0])
+
+
+def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor
+                ) -> torch.Tensor:
+    """TileKernels' ``engram_hash``."""
+    out = tile_kernels.engram.engram_hash(tokens.to(torch.int32).contiguous(), multipliers.contiguous(),
+                                          primes.to(torch.int32).contiguous(), offsets.to(torch.int32).contiguous())
+    return out.permute(1, 0, 2).long()
