@@ -124,7 +124,8 @@ class TorchNativeAttnBackend:
         req_pool_indices = rows + 1
         out_cache_loc = torch.cat([req_to_token[int(r), int(p):int(p + n)]
                                    for r, p, n in zip(req_pool_indices, prefix, extend, strict=True)])
-        self.forward_metadata = Metadata(plan.phase == "decode", req_to_token, on_device(req_pool_indices, device),
+        self.forward_metadata = Metadata(plan.phase == "decode" and not plan.draft_tokens, req_to_token,
+                                         on_device(req_pool_indices, device),
                                          on_device(prefix + extend, device), on_device(prefix, device),
                                          on_device(extend, device), out_cache_loc.to(torch.int64))
 
@@ -158,9 +159,12 @@ class TorchNativeAttnBackend:
 class AttnBackend:
     """``layers.attn@1``: each phase's backend."""
 
-    def __init__(self, kernels: Kernels, kv: Any, dtype: str) -> None:
+    def __init__(self, kernels: Kernels, kv: Any, dtype: str, speculative: bool = False) -> None:
         self.kernels = kernels
         self.dtype = dtype
+        self.speculative = speculative
+        """Speculation on (``spec.algorithm``): a verify step replayed from a graph runs the decode
+        backend's extend, which is resolved for captured steps too."""
         """The activations' dtype (``model.dtype``): some kernels take bf16 / fp16 only, and some
         read the cache as if it had the queries' dtype."""
         self.native, self.paged = TorchNativeAttnBackend(kernels, kv), PagedAttnBackend(kernels, kv)
@@ -188,6 +192,8 @@ class AttnBackend:
             paged = self._paged(phase, shape)
             self.backends[phase] = self.paged if paged else self.native
             calls[phase] = {"kv.store@1": {}, (PAGED if paged else NATIVE)[phase]: shape}
+            if phase == "decode" and self.speculative:
+                calls[phase][(PAGED if paged else NATIVE)["prefill"]] = shape
             if paged:
                 calls[phase][KV_INDICES] = {}
         return self.kernels.resolve(calls, shared=frozenset({"kv.store@1", KV_INDICES}))
@@ -205,7 +211,10 @@ class AttnBackend:
         return False
 
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
-        self.active = self.backends["decode" if key.bucket or plan.phase == "decode" else "prefill"]
+        # A verify step (a decode plan with draft tokens, doc/specs/mtp.md) attends as an extend of each
+        # row's D tokens, as SGLang's TARGET_VERIFY runs the prefill wrappers.
+        decode = (key.bucket or plan.phase == "decode") and not plan.draft_tokens
+        self.active = self.backends["decode" if decode or key.bucket else "prefill"]
         self.active.prepare(batch, plan, key)
 
     def forward(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int,
@@ -216,7 +225,8 @@ class AttnBackend:
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "attn")
-        ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"]))
+        ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"],
+                                                 speculative=bool(config["spec.algorithm"])))
 
 
 if TYPE_CHECKING:

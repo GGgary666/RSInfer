@@ -55,10 +55,12 @@ class BatchPlan(msgspec.Struct, frozen=True):
     rows: Column
     """``i32``: rows of the persistent batch that run in this step."""
     num_tokens: Column
-    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step. How speculation
-    counts drafts is decided in M2d, following the compatibility rules in spec §3."""
+    """``i32`` per row: prompt tokens of this chunk, or 1 for a decode step (also with
+    speculation: the one input token is the last one accepted, the drafts are the worker's)."""
     positions: Column
-    """``i32`` per row: position of the row's first token in this step."""
+    """``i32`` per row: position of the row's first token in this step. With speculation, for a
+    ``from_previous`` decode row only where it is at least: the steps before it may still be on
+    their way, and how far they went is the worker's (doc/specs/mtp.md §2.2)."""
     tokens: Column
     """``i64``, flat: the input tokens of the rows whose ``from_previous`` is 0, in row order:
     such a row takes the next ``num_tokens`` of them, a ``from_previous`` row none. So its
@@ -73,6 +75,15 @@ class BatchPlan(msgspec.Struct, frozen=True):
     bucket: int
     """The scheduler's bucket hint (padded batch size); 0 = eager. The worker picks the plan it runs
     itself, from those ready (stage2-contract.md §9.1)."""
+    draft_tokens: int = 0
+    """Speculation (doc/specs/mtp.md): 0 without; else SGLang's ``num_draft_tokens`` D. Each decode
+    row then verifies D tokens, its input token and D - 1 drafts, and advances by as many as are
+    accepted (``Sampled.counts``), 1 to D; a prefill row runs the draft model's extend after the
+    target's. Such a step is not mixed."""
+    next_tokens: Column = Column("i64")
+    """With ``draft_tokens``, ``i64`` per row: the prompt token after the row's chunk, which the draft
+    model's extend takes as the chunk's last input (SGLang's ``chunked_req_next_prompt_token``); -1
+    for a row whose chunk ends its prompt (it takes the token sampled now) or that decodes."""
 
 
 class StateAssign(msgspec.Struct, frozen=True):
@@ -102,7 +113,10 @@ class StateTrack(msgspec.Struct, frozen=True):
     """For the prefix cache (prefix-cache.md, SGLang's ``mamba_track_*``): row ``rows[i]`` writes its
     state at position ``upto[i]`` (exclusive; inside this step's input or at its end) into item
     ``dst[i]``. A position inside the input is a multiple of the kind's chunk (64 tokens for GDN)
-    from where the row starts in this step."""
+    from where the row starts in this step. ``upto[i] = -g``, for a decode row of a speculative step:
+    at the multiple of ``g`` its accepted tokens cross, if they cross one (SGLang's
+    ``mamba_steps_to_track`` over its ``mamba_track_grid``); the worker finds it on the device, the
+    scheduler from ``Sampled``."""
 
     kind: str
     rows: Column

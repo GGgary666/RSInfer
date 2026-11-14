@@ -58,6 +58,62 @@ def triton() -> Any:
     return ops
 
 
+
+@pytest.mark.parametrize(("dtype", "ssm_dtype"), [(torch.bfloat16, torch.float32), (torch.float32, torch.float32)])
+def test_triton_gdn_verify_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,
+                                                                 ssm_dtype: torch.dtype) -> None:
+    """A verify step (doc/specs/mtp.md): five rows of D = 4 tokens at scattered slots. The conv keeps
+    the window after each token and leaves the row's state after all four; the delta rule keeps the
+    state after each token and leaves the row's own untouched."""
+    from kernels.reference import spec as ref_spec
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    rand: Callable[..., torch.Tensor] = lambda *shape: torch.randn(*shape, device=DEVICE, generator=gen)
+    rows, steps = 5, 4
+    n = rows * steps
+    weight = (0.3 * rand(CONV_DIM, WIDTH)).to(dtype)
+    conv0 = (0.5 * rand(9, CONV_DIM, WIDTH - 1)).to(dtype)
+    slots = torch.tensor([3, 1, 7, 5, 2], device=DEVICE, dtype=torch.int32)
+    lanes = torch.arange(rows, device=DEVICE)
+    x = rand(rows, steps, CONV_DIM).to(dtype).transpose(1, 2)  # as a verify step's projection is laid out
+    conv_ref, conv_tri = conv0.clone(), conv0.clone()
+    win_ref = torch.zeros(rows, steps, CONV_DIM, WIDTH - 1, device=DEVICE, dtype=dtype)
+    win_tri = win_ref.clone()
+    close("gdn.verify_conv1d_update@1", triton.verify_conv1d_update(x, conv_tri, weight, None, "silu", slots, win_tri, lanes),
+          ref_spec.verify_conv1d_update(x, conv_ref, weight, None, "silu", slots, win_ref, lanes))
+    assert torch.equal(win_tri, win_ref) and torch.equal(conv_tri, conv_ref)
+
+    q, k, v = (rand(1, n, HK, K).to(dtype), rand(1, n, HK, K).to(dtype), rand(1, n, HV, V).to(dtype))
+    A_log, dt_bias = 0.5 * rand(HV), 0.5 * rand(HV)
+    ba = rand(n, 2 * HV).to(dtype)
+    b, a = ba[:, :HV], ba[:, HV:]  # views of the projection, as the backend hands them over
+    ssm0 = (0.1 * rand(9, HV, V, K)).to(ssm_dtype)
+    ssm_ref, ssm_tri = ssm0.clone(), ssm0.clone()
+    kept_ref = torch.zeros(rows, steps, HV, V, K, device=DEVICE, dtype=ssm_dtype)
+    kept_tri = kept_ref.clone()
+    close("gdn.verify_recurrent@1",
+          triton.verify_recurrent(A_log, dt_bias, q, k, v, a, b, ssm_tri, slots, kept_tri, lanes, steps),
+          ref_spec.verify_recurrent(A_log, dt_bias, q, k, v, a, b, ssm_ref, slots, kept_ref, lanes, steps))
+    close("gdn.verify_recurrent@1", kept_tri, kept_ref)
+    assert torch.equal(ssm_tri, ssm0) and torch.equal(ssm_ref, ssm0)
+
+    # The commit (every layer at once: pools [layers, slots, ...], intermediates [layers, lanes, D, ...]):
+    # each row's accepted step into its slot; rows 1 and 3 also keep the step at a tracking boundary.
+    layers = 3
+    pools = [(0.5 * rand(layers, 9, CONV_DIM, WIDTH - 1)).to(dtype), (0.1 * rand(layers, 9, HV, V, K)).to(ssm_dtype)]
+    inters = [(0.5 * rand(layers, rows, steps, CONV_DIM, WIDTH - 1)).to(dtype),
+              (0.1 * rand(layers, rows, steps, HV, V, K)).to(ssm_dtype)]
+    accepted = torch.tensor([3, 0, 2, 1, 0], device=DEVICE)
+    track_dst = torch.tensor([0, 8, 0, 6, 0], device=DEVICE, dtype=torch.int32)
+    track = torch.tensor([-1, 0, -1, 1, -1], device=DEVICE)
+    mine, theirs = [p.clone() for p in pools], [p.clone() for p in pools]
+    triton.commit_states(mine[0], mine[1], inters[0], inters[1], slots, lanes, accepted, track_dst, track)
+    ref_spec.commit_states(theirs[0], theirs[1], inters[0], inters[1], slots, lanes, accepted, track_dst, track)
+    for got, want, pool, inter in zip(mine, theirs, pools, inters, strict=True):
+        assert torch.equal(got, want)  # copies: exactly the reference's
+        assert torch.equal(got[:, 7], inter[:, 2, 2]) and torch.equal(got[:, 8], inter[:, 1, 0])
+        assert torch.equal(got[:, 0], pool[:, 0])  # no lane tracks into the padding slot: untouched
+
 @pytest.mark.parametrize(("dtype", "ssm_dtype"), [(torch.bfloat16, torch.float32), (torch.bfloat16, torch.bfloat16),
                                                   (torch.float32, torch.float32)])
 def test_triton_gdn_decode_kernels_stay_within_their_definitions(triton: Any, dtype: torch.dtype,
@@ -241,8 +297,19 @@ def test_flashinfer_paged_attention_stays_within_its_definitions() -> None:
             operator.plan(indptr_of(new), *layout(rows, [p + n for p, n in zip(prefix, new, strict=True)]))
         close("attn.paged_extend@1", extend.run(q, k_cache, v_cache, scaling),
               want_extend.run(q, k_cache, v_cache, scaling))
-    with pytest.raises(ValueError, match="not replayed from a graph"):
-        ops.PagedExtend(workspace, *shape, buffers)
+    # a graph bucket of verify steps (doc/specs/mtp.md): D new tokens a lane, over fixed buffers
+    steps = 4
+    verify = {**buffers, "qo_indptr": torch.arange(size + 1, dtype=torch.int32, device=DEVICE) * steps}
+    bucket_extend = ops.PagedExtend(workspace, *shape, verify)
+    for rows, prefix in (([2, 5, 0, 0], [10, 20, 0, 0]), ([1, 2, 3, 4], [296, 1, 250, 7])):
+        q = torch.randn(size * steps, HEADS, HEAD_DIM, device=DEVICE, generator=gen).to(torch.bfloat16)
+        kv_indptr_cpu, kv_indptr, kv_indices = layout(rows, [p + steps for p in prefix], verify["kv_indices"])
+        verify["kv_indptr"].copy_(kv_indptr)
+        qo = torch.arange(size + 1, dtype=torch.int32) * steps
+        bucket_extend.plan(qo, kv_indptr_cpu, verify["kv_indptr"], kv_indices)
+        want_extend.plan(qo, kv_indptr_cpu, kv_indptr, kv_indices)
+        close("attn.paged_extend@1", bucket_extend.run(q, k_cache, v_cache, scaling),
+              want_extend.run(q, k_cache, v_cache, scaling))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -503,7 +570,8 @@ def test_graphs_that_are_refused_or_only_checked_leave_nothing_in_the_backends(c
         attn, gdn = w.service("layers.attn@1"), w.service("layers.gdn@1")
         assert w.service("plan@1").buckets("decode") == [2, 4]
         assert sorted(attn.paged.graph_metadata) == [2, 4] and sorted(gdn.graph_metadata) == [2, 4]
-        assert sorted(key for key in attn.paged.operators if key[0] == "graph") == [("graph", 2), ("graph", 4)]
+        assert sorted(key for key in attn.paged.operators if key[0] == "graph") == [("graph", 2, False),
+                                                                                     ("graph", 4, False)]
         assert not [name for name in (*attn.binding.buffers(), *gdn.binding.buffers()) if name.split(".")[-2] == "1"]
     finally:
         w.close()
@@ -563,7 +631,7 @@ def test_the_kernel_units_reload_under_running_requests(checkpoint: Path) -> Non
             for _ in range(3):
                 d.step({0: 1, 2: 1})
         attn = reloaded.service("layers.attn@1")
-        before = attn.active.operators["graph", 2][0]
+        before = attn.active.operators["graph", 2, False][0]
         version = reloaded.service("kernels.catalog@1").version
         for _ in range(2):
             reloaded.runtime.reload(ReloadPlan(units_to_reload=[
@@ -575,7 +643,7 @@ def test_the_kernel_units_reload_under_running_requests(checkpoint: Path) -> Non
             x, y = a.step({0: 1, 2: 1}), b.step({0: 1, 2: 1})
             torch.testing.assert_close(y.logits.float(), x.logits.float(), rtol=2e-2, atol=2e-2)
             assert y.finish() == x.finish()
-        assert attn.active.operators["graph", 2][0] is not before
+        assert attn.active.operators["graph", 2, False][0] is not before
     finally:
         steady.close()
         reloaded.close()

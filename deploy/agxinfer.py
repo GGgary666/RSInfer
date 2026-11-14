@@ -48,6 +48,8 @@ from deploy.models.hf import cut, read_config  # noqa: E402
 RECIPES: tuple[types.ModuleType, ...] = (qwen38,)
 HOST = "host-a"
 SCHED = {"host": HOST, "role": "sched", "index": 0}
+SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
+"""SGLang's --speculative-algorithm values the engine takes: the MTP layer drafts (SGLang runs NEXTN as EAGLE)."""
 WORKER = {"host": HOST, "role": "worker", "index": 0}
 DEFAULT_RUN = Path("run/agxinfer")
 ENGINE_FILE = "engine.json"
@@ -214,6 +216,10 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         "sched.workers": [WORKER], "sched.frontend_host": HOST, "sched.max_batch": args.max_rows,
         "sched.token_budget": args.token_budget, "sched.overlap": args.overlap,
         "alloc.radix_cache": not args.disable_radix_cache,
+        # speculation (doc/specs/mtp.md), SGLang's flags
+        "spec.algorithm": SPEC_ALGORITHMS[args.speculative_algorithm.upper()] if args.speculative_algorithm else "",
+        "spec.num_steps": args.speculative_num_steps, "spec.eagle_topk": args.speculative_eagle_topk,
+        "spec.num_draft_tokens": args.speculative_num_draft_tokens,
         # worker
         "worker.scheduler": SCHED, "weights.path": weights,
         "state.kv.page_size": args.page_size, "state.kv.dtype": args.kv_dtype,
@@ -517,6 +523,12 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     sched.add_argument("--overlap", action="store_true", help="one step of overlap (sched.overlap)")
     sched.add_argument("--disable-radix-cache", action="store_true",
                        help="no prefix cache (alloc.radix_cache = false), as SGLang's flag")
+    spec = s.add_argument_group("speculative decoding (doc/specs/mtp.md; SGLang's flags)")
+    spec.add_argument("--speculative-algorithm", choices=sorted(SPEC_ALGORITHMS) + sorted(a.lower() for a in SPEC_ALGORITHMS),
+                      help="the model's MTP layer drafts (spec.algorithm); off without it")
+    spec.add_argument("--speculative-num-steps", type=int, default=3)
+    spec.add_argument("--speculative-eagle-topk", type=int, default=1, help="only 1, a chain")
+    spec.add_argument("--speculative-num-draft-tokens", type=int, default=4)
     e = s.add_argument_group("engine")
     e.add_argument("--host", "--bind", dest="host", default="127.0.0.1",
                    help="address the frontend (HTTP) listens on, e.g. 0.0.0.0 for every interface")

@@ -42,6 +42,10 @@ class Row:
     ids: dict[str, list[int]] = field(default_factory=dict[str, list[int]])
     has_previous: bool = False
     """A token was sampled for the row since it was added: ``from_previous`` may name it."""
+    committed: int | None = None
+    """Speculation: where its last step left the row; the scheduler knows less while steps are in flight."""
+    has_drafts: bool = False
+    """Speculation: ``spec.drafts`` and ``spec.hidden`` hold the row's own, from its last step."""
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,9 @@ class PersistentBatch:
     rows: dict[int, Row] = field(default_factory=dict[int, Row])
     tensors: dict[str, torch.Tensor] = field(default_factory=dict[str, torch.Tensor])
     allocated: list[Any] = field(default_factory=list[Any])
+    spec: tuple[int, int, str] | None = None
+    """What ``prepare_spec`` last made the speculation tables for."""
+    spec_buffers: list[Any] = field(default_factory=list[Any])
     generation: int = 0
     rebuilt: bool = True
     """Built, or left half changed by a step that failed (``invalidate``), and not yet given a full
@@ -101,6 +108,13 @@ class PersistentBatch:
         if any(int(p) + int(n) > self.max_context_len
                for p, n in zip(plan.positions.values(), plan.num_tokens.values(), strict=True)):
             raise ValueError("plan exceeds batch.max_context_len")
+        if plan.draft_tokens and plan.phase == "decode":  # the verify window, from where each row is
+            for r, p, prev in zip((int(x) for x in plan.rows.values()), plan.positions.values(),
+                                  plan.from_previous.values(), strict=True):
+                row = self.rows.get(r)
+                at = row.committed if prev and row is not None and row.committed is not None else int(p)
+                if at + plan.draft_tokens > self.max_context_len:
+                    raise ValueError(f"row {r}'s verify window from {at} exceeds batch.max_context_len")
         if self.rebuilt and not delta.full:
             return "the persistent batch was rebuilt (or a step failed after changing it) and waits for a full delta"
         known = set() if delta.full else set(self.rows)
@@ -181,6 +195,29 @@ class PersistentBatch:
 
     def ids(self, kind: str) -> Mapping[int, Sequence[int]]:
         return {r: row.ids.get(kind, []) for r, row in self.rows.items()}
+
+    def prepare_spec(self, draft_tokens: int, hidden_size: int, dtype: str) -> None:
+        """The speculation tables; kept when asked for the same again (a reloaded executor, or
+        ``core.plan`` before it), made again when ``spec.num_draft_tokens`` or the model changed."""
+        if self.spec == (draft_tokens, hidden_size, dtype):
+            return
+        for buf in self.spec_buffers:  # what graphs recorded over them went with the plan that had them
+            self.allocated.remove(buf)
+            self.platform.free(buf)
+        self._alloc("spec.drafts", (self.max_rows + 1, draft_tokens - 1), "i64")
+        self._alloc("spec.hidden", (self.max_rows + 1, hidden_size), dtype)
+        self.spec, self.spec_buffers = (draft_tokens, hidden_size, dtype), self.allocated[-2:]
+        self.generation += 1
+
+    def committed(self, row: int) -> int | None:
+        return self.rows[row].committed
+
+    def has_drafts(self, row: int) -> bool:
+        return self.rows[row].has_drafts
+
+    def speculated(self, rows: Sequence[int], committed: Sequence[int]) -> None:
+        for r, at in zip(rows, committed, strict=True):
+            self.rows[r].committed, self.rows[r].has_drafts = at, True
 
     def sampling(self, rows: Sequence[int]) -> list[SamplingParams]:
         return [self.rows[r].sampling for r in rows]

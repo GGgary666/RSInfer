@@ -141,7 +141,7 @@ class Table(Protocol):
     def start_step(self, epoch: int, rows: Mapping[int, int], counts: Mapping[int, int] | None = None) -> None: ...
     def sample(self, epoch: int, identity: str, sampled: Sampled) -> TokenEvents: ...
     def cancel(self, request: int, identity: str) -> TokenEvents: ...
-    def retire(self, epoch: int, ran: bool = True) -> list[int]: ...
+    def retire(self, epoch: int, ran: bool = True, advanced: Mapping[int, int] | None = None) -> list[int]: ...
     def reap(self, request: int) -> Any: ...
 
 
@@ -159,6 +159,9 @@ class Settings:
     idle_wait_s: float = 0.01
     asleep: bool = False
     """``holder.sleep``: the workers gave their memory back; every request is refused."""
+    draft_tokens: int = 0
+    """Speculation (doc/specs/mtp.md): 0 off, else ``spec.num_draft_tokens`` D. A decode row then
+    verifies D tokens and advances by what it accepts; its KV is reserved for the worst case."""
 
 
 ASLEEP = ("the engine is asleep (holder.sleep): it holds no weights or states. Wake it first "
@@ -200,6 +203,9 @@ class Flight:
     prefills: frozenset[int] = frozenset()
     """Rows that computed prompt tokens: what they computed enters the prefix cache once the step
     retired (``Ledger.commit``)."""
+    speculative: frozenset[int] = frozenset()
+    """Decode rows that verify drafts: planned at ``draft_tokens`` tokens (``counts``), the most they
+    advance; how far they went is their ``Sampled`` count."""
     answers: dict[int, Answer] = field(default_factory=dict[int, Answer])
     void: bool = False
     """Sent after a step the workers refused (``Resync``): they refuse this one too."""
@@ -582,9 +588,15 @@ class Scheduler:
                                         f"{sorted(int(x) for x in sampled.rows.values())}, not its rows "
                                         f"{sorted(flight.rows)}")
             return
+        advanced = self._advanced(flight, kept)
+        if advanced is None:
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, 0, f"step {flight.epoch} accepted more than its {self.settings.draft_tokens} "
+                                        "draft tokens in a row, or none")
+            return
         events = self.table.sample(flight.epoch, self.identity(), kept)
-        self.ledger.retire(flight.epoch)
-        ready = self.table.retire(flight.epoch)
+        self.ledger.retire(flight.epoch, advanced={flight.rows[row]: n for row, n in advanced.items()})
+        ready = self.table.retire(flight.epoch, advanced=advanced)
         for row in flight.prefills:  # checkpoint_kv_cache
             request = self.table.get(flight.rows[row])
             if request is not None and not request.finished():
@@ -611,6 +623,15 @@ class Scheduler:
         self._note(f"step {flight.epoch} not run: refused by the new worker(s) of rank(s) {sorted(refused)}")
         for rid in ready:
             self._reap(rid)
+
+    def _advanced(self, flight: Flight, kept: Sampled) -> dict[int, int] | None:
+        """Row -> tokens each speculative decode row accepted: its count, 1 to ``draft_tokens``.
+        ``None``: a count out of that range."""
+        counts = dict(zip((int(x) for x in kept.rows.values()), (int(x) for x in kept.counts.values()), strict=True))
+        out = {row: counts.get(row, 0) for row in flight.speculative}
+        if any(not 1 <= n <= self.settings.draft_tokens for n in out.values()):
+            return None
+        return out
 
     @staticmethod
     def _kept(flight: Flight, sampled: Sampled) -> Sampled | None:
@@ -731,7 +752,7 @@ class Scheduler:
             if not added.ok:
                 self._refuse(route, new.request, "; ".join(d.reason for d in added.diagnostics))
                 continue
-            if self.ledger.ready and (why := self._too_long(len(new.prompt) + new.max_tokens)):
+            if self.ledger.ready and (why := self._too_long(self._extent(len(new.prompt), new.max_tokens))):
                 self._error(added.value, why)
         for abort in requests.abort:
             request = self.table.get(abort.request)
@@ -741,12 +762,19 @@ class Scheduler:
             if request.reclaimable:
                 self._reap(abort.request)
 
+    def _extent(self, prompt: int, max_tokens: int) -> int:
+        """The positions a request may write: its prompt and ``max_tokens``, and with speculation the
+        window a decode step writes past them, twice over for the step in flight before it (SGLang's
+        ``get_alloc_reserve_per_decode``)."""
+        return prompt + max_tokens + 2 * self.settings.draft_tokens
+
     def _too_long(self, extent: int) -> str:
-        """Why a request of ``extent`` tokens (prompt plus max_tokens) can never run, or ``""``."""
+        """Why a request of ``extent`` tokens (``_extent``) can never run, or ``""``."""
+        what = "prompt plus max_tokens" + (" plus the speculation window" if self.settings.draft_tokens else "")
         if not self.ledger.fits(extent):
-            return f"{extent} tokens (prompt plus max_tokens) need more state than the engine has"
+            return f"{extent} tokens ({what}) need more state than the engine has"
         if self.settings.max_context and extent > self.settings.max_context:
-            return f"{extent} tokens (prompt plus max_tokens); a row of the workers holds {self.settings.max_context}"
+            return f"{extent} tokens ({what}); a row of the workers holds {self.settings.max_context}"
         return ""
 
     def _refuse(self, route: StreamAddress, rid: int, message: str) -> None:
@@ -958,6 +986,9 @@ class Scheduler:
         used = {r.row for r in self.table.entries() if r.row is not None}
         free = [row for row in range(self.settings.max_batch) if row not in used]
         takes = self._decide(waiting, prefilling, decoding, free_rows)
+        if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
+            # No mixed step with speculation (SGLang disables mixed chunks): the prompts go first.
+            takes = [t for t in takes if kinds[t.request][0] != "decoding"]
         step = _Step(epoch)
         try:
             refused = self._carry_out(step, takes, kinds, tokens, free)
@@ -987,7 +1018,7 @@ class Scheduler:
             if kind == "waiting":
                 if refused:
                     continue
-                extent = len(request.prompt_tokens) + request.input.max_tokens
+                extent = self._extent(len(request.prompt_tokens), request.input.max_tokens)
                 if why := self._too_long(extent):
                     self._error(request, why)
                     continue
@@ -1007,13 +1038,17 @@ class Scheduler:
                 step.assign_all(request.row, got.items)
             row = request.row
             assert row is not None
-            n = take.tokens if kind == "decoding" else self._chunk(request, planned, take.tokens)
+            speculative = kind == "decoding" and self.settings.draft_tokens > 0
+            n = self.settings.draft_tokens if speculative else take.tokens if kind == "decoding" else \
+                self._chunk(request, planned, take.tokens)
             if n <= 0:
                 if kind == "waiting":
                     self.ledger.cancel(rid, step.epoch)
                     step.unadmit(request, free)
                 continue
-            extra = self.ledger.reserve(rid, planned + n, step.epoch)
+            # Speculative: planned counts the steps in flight at D tokens each, the most they go, so
+            # this reserves the window of the furthest this one can start at (2 x D with overlap).
+            extra = self.ledger.reserve(rid, planned + n, step.epoch, speculative=speculative)
             if extra is None:  # what step.epoch took for it is back in the ledger
                 if kind == "waiting":
                     step.unadmit(request, free)
@@ -1024,18 +1059,26 @@ class Scheduler:
             for state_kind, (dst, upto) in extra.track.items():
                 step.track.setdefault(state_kind, []).append((row, dst, upto))
             step.rows[row], step.counts[row] = rid, n
-            step.positions.append(planned)
+            # A speculative decode row starts where the retired steps left it at least; the worker
+            # knows where the steps in flight took it (BatchPlan.positions).
+            step.positions.append(request.computed if speculative else planned)
+            if speculative:
+                step.speculative.add(row)
             if kind == "decoding":
                 previous = rid in in_flight  # its last run is still in flight: the worker has the token
                 step.from_previous.append(int(previous))
                 if not previous:
                     step.tokens.append(request.output_ids[-1])
                 step.decodes += 1
+                step.next_tokens.append(-1)
             else:
                 step.from_previous.append(0)
                 step.tokens.extend(request.prompt_tokens[planned:planned + n])
                 step.prefills += 1
                 step.prefill_rows.add(row)
+                # the draft model's extend takes the token after the chunk (BatchPlan.next_tokens)
+                step.next_tokens.append(request.prompt_tokens[planned + n] if planned + n < len(request.prompt_tokens)
+                                        else -1)
             if planned + n >= len(request.prompt_tokens):
                 step.samples.add(row)
         return refused
@@ -1061,9 +1104,11 @@ class Scheduler:
                     step.assign_all(request.row, self.ledger.items(request.input.request))
         phase: Literal["prefill", "decode", "mixed"] = (
             "decode" if not step.prefills else "prefill" if not step.decodes else "mixed")
-        batch = BatchPlan(Column.of("i32", step.rows), Column.of("i32", step.counts.values()),
+        counts = [1 if row in step.speculative else n for row, n in step.counts.items()]
+        batch = BatchPlan(Column.of("i32", step.rows), Column.of("i32", counts),
                           Column.of("i32", step.positions), Column.of("i64", step.tokens),
-                          Column.of("u8", step.from_previous), phase, 0)
+                          Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens,
+                          Column.of("i64", step.next_tokens if self.settings.draft_tokens else []))
         state = StateOps([StateAssign(kind, Column.of("i32", per_row), *ragged("i32", per_row.values()))
                           for kind, per_row in step.assign.items()],
                          [StateCopy(kind, "before", Column.of("i32", [c[1] for c in cs]),
@@ -1078,7 +1123,7 @@ class Scheduler:
         for rank, outbox in enumerate(self.plans):
             outbox.put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)), now, step.epoch)
         self.flights.append(Flight(step.epoch, dict(step.rows), dict(step.counts), frozenset(step.samples), now,
-                                   frozenset(step.prefill_rows)))
+                                   frozenset(step.prefill_rows), frozenset(step.speculative)))
         self.full = False
         self.removed.clear()
 
@@ -1100,6 +1145,8 @@ class _Step:
     track: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict[str, list[tuple[int, int, int]]])
     """kind -> (row, dst, upto): states the step keeps for the prefix cache."""
     prefill_rows: set[int] = field(default_factory=set[int])
+    speculative: set[int] = field(default_factory=set[int])
+    next_tokens: list[int] = field(default_factory=list[int])
     prefills: int = 0
     decodes: int = 0
 

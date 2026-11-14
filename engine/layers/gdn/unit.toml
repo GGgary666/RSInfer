@@ -16,4 +16,4 @@ services = ["kernels.catalog@1", "state.gdn.slots@1"]
 "gdn.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps (SGLang's --linear-attn-decode-backend); empty: gdn.backend" }
 
 [reads]
-config = ["model.dtype"]
+config = ["model.dtype", "spec.algorithm"]

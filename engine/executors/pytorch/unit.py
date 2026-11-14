@@ -29,6 +29,7 @@ import torch
 from core.contracts.columns import Column
 from core.contracts.plan import Plan, PlanKey, PlanService
 from core.contracts.records import BatchPlan, Capacity, Resync, RowDelta, Sampled, StateOps, StepStats
+from executors.pytorch.spec import Speculative, spec_draft_tokens
 from platforms.base import StaleGraph
 
 
@@ -87,15 +88,21 @@ class Step:
     previous: Mark | None
     """The previous step's ``end``: the device sat idle from there to ``begin``."""
     logits: torch.Tensor
-    """Each row's last-token logits; for evaluation and tests."""
+    """Each row's last-token logits (a verify step's ``[rows * D, vocab]``); for evaluation and tests."""
+    counts: torch.Tensor | None = None
+    """A verify step's accepted lengths on the host (``tokens`` is then ``[rows, D]``); ``None``: one each."""
 
     def ready(self) -> bool:
         return self.end.passed()
 
     def finish(self) -> Sampled:
         self.end.wait()
-        return Sampled(Column.of("i32", self.rows), Column.of("i32", [1] * len(self.rows)),
-                       Column.of("i64", self.tokens.tolist()))
+        if self.counts is None:
+            return Sampled(Column.of("i32", self.rows), Column.of("i32", [1] * len(self.rows)),
+                           Column.of("i64", self.tokens.tolist()))
+        counts = [int(n) for n in self.counts.tolist()]
+        tokens = [int(t) for row, n in zip(self.tokens.tolist(), counts, strict=True) for t in row[:n]]
+        return Sampled(Column.of("i32", self.rows), Column.of("i32", counts), Column.of("i64", tokens))
 
     def stats(self) -> StepStats:
         """``device_us`` spans the step's device work, gaps between its kernels included;
@@ -129,8 +136,11 @@ def check_plan(plan: BatchPlan) -> None:
 class PyTorchExecutor:
     """``executor@1``."""
 
-    def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any]) -> None:
+    def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
+                 spec: Speculative | None = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
+        self.spec = spec
+        """Speculation (doc/specs/mtp.md); ``None`` off."""
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
         self.row_index: torch.Tensor | None = None
@@ -144,11 +154,16 @@ class PyTorchExecutor:
 
     def submit(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps) -> Step | Resync:
         start = time.perf_counter()
+        if self.spec is not None:
+            self.spec.settle()  # where the last verify left its rows (waits for it, not for its draft extend)
+        elif plan.draft_tokens:
+            raise ValueError("a speculative plan reached a worker with speculation off (spec.algorithm)")
         check_plan(plan)
         reason = self.batch.check(delta, plan)
         if reason:
             return Resync(reason)
-        chosen, eager = self._plans(plan)
+        # A speculative step picks its plans itself (PlanService.verify), after the rows' positions.
+        chosen, eager = self._plans(plan) if self.spec is None else (self.plans.get(PlanKey("prefill", 0)),) * 2
         last_token = self.batch.binding.buffers()["last_token"]
         device = last_token.device
         begin = Mark(device)
@@ -170,10 +185,12 @@ class PyTorchExecutor:
         # mamba_clear_indices: a row that starts from position 0 has no state yet (its conv runs
         # without an initial state); a row restored from a snapshot or continuing keeps its items.
         restored = {(c.kind, int(d)) for c in state.copy if c.when == "before" for d in c.dst.values()}
+        # A from_previous row goes on from its last step: with speculation its plan position is only
+        # where it is at least, 0 while its prefill is still in flight (doc/specs/mtp.md).
+        starting = [r for r, p, f in zip(rows, positions, plan.from_previous.values(), strict=True) if p == 0 and not f]
         for kind, store in self.stores.items():
             ids = self.batch.ids(kind)
-            fresh = [i for r, p in zip(rows, positions, strict=True) if p == 0 for i in ids.get(r, [])
-                     if (kind, i) not in restored]
+            fresh = [i for r in starting for i in ids.get(r, []) if (kind, i) not in restored]
             if fresh:
                 store.clear(fresh)
         self._copies(state, "before")
@@ -197,15 +214,23 @@ class PyTorchExecutor:
         else:
             last_index = on_device(torch.cumsum(torch.tensor(num_tokens), dim=0) - 1, device)
 
-        try:
-            logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
-        except StaleGraph:
-            if chosen is eager or self.plans.required:
-                raise
-            logits = eager.run(self.batch, plan, input_ids, pos, last_index)
-        next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
-                                             [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
-        self.batch.record(rows, next_token_ids)
+        counts: torch.Tensor | None = None
+        if self.spec is not None and plan.phase == "decode":
+            next_token_ids, _, done = self.spec.decode(plan, rows, positions, input_ids,
+                                                            self.batch.track("gdn.slots"))
+            counts, logits = done.lengths, next_token_ids
+        elif self.spec is not None:
+            next_token_ids, logits = self.spec.prefill(plan, rows, num_tokens, positions, input_ids, pos, last_index)
+        else:
+            try:
+                logits = chosen.run(self.batch, plan, input_ids, pos, last_index)
+            except StaleGraph:
+                if chosen is eager or self.plans.required:
+                    raise
+                logits = eager.run(self.batch, plan, input_ids, pos, last_index)
+            next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
+                                                 [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
+            self.batch.record(rows, next_token_ids)
         tokens = next_token_ids
         if device.type == "cuda":  # async_d2h: into pinned memory, without waiting for the device
             tokens = torch.empty(next_token_ids.shape, dtype=next_token_ids.dtype, pin_memory=True)
@@ -214,7 +239,7 @@ class PyTorchExecutor:
         end, previous = Mark(device), self.last_end
         self.last_end = end
         host_us = (time.perf_counter() - start) * 1e6
-        return Step(rows, tokens, epoch, host_us, begin, end, previous, logits)
+        return Step(rows, tokens, epoch, host_us, begin, end, previous, logits, counts)
 
     def _plans(self, plan: BatchPlan) -> tuple[Plan, Plan]:
         """The step's plan and the eager one. A decode step takes the smallest ready graph bucket
@@ -239,5 +264,10 @@ class Unit:
 
     def __init__(self, ctx: Any, config: Any) -> None:
         stores = {kind: ctx.use(name) for kind, name in self.STORES}
-        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, ctx.use("worker.batch@1"), ctx.use("plan@1"),
-                                                ctx.use("layers.sampler@1"), stores))
+        batch, plans, sampler = ctx.use("worker.batch@1"), ctx.use("plan@1"), ctx.use("layers.sampler@1")
+        draft_tokens = spec_draft_tokens(config)
+        spec = None
+        if draft_tokens:
+            model = ctx.use("model@1")
+            spec = Speculative(plans, batch, sampler, draft_tokens, model.hidden_size, model.dtype)
+        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec))

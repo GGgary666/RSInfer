@@ -47,10 +47,37 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 
 
+def mtp_tensors(t: dict[str, Any], dtype: Any, seed: int) -> dict[str, Any]:
+    """The MTP layer of a Qwen3.5 checkpoint (``Qwen3_5ForCausalLMMTP``, ``mtp_num_hidden_layers`` 1),
+    random: ``fc``, the two norms before it, one gated full-attention decoder layer, the final norm."""
+    import torch
+
+    g = torch.Generator().manual_seed(seed + 1)
+    h, heads, kv, hd, inter = (t["hidden_size"], t["num_attention_heads"], t["num_key_value_heads"],
+                               t.get("head_dim", t["hidden_size"] // t["num_attention_heads"]), t["intermediate_size"])
+
+    def w(*shape: int) -> Any:
+        return (0.02 * torch.randn(*shape, generator=g)).to(dtype).contiguous()
+
+    def norm(n: int) -> Any:
+        return (0.1 * torch.randn(n, generator=g)).to(dtype).contiguous()
+
+    p = "mtp.layers.0."
+    return {"mtp.fc.weight": w(h, 2 * h), "mtp.pre_fc_norm_embedding.weight": norm(h),
+            "mtp.pre_fc_norm_hidden.weight": norm(h), p + "self_attn.q_proj.weight": w(heads * hd * 2, h),
+            p + "self_attn.k_proj.weight": w(kv * hd, h), p + "self_attn.v_proj.weight": w(kv * hd, h),
+            p + "self_attn.o_proj.weight": w(h, heads * hd), p + "self_attn.q_norm.weight": norm(hd),
+            p + "self_attn.k_norm.weight": norm(hd), p + "mlp.gate_proj.weight": w(inter, h),
+            p + "mlp.up_proj.weight": w(inter, h), p + "mlp.down_proj.weight": w(h, inter),
+            p + "input_layernorm.weight": norm(h), p + "post_attention_layernorm.weight": norm(h),
+            "mtp.norm.weight": norm(h)}
+
+
 def checkpoint(args: argparse.Namespace) -> int:
-    """Random weights in a Qwen3.8 checkpoint's layout (``model.language_model.*``, plus ``visual``
-    and ``mtp`` tensors the loader skips), with HF's initialization and a seed, the config cut to
-    ``--layers``: for tests that compare against HF."""
+    """Random weights in a Qwen3.8 checkpoint's layout (``model.language_model.*``, a ``visual`` tensor
+    the loader skips, and the MTP layer, ``mtp.*``, which speculation drafts with; doc/specs/mtp.md),
+    with HF's initialization and a seed, the config cut to ``--layers``: for tests that compare
+    against HF."""
     import torch
     from safetensors.torch import save_file
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
@@ -77,7 +104,7 @@ def checkpoint(args: argparse.Namespace) -> int:
         if multimodal and name.startswith("model."):
             name = "model.language_model." + name[len("model."):]
         tensors[name] = value.detach().to("cpu").contiguous()
-    tensors["mtp.fc.weight"] = torch.zeros(8, 8, dtype=dtype)  # skipped by the loader, as in a real checkpoint
+    tensors |= mtp_tensors(t, dtype, args.seed)
     tensors["model.visual.patch_embed.proj.weight"] = torch.zeros(8, 8, dtype=dtype)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)

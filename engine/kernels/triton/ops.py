@@ -36,6 +36,7 @@ _fused_qk_gemma_rmsnorm_rope_gate: Any = fused_qk_rmsnorm_rope_gate.fused_qk_gem
 _fused_sigmoid_mul: Any = elementwise.fused_sigmoid_mul
 _create_flashinfer_kv_indices: Any = kv_indices.create_flashinfer_kv_indices_triton
 _track_mamba_states_all_layers: Any = mamba_track.track_mamba_states_all_layers
+_fused_mamba_state_scatter_with_mask: Any = mamba_track.fused_mamba_state_scatter_with_mask
 
 
 def causal_conv1d_fn(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, activation: str | None,
@@ -135,3 +136,49 @@ def track_states(conv: torch.Tensor, temporal: torch.Tensor, cache_indices: torc
     """``gdn.track_states@1``: ``MambaAttnBackendBase._track_mamba_state_decode``, one launch for every
     layer (``track_mamba_states_all_layers``)."""
     _track_mamba_states_all_layers(conv, temporal, cache_indices, mask, dst, mask.shape[0])
+
+
+# ------------------------------------------------------------------ speculation (doc/specs/mtp.md)
+
+
+def verify_conv1d_update(x: torch.Tensor, conv_state: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
+                         activation: str | None, conv_state_indices: torch.Tensor,
+                         intermediate_conv_window: torch.Tensor, intermediate_state_indices: torch.Tensor
+                         ) -> torch.Tensor:
+    """``gdn.verify_conv1d_update@1``: ``causal_conv1d_update`` with ``intermediate_conv_window``, as
+    ``GDNAttnBackend.forward_extend`` calls it in ``TARGET_VERIFY``."""
+    from kernels.triton.causal_conv1d import causal_conv1d_update
+
+    return causal_conv1d_update(x, conv_state, weight, bias, activation, conv_state_indices=conv_state_indices,
+                                intermediate_conv_window=intermediate_conv_window,
+                                intermediate_state_indices=intermediate_state_indices)
+
+
+def commit_states(conv: torch.Tensor, temporal: torch.Tensor, intermediate_conv: torch.Tensor,
+                  intermediate_temporal: torch.Tensor, cache_indices: torch.Tensor, lanes: torch.Tensor,
+                  steps: torch.Tensor, track_dst: torch.Tensor, track_steps: torch.Tensor) -> None:
+    """``gdn.commit_states@1``: ``scatter_mamba_states_after_mtp_verify`` over dense conv windows, two
+    masked scatters per pool, every layer in one launch: the accepted step's state into the row's slot,
+    and where ``track_steps >= 0`` the state at the tracking boundary into ``track_dst``. A lane of no
+    tracking copies nothing (the reference rewrites its ``track_dst`` with what it holds)."""
+    for pool, inter in ((conv, intermediate_conv), (temporal, intermediate_temporal)):
+        _fused_mamba_state_scatter_with_mask(pool, inter, cache_indices, steps, lanes)
+        _fused_mamba_state_scatter_with_mask(pool, inter, track_dst, track_steps, lanes)
+
+
+def verify_recurrent(A_log: torch.Tensor, dt_bias: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                     a: torch.Tensor, b: torch.Tensor, ssm_states: torch.Tensor, cache_indices: torch.Tensor,
+                     intermediate_states: torch.Tensor, intermediate_state_indices: torch.Tensor, cache_steps: int,
+                     use_qk_l2norm_in_kernel: bool = True) -> torch.Tensor:
+    """``gdn.verify_recurrent@1``: ``TritonGDNKernel.target_verify``, i.e.
+    ``fused_sigmoid_gating_delta_rule_update`` with ``disable_state_update`` and the intermediate states,
+    each row ``cache_steps`` tokens."""
+    from kernels.triton.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+
+    rows = cache_indices.shape[0]
+    cu_seqlens = torch.arange(rows + 1, dtype=torch.int32, device=q.device) * cache_steps
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log, a, dt_bias, 1.0, 20.0, q, k, v, b, ssm_states, cache_indices, cu_seqlens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, disable_state_update=True,
+        intermediate_states_buffer=intermediate_states, intermediate_state_indices=intermediate_state_indices)
+

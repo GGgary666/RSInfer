@@ -63,6 +63,13 @@ class MambaPool:
     (the checkpoint's config) the weight store reads."""
     configured: int = field(init=False, default=0)
     """``state.gdn.slots``; 0: the holder's count."""
+    spec_steps: int = 0
+    """Speculation (doc/specs/mtp.md): the D tokens a verify step keeps a state after, per lane; 0 off."""
+    spec_lanes: int = 0
+    """Lanes of the intermediate buffers: the rows one step runs at most (``batch.max_rows``)."""
+    intermediate: tuple[torch.Tensor, torch.Tensor] | None = None
+    """SGLang's ``intermediate_conv_window`` and ``intermediate_ssm``: ``[layers, lanes, D, ...]`` of conv
+    and temporal, what a verify step leaves after each of its tokens."""
 
     def __post_init__(self) -> None:
         self.configured = self.size
@@ -97,6 +104,12 @@ class MambaPool:
         temporal = self.platform.alloc(0, 0, shape=(n, self.size + 1, *temporal_shape), dtype=ssm_dtype)
         self.allocated = [conv, temporal]
         self.conv, self.temporal = self.platform.tensor(conv), self.platform.tensor(temporal)
+        if self.spec_steps:
+            lanes = (n, self.spec_lanes, self.spec_steps)
+            iconv = self.platform.alloc(0, 0, shape=(*lanes, *conv_shape), dtype=conv_dtype)
+            itemporal = self.platform.alloc(0, 0, shape=(*lanes, *temporal_shape), dtype=ssm_dtype)
+            self.allocated += [iconv, itemporal]
+            self.intermediate = (self.platform.tensor(iconv), self.platform.tensor(itemporal))
         self.mamba_layer_ids, self.decls = [d.layer for d in decls], list(decls)
 
     def _tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,6 +124,19 @@ class MambaPool:
 
     def capacity(self) -> int:
         return self.size
+
+    def verify_buffers(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``layer``'s intermediate conv windows and states ``[lanes, D, ...]`` for a verify step."""
+        if self.intermediate is None:
+            raise RuntimeError(f"{KIND} keeps no intermediate states: speculation is off")
+        i = self.mamba_layer_ids.index(layer)
+        return self.intermediate[0][i], self.intermediate[1][i]
+
+    def verify_pools(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Every layer's intermediate buffers ``[layers, lanes, D, ...]``, for the commit."""
+        if self.intermediate is None:
+            raise RuntimeError(f"{KIND} keeps no intermediate states: speculation is off")
+        return self.intermediate
 
     def pools(self) -> tuple[torch.Tensor, torch.Tensor, int]:
         """``conv`` and ``temporal`` of every layer, ``[layers, size + 1, ...]``, and the last GDN layer:
@@ -151,11 +177,14 @@ class MambaPool:
             self.platform.free(buf)
         self.generation += bool(self.allocated)  # their bindings are stale
         self.allocated, self.conv, self.temporal, self.decls = [], None, None, []
+        self.intermediate = None
 
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
+        steps = config["spec.num_draft_tokens"] if config["spec.algorithm"] else 0
         self.pool = MambaPool(ctx.platform, config["state.gdn.slots"], holder=ctx.use("state.holder@1"), sized_from={
-            "state.gdn.ssm_dtype": config["state.gdn.ssm_dtype"], "state.gdn.conv_dtype": config["state.gdn.conv_dtype"]})
+            "state.gdn.ssm_dtype": config["state.gdn.ssm_dtype"], "state.gdn.conv_dtype": config["state.gdn.conv_dtype"]},
+            spec_steps=steps, spec_lanes=config["batch.max_rows"] if steps else 0)
         ctx.effect(lambda: self.pool.free, label="gdn states")
         ctx.provide("state.gdn.slots@1", self.pool)

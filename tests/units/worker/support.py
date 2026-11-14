@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import torch
 import zmq
 
 from core.common.ids import Identity
@@ -31,8 +32,10 @@ class RealWorker:
     function on that thread between two steps (a reload, as a change would make it)."""
 
     def __init__(self, directory: Directory, rank: int, hf_config: dict[str, Any], checkpoint: Path,
-                 **config: Any) -> None:
+                 platform: Any = None, **config: Any) -> None:
         self.directory, self.rank, self.proc = directory, rank, WORKERS[rank]
+        self.platform = platform
+        """The worker's platform (``torch_eager`` on the CPU by default); tests/gpu give a CUDA one."""
         self.values: dict[str, Any] = {
             "model.hf_config": hf_config, "model.dtype": "f32", "state.gdn.conv_dtype": "f32", "weights.path": str(checkpoint),
             "state.kv.page_size": PAGE_SIZE, "state.kv.pages": 64, "state.gdn.slots": 8, "batch.max_rows": 8,
@@ -54,7 +57,7 @@ class RealWorker:
             specs = [spec(u) for u in UNITS]
             entries = {key: ConfigEntry(s.id, decl, self.values.get(key, decl.default))
                        for s in specs for key, decl in s.manifest.config.items()}
-            self.runtime = UnitRuntime(self.proc, platform=TorchEagerPlatform())
+            self.runtime = UnitRuntime(self.proc, platform=self.platform or TorchEagerPlatform())
             self.runtime.provide_host("proc.streams@1", channels)
             self.runtime.provide_host("proc.control@1", SimpleNamespace(identity=Identity("v1"), address=""))
             self.runtime.load_process_plan(ProcessPlan(self.proc, Identity("v1"), specs, config=entries,
@@ -100,7 +103,7 @@ class RealWorker:
 
 @contextmanager
 def stack(hf_config: dict[str, Any], checkpoint: Path, *, ranks: int = 1, overlap: bool = False,
-          token_budget: int = 8, sched: dict[str, Any] | None = None, **worker: Any
+          token_budget: int = 8, sched: dict[str, Any] | None = None, platform: Any = None, **worker: Any
           ) -> Generator[tuple[Bed, list[RealWorker]]]:
     """The scheduler host's units, ``ranks`` real workers and a client standing in for the frontend.
     ``sched``: config of the scheduler host's units; ``worker``: of the workers'."""
@@ -111,7 +114,7 @@ def stack(hf_config: dict[str, Any], checkpoint: Path, *, ranks: int = 1, overla
     try:
         engine = Engine(directory, ranks=ranks, overlap=overlap, max_batch=8, token_budget=token_budget,
                         config={"batch.max_rows": 8, "batch.max_context_len": 64, **(sched or {})})
-        workers = [RealWorker(directory, r, hf_config, checkpoint, **worker) for r in range(ranks)]
+        workers = [RealWorker(directory, r, hf_config, checkpoint, platform, **worker) for r in range(ranks)]
         client = Client(directory)
         bed = Bed(engine, [], client)
         bed.run_until(lambda: engine.ledger.ready, timeout=60, what="capacity")
@@ -129,3 +132,47 @@ def stack(hf_config: dict[str, Any], checkpoint: Path, *, ranks: int = 1, overla
             engine.close()
         if problems:
             raise problems[0]
+
+
+class Oracle:
+    """The draft model replaced: at position ``p`` after input ``S[p + 1]`` (the MTP layer's convention:
+    the token after the position) it drafts ``S[p + 2]``, the target's greedy token, of whichever
+    request ``S`` that is; wrong where ``p % WRONG_EVERY == WRONG_AT``. So steps accept every length.
+    Tensor operations only, on ``device``, so that a graph can record it in place of the draft model."""
+
+    WRONG_EVERY, WRONG_AT = 7, 3
+
+    def __init__(self, sequences: dict[int, list[int]], vocab: int, device: str = "cpu") -> None:
+        nexts: dict[tuple[int, int], int] = {}
+        for s in sequences.values():
+            for p in range(len(s) - 2):
+                assert nexts.setdefault((p, s[p + 1]), s[p + 2]) == s[p + 2], "two requests meet: pick others"
+        keys = sorted(nexts)  # by position, then token: the order of p * vocab + token
+        self.keys = torch.tensor([p * vocab + t for p, t in keys], dtype=torch.int64, device=device)
+        self.values = torch.tensor([nexts[k] for k in keys], dtype=torch.int64, device=device)
+        self.vocab = vocab
+
+    def __call__(self, input_ids: Any, positions: Any, hidden: Any, last_index: Any) -> tuple[Any, Any]:
+        p, t = positions[last_index].long(), input_ids[last_index].long()
+        q = p * self.vocab + t
+        i = torch.searchsorted(self.keys, q).clamp(max=self.keys.numel() - 1)
+        draft = torch.where(self.keys[i] == q, self.values[i], torch.zeros_like(q))
+        draft = torch.where(p % self.WRONG_EVERY == self.WRONG_AT, (draft + 1) % self.vocab, draft)
+        logits = torch.zeros(q.shape[0], self.vocab, device=q.device)
+        logits.scatter_(1, draft[:, None], 1.0)
+        return logits, hidden[last_index]
+
+    def counts(self, prompt: int, steps: int, draft_tokens: int) -> list[int]:
+        """What each step of a request of ``prompt`` tokens accepts: 1 for its prefill, then at ``L``
+        the drafts for ``L + 1 ..`` up to the first wrong one (the draft for ``q`` comes from position
+        ``q - 2``)."""
+        out, at = [1], prompt
+        while sum(out) < steps:
+            right = 0
+            # the draft for q is right if it is not one made wrong, and q is in the sequence the oracle knows
+            while right < draft_tokens - 1 and (at + right + 1 - 2) % self.WRONG_EVERY != self.WRONG_AT \
+                    and at + right + 1 < prompt + steps:
+                right += 1
+            out.append(right + 1)
+            at += right + 1
+        return out

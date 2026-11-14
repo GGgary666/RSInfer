@@ -65,7 +65,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | 路径 | 内容 |
 |---|---|
 | `engine/core/kernels/` | kernel 目录 `core.kernels`（`kernels.catalog@1`）：登记 definition 和 solution，按 shape 和平台能力选，没有合适的就用参照实现；`select(capture=True)` 给从 graph 回放的步选可捕获的 solution |
-| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），从 SGLang 搬运，签名和状态排布照 SGLang；`paged.py` 是 paged attention 两个 definition 的参照，它们的 solution 是每步先 plan 再 run 的 operator |
+| `engine/kernels/reference/` | `kernels.reference`：Qwen3.8 要的全部 definition 及 PyTorch 参照（`ops.py`），从 SGLang 搬运，签名和状态排布照 SGLang；`paged.py` 是 paged attention 两个 definition 的参照，它们的 solution 是每步先 plan 再 run 的 operator；`spec.py` 是投机解码的验证 conv 和递归、提交、接受（doc/specs/mtp.md） |
 | `engine/kernels/torch_graph/` | `kernels.torch_graph`：只给从 graph 回放的步用的 PyTorch solution（`requires=[CAPTURE]`），固定容量的 decode attention，代价随 `batch.max_context_len` 增长。有 FlashInfer 的 bf16 模型不会选到它；fp32 的 graph、没有 FlashInfer 的 GPU 和 CPU 上的回放测试还用 |
 | `engine/kernels/triton/` | `kernels.triton`：SGLang 的 Triton kernel，登记成 `triton.*`，只在有 CUDA 设备的进程里登记：GDN 的 prefill conv、gating、chunk，decode 的"投影解包 + conv"和 packed decode，gated RMSNorm；attention 层的两个融合 kernel（Q/K norm + RoPE + gate 拆分、输出 gate 的 sigmoid·mul）；以及 paged attention 每步拼 KV 槽列表的 kernel（`attn.kv_indices@1`）。`ops.py` 把 definition 的签名接到 SGLang 的调法上；其余文件和 `fla/` 是搬来的 kernel，只去掉了对 `sglang.srt` 的依赖，第一行 `# type: ignore` |
 | `engine/kernels/flashinfer/` | `kernels.flashinfer`：FlashInfer 的 paged prefill / decode wrapper（`flashinfer.attn.paged_*`），以及它的 Gemma RMSNorm（`flashinfer.norm.gemma_rms@1`，带 residual 时原地改）和 SiLU·mul（`flashinfer.act.silu_and_mul@1`），同样只在有 CUDA 设备时登记。attention 和 SiLU·mul 不收 fp32；attention 还要求 KV 的 dtype 和模型的相同。第一次 plan 某个 shape 时要编译，`PATH` 上要有 `ninja` 和 CUDA 编译器（`uv run` 下有） |
@@ -76,7 +76,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
 | `engine/core/state/holder/` | `core.state.holder`（`state.holder@1`）：按 SGLang 的分法定 KV 页数和 GDN 槽数（`mem_fraction_static`、`mamba_full_memory_ratio`、`max_mamba_cache_size`），启动时定，阶段 2 不在线扩容 |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
-| `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_graph` 上都用它；plan 要求必须有图（`PlanService.required`）时，没有图能装下的 decode 步在状态写入前被拒绝 |
+| `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_graph` 上都用它；plan 要求必须有图（`PlanService.required`）时，没有图能装下的 decode 步在状态写入前被拒绝；`spec.py` 是投机解码的一步（草稿、验证、接受、提交、草稿扩展，SGLang 的 `EAGLEWorkerV2` 链式那条路，doc/specs/mtp.md），`spec.*` 配置键也由这个单元声明和检查 |
 | `engine/core/plan/` | `core.plan`（`plan@1`）：eager（bucket 0）和 TP1 的 decode graph（`graph.py`：默认的桶、每个桶的固定输入、录制、依赖记录）。没配 `plan.graph_buckets` 时用 SGLang 的默认档位到 `min(batch.max_rows, 64)`；graph 里的 attention 是固定容量的那个（`kernels.torch_graph`）时仍是 2 的幂到 8。单元加载时录制（启动或暂停期），`plan.cuda_graph` 为 auto / off / required；没有 rebuild action，依赖变了由 `core.deps` 重载本单元。启动时让各 backend 按配置固定 kernel 并打一行 `core.plan: {json}`（含录了哪些桶、没录的原因、留下的显存） |
 | `engine/core/worker/` | worker 循环 `core.worker`（`proc.loop@1`）：读计划、交给 `executor@1`、按计划顺序回 `Sampled` / `Resync` / `StepFailure`，启动时和结果换了读端时报 `Capacity` |
 
@@ -105,6 +105,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `test_state_rebuild.py`：状态池原地重建（新池比旧池稍大）和撤回时旧权重、旧池重新装回（一次更大的尝试失败以后）都放得下，大小按设备空闲显存定（2026-11-10、2026-11-13 两份 framework-bugs 报告）。
+  - `test_speculation.py`：投机解码（doc/specs/mtp.md）：真实结构 4 层、真 kernel、开重叠，fp32 下和不开投机逐 token 相同，bf16 下回放验证 graph 和 eager 相同；草稿来自预言（`tests/units/worker/support.py` 的 `Oracle`），checkpoint 的随机 MTP 权重几乎什么都不接受。
   - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。
@@ -132,7 +133,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
-- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
+- `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、投机解码（`mtp.md`：照 SGLang 的 MTP 和 EAGLE 链式验证，2026-11-13）、v1 多卡和多机的讨论记录（`v1-distributed.md`：未定，2026-11-13）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
 - `doc/v0-plan.md`、`doc/discussion-summary.md`：v0 计划、讨论纪要。
 - `doc/evaluations/`：历次修复 / 对抗测试的评估记录，属于历史，不随代码更新。
   - `doc/evaluations/gpu-probes/`：阶段 1′ 的 GPU 探针脚本（`run.sh` 一次跑完）和原始输出 `logs/`，结论在 `doc/evaluations/gpu-probes.md`。探针用完就扔，不进骨架；不在 pyright 和 pytest 的范围内（要 GPU、torch 和第三方 kernel 库）。
@@ -220,6 +221,16 @@ $A control status                               # 也可以是 introspect（单�
 - **`refit`**：`core.state.weights` 的动作，把 checkpoint 读进同一组张量，不重录 graph，撤回时读回原来的内容。现在只有引擎内部发起的变更能请求它（`ChangeSet.state`），控制接口和 `$A control` 还没有入口。从外面换权重用 `weights.path`。
 - `$A wake` 从 `weights.path` 重读，`refit` 换过的内容回到 checkpoint。
 
+### 投机解码（MTP，2026-11-13）
+
+做法和数见 `doc/specs/mtp.md`，过程见 `doc/rsi/2026-11-13-mtp-on-a-live-engine.md`。
+
+- 打开：冷启动 `serve --speculative-algorithm EAGLE`（还有 `--speculative-num-steps` 等，和 SGLang 同名，默认 3、1、4），或者在跑着的引擎上 `$A control apply --config '{"spec.algorithm": "eagle"}'`：调度宿主重载 `core.sched`、`core.state.alloc`，worker 重载模型、GDN 存储和后端、executor，几秒。关掉是把它改回 `""`。checkpoint 里要有 `mtp.*`；`$A checkpoint` 生成的有（随机的）。
+- 打开以后正常的现象：KV 页变少（草稿模型的那层 attention 也占页）、GDN 槽变少（验证要的中间状态先从预算里扣）；`core.plan` 录的是验证步的 graph（日志里 `"verify": true`），不录 decode 的；还录草稿模型的 decode forward 和验证步之后的草稿扩展（`"draft": true`）。草稿扩展用验证步 prepare 好的 attention metadata，只跟在回放过的验证步后面回放。
+- 随机权重的 MTP 几乎什么都不接受，所以本机上开投机更慢，这是对的：4 层时 LM head 占满带宽（mtp.md §6.4）。要看接受多个 token 的路径，测试里用 `Oracle` 换掉 `models.qwen38` 实例的 `draft_forward`。录了 graph 的，换掉以后还要重载 `core.plan`（`tests/gpu/test_speculation.py` 的 `draft_with`），否则回放的还是录 graph 时的草稿模型；`Oracle` 只用张量运算，graph 录得进去。
+- **投机的 graph 有没有真在用**：用 `plan.cuda_graph = required`（`--cuda-graph required`）冷启动。graph 过期时，第一个投机步就报 `StaleGraph`（草稿、验证、草稿扩展都这样），不会悄悄退回 eager；`tests/gpu/test_speculation.py` 也这样测。2026-11-13 的第一版里，graph 一录完就过期，`auto` 下全退回了 eager。我在 4090 D 上没查出来，是 Codex 在 SM100 上发现的（`doc/evaluations/mtp-sm100.md`），原因见下一节第 11 条。
+- 开投机前后文本不同时，先分清是 kernel 的数值还是 bug：用 fp32，并且两边都 `--set gdn.backend=reference --set attn.backend=reference`，再比。2026-11-13 就是这样查出开重叠时清掉刚 prefill 完的 GDN 状态那个 bug（只在 GPU 上、请求一个一个来时出现）。
+
 ### 撤回没成功、引擎要求恢复的时候
 
 - 表现：`apply` 的结果是 `failed`，诊断里有 `escalate.restart_process`（"reload rolled back, but units did not come back: `<单元>` is FAILED: `<原因>`"）、`change.abort_unacknowledged`、`change.recovery_required`。之后每次 `apply` 都被拒。
@@ -290,6 +301,11 @@ $A control status                               # 也可以是 introspect（单�
 8. **每次 apply 都要求引擎是空的**。临时代码和临时配置会改变引擎的身份，查完要改回去。
 9. **这条路径不代替测试。** 能复现的问题最后写成 pytest（`tests/gpu/` 或 `tests/units/`），提交前照常跑 pyright 和 pytest。
 10. 只试过 worker 里的单元（层、executor）。前端和调度宿主里没有这样试过。
+11. **检查本身可能让问题消失**（2026-11-13）。
+    - 检查写进哪个单元，apply 时那个单元和依赖它的单元就重载。
+    - 热改时状态单元保留着上次建的东西，所以重载走的初始化顺序和冷启动不一样。
+    - 例子：为了看验证步的 graph 有没有回放，我把打印写进了 `core.plan`。它重载时 batch 里投机用的表已经在了，重录的 graph 是好的，打印出来"在用"；冷启动时 graph 其实一直是过期的。
+    - 所以查"冷启动以后是什么样"，检查要写在不会让被查的单元重载的地方，或者带着检查冷启动。
 
 ### 哪些是正常的，哪些可能是 bug
 

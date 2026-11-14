@@ -12,6 +12,11 @@ to it and whose they are; a slot holds whose it is and how far its state has gon
 continues a row anywhere but where its items end (a position put back too far, or not far
 enough after a step that did run) fails, as a GDN state advanced twice would be wrong.
 
+With speculation (``BatchPlan.draft_tokens`` D, doc/specs/mtp.md) a decode row verifies D tokens and
+accepts 1 to D of them, as many as ``accepted`` says for its seed and position: always tokens of the
+same chain, so a request generates what it does without speculation. The row's length is the
+worker's (``Row.committed``): a ``from_previous`` row's plan position is only where it is at least.
+
 Each plan's answer is due ``delay_s`` after it arrived; plans are read while answers wait, as
 the worker reads the next plan while one runs. ``script`` makes a step answer differently:
 ``resync`` (the persistent batch was rebuilt), ``fail`` (``StepFailure``), ``silent`` (no answer).
@@ -51,6 +56,11 @@ def model(seed: int, position: int, token: int) -> int:
     return (seed * 31 + position * 17 + token * 7) % VOCAB
 
 
+def accepted(seed: int, position: int, draft_tokens: int) -> int:
+    """How many tokens a speculative decode row at ``position`` accepts: 1 to ``draft_tokens``."""
+    return 1 + (seed * 13 + position * 7) % draft_tokens
+
+
 def expected(prompt: Sequence[int], seed: int, max_tokens: int, stop: Sequence[int] = ()) -> list[int]:
     """What a request generates, computed directly; the stop token is included."""
     out: list[int] = []
@@ -85,6 +95,8 @@ class Row:
     """The token sampled the last time the row ran."""
     ran: bool = False
     """Ran since it was last added."""
+    committed: int | None = None
+    """Tokens computed, once the row ran: where a speculative ``from_previous`` row goes on."""
 
 
 class FixtureWorker:
@@ -241,6 +253,10 @@ class FixtureWorker:
             raise PlanError("tokens do not hold the rows' num_tokens")
         taken = 0
         out: list[int] = []
+        sampled_counts: list[int] = []
+        draft = plan.draft_tokens
+        if draft and plan.phase == "mixed":
+            raise PlanError("a speculative step mixes prompts and decodes")
         for row, n, position, prev in zip(order, counts, positions, previous, strict=True):
             r = rows.get(row)
             if r is None:
@@ -254,6 +270,10 @@ class FixtureWorker:
             else:
                 given = tokens[taken:taken + n]
                 taken += n
+            if draft and plan.phase == "decode":
+                out.extend(self._verify(r, row, n, position, prev, given[0], draft, pages, slots))
+                sampled_counts.append(len(out) - sum(sampled_counts))
+                continue
             for kind, page in self.pages.items():
                 have = len(r.items.get(kind, []))
                 if (page and have * page < position + n) or (not page and have != 1):
@@ -264,8 +284,40 @@ class FixtureWorker:
                     self._advance_slot(kind, r, position, n, slots)
             r.ran = True
             r.last = model(r.seed, position + n - 1, given[-1])
+            r.committed = position + n
             out.append(r.last)
-        return Sampled(Column.of("i32", order), Column.of("i32", [1] * len(order)), Column.of("i64", out))
+            sampled_counts.append(1)
+        return Sampled(Column.of("i32", order), Column.of("i32", sampled_counts), Column.of("i64", out))
+
+    def _verify(self, r: Row, row: int, n: int, position: int, prev: int, bonus: int, draft: int,
+                pages: dict[tuple[str, int], tuple[int, list[int]]],
+                slots: dict[tuple[str, int], tuple[int, int]]) -> list[int]:
+        """A speculative decode row: from where the row is, ``draft`` tokens of its chain are
+        written (the verify window), ``accepted`` of them taken."""
+        if n != 1:
+            raise PlanError(f"row {row}: a speculative decode row names its one input token, not {n}")
+        at = position
+        if prev:
+            if r.committed is None or position > r.committed:
+                raise PlanError(f"row {row} is planned from {position}, past where it is ({r.committed})")
+            at = r.committed
+        elif r.committed is not None and position != r.committed:
+            raise PlanError(f"row {row} is given its token at {position}, but it is at {r.committed}")
+        chain = [bonus]
+        for j in range(draft - 1):
+            chain.append(model(r.seed, at + j, chain[-1]))
+        a = accepted(r.seed, at, draft)
+        for kind, page in self.pages.items():
+            have = len(r.items.get(kind, []))
+            if (page and have * page < at + draft) or (not page and have != 1):
+                raise PlanError(f"row {row} holds {have} {kind} items for the window {at} .. {at + draft}")
+            if page:
+                self._write_pages(kind, page, r, at, chain, pages)
+            else:
+                self._advance_slot(kind, r, at, a, slots)
+        out = [*chain[1:a], model(r.seed, at + a - 1, chain[a - 1])]
+        r.ran, r.last, r.committed = True, out[-1], at + a
+        return out
 
     @staticmethod
     def _write_pages(kind: str, page: int, r: Row, position: int, given: list[int],

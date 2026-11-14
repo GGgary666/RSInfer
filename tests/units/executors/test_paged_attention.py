@@ -68,8 +68,8 @@ def test_the_paged_backend_generates_what_the_native_one_generates(workers: tupl
     for row in rows:
         torch.testing.assert_close(torch.stack(logits[row]), torch.stack(want_logits[row]), rtol=1e-5, atol=1e-5)
     attn = other.service("layers.attn@1")
-    assert isinstance(attn.active.operators["decode", 0][0], PagedDecode)
-    assert set(attn.active.operators) == {("prefill", 0), ("decode", 0)}
+    assert isinstance(attn.active.operators["decode", 0, False][0], PagedDecode)
+    assert set(attn.active.operators) == {("prefill", 0, False), ("decode", 0, False)}
 
 
 def test_a_planned_operator_is_made_again_after_the_kernel_catalog_changed(workers: tuple[Worker, Worker]) -> None:
@@ -78,10 +78,10 @@ def test_a_planned_operator_is_made_again_after_the_kernel_catalog_changed(worke
     _, other = workers
     run(other, [0], None)
     attn, catalog = other.service("layers.attn@1"), other.service("kernels.catalog@1")
-    before = attn.active.operators["decode", 0][0]
+    before = attn.active.operators["decode", 0, False][0]
     catalog._changed()
     run(other, [0], None)
-    assert attn.active.operators["decode", 0][0] is not before
+    assert attn.active.operators["decode", 0, False][0] is not before
 
 
 def test_the_kv_indices_reference_lays_out_the_same_lists_and_each_rows_last_slot() -> None:

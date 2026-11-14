@@ -117,6 +117,20 @@ def kv_pages(row: int, items: list[int]) -> StateOps:
     return StateOps([StateAssign("kv.paged", Column.of("i32", [row]), *ragged("i32", [items]))])
 
 
+def test_the_speculation_tables_are_kept_when_asked_again_and_made_again_when_their_shape_changed() -> None:
+    """``core.plan`` makes them before it records verify graphs over them and the executor asks
+    again: the same tables, the same generation, or the graphs just recorded would be stale. A
+    new ``spec.num_draft_tokens`` makes new ones and frees the old (doc/specs/mtp.md)."""
+    batch = PersistentBatch(TorchEagerPlatform(), 4, 16, 4)
+    batch.prepare_spec(4, 8, "f32")
+    tables, generation, held = dict(batch.tensors), batch.generation, len(batch.allocated)
+    batch.prepare_spec(4, 8, "f32")
+    assert batch.generation == generation and all(batch.tensors[k] is v for k, v in tables.items())
+    batch.prepare_spec(3, 8, "f32")
+    assert batch.generation == generation + 1 and len(batch.allocated) == held
+    assert batch.tensors["spec.drafts"].shape == (5, 2) and batch.tensors["spec.hidden"].shape == (5, 8)
+
+
 def test_a_delta_beyond_the_limits_of_the_batch_changes_nothing() -> None:
     """More pages than a row holds, a row outside the batch, items for a row it does not have: the
     scheduler admitted what this worker cannot hold, so ``apply`` raises before changing anything."""

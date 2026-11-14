@@ -104,6 +104,64 @@ def test_a_step_checks_the_dependencies_once_for_all_buckets() -> None:
         plans.get(PlanKey("decode", 8))
 
 
+def test_a_speculative_step_replays_each_forward_where_it_can_and_its_draft_extend_after_its_verify() -> None:
+    """doc/specs/mtp.md: the draft model's decode forwards and the verify step replay in their smallest
+    bucket while the dependencies hold; the draft extend replays only right after a verify step that
+    replayed, on that step's metadata, else eagerly; a prefill's extend always eagerly. ``required``
+    refuses a forward no graph holds instead of running it eagerly."""
+    from executors.pytorch.spec import view
+
+    calls: list[tuple[str, int]] = []
+    holds = True
+
+    class Deps:
+        def valid(self) -> bool:
+            return holds
+
+    def graph(name: str, size: int) -> Any:
+        def run(*_: Any) -> tuple[str, str]:
+            calls.append((name, size))
+            return name, name
+        return SimpleNamespace(run=run, size=size)
+
+    def eager(name: str) -> Callable[..., tuple[str, str]]:
+        def run(*_: Any) -> tuple[str, str]:
+            calls.append((name, 0))
+            return name, name
+        return run
+
+    model = SimpleNamespace(forward_hidden=eager("verify"), draft_forward=eager("draft"))
+    plans: Any = Plans(model, [])
+    plans.verify_graphs = {size: graph("verify", size) for size in (2, 4)}
+    for v in plans.verify_graphs.values():
+        v.extend = graph("extend", v.size)
+    plans.draft_graphs = {size: graph("draft", size) for size in (2, 4)}
+    plans.deps = Deps()
+    rows, tokens = [0, 1, 2], torch.zeros(12, dtype=torch.int64)
+    decode, verify = view(rows, [1] * 3, [5, 6, 7], "decode"), view(rows, [4] * 3, [5, 6, 7], "decode", 4)
+
+    def step() -> None:
+        plans.draft(None, decode, tokens[:3], tokens[:3], tokens[:3], tokens[:3])
+        plans.verify(None, verify, tokens, tokens)
+        plans.draft(None, verify, tokens, tokens, tokens, tokens[:3])
+
+    step()
+    assert calls == [("draft", 4), ("verify", 4), ("extend", 4)]
+    calls.clear()
+    plans.draft(None, verify, tokens, tokens, tokens, tokens[:3])  # no verify replayed just before it
+    plans.draft(None, view(rows, [4] * 3, [0, 0, 0], "prefill"), tokens, tokens, tokens, tokens[:3])
+    assert calls == [("draft", 0), ("draft", 0)]
+    calls.clear()
+    holds = False
+    step()
+    assert calls == [("draft", 0), ("verify", 0), ("draft", 0)]
+    plans.required = True
+    with pytest.raises(StaleGraph, match="no ready draft graph"):
+        plans.draft(None, decode, tokens[:3], tokens[:3], tokens[:3], tokens[:3])
+    with pytest.raises(StaleGraph, match="not replayed"):
+        plans.draft(None, verify, tokens, tokens, tokens, tokens[:3])
+
+
 def test_required_on_cpu_fails_at_start() -> None:
     with pytest.raises(Exception, match="platform has no CUDA graph support"):
         Worker(tiny_config().to_dict(), **{"plan.cuda_graph": "required"})

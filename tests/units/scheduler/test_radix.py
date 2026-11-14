@@ -236,3 +236,29 @@ def test_a_request_admitted_from_the_cache_restarts_from_0_on_pages_of_its_own()
     led.release(2, 3, a)
     assert not led.holdings and led.check() == [] and led.tree.held() == ([], [])
     assert len(led.free[KV]) == 64 and len(led.free[GDN]) == 20
+
+
+def test_a_speculative_step_keeps_its_state_only_where_its_accepted_tokens_cross_a_boundary() -> None:
+    """doc/specs/mtp.md: every speculative decode step carries the next tracking slot with ``upto -grid``;
+    the retired step's accepted length says whether it crossed (SGLang's ``_verify_commit_step_indices``)."""
+    led = ledger(track_interval=64)
+    prompt = list(range(100, 160))  # 60 tokens: no prefill checkpoint
+    run(led, 1, prompt, 1, 60, admit=120)
+    r = led.reserve(1, 64, 2, speculative=True)
+    assert r is not None and r.track[GDN][1] == -64  # at the multiple of 64 it crosses
+    slot = r.track[GDN][0]
+    with pytest.raises(ValueError, match="accepted length"):
+        led.retire(2)
+    led.retire(2, advanced={1: 3})  # 60 -> 63: no boundary
+    assert led.holdings[1].last_seqlen is None and led.holdings[1].committed == 63
+    r = led.reserve(1, 67, 3, speculative=True)
+    assert r is not None and r.track[GDN][0] == slot  # still the next slot
+    led.retire(3, advanced={1: 2})  # 63 -> 65: the state at 64 was kept
+    assert (led.holdings[1].last_seqlen, led.holdings[1].committed) == (64, 65)
+    r = led.reserve(1, 69, 4, speculative=True)
+    assert r is not None and r.track[GDN][0] != slot  # the kept one is not written over
+    led.retire(4, advanced={1: 1})
+    tokens = [*prompt, *range(900, 906)]
+    led.release(1, 99, tokens)
+    led.retire(99)
+    assert led.match(2, [*tokens, 1]) == 64 and led.check() == []

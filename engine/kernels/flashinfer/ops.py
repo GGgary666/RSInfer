@@ -109,21 +109,25 @@ class PagedDecode:
 class PagedExtend:
     """``attn.paged_extend@1``: ``BatchPrefillWithPagedKVCacheWrapper`` over each row's whole
     sequence, its new tokens stored first: SGLang's extend without the ragged wrapper
-    (``use_ragged`` off, as under ``SGLANG_FLASHINFER_USE_PAGED``)."""
+    (``use_ragged`` off, as under ``SGLANG_FLASHINFER_USE_PAGED``). With ``buffers`` (a graph bucket
+    of verify steps, doc/specs/mtp.md) the wrapper runs over fixed buffers, as SGLang's
+    ``prefill_wrappers_verify`` under its graph runner (``use_cuda_graph``)."""
 
     def __init__(self, workspace: Workspace, num_qo_heads: int, num_kv_heads: int, head_dim: int,
                  q_dtype: torch.dtype, kv_dtype: torch.dtype, device: torch.device,
                  buffers: Mapping[str, torch.Tensor] | None = None) -> None:
-        if buffers is not None:
-            raise ValueError("an extend step is not replayed from a graph")
         self.shape = (num_qo_heads, num_kv_heads, head_dim)
-        self.q_dtype, self.kv_dtype, self.device = q_dtype, kv_dtype, device
-        self.wrapper: Any = BatchPrefillWithPagedKVCacheWrapper(workspace.on(device), LAYOUT, backend=BACKEND)
+        self.q_dtype, self.kv_dtype, self.device, self.buffers = q_dtype, kv_dtype, device, buffers
+        graph: dict[str, Any] = {} if buffers is None else {
+            "use_cuda_graph": True, "qo_indptr_buf": buffers["qo_indptr"], "paged_kv_indptr_buf": buffers["kv_indptr"],
+            "paged_kv_indices_buf": buffers["kv_indices"], "paged_kv_last_page_len_buf": buffers["kv_last_page_len"]}
+        self.wrapper: Any = BatchPrefillWithPagedKVCacheWrapper(workspace.on(device), LAYOUT, backend=BACKEND, **graph)
 
     def plan(self, qo_indptr_cpu: torch.Tensor, kv_indptr_cpu: torch.Tensor, kv_indptr: torch.Tensor,
              kv_indices: torch.Tensor) -> None:
         rows = kv_indptr_cpu.shape[0] - 1
-        self.wrapper.begin_forward(qo_indptr_cpu, kv_indptr_cpu, kv_indices, torch.ones(rows, dtype=torch.int32),
+        indices = kv_indices[:int(kv_indptr_cpu[-1])] if self.buffers is not None else kv_indices
+        self.wrapper.begin_forward(qo_indptr_cpu, kv_indptr_cpu, indices, torch.ones(rows, dtype=torch.int32),
                                    *self.shape, 1, q_data_type=self.q_dtype, kv_data_type=self.kv_dtype,
                                    non_blocking=True)
 
