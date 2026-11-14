@@ -171,6 +171,14 @@ class Qwen3_5ForCausalLM:
     def assembly(self) -> Assembly:
         return self._assembly
 
+    @property
+    def backends(self) -> Mapping[str, Any]:
+        return {"layers.attn@1": self.attn, "layers.gdn@1": self.gdn}
+
+    @property
+    def stores(self) -> Mapping[str, Any]:
+        return {"kv.paged": self.kv, "gdn.slots": self.gdn_states}
+
     def start(self) -> None:
         a = self._assembly
         self.weights.declare(a.weights)

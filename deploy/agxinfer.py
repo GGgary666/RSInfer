@@ -42,10 +42,10 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
-from deploy.models import qwen38  # noqa: E402
+from deploy.models import ds1017, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
 
-RECIPES: tuple[types.ModuleType, ...] = (qwen38,)
+RECIPES: tuple[types.ModuleType, ...] = (qwen38, ds1017)
 HOST = "host-a"
 SCHED = {"host": HOST, "role": "sched", "index": 0}
 SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
@@ -184,11 +184,16 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
 
     from core.change.config import ChangeTunables
     from core.common.ids import HostId
+    from core.sourcetree import read_tree
     from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 
     model = Path(args.model).resolve()
     cfg = read_config(model)
     recipe = recipe_for(cfg)
+    # The worker runs the units of its model's family: those only another family runs stay out (two
+    # model units would both provide model@1).
+    others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
+    workers = [u for u in read_tree(args.source.resolve() / "engine").role_units(None, "worker") if u not in others]
     if args.layers:
         cfg = cut(cfg, args.layers)
     weights = "" if args.dummy else str((args.weights or model).resolve())
@@ -204,7 +209,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
         placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
-               RoleSpec("worker", [], per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
+               RoleSpec("worker", workers, per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
     config: dict[str, Any] = {
         # frontend

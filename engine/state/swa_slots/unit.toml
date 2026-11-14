@@ -1,0 +1,14 @@
+[unit]
+id = "state.swa_slots"
+kind = "state"
+process = ["worker"]
+entry = "state.swa_slots.unit:Unit"
+
+[provides]
+services = ["state.swa.slots@1"]
+
+[config]
+"state.swa.slots" = { type = "int", default = 0, binding = "startup", doc = "Usable request slots, slot 0 being padding; 0: as many as core.state.holder gives" }
+
+[requires]
+services = ["state.holder@1"]

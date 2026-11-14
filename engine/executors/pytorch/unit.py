@@ -260,14 +260,12 @@ class PyTorchExecutor:
 
 
 class Unit:
-    STORES = (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
-
     def __init__(self, ctx: Any, config: Any) -> None:
-        stores = {kind: ctx.use(name) for kind, name in self.STORES}
+        model = ctx.use("model@1")
+        stores = dict(model.stores)  # every kind the model's layers store
         batch, plans, sampler = ctx.use("worker.batch@1"), ctx.use("plan@1"), ctx.use("layers.sampler@1")
         draft_tokens = spec_draft_tokens(config)
         spec = None
         if draft_tokens:
-            model = ctx.use("model@1")
             spec = Speculative(plans, batch, sampler, draft_tokens, model.hidden_size, model.dtype)
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec))

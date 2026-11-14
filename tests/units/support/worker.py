@@ -17,7 +17,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 from core.common.ids import Identity, UnitId
 from core.common.manifest import load_manifest
 from core.common.result import Failed
-from core.context.config import ConfigEntry
+from core.context.config import config_entries
 from core.contracts.columns import Column, ragged
 from core.contracts.records import AddedRow, BatchPlan, RowDelta, StateAssign, StateCopy, StateOps, StateTrack
 from core.contracts.sampling import SamplingParams
@@ -135,14 +135,18 @@ def hf_greedy(model: Qwen3_5ForCausalLM, prompt: list[int], steps: int) -> tuple
 class Worker:
     """The worker units, loaded and started; ``config`` overrides the defaults."""
 
+    UNITS = WORKER_UNITS
+    DEFAULTS: dict[str, Any] = {"model.dtype": "f32", "state.gdn.conv_dtype": "f32", "state.kv.page_size": PAGE_SIZE,
+                                "state.kv.pages": 32, "state.gdn.slots": 6, "batch.max_rows": 8,
+                                "batch.max_context_len": 64}
+    """What a worker of another model family sets otherwise (tests/units/support/ds1017.py)."""
+
     def __init__(self, hf_config: dict[str, Any], platform: Any = None, **config: Any) -> None:
-        overrides: dict[str, Any] = {"model.hf_config": hf_config, "model.dtype": "f32", "state.gdn.conv_dtype": "f32",
-                                     "state.kv.page_size": PAGE_SIZE,
-                                     "state.kv.pages": 32, "state.gdn.slots": 6, "batch.max_rows": 8,
-                                     "batch.max_context_len": 64, **config}
-        self.specs = [spec(u) for u in WORKER_UNITS]
-        entries = {key: ConfigEntry(s.id, decl, overrides.get(key, decl.default))
-                   for s in self.specs for key, decl in s.manifest.config.items()}
+        overrides: dict[str, Any] = {"model.hf_config": hf_config, **self.DEFAULTS, **config}
+        self.specs = [spec(u) for u in self.UNITS]
+        # A key a unit reads may be declared by a unit this worker does not load (the model's keys).
+        manifests = [load_manifest(path).unwrap() for path in sorted(ENGINE.rglob("unit.toml"))]
+        entries = config_entries([s.manifest for s in self.specs], manifests, overrides)
         self.runtime = UnitRuntime(PROC, platform=platform or TorchEagerPlatform())
         loaded = self.runtime.load_process_plan(ProcessPlan(PROC, Identity("w"), self.specs, config=entries,
                                                             code_root=str(ENGINE)))
@@ -191,6 +195,9 @@ class Driver:
     worker: Worker
     executor: Any = None
     """The executor to submit to; ``None``: the worker's ``executor@1``."""
+    slot_kind: str = "gdn.slots"
+    """The state kind a request holds one item of."""
+    page_size: int = PAGE_SIZE
     requests: dict[int, Request] = field(default_factory=dict[int, Request])
     next_page: int = 0
     next_slot: int = 0
@@ -220,18 +227,18 @@ class Driver:
         reqs = self.requests
         rows = list(chunks)
         added = [AddedRow(r.row, r.request, r.sampling) for r in reqs.values() if self.full or not r.in_batch]
-        assign: dict[str, dict[int, list[int]]] = {"kv.paged": {}, "gdn.slots": {}}
+        assign: dict[str, dict[int, list[int]]] = {"kv.paged": {}, self.slot_kind: {}}
         for r in reqs.values():
             if self.full or not r.in_batch:
                 if r.pages:
                     assign["kv.paged"][r.row] = list(r.pages)
                 if fresh_slots or self.full:
-                    assign["gdn.slots"][r.row] = [r.slot]
+                    assign[self.slot_kind][r.row] = [r.slot]
         tokens: list[int] = []
         prev: list[int] = []
         for row in rows:
             r, n = reqs[row], chunks[row]
-            need = -(-(r.computed + n) // PAGE_SIZE) - len(r.pages)
+            need = -(-(r.computed + n) // self.page_size) - len(r.pages)
             new = list(range(self.next_page, self.next_page + max(need, 0)))
             self.next_page += len(new)
             r.pages += new

@@ -1,0 +1,8 @@
+[unit]
+id = "kernels.tilelang"
+kind = "logic"
+process = ["worker"]
+entry = "kernels.tilelang.unit:Unit"
+
+[requires]
+services = ["kernels.catalog@1"]
