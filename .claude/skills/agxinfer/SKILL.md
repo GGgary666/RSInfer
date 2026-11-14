@@ -73,7 +73,13 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/core/state/weights/` | `core.state.weights`（`state.weights@1`）：参数存储、safetensors 读取、dummy 权重、`refit` |
 | `engine/models/qwen38/` | `models.qwen38`（`model@1`）：SGLang `Qwen3_5ForCausalLM` 的搬运，参数名、`load_weights`、前向 |
 | `engine/layers/` | `layers.linear`、`embedding`、`norm`、`rope`（cos/sin 表，和 attention 层在 attention 之前的那一个融合调用 `attn.qk_norm_rope_gate@1`）、`activation`（SiLU·mul 和输出 gate）、`sampler`；`layers.attn`、`layers.gdn` 是 attention / GDN 外壳加 backend（SGLang 的 `TorchNativeAttnBackend`、`GDNAttnBackend`；GDN 的 backend 直接接两个输入投影，自己拆）；`layers/attn/paged.py` 是 paged attention kernel 的 backend（SGLang `FlashInferAttnBackend` 的普通路径），`layers.attn` 按阶段在它和 `TorchNativeAttnBackend` 之间选；`solutions.py` 是 attention 和 GDN 的 backend 共用的库：按 `attn.*` / `gdn.*` 的 backend 配置在启动时固定每个阶段的 kernel |
-| `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`）、`state.gdn_slots`（`MambaPool`） |
+| `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`；一层声明什么张量就放什么，Qwen 是 `k`、`v`，DS 是压缩 latent `kv` 和 indexer 的 `ik`）、`state.gdn_slots`（`MambaPool`） |
+| DS 1017（v1，2026-11-14，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md)） | 另一族模型的 worker 单元，和 Qwen 的那些并列，一个 worker 只装其中一族（见下面「两族模型」）： |
+| `engine/models/ds1017/`、`engine/models/ds1017_config.py` | `models.ds1017`（`model@1`）：DeepSeek-V4.1 文本模型，照 checkpoint 自带的参照实现 `inference/model.py`；参数按 checkpoint 的名字和字节声明（FP8、FP4 存成 `u8`），一层的路由专家叠成一个张量。`ds1017_config.py` 是库：config 字段、每层存什么状态（`states`）、Engram 的哈希布局 |
+| `engine/layers/ds1017/` | `layers.ds1017`（`layers.ds1017@1`）：稀疏 attention（连同压缩器和 indexer）、Engram、MoE、Hyper-Connections。decode 步在设备上按固定形状推出一步的布局（能录进 graph），其他步在主机上排（`Layout`）。kernel 后端由 `dsv4.backend` 定 |
+| `engine/state/swa_slots/` | `state.swa_slots`（`state.swa.slots@1`）：每个请求一个槽，放每层的滑动窗口 KV、没凑满的压缩组、n-gram 往回看的几个 token |
+| `engine/kernels/ds1017/`、`engine/kernels/ds1017_formats.py` | `kernels.ds1017`：DS 的 definition（`ds.*`）和纯 PyTorch 参照。参照是 batch 无关的：求和顺序固定（`total`）、矩阵乘每行单独算（`matmul`），所以一个 token 的结果不随这一步怎么排而变。`ds1017_formats.py` 是库：FP8、FP4 的量化和反量化、RoPE 表 |
+| `engine/kernels/tilelang/` | `kernels.tilelang`：参照实现自带的 TileLang kernel（`kernel.py`，原样）和它调用的 torch 写法，作为后端 `tilelang`。用它时引擎的 logits 和参照实现逐位相同。要 CUDA 和 `tilelang` 包，不能录进 graph |
 | `engine/core/state/holder/` | `core.state.holder`（`state.holder@1`）：按 SGLang 的分法定 KV 页数和 GDN 槽数（`mem_fraction_static`、`mamba_full_memory_ratio`、`max_mamba_cache_size`），启动时定，阶段 2 不在线扩容 |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
 | `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_graph` 上都用它；plan 要求必须有图（`PlanService.required`）时，没有图能装下的 decode 步在状态写入前被拒绝；`spec.py` 是投机解码的一步（草稿、验证、接受、提交、草稿扩展，SGLang 的 `EAGLEWorkerV2` 链式那条路，doc/specs/mtp.md），`spec.*` 配置键也由这个单元声明和检查 |
@@ -85,6 +91,11 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
 需要在 SM100 上运行实验时，使用 [sm100-eval skill](../sm100-eval/SKILL.md) 和 `.github/scripts/gpu_job_runner.py` 客户端提交、查看日志并回收结果。
+
+**两族模型**（2026-11-14）：`models.qwen38` 和 `models.ds1017` 都提供 `model@1`，一个 worker 只能装一族。
+- `deploy/agxinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）。自己写拓扑时也要列，否则两个模型单元都会被装进去。
+- `core.plan` 和 `executors.pytorch` 不再写死 Qwen 的状态种类和层：backend 和存储从模型拿（`model.backends`、`model.stores`）。
+- DS 的随机 checkpoint：`deploy/agxinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
 
 ### `tests/`
 
@@ -102,12 +113,15 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/units/kernels/`：kernel 目录的选择（含回放步的选择）和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`），`kernels.torch_graph` 对照参照 kernel，paged attention 的参照对照原来的参照。
 - `tests/units/worker/`：worker 循环。先对着假 executor 测循环本身，再把 worker 的全部单元加上循环放到线程上（`support.py` 的 `RealWorker`），接在 `tests/units/scheduler/support.py` 的真调度器下面，贪心生成和 HF 逐 token 相同。
 - `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。 `executors/test_paged_attention.py` 在 CPU 上把 attention 切到 paged 一族的参照 operator，对照原来那一族。
+- DS 1017 的测试：`tests/units/kernels/test_ds1017.py`（数值格式和参照 kernel）、`tests/units/models/test_ds1017.py`（小配置过整个 worker 栈：分块、多行、graph 桶都和一次性算逐位相同）；`tests/units/support/ds1017.py` 提供小配置、随机 checkpoint 和 DS 的 worker（`DSWorker`），`tests/units/support/graphs.py` 是 CPU 上的 graph 替身。
 - `tests/units/support/tokenizer.py`：测试用的真 HF tokenizer（词级、带 Qwen 的 chat 标记和模板）。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
 - `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `test_state_rebuild.py`：状态池原地重建（新池比旧池稍大）和撤回时旧权重、旧池重新装回（一次更大的尝试失败以后）都放得下，大小按设备空闲显存定（2026-11-10、2026-11-13 两份 framework-bugs 报告）。
   - `test_speculation.py`：投机解码（doc/specs/mtp.md）：真实结构 4 层、真 kernel、开重叠，fp32 下和不开投机逐 token 相同，bf16 下回放验证 graph 和 eager 相同；草稿来自预言（`tests/units/worker/support.py` 的 `Oracle`），checkpoint 的随机 MTP 权重几乎什么都不接受。
+  - `test_ds1017.py`：DS 1017 对照 checkpoint 自带的参照实现（`ds1017_reference/`，原样带进来）：用后端 `tilelang` 时 logits 逐位相同；参照 kernel 逐个在容差内；参照 kernel 下分块、多行、graph 回放逐位相同。要先在 GPU 环境里装 `tilelang==0.1.12`（不带依赖装，别换掉 torch：`uv pip install --no-deps tilelang==0.1.12 apache-tvm-ffi==0.1.11 torch-c-dlpack-ext==0.1.5 z3-solver==4.15.4.0 cloudpickle ml-dtypes psutil`）。小形状（1024 宽、16 头 × 128）在 4090 D 上能跑；真实形状的 attention kernel 要 SM 10.0。
+  - `check_ds1017_real.py`、`sm100_ds1017.sh`、`sm100_deepinfer_env.sh`：SM100 上手动跑的检查和任务入口（真实形状、真 checkpoint 的前几层、DeepInfer 的环境）。
   - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。

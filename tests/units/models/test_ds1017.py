@@ -210,3 +210,25 @@ def test_a_config_the_layers_cannot_run_is_refused() -> None:
         text(q_lora_rank=48).check()
     with pytest.raises(ValueError, match="sqrtsoftplus"):
         text(scoring_func="sigmoid")
+
+
+def test_a_model_cut_to_its_first_layers_reads_only_their_tensors(model: tuple[dict[str, Any], Path]) -> None:
+    """The real checkpoint is hundreds of GiB: a config cut to a few layers must not read the rest."""
+    from core.state.weights.unit import safetensors_files, safetensors_weights_iterator
+    from deploy.models.hf import cut
+
+    w = DSWorker(cut(model[0], 3), **{"weights.path": str(model[1])})
+    try:
+        wants = w.service("model@1").wants_weight
+        assert wants("layers.2.ffn.experts.3.w1.weight") and wants("embed.weight") and wants("layers.0.attn.wo_a.scale")
+        assert not wants("layers.3.attn.wq_a.weight") and not wants("layers.5.ffn.experts.0.w2.scale")
+        assert not wants("mtp.0.attn.wq_a.weight") and not wants("vision.blocks.0.mlp.w1.weight")
+        assert not wants("layers.1.ffn.gate.bias_vl") and wants("model.layers.1.self_attn.wkv.weight")
+        read = [name for name, _ in safetensors_weights_iterator(safetensors_files(str(model[1])), wants)]
+        assert read and all(wants(name) for name in read) and not any(name.startswith(("layers.3.", "layers.5.")) for name in read)
+        every = [name for name, _ in safetensors_weights_iterator(safetensors_files(str(model[1])))]
+        assert len(read) < len(every)
+        tokens, _ = generate(w, [2])
+        assert len(tokens[2]) == STEPS
+    finally:
+        w.close()
