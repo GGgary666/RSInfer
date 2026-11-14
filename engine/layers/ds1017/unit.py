@@ -52,7 +52,8 @@ from models.ds1017_config import SLOT_KIND, DSConfig, compressed_token_map, engr
 
 DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.fake_quant_fp4@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grouped_linear@1",
                "ds.index_score@1", "ds.rms_norm@1", "ds.rope@1", "ds.sparse_attn@1", "ds.hc_mixes@1", "ds.hc_pre@1",
-               "ds.hc_post@1", "ds.moe_gate@1", "ds.moe_experts@1", "ds.pool@1", "ds.engram_gate@1")
+               "ds.hc_post@1", "ds.moe_gate@1", "ds.moe_experts@1", "ds.pool@1", "ds.engram_gate@1", "ds.silu@1",
+               "ds.top@1")
 
 KEY_BYTES = 192 << 20
 """A step's attention runs this many bytes of keys at a time (``[tokens, keys, dim]`` in bf16)."""
@@ -113,17 +114,19 @@ class Layout:
     tail_from: torch.Tensor
 
 
-def candidate_blocks(scores: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block: int) -> torch.Tensor:
+def candidate_blocks(scores: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block: int, top: KernelFn
+                     ) -> torch.Tensor:
     """``select_candidate_blocks``: level one of the two-level top-k. ``scores`` ``[..., latents]`` with
     what a query cannot reach at -inf, ``lens`` ``[..., 1]`` how many it reaches; a bool mask shaped
-    like ``scores`` of the ``topk_blocks`` best blocks, the one with the newest latent always kept."""
+    like ``scores`` of the ``topk_blocks`` best blocks (``top`` picks them), the one with the newest
+    latent always kept."""
     width = scores.size(-1)
     per_block = F.pad(scores, (0, -width % block), value=-torch.inf).unflatten(-1, (-1, block)).amax(dim=-1)
     count = per_block.size(-1)
     newest = (lens - 1) // block
     per_block = per_block.masked_fill(torch.arange(count, device=scores.device) == newest, torch.inf)
-    top = per_block.topk(min(topk_blocks, count), dim=-1)
-    keep = torch.zeros_like(per_block, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
+    best = top(per_block, min(topk_blocks, count))
+    keep = torch.zeros_like(per_block, dtype=torch.bool).scatter_(-1, best, per_block.gather(-1, best) > -torch.inf)
     return keep.repeat_interleave(block, dim=-1)[..., :width]
 
 
@@ -385,7 +388,7 @@ class Layers:
         if cfg.swiglu_limit > 0:
             up = up.clamp(-cfg.swiglu_limit, cfg.swiglu_limit)
             gate = gate.clamp(max=cfg.swiglu_limit)
-        y = y + self.linear_fp8((F.silu(gate) * up).to(x.dtype), w, "ffn.shared_experts.w2")
+        y = y + self.linear_fp8((self.k("ds.silu@1")(gate) * up).to(x.dtype), w, "ffn.shared_experts.w2")
         return y.to(x.dtype)
 
     # ------------------------------------------------------------------ attention
@@ -519,10 +522,11 @@ class Layers:
             score = self.k("ds.index_score@1")(q, keys[slots], weights)
             score = score.masked_fill(torch.arange(count, device=score.device) >= lens, -torch.inf)
             if source:
-                step["candidates", which] = candidate_blocks(score, lens, cfg.candidate_topk_blocks, cfg.candidate_block_size)
+                step["candidates", which] = candidate_blocks(score, lens, cfg.candidate_topk_blocks,
+                                                             cfg.candidate_block_size, self.k("ds.top@1"))
             elif uses:
                 score = score.masked_fill(~step["candidates", which], -torch.inf)
-            best = score.topk(min(cfg.index_topk, count), dim=-1, sorted=False).indices.sort(dim=-1).values
+            best = self.k("ds.top@1")(score, min(cfg.index_topk, count)).sort(dim=-1).values
             return best, best < lens
 
         if self.layout is None:  # every row at once, over one extent

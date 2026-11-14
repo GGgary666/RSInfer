@@ -36,10 +36,17 @@ token gets the same result in a chunk of a prompt, in a batch with other rows an
 from a graph. ``matmul`` costs a product tensor ``[rows, outputs, inputs]`` in pieces of
 ``MATMUL_BYTES``; the references are not for speed.
 
+On the CPU one more thing follows the size of a tensor: which implementation of ``exp`` or
+``sigmoid`` its elements get (a vector one, a scalar one, a math library's), and those round the
+last bit differently. ``each`` applies such a function to every row of the first dimension on its
+own there, so a row is always computed the same way. On a GPU every element is computed alike.
+
 The number formats and their byte layouts are in ``kernels.ds1017_formats``.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +67,14 @@ def total(v: torch.Tensor, dim: int = -1) -> torch.Tensor:
     while v.shape[-1] > 1:
         v = v[..., 0::2] + v[..., 1::2]
     return v[..., 0]
+
+
+def each(fn: Callable[[torch.Tensor], torch.Tensor], v: torch.Tensor) -> torch.Tensor:
+    """``fn(v)`` for an elementwise function that is not exact (``exp``, ``sigmoid``, ...), each row of
+    the first dimension computed as it is on its own (the module docstring's last paragraph)."""
+    if v.device.type != "cpu" or not v.shape[0]:
+        return fn(v)
+    return torch.stack([fn(row.clone()) for row in v])
 
 
 def fake_quant_fp8(x: torch.Tensor, block: int = BLOCK) -> torch.Tensor:
@@ -166,11 +181,11 @@ def sparse_attn(q: torch.Tensor, source: torch.Tensor, idx: torch.Tensor, sink: 
         scores = (total(qf[:, :, None, :] * kv[:, None, :, :]) * scale).masked_fill(~valid[:, None, :], -torch.inf)
         previous = high
         high = torch.maximum(high, scores.amax(-1))
-        decay = torch.exp(previous - high)
-        weights = torch.exp(scores - high[..., None])
+        decay = each(torch.exp, previous - high)
+        weights = each(torch.exp, scores - high[..., None])
         norm = norm * decay + total(weights)
         out = out * decay[..., None] + total(weights.to(q.dtype).float()[..., None] * kv[:, None, :, :], dim=2)
-    norm = norm + torch.exp(sink - high)
+    norm = norm + each(torch.exp, sink - high)
     return (out / norm[..., None]).to(q.dtype)
 
 
@@ -181,10 +196,10 @@ def hc_mixes(x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch
     hc = x.shape[1]
     flat = x.flatten(1).float()
     mixes = matmul(flat, fn) * torch.rsqrt(total(flat.square()).unsqueeze(-1) / flat.shape[-1] + norm_eps)
-    pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + eps
-    post = 2 * torch.sigmoid(mixes[:, hc:2 * hc] * scale[1] + base[hc:2 * hc])
+    pre = each(torch.sigmoid, mixes[:, :hc] * scale[0] + base[:hc]) + eps
+    post = 2 * each(torch.sigmoid, mixes[:, hc:2 * hc] * scale[1] + base[hc:2 * hc])
     comb = (mixes[:, 2 * hc:] * scale[2] + base[2 * hc:]).unflatten(-1, (hc, hc))
-    comb = torch.exp(comb - comb.amax(-1, keepdim=True))
+    comb = each(torch.exp, comb - comb.amax(-1, keepdim=True))
     comb = comb / total(comb).unsqueeze(-1) + eps
     comb = comb / (total(comb, -2).unsqueeze(-2) + eps)
     for _ in range(iters - 1):
@@ -208,7 +223,7 @@ def moe_gate(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, topk: in
              ) -> tuple[torch.Tensor, torch.Tensor]:
     """``Gate.forward`` with ``sqrtsoftplus`` scores: the bias picks the experts, the weights come from
     the scores without it, normalized over the chosen ones. ``[tokens, topk]`` fp32 weights and indices."""
-    scores = F.softplus(matmul(x, weight)).sqrt()
+    scores = each(F.softplus, matmul(x, weight)).sqrt()
     indices = (scores + bias).topk(topk, dim=-1)[1]
     weights = scores.gather(1, indices)
     if topk > 1:
@@ -224,7 +239,7 @@ def _expert(xq: torch.Tensor, weights: torch.Tensor, w1: torch.Tensor, s1: torch
     if limit > 0:
         up = up.clamp(-limit, limit)
         gate = gate.clamp(max=limit)
-    hidden = (weights * (F.silu(gate) * up)).to(dtype)
+    hidden = (weights * (each(F.silu, gate) * up)).to(dtype)
     return matmul(fake_quant_fp8(hidden), dequant_fp4(w2, s2)).to(dtype)
 
 
@@ -253,10 +268,21 @@ def moe_experts_masked(x: torch.Tensor, weights: torch.Tensor, indices: torch.Te
     return y
 
 
+def top(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """The indices of the ``k`` largest along the last dimension, in no order; of equal scores the
+    earlier ones. ``torch.topk`` leaves that choice open, and makes it differently for another
+    width: the indexer's scores are bf16 sums of rectified products, where equal scores are common."""
+    return scores.sort(dim=-1, descending=True, stable=True).indices[..., :k]
+
+
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return each(F.silu, x)
+
+
 def pool(members: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
     """``Compressor``'s pooling: each group's members ``[groups, ratio, dim]`` weighted by the softmax
     of their scores over the group; fp32 ``[groups, dim]``."""
-    weights = torch.exp(scores - scores.amax(dim=1, keepdim=True))
+    weights = each(torch.exp, scores - scores.amax(dim=1, keepdim=True))
     return total(members * (weights / total(weights, dim=1).unsqueeze(1)), dim=1)
 
 
@@ -272,6 +298,6 @@ def engram_gate(x: torch.Tensor, kv: torch.Tensor, q_weight: torch.Tensor, k_wei
     h = x.float()
     rstd = torch.rsqrt(total(h.square()) / dim + eps) * torch.rsqrt(total(key.square()) / dim + eps)
     dot = total(h * weight * key) * rstd * dim ** -0.5
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    gate = each(torch.sigmoid, torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
 

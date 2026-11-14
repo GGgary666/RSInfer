@@ -84,6 +84,10 @@ def index_score(q: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor) -> t
     return (score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
 
+def top(scores: torch.Tensor, k: int) -> torch.Tensor:
+    return scores.topk(k, dim=-1, sorted=False).indices
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     v = x.float()
     return (weight * (v * torch.rsqrt(v.square().mean(-1, keepdim=True) + eps))).to(x.dtype)
