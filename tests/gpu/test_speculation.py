@@ -107,13 +107,24 @@ def test_speculation_on_the_real_structure_generates_what_decoding_without_it_do
 def test_a_verify_step_replayed_from_a_graph_gives_what_the_eager_one_gives(checkpoint: Path) -> None:
     """bf16, the same kernels eagerly and replayed (FlashInfer's wrappers over a bucket's fixed buffers;
     the draft extend on the verify step's): the same tokens and the same accepted lengths, which the
-    oracle recorded into the draft graphs decides."""
+    oracle recorded into the draft graphs decides.
+
+    In bf16, speculation can leave the tokens of decoding without it at a near tie: on the SM100
+    (2026-11-14) two of the three prompts did, where fp32's logits for the two tokens differ by 0.04 and
+    0.002. The oracle drafts the tokens of decoding without it, so past that point it drafts nothing
+    right. Its counts are held only for the prompts whose tokens did not leave them; the replayed
+    counts are held to the eager ones for every prompt."""
     plain, _ = generate(checkpoint, "bf16", spec=False, graphs=False)
     vocab = json.loads((checkpoint / "config.json").read_text())["text_config"]["vocab_size"]
     oracle = oracle_for(plain, vocab)
     eager = generate(checkpoint, "bf16", spec=True, graphs=False, oracle=oracle)
     replayed = generate(checkpoint, "bf16", spec=True, graphs=True, oracle=oracle)
     assert replayed[0] == eager[0]
-    expected = {rid: oracle.counts(len(p), STEPS, SPEC["spec.num_draft_tokens"]) for rid, p in PROMPTS.items()}
-    for run in (eager, replayed):  # with overlap, a step more where the next was planned before the end was known
-        assert {rid: c[:len(expected[rid])] for rid, c in run[1].items()} == expected
+    for rid, p in PROMPTS.items():
+        want, got = eager[1][rid], replayed[1][rid]
+        n = min(len(want), len(got))  # with overlap, a step more where the next was planned before the end was known
+        assert got[:n] == want[:n], (rid, want, got)
+        if eager[0][rid] == plain[rid]:
+            expected = oracle.counts(len(p), STEPS, SPEC["spec.num_draft_tokens"])
+            assert want[:len(expected)] == expected, (rid, want, expected)
+    assert any(n > 1 for c in eager[1].values() for n in c), "no step took a draft: nothing above is compared"
