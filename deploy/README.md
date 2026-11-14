@@ -3,7 +3,11 @@
 `deploy/` 放的是不属于 pytest 的部署工具。用户同意为它新开这个顶层目录。
 
 - `agxinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
-- `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。现在只有 `qwen38.py`（`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`）。`hf.py` 是几个 recipe 共用的读配置、截层。
+- `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
+  - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
+  - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`）；前缀缓存对它是关着的。
+  - 两族模型的单元都提供 `model@1`，一个 worker 只装一族：`serve` 在拓扑里把 worker 的单元列出来，去掉别的 recipe 独有的（`WORKER_ONLY`）。
+- 引擎进程只从引擎的源码和 Python 环境里 import。有 kernel 库装在环境外面时（比如 `tilelang` 用 `pip install --target` 放在一边），用环境变量 `AGXINFER_PYTHONPATH` 给出它的目录。
 
 ## 命令
 

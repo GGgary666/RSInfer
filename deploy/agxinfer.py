@@ -64,7 +64,11 @@ def recipe_for(cfg: dict[str, Any]) -> types.ModuleType:
 
 
 def env() -> dict[str, str]:
-    return {**os.environ, "PYTHONPATH": str(REPO / "engine")}
+    """The engine processes' environment: they import the engine, and whatever ``AGXINFER_PYTHONPATH``
+    names besides (a kernel library kept beside the Python environment rather than in it). The
+    caller's own ``PYTHONPATH`` does not reach them: it may hold a workspace."""
+    extra = os.environ.get("AGXINFER_PYTHONPATH", "")
+    return {**os.environ, "PYTHONPATH": os.pathsep.join([str(REPO / "engine"), *([extra] if extra else [])])}
 
 
 # ------------------------------------------------------------------ the run directory
