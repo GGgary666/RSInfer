@@ -64,6 +64,21 @@ def random_checkpoint(root: Path, shapes: str, seed: int) -> tuple[Path, Path]:
     return out, tokenizer
 
 
+def graphs(run: Path) -> list[str]:
+    """What each worker's ``core.plan`` said about its decode graphs at start: the buckets it recorded,
+    or why it recorded none."""
+    out: list[str] = []
+    for log in sorted(run.glob("host-a/snapshots/.run/worker-*/log")):
+        for line in log.read_text(errors="replace").splitlines():
+            if line.startswith("core.plan: {"):
+                try:
+                    said = json.loads(line[len("core.plan: "):])["cuda_graph"]
+                except (ValueError, KeyError):
+                    continue
+                out.append(f"buckets {said.get('buckets')}" + (f", {said['reason']}" if said.get("reason") else ""))
+    return out
+
+
 def generate(run: Path, serve: list[str], prompts: list[str], max_tokens: int, model: str, ready_s: float
              ) -> tuple[list[str], list[str], float]:
     """The prompts' completions asked one after another, then all at once; and tokens a second of the latter."""
@@ -126,7 +141,9 @@ def main() -> int:
         serve = [*common, "--ds-backend", backend]
         ranked, together, rate = generate(work / f"{backend}-ranks", [*serve, *several], prompts, args.max_tokens, name,
                                           args.timeout)
-        entry: dict[str, Any] = {"ranks": ranked, "ranks_together": together, "tokens_per_s": round(rate, 2)}
+        entry: dict[str, Any] = {"ranks": ranked, "ranks_together": together, "tokens_per_s": round(rate, 2),
+                                 "graphs": graphs(work / f"{backend}-ranks")}
+        print(f"graphs {backend}: {entry['graphs']}", flush=True)
         problems: list[str] = []
         invariant = ""
         if not args.no_single:
