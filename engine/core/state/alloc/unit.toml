@@ -5,13 +5,13 @@ process = ["sched"]
 entry = "core.state.alloc.unit:Unit"
 
 [provides]
-services = ["ledger@1"]
+services = ["ledger@1", "ledger.domains@1"]
 
 [state]
 drain_on_reload = true
 
 [reads]
-config = ["state.kv.page_size", "spec.algorithm", "spec.num_draft_tokens"]
+config = ["state.kv.page_size", "spec.algorithm", "spec.num_draft_tokens", "sched.domains"]
 
 [config]
 "alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them: request pages and request slots." }

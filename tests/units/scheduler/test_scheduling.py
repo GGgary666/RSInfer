@@ -370,11 +370,11 @@ def test_planning_that_fails_after_an_admission_gives_back_what_it_took(monkeypa
         send = loop._send_plan  # pyright: ignore[reportPrivateUsage]
         calls: list[int] = []
 
-        def fail_once(step: Any) -> None:
-            calls.append(step.epoch)
+        def fail_once(steps: Any) -> None:  # one part per scheduling domain
+            calls.append(steps[0].epoch)
             if len(calls) == 1:
                 raise RuntimeError("scripted failure while sending")
-            send(step)
+            send(steps)
 
         monkeypatch.setattr(loop, "_send_plan", fail_once)
         r = request(1, [1, 2, 3], 4)
