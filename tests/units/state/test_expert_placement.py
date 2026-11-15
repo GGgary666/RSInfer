@@ -88,7 +88,7 @@ def test_the_moves_take_each_changed_slot_from_a_slot_that_held_its_expert_the_s
     assert moves([0, 1, 0, 2, 3, 0], [0, 1, 2, 0, 3, 0], 3) == [(3, 2), (5, 3)]  # a copy on the same rank is preferred
 
 
-@pytest.mark.parametrize(("ranks", "logical", "extra"), [(2, 4, 2), (4, 8, 4), (2, 6, 0)])
+@pytest.mark.parametrize(("ranks", "logical", "extra"), [(2, 4, 2), (4, 8, 4), (2, 6, 0), (4, 64, 8)])
 def test_placing_again_moves_the_weights_to_where_the_maps_say(ranks: int, logical: int, extra: int) -> None:
     layers, interval = 3, 4
     bus = Ranks(ranks)
@@ -168,3 +168,23 @@ def test_the_policy_gives_spare_slots_to_the_busiest_and_evens_out_the_ranks() -
     for expert in range(8):
         slots = sorted(s for s in to_physical[0, expert].tolist() if s >= 0)
         assert slots == [i for i, e in enumerate(held[0].tolist()) if e == expert]
+
+
+def test_placement_started_inside_inference_mode_steps_and_rebalances_outside_it() -> None:
+    """With ``cuda_graph``, ``Placement.start`` runs for the first time inside ``torch.inference_mode``
+    while ``Placement.step`` runs from ``model.stepped`` outside it."""
+    bus = Ranks(2)
+    placements = [Placement(bus.of(r), Greedy(), 4, 4, 2) for r in range(2)]
+    weights = [stacks(p, r, 2, 4) for r, p in enumerate(placements)]
+    with torch.inference_mode():
+        for r, p in enumerate(placements):
+            p.start(2, 4, lambda layer, r=r: weights[r][layer], torch.device("cpu"))
+
+    def run_steps(rank: int) -> int:
+        p = placements[rank]
+        with torch.inference_mode():
+            p.count(0).add_(10 * (rank + 1))
+        p.step()  # outside torch.inference_mode(), as PyTorchExecutor calls model.stepped()
+        return p.placed
+
+    assert bus.run(run_steps) == [1, 1]

@@ -69,3 +69,20 @@
   - 两个单元的修复热改到 master 的引擎上，提交，输出不变；
   - 同样的 `apply --config '{"model.dtype": "f32", "state.gdn.conv_dtype": "f32"}'`：**提交**，holder 给 250 个槽、20,934 页，和 f32 冷启动相同，输出和 f32 冷启动逐字相同；改回 bf16 也提交，输出回到最初的；
   - 显式定死池子的大小（`state.kv.pages=107020`、`state.gdn.slots=656`）再改 f32，真的放不下：`aborted`，"reload rolled back; the previous units are serving"，不要求恢复，输出和之前相同。
+
+## 补充记录（2026-11-16）：原地改权重形状时 `WeightStore.declare` 仍留着 `self.tensors` 引用，导致 OOM 且撤回失败
+
+- 日期：2026-11-16
+- 报告人：Antigravity（在 SM100 4 卡引擎上热改 PR #66 的 `eplb.extra_experts` 时碰到）
+- 状态：已修（PR #66）
+- 引擎：4×SM100（每卡 178.35 GiB），DeepSeek-V4.1-Flash-1017，`--ds-backend deepinfer --cuda-graph auto --graph-buckets 1 2 4 8 16 32 64 --disable-radix-cache`。
+- 变更：`agxinfer.py control apply --config '{"eplb.interval": 16, "eplb.window": 16, "eplb.extra_experts": 32}'`（不改 `core.state.weights` 的配置，所以在**同一个** `WeightStore` 实例上重新声明专家栈形状：每卡每层从 96 个槽位扩到 104 个槽位）。
+- 现象：`models.ds1017` 在重新声明最后几层的专家权重时 `OutOfMemoryError`（172.70 GiB 已分配），随后撤回（`_rollback`）再次 `OutOfMemoryError`，控制面落到 `change.recovery_required`。
+- 原因（三处）：
+  1. **`core.state.weights`**：2026-11-13 的修复在 `WeightStore.declare` 第一个循环里调了 `self.platform.free(self.buffers_.pop(d.name))` 并接着 `torch.cuda.empty_cache()`，但**没有同时 `self.tensors.pop(d.name, None)` 和 `self.decls.pop(d.name, None)`**。在 `platforms.torch_eager` 上，`free(buf)` 只把 `buf.data = None` 清掉；只要 `self.tensors[d.name]` 还握着旧张量的引用，底层存储的引用计数就不为 0，`empty_cache()` 一字节也没释放，旧专家栈一直占着显存直到逐个被新张量覆盖，同时造成缓存块碎片；一旦中途 OOM，`self.decls` 里还留着未成功替换的旧声明，撤回时继续卡死在 OOM。
+  2. **`models.ds1017`（卸载时挂在 `layers.ds1017` 上的回调钉死旧 `_cached` 视图）**：`eplb.extra_experts` 变更只重载 `state.expert_placement` 和 `models.ds1017`，**不重载** `layers.ds1017`。旧 `DeepseekV41ForCausalLM` 在 `start()` 末尾调过 `self.layers.set_tables(self._engram_tables)`，于是没重载的 `layers.ds1017` 一直握着绑定方法 `old_model._engram_tables` → `old_model` → `old_model._cached`（全部 40 层旧权重的张量字典，其中待替换的 96 槽位专家栈共约 45.7 GiB），导致新实例在 `self.weights.declare(a.weights)` 重新分配 104 槽位专家栈时新旧两份专家权重并存而 OOM。
+  3. **`models.ds1017`（扩权重与缩状态池的顺序）**：`start()` 先 `self.weights.declare(a.weights)` 扩权重，后调 `holder.size` 缩小 `kv.paged` 和 `swa.slots`，过渡期同时占着新权重和旧的大状态池。
+- 修复：
+  1. `WeightStore.declare` 在释放 `buffers_` 时同步弹出 `self.tensors`、`self.decls`、`self.filled`，使 `torch.cuda.empty_cache()` 真正归还旧权重显存（回归测试：`tests/gpu/test_state_rebuild.py::test_a_weight_store_redeclared_in_place_gives_the_old_tensors_back_before_allocating`）。
+  2. `models.ds1017` 的 `Unit.__init__` 注册 `ctx.effect(lambda: self.model.close, ...)`，卸载时清空 `self._cached`、`self._views`、`self.placement.stacks` 并解绑 `self.layers.set_tables`，让旧权重张量引用计数立即归零。
+  3. `models.ds1017.start()` 按声明计算新权重字节数；当原地扩权重（`weights_bytes > held_bytes > 0`）时先缩状态池再扩权重，缩权重时反之。

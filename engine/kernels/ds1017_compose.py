@@ -398,3 +398,64 @@ def moe(gate: Fn, experts: Fn, ep_experts: Fn, shared: Fn, group: Any, x: torch.
     y = y + shared(x, *shared_weights, limit)
     return y.to(x.dtype)
 
+
+# ---------------------------------------------------------------- attention projections and Engram
+
+def attn_qkv(p: Pieces, x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torch.Tensor,
+             wkv: torch.Tensor, skv: torch.Tensor, pkv: torch.Tensor, q_norm: torch.Tensor, eps: float,
+             wq_b: torch.Tensor, sq_b: torch.Tensor, pq_b: torch.Tensor, iwq_b: torch.Tensor | None,
+             isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """``ds.attn_qkv@1``: ``wq_a`` and ``q_norm``, ``wq_b`` ``[tokens, heads, head_dim]`` (before
+    rotation), ``wkv`` ``[tokens, head_dim]``, and on an index-source layer ``indexer.wq_b``."""
+    qr = p.rms_norm(p.linear_fp8(x, wq_a, sq_a, pq_a), q_norm, eps)
+    q = p.linear_fp8(qr, wq_b, sq_b, pq_b).unflatten(-1, (heads, head_dim))
+    kv = p.linear_fp8(x, wkv, skv, pkv)
+    iq = p.linear_fp8(qr, iwq_b, isq_b, ipq_b) if iwq_b is not None and isq_b is not None else None
+    return q, kv, iq
+
+
+def attn_out(p: Pieces, grouped_linear: Fn, o: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor,
+             rotary: int, groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor
+             ) -> torch.Tensor:
+    """``Attention.forward`` after the attention kernel: inverse rotation, FP8 per 32, ``wo_a`` per
+    group, and ``wo_b``."""
+    o = rope(p, o, cos_sin, positions, rotary, True)
+    o = p.fake_quant_fp8(o.reshape(o.shape[0], groups, -1), formats.BLOCK)
+    o = grouped_linear(o, wo_a.view(groups, wo_a.shape[0] // groups, -1))
+    return p.linear_fp8(o.flatten(1), wo_b, so_b, po_b)
+
+
+def cache_attn_out(p: Pieces, cache_attn: Fn, grouped_linear: Fn, q: torch.Tensor, cos_sin: torch.Tensor,
+                   positions: torch.Tensor, rotary: int, window: torch.Tensor, window_idx: torch.Tensor,
+                   latents: torch.Tensor | None, latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float,
+                   groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor
+                   ) -> torch.Tensor:
+    """``ds.cache_attn_out@1``: query rotation, ``cache_attn``, inverse rotation, ``wo_a`` and ``wo_b``."""
+    o = cache_attn(rope(p, q, cos_sin, positions, rotary), window, window_idx, latents, latent_idx, sink, scale)
+    return attn_out(p, grouped_linear, o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def sparse_attn_out(p: Pieces, sparse_attn: Fn, grouped_linear: Fn, q: torch.Tensor, cos_sin: torch.Tensor,
+                    positions: torch.Tensor, rotary: int, source: torch.Tensor, idx: torch.Tensor,
+                    sink: torch.Tensor, scale: float, groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor,
+                    so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    """``ds.sparse_attn_out@1``: query rotation, ``sparse_attn``, inverse rotation, ``wo_a`` and ``wo_b``."""
+    o = sparse_attn(rope(p, q, cos_sin, positions, rotary), source, idx, sink, scale)
+    return attn_out(p, grouped_linear, o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def engram(p: Pieces, gate: Fn, index: int, x: torch.Tensor, held: torch.Tensor | None, scales: torch.Tensor | None,
+           ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
+           wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
+           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """``ds.engram@1``: an Engram layer's table rows (``held`` and ``scales`` brought in from the ranks,
+    or looked up at ``ids`` here), projected through ``wkv`` and gated onto the stream ``x``."""
+    if held is None or scales is None:
+        assert ids is not None
+        held, scales = embed_weight[ids], embed_scale[ids]
+    rows = formats.dequant_rows_fp8(held, scales).to(x.dtype)
+    kv = p.linear_fp8(rows.flatten(-2), wkv_w, wkv_s, wkv_p)
+    return gate(x, kv, q_weight, k_weight, eps)
+
+

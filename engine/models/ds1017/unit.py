@@ -21,9 +21,11 @@ executor prepares for the step; the residual stream is ``hc_mult`` copies ``[tok
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -31,6 +33,8 @@ import torch
 from core.contracts.model import Assembly, WeightDecl
 from kernels import ds1017_formats as formats
 from models.ds1017_config import KV_KIND, SLOT_KIND, DSConfig, states
+
+_DECL_BYTES = MappingProxyType({"u8": 1, "i8": 1, "bf16": 2, "f16": 2, "f32": 4, "i32": 4, "i64": 8, "f64": 8})
 
 LAYER = re.compile(r"layers\.(\d+)\.")
 EXPERT = re.compile(r"(layers\.\d+\.ffn\.experts)\.(\d+)\.(w[123])\.(weight|scale)")
@@ -177,15 +181,33 @@ class DeepseekV41ForCausalLM:
 
     def start(self) -> None:
         a = self._assembly
-        self.weights.declare(a.weights)
-        weights = self.weights.bind("").buffers().values()
-        self.holder.size(a.states, sum(t.numel() * t.element_size() for t in weights))
-        self.kv.declare([s for s in a.states if s.kind == KV_KIND])
-        self.slots.declare([s for s in a.states if s.kind == SLOT_KIND])
+        weights_bytes = sum(math.prod(d.shape) * _DECL_BYTES[d.format] for d in a.weights)
+        held_bytes = sum(t.numel() * t.element_size() for t in self.weights.bind("").buffers().values())
+        kv_decls = [s for s in a.states if s.kind == KV_KIND]
+        slot_decls = [s for s in a.states if s.kind == SLOT_KIND]
+        if weights_bytes > held_bytes > 0:
+            # When weights grow in place (e.g. hot-applying eplb.extra_experts), shrink the state pools
+            # first so weights + states never transiently exceed holder.mem_fraction.
+            self.holder.size(a.states, weights_bytes)
+            self.kv.declare(kv_decls)
+            self.slots.declare(slot_decls)
+            self.weights.declare(a.weights)
+        else:
+            self.weights.declare(a.weights)
+            self.holder.size(a.states, weights_bytes)
+            self.kv.declare(kv_decls)
+            self.slots.declare(slot_decls)
         self.weights.load()
         self._views = [self.weights.bind(f"layers.{i}.") for i in range(self.cfg.num_hidden_layers)]
         self._views.append(self.weights.bind(""))
         self.layers.set_tables(self._engram_tables)
+
+    def close(self) -> None:
+        """Drop cached views of the weight store and hooks into long-lived services on unload."""
+        self._cached = (-1, [])
+        self._views.clear()
+        self.placement.stacks = None
+        self.layers.set_tables(lambda: ([], []))
 
     def _engram_tables(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """This rank's rows of the Engram layers' tables, weights and scales, in the layers' order."""
@@ -404,6 +426,7 @@ class Unit:
         cfg.check()
         self.model = DeepseekV41ForCausalLM(cfg, config["model.dtype"], config["state.kv.page_size"],
                                             {name: ctx.use(name) for name in self.SERVICES})
+        ctx.effect(lambda: self.model.close, label="model caches and layer hooks")
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")
         self.model.start()
         ctx.provide("model@1", self.model)

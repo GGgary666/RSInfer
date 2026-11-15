@@ -65,12 +65,18 @@ def shadow(w: Any, against: str, stats: dict[str, dict[str, float]]) -> None:
         def call(*a: Any) -> Any:
             if definition == "ds.store_cache@1":  # it writes the cache: compared in tests/gpu, not here
                 return fn(*a)
+            if definition in ("ds.attn_qkv@1", "ds.cache_attn_out@1", "ds.sparse_attn_out@1") and layers.attn_staged.get(layers.table, False):
+                return fn(*a)  # fused pair shares permuted q layout; compared end-to-end in tests/gpu
+            if definition == "ds.engram@1" and a[2] is None and a[4] is None:
+                return fn(*a)  # reads staged EngramBuffer hooks; compared end-to-end in tests/gpu
             # The compressor writes its ring: the other kernel gets a copy of it (it is small).
             b = tuple(x.clone() if i == 2 and definition.startswith("ds.compress") else x for i, x in enumerate(a))
             want = other(*b)
             out = fn(*a)
             got: list[torch.Tensor] = [t for t in (out if isinstance(out, tuple) else (out,)) if t is not None]
             ref: list[torch.Tensor] = [t for t in (want if isinstance(want, tuple) else (want,)) if t is not None]
+            if not got or not ref:
+                return out
             entry = stats.setdefault(definition, {"calls": 0, "worst": 0.0, "unequal": 0.0, "other_choices": 0})
             entry["calls"] += 1
             if not got[0].numel():

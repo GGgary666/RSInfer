@@ -91,6 +91,14 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
      ops.ep_experts, CHAINED, True),
     ("ds.engram_fetch@1", "rows of every Engram layer's table, the tables split over the ranks, as bytes and "
      "scales", ops.engram_fetch, EXACT, True),
+    ("ds.attn_qkv@1", "attention's Q/KV projections, q_norm and (on an index-source layer) indexer.wq_b",
+     ops.attn_qkv, LOOSE, True),
+    ("ds.cache_attn_out@1", "decode attention in the caches with query/output RoPE, wo_a and wo_b",
+     ops.cache_attn_out, LOOSE, True),
+    ("ds.sparse_attn_out@1", "prefill sparse attention over listed keys with query/output RoPE, wo_a and wo_b",
+     ops.sparse_attn_out, LOOSE, True),
+    ("ds.engram@1", "an Engram layer's table rows projected to keys and value and added through its gate",
+     ops.engram, LOOSE, True),
 )
 """(definition, doc, reference, tolerance, batch invariant). Every reference sums in a fixed order and
 multiplies a row on its own (``ops.total``, ``ops.matmul``), so a token's result does not depend on

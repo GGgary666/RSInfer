@@ -130,6 +130,9 @@ class WeightStore:
         existing = bool(self.decls)
         decls = [d for d in decls if self.decls.get(d.name) != d]
         for d in decls:
+            self.tensors.pop(d.name, None)
+            self.decls.pop(d.name, None)
+            self.filled.discard(d.name)
             if d.name in self.buffers_:
                 self.platform.free(self.buffers_.pop(d.name))
                 moved = True

@@ -63,7 +63,7 @@ from kernels.deepinfer.tilelang_ops.load_paged_kv_cache import load_paged_kv_cac
 from kernels.deepinfer.tilelang_ops.store_kv_cache import store_kv_cache
 from kernels import ds1017_compose as compose
 from kernels import ds1017_ep as ep
-from kernels.ds1017_formats import BLOCK, packed_words
+from kernels.ds1017_formats import BLOCK, dequant_rows_fp8, packed_words
 
 E4M3 = torch.float8_e4m3fn
 BF16 = torch.bfloat16
@@ -469,11 +469,17 @@ def _aligned(idx: torch.Tensor) -> torch.Tensor:
     return out.copy_(idx)
 
 
+INDEX_PAD = 512
+"""Minimum padded top-k width for the indexer's TileLang post-processing kernels, matching
+DeepInfer's fixed 512 width so shorter contexts do not compile narrower kernels mid-flight."""
+
+
 def _padded(idx: torch.Tensor) -> torch.Tensor:
-    """``idx`` with none after it up to a multiple of 128 entries, rows aligned: the TileLang kernels
-    after the top-k lay a row out over 128 threads and are compiled for its length (DeepInfer's is
-    always 512)."""
-    return _aligned(F.pad(idx, (0, -idx.shape[1] % 128), value=-1))
+    """``idx`` with none after it up to at least ``INDEX_PAD`` (and a multiple of 128 entries), rows
+    aligned: the TileLang kernels after the top-k lay a row out over 128 threads and are compiled for
+    its length (DeepInfer's is always 512)."""
+    target = max(INDEX_PAD, -(-idx.shape[1] // 128) * 128)
+    return _aligned(F.pad(idx, (0, target - idx.shape[1]), value=-1))
 
 
 def _candidates(logits: torch.Tensor, lens: torch.Tensor, topk_blocks: int, block: int) -> torch.Tensor:
@@ -559,8 +565,9 @@ def index_topk_paged(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torc
         valid = lens32
         idx = _top(logits, topk, valid).contiguous()
     # convert_kv_index lays a row out over 128 threads: DeepInfer's lists are 512 long; a shorter one is
-    # padded with none (an entry past min(valid, topk) stays none).
-    idx = F.pad(idx, (0, -topk % 128), value=-1)[:, None].contiguous()
+    # padded with none to at least INDEX_PAD so only one width is compiled (entries past valid stay -1).
+    target = max(INDEX_PAD, -(-topk // 128) * 128)
+    idx = F.pad(idx, (0, target - idx.shape[1]), value=-1)[:, None].contiguous()
     convert_kv_index(idx, entries, valid.clamp_max(topk)[:, None].contiguous(), table)
     return idx[:, 0, :topk].long(), picked
 
@@ -597,10 +604,10 @@ def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: to
     return out.reshape(*x.shape[:-1], w2.shape[0])
 
 
-def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor]
-                 ) -> tuple[torch.Tensor, torch.Tensor]:
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor],
+                 stage: bool = False) -> Any:
     """Rows of an Engram table split over the ranks, through the group's collectives
-    (``kernels.ds1017_ep``): DeepInfer's own way, ``deep_ep.EngramBuffer``, is not wired yet."""
+    (``kernels.ds1017_ep``): the unfused fallback where ``deep_ep.EngramBuffer`` is not used."""
     return ep.engram_fetch(group, ids, weights, scales)
 
 
@@ -652,4 +659,52 @@ def moe_fixed(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias:
     return compose.moe(moe_gate, moe_experts_fixed, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
                        (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
                        copies, taken)
+
+
+def attn_qkv(x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torch.Tensor,
+             wkv: torch.Tensor, skv: torch.Tensor, pkv: torch.Tensor, q_norm: torch.Tensor, eps: float,
+             wq_b: torch.Tensor, sq_b: torch.Tensor, pq_b: torch.Tensor, iwq_b: torch.Tensor | None,
+             isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    qr = rms_norm(linear_fp8(x, wq_a, sq_a, pq_a), q_norm, eps)
+    q = linear_fp8(qr, wq_b, sq_b, pq_b).unflatten(-1, (heads, head_dim))
+    kv = linear_fp8(x, wkv, skv, pkv)
+    iq = linear_fp8(qr, iwq_b, isq_b, ipq_b) if iwq_b is not None and isq_b is not None else None
+    return q, kv, iq
+
+
+def _attn_out(o: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int, groups: int,
+              wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    o = rope(o, cos_sin, positions, rotary, True)
+    o = fake_quant_fp8(o.reshape(o.shape[0], groups, -1), BLOCK)
+    o = grouped_linear(o, wo_a.view(groups, wo_a.shape[0] // groups, -1))
+    return linear_fp8(o.flatten(1), wo_b, so_b, po_b)
+
+
+def cache_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
+                   window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+                   latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float, groups: int,
+                   wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    o = cache_attn(rope(q, cos_sin, positions, rotary), window, window_idx, latents, latent_idx, sink, scale)
+    return _attn_out(o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def sparse_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
+                    source: torch.Tensor, idx: torch.Tensor, sink: torch.Tensor, scale: float, groups: int,
+                    wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    o = sparse_attn(rope(q, cos_sin, positions, rotary), source, idx, sink, scale)
+    return _attn_out(o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def engram(index: int, x: torch.Tensor, held: torch.Tensor | None, scales: torch.Tensor | None,
+           ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
+           wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
+           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    if held is None or scales is None:
+        assert ids is not None
+        held, scales = embed_weight[ids], embed_scale[ids]
+    rows = dequant_rows_fp8(held, scales).to(x.dtype)
+    kv = linear_fp8(rows.flatten(-2), wkv_w, wkv_s, wkv_p)
+    return engram_gate(x, kv, q_weight, k_weight, eps)
+
 

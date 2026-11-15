@@ -90,3 +90,24 @@ def test_old_weights_and_pool_fit_again_after_a_larger_attempt_failed() -> None:
         pool_again.free()
         weights_again.free()
         torch.cuda.empty_cache()
+
+
+def test_a_weight_store_redeclared_in_place_gives_the_old_tensors_back_before_allocating() -> None:
+    """When a model reloads on the same ``WeightStore`` (e.g. ``eplb.extra_experts`` changing the expert
+    stacks' slot count), ``declare`` drops the old tensors from ``self.tensors`` before ``empty_cache`` so
+    the larger stacks fit where only one copy fits."""
+    platform = TorchEagerPlatform(cuda=True)
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    store = WeightStore(platform, "", 0)
+    try:
+        store.declare([WeightDecl("experts", (int(free * 0.55) // 2,), "bf16")])
+        store.declare([WeightDecl("experts", (int(free * 0.58) // 2,), "bf16")])
+        assert store.tensors["experts"].numel() == int(free * 0.58) // 2
+    finally:
+        store.declare([])
+        for buf in list(store.buffers_.values()):
+            platform.free(buf)
+        store.buffers_.clear()
+        store.tensors.clear()
+        torch.cuda.empty_cache()

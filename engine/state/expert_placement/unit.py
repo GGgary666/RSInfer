@@ -105,17 +105,20 @@ class Placement:
         if not self.active:
             return
         spare = self.slots_all - logical
-        held = torch.tensor(initial(logical, self.slots_all), dtype=torch.int64)
-        to_physical = torch.full((logical, spare + 1), -1, dtype=torch.int32)
-        copies = torch.zeros(logical, dtype=torch.int32)
-        for slot, expert in enumerate(held.tolist()):
-            to_physical[expert, copies[expert]] = slot
-            copies[expert] += 1
-        self.held = held.expand(layers, -1).contiguous()
-        self.to_physical = to_physical.expand(layers, -1, -1).contiguous().to(device)
-        self.copies = copies.expand(layers, -1).contiguous().to(device)
-        self.counts = torch.zeros(layers, self.local, dtype=torch.int32, device=device)
-        self.window = torch.zeros(max(1, self.window_steps), layers, self.local, dtype=torch.int32, device=device)
+        # ``start`` may run inside CUDA graph warmup/capture (``torch.inference_mode``), while ``step``
+        # mutates these buffers in place from ``model.stepped`` outside inference mode.
+        with torch.inference_mode(False):
+            held = torch.tensor(initial(logical, self.slots_all), dtype=torch.int64)
+            to_physical = torch.full((logical, spare + 1), -1, dtype=torch.int32)
+            copies = torch.zeros(logical, dtype=torch.int32)
+            for slot, expert in enumerate(held.tolist()):
+                to_physical[expert, copies[expert]] = slot
+                copies[expert] += 1
+            self.held = held.expand(layers, -1).contiguous()
+            self.to_physical = to_physical.expand(layers, -1, -1).contiguous().to(device)
+            self.copies = copies.expand(layers, -1).contiguous().to(device)
+            self.counts = torch.zeros(layers, self.local, dtype=torch.int32, device=device)
+            self.window = torch.zeros(max(1, self.window_steps), layers, self.local, dtype=torch.int32, device=device)
 
     # ------------------------------------------------------------------ what the kernels read
 
@@ -189,18 +192,23 @@ class Placement:
         between = [(src, dst) for src, dst in plan if src // local != dst // local]
         within = [(src - first, dst - first) for src, dst in plan
                   if src // local == dst // local == self.group.rank]
-        leaving = [src - first for src, _ in between if src // local == self.group.rank]
-        arriving = [(i, dst - first) for i, (_, dst) in enumerate(between) if dst // local == self.group.rank]
         for stack in stacks:
             # Read everything before anything is written: a slot may be both a source and a target.
-            kept = stack[[src for src, _ in within]].clone()
-            got = None
-            if between:  # every rank's leaving rows, in rank order: the order of ``between``
+            # Gather cross-rank rows in bounded chunks so a 96-expert rebalance never spikes multi-GiB
+            # temporary collective buffers on tight GPU memory budgets.
+            kept = stack[[src for src, _ in within]].clone() if within else None
+            chunks: list[tuple[list[int], torch.Tensor]] = []
+            for off in range(0, len(between), 16):
+                batch = between[off:off + 16]
+                leaving = [src - first for src, _ in batch if src // local == self.group.rank]
+                arriving = [(i, dst - first) for i, (_, dst) in enumerate(batch) if dst // local == self.group.rank]
                 (got,), _ = self.group.gather([stack[leaving]])
-            if within:
+                if arriving:
+                    chunks.append(([dst for _, dst in arriving], got[[i for i, _ in arriving]]))
+            if kept is not None and within:
                 stack[[dst for _, dst in within]] = kept
-            if got is not None and arriving:
-                stack[[dst for _, dst in arriving]] = got[[i for i, _ in arriving]]
+            for dsts, rows in chunks:
+                stack[dsts] = rows
         return len(plan)
 
     def _balance(self, tokens: torch.Tensor, held: torch.Tensor, copies: torch.Tensor) -> float:
