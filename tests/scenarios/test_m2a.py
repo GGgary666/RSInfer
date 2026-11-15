@@ -246,32 +246,61 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
         procs = json.loads(cli("control", "introspect", "--run", str(run)))["procs"]
         return {u["unit"] for p in procs if p["proc"]["role"] == "worker" for u in p["units"] if u["state"] == "ACTIVE"}
 
-    def listed() -> list[str]:
+    def worker_role() -> dict[str, Any]:
         roles = json.loads((run / "topology.json").read_text())["roles"]
-        return next(r["units"] for r in roles if r["name"] == "worker")
+        return next(r for r in roles if r["name"] == "worker")
+
+    def listed() -> list[str]:
+        return list(worker_role()["units"])
 
     with served(run, *args) as url:
         baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
         assert baseline and "kernels.reference" in running() and "kernels.added" not in running()
+        # An explicit --topology change first (worker env -> one worker restart): topology.json is
+        # synced, and a subsequent hot-add builds on the running topology instead of reverting env
+        # and restarting the worker a second time.
+        custom = json.loads((run / "topology.json").read_text())
+        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"AGX_TEST_TOPO_ENV": "kept"}
+        topo_file = tmp_path / "custom-topology.json"
+        topo_file.write_text(json.dumps(custom))
+        restarted = json.loads(cli("control", "apply", "--topology", str(topo_file), "--run", str(run)))
+        assert restarted["status"] == "committed" and restarted["restarted"] == ["host-a/worker/0"], restarted
+        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept"}
+
+        # Direct core.control.client --topology (bypassing agxinfer.py) is also picked up from the
+        # control plane's committed change log rather than overwritten by a stale topology.json.
+        control = json.loads((run / "control" / "control.json").read_text())["control"]
+        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"AGX_TEST_TOPO_ENV": "kept-direct"}
+        topo_file.write_text(json.dumps(custom))
+        direct = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, "apply",
+                                 "--topology", str(topo_file)], env=ENV, capture_output=True, text=True, timeout=300)
+        assert direct.returncode == 0 and json.loads(direct.stdout)["restarted"] == ["host-a/worker/0"], direct.stdout
+        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept"}  # local file not touched by direct client
+
         added.mkdir()
         (added / "__init__.py").write_text("")
         (added / "unit.toml").write_text('[unit]\nid = "kernels.added"\nkind = "logic"\nprocess = ["worker"]\n'
                                          'entry = "kernels.added.unit:Unit"\n\n[provides]\nservices = ["kernels.added@1"]\n')
-        (added / "unit.py").write_text("from typing import Any\n\n\nclass Unit:\n"
+        (added / "unit.py").write_text("import os\nfrom typing import Any\n\n\nclass Unit:\n"
                                        "    def __init__(self, ctx: Any, config: Any) -> None:\n"
+                                       '        assert os.environ.get("AGX_TEST_TOPO_ENV") == "kept-direct"\n'
                                        '        ctx.provide("kernels.added@1", self)\n')
         assert apply("--dry-run")["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
         assert "kernels.added" not in listed()  # a dry run leaves the run directory's topology
         applied = apply()
-        assert applied["status"] == "committed" and applied["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
+        assert applied["status"] == "committed" and "restarted" not in applied, applied
+        assert applied["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
         assert "kernels.added" in running() and "kernels.added" in listed()
+        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept-direct"}
         assert "models.ds1017" not in running()  # still the units of this model's family alone
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
         shutil.rmtree(added)
         applied = apply()
-        assert applied["status"] == "committed" and applied["processes"]["host-a/worker/0"]["remove"] == ["kernels.added"]
+        assert applied["status"] == "committed" and "restarted" not in applied, applied
+        assert applied["processes"]["host-a/worker/0"]["remove"] == ["kernels.added"]
         assert "kernels.added" not in running() and "kernels.added" not in listed()
+        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept-direct"}
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
 

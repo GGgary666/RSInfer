@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -423,32 +424,53 @@ def control_argv(args: argparse.Namespace) -> list[str]:
     return ["--control", args.control or control_address(args.run.resolve())]
 
 
-def changed_topology(run: Path, rest: list[str]) -> tuple[Path | None, bool]:
-    """The topology a ``check`` or ``apply`` of a workspace has to carry, and whether the change may
-    commit (an ``apply`` that is no dry run). ``serve`` lists the worker's units in the topology, and
-    the control plane takes a role's listed units as they are: a unit added to the workspace would
-    not load, and one removed would be missed. So the list is worked out again from the workspace;
-    where it differs from the run directory's topology, that topology with the new list is written
-    beside it."""
+def running_topology(run: Path) -> dict[str, Any] | None:
+    """The topology the engine in ``run`` runs under now: the ``plan.topology`` of the last committed
+    change that carried one (the control plane's event log, including changes applied through
+    ``core.control.client`` directly), else ``topology.json``."""
+    import sqlite3
+
+    db = run / "control" / "events.sqlite"
+    if db.is_file():
+        with sqlite3.connect(db) as conn:
+            for (raw,) in conn.execute("SELECT plan_json FROM changes WHERE status = 'committed' "
+                                       "AND plan_json IS NOT NULL ORDER BY id DESC"):
+                topology = json.loads(raw).get("topology")
+                if topology is not None:
+                    return dict(topology)
+    current = run / "topology.json"
+    return json.loads(current.read_text()) if current.is_file() else None
+
+
+def changed_topology(run: Path, rest: list[str]) -> tuple[Path | None, Path | None, bool]:
+    """For ``check`` or ``apply``: a temporary topology file to add (when ``--source`` changes the
+    worker's units), the topology file the change carries (explicit ``--topology`` or that one), and
+    whether the change commits (an ``apply`` that is no dry run). ``serve`` lists the worker's units
+    in the topology, and the control plane takes a role's listed units as they are: a unit added to
+    the workspace would not load, and one removed would be missed. So the list is worked out again
+    from the workspace over ``running_topology(run)``."""
     options = argparse.ArgumentParser(add_help=False)
     options.add_argument("--source", type=Path)
-    options.add_argument("--topology")
+    options.add_argument("--topology", type=Path)
     options.add_argument("--dry-run", action="store_true")
     given = options.parse_known_args(rest[1:])[0] if rest[:1] in (["check"], ["apply"]) else None
-    current = run / "topology.json"
+    if given is None:
+        return None, None, False
+    commits = rest[0] == "apply" and not given.dry_run
+    if given.topology is not None:
+        return None, given.topology.resolve(), commits
     recipe = next((r for r in RECIPES if r.NAME == engine_record(run).get("recipe")), None)
-    if given is None or given.source is None or given.topology or recipe is None or not current.is_file() \
-            or not (given.source / "engine").is_dir():
-        return None, False
-    topology = json.loads(current.read_text())
-    worker = next(r for r in topology["roles"] if r["name"] == "worker")
+    topology = running_topology(run) if recipe is not None and given.source is not None else None
+    if topology is None or recipe is None or given.source is None or not (given.source / "engine").is_dir():
+        return None, None, False
+    workers = [r for r in topology["roles"] if r["name"] == "worker"]
     units = worker_units(given.source, recipe)
-    if units == worker["units"]:
-        return None, False
-    worker["units"] = units
+    if not workers or not workers[0]["units"] or units == workers[0]["units"]:
+        return None, None, False
+    workers[0]["units"] = units
     changed = run / "topology.changed.json"
     changed.write_text(json.dumps(topology))
-    return changed, rest[0] == "apply" and not given.dry_run
+    return changed, changed, commits
 
 
 def cmd_control(args: argparse.Namespace) -> int:
@@ -457,16 +479,19 @@ def cmd_control(args: argparse.Namespace) -> int:
     rest = list(args.rest)
     if rest and rest[0] == "--":
         rest = rest[1:]
+    run = args.run.resolve()
     # An engine named by its address alone has no run directory to tell its topology by.
-    changed, commits = (None, False) if args.control else changed_topology(args.run.resolve(), rest)
+    added, carried, commits = (None, None, False) if args.control else changed_topology(run, rest)
     try:
-        code = client([*control_argv(args), *rest, *(["--topology", str(changed)] if changed else [])])
-        if changed and commits and code == 0:  # committed: the engine's topology from now on
-            changed.replace(changed.with_name("topology.json"))
+        code = client([*control_argv(args), *rest, *(["--topology", str(added)] if added else [])])
+        if carried is not None and commits and code == 0 and run.is_dir():
+            target = run / "topology.json"
+            if carried != target:  # committed: keep the run directory's topology.json in sync
+                shutil.copyfile(carried, target)
         return code
     finally:
-        if changed:
-            changed.unlink(missing_ok=True)
+        if added is not None:
+            added.unlink(missing_ok=True)
 
 
 def cmd_sleep(args: argparse.Namespace, asleep: bool) -> int:
