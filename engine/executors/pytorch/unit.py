@@ -16,11 +16,18 @@ prompt sampled.
 
 With CUDA, ``submit`` returns once the step's work is queued (``Step``): the worker takes the
 next plan while the device runs this one (one step of overlap, stage2-contract.md §4.4).
+
+A plan without rows is a step in which this rank's scheduling domain has nothing to run while
+another has (``sched.domains``): the delta is applied and nothing is sampled. A model whose ranks
+compute each step together (``model.idle``: expert parallelism, doc/specs/v1-ds1017.md stage 3) takes
+part in it without rows, also when the plan is refused (``Resync``): the other ranks wait for this
+one in every layer.
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -137,10 +144,12 @@ class PyTorchExecutor:
     """``executor@1``."""
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
-                 spec: Speculative | None = None) -> None:
+                 spec: Speculative | None = None, idle: Callable[[], None] | None = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
         self.spec = spec
         """Speculation (doc/specs/mtp.md); ``None`` off."""
+        self.idle = idle
+        """The model's part in a step this rank has no rows in (``model.idle``); ``None``: none."""
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
         self.row_index: torch.Tensor | None = None
@@ -158,9 +167,13 @@ class PyTorchExecutor:
             self.spec.settle()  # where the last verify left its rows (waits for it, not for its draft extend)
         elif plan.draft_tokens:
             raise ValueError("a speculative plan reached a worker with speculation off (spec.algorithm)")
+        if not len(plan.rows):
+            return self._empty(epoch, delta, plan, state, start)
         check_plan(plan)
         reason = self.batch.check(delta, plan)
         if reason:
+            if self.idle is not None:
+                self.idle()  # the step runs on the other ranks, which compute it with this one
             return Resync(reason)
         # A speculative step picks its plans itself (PlanService.verify), after the rows' positions.
         chosen, eager = self._plans(plan) if self.spec is None else (self.plans.get(PlanKey("prefill", 0)),) * 2
@@ -175,6 +188,26 @@ class PyTorchExecutor:
             # sched.overlap) would run on half-changed tables. Refuse those until a full delta.
             self.batch.invalidate()
             raise
+
+    def _empty(self, epoch: int, delta: RowDelta, plan: BatchPlan, state: StateOps, start: float) -> Step | Resync:
+        """A step without rows on this rank."""
+        reason = self.batch.check(delta, plan)
+        device = self.batch.binding.buffers()["last_token"].device
+        begin = Mark(device)
+        if not reason:
+            self.batch.apply(delta, state)
+        try:
+            if self.idle is not None:
+                self.idle()
+        except BaseException:
+            self.batch.invalidate()
+            raise
+        if reason:
+            return Resync(reason)
+        end, previous = Mark(device), self.last_end
+        self.last_end = end
+        return Step([], torch.empty(0, dtype=torch.int64), epoch, (time.perf_counter() - start) * 1e6, begin, end,
+                    previous, torch.empty(0))
 
     def _run(self, epoch: int, plan: BatchPlan, state: StateOps, chosen: Plan, eager: Plan, last_token: torch.Tensor,
              begin: Mark, start: float) -> Step:
@@ -270,4 +303,5 @@ class Unit:
             if not getattr(model, "draft_tokens", 0):
                 raise ValueError(f"spec.algorithm = {config['spec.algorithm']!r}: the model drafts no tokens")
             spec = Speculative(plans, batch, sampler, draft_tokens, model.hidden_size, model.dtype)
-        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec))
+        ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec,
+                                                  getattr(model, "idle", None)))
