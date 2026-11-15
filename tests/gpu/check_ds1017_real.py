@@ -234,7 +234,9 @@ def main() -> int:
                   "state.kv.pages": -(-args.context // 128) * 4 * args.rows, "state.swa.slots": args.rows + 1,
                   "batch.max_rows": max(2, args.rows),
                   "holder.mem_fraction": 0.95,
-                  "plan.cuda_graph": "required" if graph else "off"}
+                  "plan.cuda_graph": "required" if graph else "off",
+                  # Required graphs cover batch.max_rows: one bucket of exactly that many rows.
+                  **({"plan.graph_buckets": [max(2, args.rows)]} if graph and args.rows > 1 else {})}
         started = time.time()
         try:
             w = worker(cfg, model, CudaGraphPlatform() if graph else None, **config)
