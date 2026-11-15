@@ -10,3 +10,5 @@ services = ["frontend.tokenizer@1"]
 [config]
 "frontend.model_path" = { type = "str", default = "", binding = "startup", doc = "Model directory whose config.json and generation_config.json name the stop tokens; empty: frontend.tokenizer_path" }
 "frontend.tokenizer_path" = { type = "str", default = "", binding = "startup", doc = "Local HF tokenizer directory; install the frontend extra." }
+"frontend.add_bos" = { type = "bool", default = false, binding = "startup", doc = "Start every prompt with the tokenizer's BOS token where the tokenizer does not (DS 1017's plain prompts, as DeepInfer makes them)" }
+"frontend.chat_template_kwargs" = { type = "dict", default = {}, binding = "startup", doc = "Arguments of the tokenizer's chat template, e.g. {\"thinking_mode\": \"chat\"} for DS 1017 without its reasoning part" }

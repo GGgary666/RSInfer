@@ -108,6 +108,33 @@ def shadow(w: Any, against: str, stats: dict[str, dict[str, float]]) -> None:
     layers.k = k
 
 
+def profile(w: Any, stats: dict[str, list[float]], on: list[bool]) -> None:
+    """Every kernel call of the worker's layers timed, the device waited for before and after, while
+    ``on[0]``: per definition its calls and seconds. Eager steps only; what the sum leaves of a step
+    is the layers' own work between the kernels."""
+    layers = w.service("layers.ds1017@1")
+    inner = layers.k
+
+    def k(definition: str) -> Any:
+        fn = inner(definition)
+        if not on[0]:
+            return fn
+
+        def call(*a: Any) -> Any:
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            out = fn(*a)
+            torch.cuda.synchronize()
+            entry = stats.setdefault(definition, [0, 0.0])
+            entry[0] += 1
+            entry[1] += time.perf_counter() - started
+            return out
+
+        return call
+
+    layers.k = k
+
+
 def direct_experts(w: Any) -> None:
     """The worker's routed experts replaced by the reference kernel with DeepInfer's rounding (the
     SwiGLU's result quantized from fp32): what the reference implementation would compute if it did
@@ -165,6 +192,9 @@ def main() -> int:
     parser.add_argument("--more-steps", type=int, default=32, help="decode steps timed after the compared ones")
     parser.add_argument("--compare", default="", help="one of the backends: the others' logits against its")
     parser.add_argument("--shadow", default="", help="a backend whose kernels run beside the engine's on every call")
+    parser.add_argument("--profile", action="store_true", help="time every kernel call of the eager engines' last steps")
+    parser.add_argument("--rows", type=int, default=1, help="requests that run together, each with the prompt (the "
+                        "first one's logits are compared: a backend that is not batch invariant then differs)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if args.random:
@@ -201,7 +231,8 @@ def main() -> int:
         backend, _, variant = backend.partition("~")
         # Pages of 128 tokens, DeepInfer's blocks: its paged indexer takes 64 or 128 latents a page.
         config = {"dsv4.backend": backend, "batch.max_context_len": args.context, "state.kv.page_size": 128,
-                  "state.kv.pages": -(-args.context // 128) * 4, "state.swa.slots": 2, "batch.max_rows": 2,
+                  "state.kv.pages": -(-args.context // 128) * 4 * args.rows, "state.swa.slots": args.rows + 1,
+                  "batch.max_rows": max(2, args.rows),
                   "holder.mem_fraction": 0.95,
                   "plan.cuda_graph": "required" if graph else "off"}
         started = time.time()
@@ -221,21 +252,37 @@ def main() -> int:
                 direct_experts(w)
             if not graph:
                 tap_head(w, vocab, heads.setdefault(name, []))
+            timed: dict[str, list[float]] = {}
+            timing = [False]
+            if args.profile and not graph:
+                profile(w, timed, timing)
             d = driver(w)
-            d.add(0, prompt)
+            rows = list(range(args.rows))
+            for row in rows:
+                d.add(row, prompt)
             started = time.time()
-            logits = d.generate([0], 1)[0]
+            logits = d.generate(rows, 1)[0]
             torch.cuda.synchronize()
             entry["prefill_s"] = round(time.time() - started, 2)
             started = time.time()
-            logits += d.generate([0], args.steps)[0]
+            logits += d.generate(rows, args.steps)[0]
             torch.cuda.synchronize()
             entry["decode_ms_per_step"] = round((time.time() - started) / max(1, args.steps - 1) * 1000, 1)
             tokens = list(d.requests[0].outputs)
             started = time.time()
-            d.generate([0], args.steps + args.more_steps)
+            d.generate(rows, args.steps + args.more_steps)
             torch.cuda.synchronize()
             entry["warm_decode_ms_per_step"] = round((time.time() - started) / max(1, args.more_steps) * 1000, 1)
+            if args.profile and not graph:  # more steps again, each kernel call waited for
+                timing[0] = True
+                started = time.time()
+                d.generate(rows, args.steps + 2 * args.more_steps)
+                torch.cuda.synchronize()
+                step_ms = (time.time() - started) / max(1, args.more_steps) * 1000
+                entry["profile"] = {"rows": args.rows, "step_ms": round(step_ms, 2), "kernels": {
+                    name: {"calls_per_step": round(calls / args.more_steps, 1),
+                           "ms_per_step": round(seconds / args.more_steps * 1000, 3)}
+                    for name, (calls, seconds) in sorted(timed.items(), key=lambda kv: -kv[1][1])}}
             entry["solutions"] = sorted({v.split(".")[0] for table in ("prefill", "decode") for k, v in
                                          w.service("layers.ds1017@1").resolve([])[table].items() if k != "backend"})
         finally:
@@ -272,6 +319,13 @@ def main() -> int:
                 e["against_" + args.compare]["head_input_relative_difference"] = [round(x, 5) for x in apart]
                 print(f"summary: {layers} layers, {name} against {args.compare}: the head's input differs by "
                       f"{max(apart):.3g} of its norm at most ({apart[0]:.3g} after the prompt)")
+        if "profile" in e:
+            pr = e["profile"]
+            spent = sum(k["ms_per_step"] for k in pr["kernels"].values())
+            print(f"profile: {layers} layers, {name}, {pr['rows']} rows: {pr['step_ms']} ms a step with every kernel "
+                  f"waited for, {spent:.2f} ms of it in kernels")
+            for definition, k in pr["kernels"].items():
+                print(f"profile:   {definition}: {k['calls_per_step']} calls, {k['ms_per_step']} ms a step")
         for definition, c in sorted(e.get("kernels_against_" + args.shadow, {}).items()):
             print(f"kernel: {name} {definition} against {args.shadow}: {int(c['calls'])} calls, the farthest "
                   f"{c['worst']:.3g} of the result's largest value, at most {c['unequal']:.4f} of the elements "

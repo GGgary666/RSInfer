@@ -70,8 +70,12 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
         own_cards = args.device == "cuda" and len(set(args.rank_gpus)) == ranks
         comm = {"comm.size": ranks, "comm.rendezvous": f"file://{meet / uuid.uuid4().hex}",
                 "comm.device_backend": "nccl" if own_cards else "gloo"}
+    # A plain prompt starts with BOS, as DeepInfer makes it (its tokenizer repair sets add_bos_token):
+    # the checkpoint's tokenizer_config says not to add one, and its chat template writes its own.
+    settings = (args.tokenizer or model).resolve() / "tokenizer_config.json"
+    bos = settings.is_file() and bool(json.loads(settings.read_text()).get("bos_token"))
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
-            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend, **comm,
+            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend, "frontend.add_bos": bos, **comm,
             **({"dsv4.token_map_path": str(found)} if found else {}),
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 
