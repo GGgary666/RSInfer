@@ -383,9 +383,12 @@ def test_the_fused_sublayer_step_and_moe_compute_what_the_unfused_kernels_comput
         # Recorded and replayed on other inputs.
         held, _ = fused_case(4)
         fresh, _ = fused_case(4, seed=1)
-        fused_moe(group, fused_step(*held, stage)[0], *fused)
-        torch.cuda.synchronize()
         graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        # The fused kernels keep a small buffer per stream, made at their first launch on it: not
+        # inside a capture. The engine's recorder warms a step up on its capture stream too.
+        with torch.cuda.stream(stream_):
+            fused_moe(group, fused_step(*held, stage)[0], *fused)
+        torch.cuda.synchronize()
         with torch.cuda.graph(graph, stream=stream_):
             recorded = fused_moe(group, fused_step(*held, stage)[0], *fused)
         expect = fused_moe(group, fused_step(*fresh, stage)[0], *fused)
