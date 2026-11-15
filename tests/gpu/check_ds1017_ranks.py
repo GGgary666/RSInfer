@@ -2,11 +2,14 @@
 routed experts and Engram tables split over the workers, each worker with requests of its own.
 
 For each backend the engine is served twice with the same checkpoint, on one rank and on several, and
-asked the same prompts, alone and together: the text has to be the same, token for token. A model cut
-to a few layers is chaotic (one changed bit moves its logits by tenths), so equal text over dozens of
-tokens says the ranks compute what one rank computes. A model one card cannot hold (the whole
-checkpoint) is served on several ranks only, with ``--no-single``: its text is printed, and compared
-with ``--expect`` where given.
+asked the same prompts, one after another and then all at once. Asked alone, a prompt's text has to
+be the same on one rank and on several, token for token. A model cut to a few layers is chaotic (one
+changed bit moves its logits by tenths), so equal text over dozens of tokens says the ranks compute
+what one rank computes. Asked with the others, the text is the same again only with kernels that
+compute a token regardless of the rest of its step (the references; not the reference
+implementation's, backend ``tilelang``): where it is on one rank, it has to be on several.
+A model one card cannot hold (the whole checkpoint) is served on several ranks only, with
+``--no-single``: its text is printed, and compared with ``--expect`` where given.
 
     # a random small model, two ranks on one card (the 4090 D)
     python tests/gpu/check_ds1017_ranks.py --random /tmp/ds-ranks --ranks 2 --backends reference,tilelang
@@ -120,14 +123,20 @@ def main() -> int:
         ranked, together, rate = generate(work / f"{backend}-ranks", [*serve, *several], prompts, args.max_tokens, name,
                                           args.timeout)
         entry: dict[str, Any] = {"ranks": ranked, "ranks_together": together, "tokens_per_s": round(rate, 2)}
-        problems = [f"prompt {i} differs when asked with the others" for i, (a, b) in enumerate(zip(ranked, together, strict=True))
-                    if a != b]
+        problems: list[str] = []
+        invariant = ""
         if not args.no_single:
-            single, _, single_rate = generate(work / f"{backend}-one", [*serve, *one], prompts, args.max_tokens, name,
-                                              args.timeout)
-            entry.update(one=single, one_tokens_per_s=round(single_rate, 2))
+            single, single_together, single_rate = generate(work / f"{backend}-one", [*serve, *one], prompts,
+                                                            args.max_tokens, name, args.timeout)
+            entry.update(one=single, one_together=single_together, one_tokens_per_s=round(single_rate, 2))
             problems += [f"prompt {i}: {a!r} on several ranks, {b!r} on one" for i, (a, b) in
                          enumerate(zip(ranked, single, strict=True)) if a != b]
+            if single == single_together:  # these kernels do not let the rest of a step show
+                problems += [f"prompt {i} differs when asked with the others, on several ranks only"
+                             for i, (a, b) in enumerate(zip(ranked, together, strict=True)) if a != b]
+                invariant = "; also asked together"
+            else:
+                invariant = "; asked together the text differs on one rank too (kernels that depend on the step's rows)"
         problems += [f"prompt {i}: {text!r} does not start with {want!r}" for i, (text, want) in
                      enumerate(zip(ranked, args.expect, strict=False)) if not text.startswith(want)]
         words = sum(len(t.split()) for t in ranked)
@@ -135,8 +144,8 @@ def main() -> int:
         report["backends"][backend] = entry
         failed |= bool(problems)
         print(f"summary {backend}: {'FAILED ' + '; '.join(problems[:3]) if problems else 'same text'}"
-              f"{'' if args.no_single else ' on one rank and on several'}, {len(prompts)} prompts, {words} words, "
-              f"{rate:.1f} tokens/s with {len(prompts)} at once", flush=True)
+              f"{'' if args.no_single else ' on one rank and on several'}{invariant}, {len(prompts)} prompts, "
+              f"{words} words, {rate:.1f} tokens/s with {len(prompts)} at once", flush=True)
         for prompt, text in zip(prompts, ranked, strict=True):
             print(f"  {prompt[:60]!r} -> {text[:200]!r}", flush=True)
     if args.out:

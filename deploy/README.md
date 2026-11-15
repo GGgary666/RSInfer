@@ -82,6 +82,8 @@ $A stop
 - `--overlap`：一步重叠（`sched.overlap`）。
 - `--speculative-algorithm EAGLE`：投机解码，模型的 MTP 层出草稿（`spec.algorithm`，`doc/specs/mtp.md`）；`--speculative-num-steps`、`--speculative-eagle-topk`、`--speculative-num-draft-tokens` 和 SGLang 同名，默认 3、1、4，只支持 topk 1。默认关。
 - `--disable-radix-cache`：关掉前缀缓存（`alloc.radix_cache = false`，和 SGLang 同名）。默认开，照 SGLang 的 radix cache 加 mamba `extra_buffer`（`doc/specs/prefix-cache.md`）；开着时同时在跑的请求数不超过 GDN 槽数除以 5。
+- `--gpus 0,1,2,3`（2026-11-15）：每张卡起一个 worker。每个 worker 跑自己的请求（一个调度域，`sched.domains`）；模型在不在它们之间分由模型族定：DS 1017 把每层的路由专家和 Engram 表按 rank 的顺序分开，所有 worker 每一步一起算（`comm.size`，[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md) 阶段 3），整个 DS 1017 要 4 张 SM100。
+- `--ranks N`：在一张卡（`--gpu`）或 CPU 上起 N 个 worker，本地试多 rank 用。同一张卡上的 worker 平分 `--mem-fraction`；参照 kernel 的中间结果占显存多，24 GB 的卡上要再把它调小（例如 0.4）。
 - `--gpu`：worker 用哪张卡（物理编号）。不给时取 `CUDA_VISIBLE_DEVICES` 的第一张，没设就是 0。节点代理只按拓扑设卡，所以靠 `CUDA_VISIBLE_DEVICES` 选卡时也是经这里生效。
 - `--device cpu`：整个引擎跑在 CPU 上（`tests/scenarios/test_m2a.py` 就是这样跑的）。
 - `--set 键=值`：没有专门参数的配置键，可以重复。
