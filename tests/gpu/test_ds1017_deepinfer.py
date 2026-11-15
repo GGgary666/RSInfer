@@ -312,56 +312,89 @@ def test_deepinfers_decode_operators_replay_from_a_graph_on_new_inputs(case: str
     assert not problem
 
 
+def fused_case(tokens: int, seed: int = 0) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """A sublayer step before the MoE and that MoE, at the released model's shapes: the step's
+    arguments (without ``stage``) and the MoE's after its input, the weights in the checkpoint's row
+    order."""
+    g = torch.Generator().manual_seed(77 + seed)
+    f32 = torch.float32
+    mix = (2 + HC) * HC
+    step = (rand(g, tokens, DIM), rand(g, tokens, HC, DIM), torch.rand(tokens, HC, generator=g).cuda(),
+            torch.rand(tokens, HC, generator=g).cuda(), torch.rand(tokens, HC, HC, generator=g).cuda(),
+            rand(g, mix, HC * DIM, scale=1 / 64, dtype=f32), 1 + rand(g, 3, scale=0.2, dtype=f32),
+            rand(g, mix, scale=0.5, dtype=f32), 1 + rand(g, DIM, scale=0.1), 1e-6, 20, 1e-6)
+    gate = rand(g, EXPERTS, DIM, scale=1 / 16)
+    shared: list[torch.Tensor] = []
+    for n, k in ((2 * INTER, DIM), (DIM, INTER)):
+        data, scale = formats.quantize_fp8(torch.randn(n, k, generator=g).cuda() * k ** -0.5)
+        shared += [data, scale, formats.pack_scales(formats.block_rows(scale, n))]
+    return step, (gate.float(), rand(g, EXPERTS, scale=0.1, dtype=f32), gate, *experts(g), *shared, TOPK, 2.5, 10.0)
+
+
+def mega_weights(moe: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The MoE's arguments with the expert stacks and the shared expert's weights in the fused kernel's row order."""
+    gate, bias, gate16, w13, p13, w2, p2, sw13, ss13, sp13, sw2, ss2, sp2, *rest = moe
+    w13, p13, w2, p2, sw13, sp13, sp2 = (t.clone() for t in (w13, p13, w2, p2, sw13, sp13, sp2))
+    formats.expert_layout(w13, p13, w2, p2, mega=True)
+    formats.shared_layout(sw13, sp13, sp2, mega=True)
+    return (gate, bias, gate16, w13, p13, w2, p2, sw13, ss13, sp13, sw2, ss2, sp2, *rest)
+
+
 @pytest.mark.timeout(1800)
-def test_the_fused_moe_kernel_on_one_rank_computes_the_routed_experts() -> None:
-    """``ds.ep_experts@1`` of this backend (``mega``: ``deep_gemm.fp8_fp4_mega_moe``) for a group of
-    one rank, against the routed experts' reference with DeepInfer's rounding: the expert stacks in the
-    fused kernel's row order, the tokens each slot took counted, slots that are not the experts'
-    numbers, a step without tokens, and the kernel recorded in a graph and replayed on other values.
-    It adds a token's terms in bf16 with fast math, so it agrees to the routed experts' tolerance,
-    not to the bit."""
-    from types import SimpleNamespace
-
+def test_the_fused_sublayer_step_and_moe_compute_what_the_unfused_kernels_compute() -> None:
+    """``ds.hc_step@1`` and ``ds.moe@1`` of this backend (``mega``: ``deep_gemm.mega_mhc``,
+    ``bf16_mega_gate``, ``fp8_fp4_mega_moe`` with the shared expert, for a group of one rank) against
+    the same from DeepInfer's unfused kernels (``ops.hc_step``, ``ops.moe``): the step writes the MoE's
+    FP8 input into the MoE buffer, the gate its choice, and the MoE kernel reads both. The fused gate's
+    product is bf16, so a token whose experts are nearly tied may choose others: compared are the
+    tokens that chose the same. Also: the tokens each slot took, a step without tokens, and the pair
+    recorded in a graph and replayed on other values."""
     from kernels.deepinfer.mega import Mega
+    from worker.comm.unit import Group
 
-    args = inputs("ds.moe_experts@1")
-    x, weights, indices, w13, p13, w2, p2, limit = args
-    want = reference.moe_experts(*args, direct=True)
-    m13, q13, m2, q2 = (t.clone() for t in (w13, p13, w2, p2))
-    formats.expert_layout(m13, q13, m2, q2, mega=True)
-    group = SimpleNamespace(size=1, rank=0, device_group=None)
+    group = Group()
+    step, moe = fused_case(TOKENS)
+    stage = (group, EXPERTS, TOPK, INTER)
+    unfused_step: Any = ops.hc_step  # the arguments are built as tuples: called as they are
+    unfused_moe: Any = ops.moe
+    want_y, want_stream, want_pre, want_post, want_comb = unfused_step(*step)
+    want = unfused_moe(group, want_y, *moe)
+    chosen = ops.moe_gate(want_y, moe[0], moe[1], TOPK, 2.5)[1].sort(dim=-1).values
+    fused = mega_weights(moe)
     mega = Mega(256)
+    fused_step: Any = mega.hc_step
+    fused_moe: Any = mega.moe
     try:
         taken = torch.zeros(EXPERTS, dtype=torch.int32, device="cuda")
-        got = mega.ep_experts(group, x, weights, indices, m13, q13, m2, q2, limit, None, taken)
+        y, stream, pre, post, comb = fused_step(*step, stage)
+        out = fused_moe(group, y, *fused, None, None, taken)
         torch.cuda.synchronize()
-        apart = float((got - want).abs().max() / want.abs().max())
-        print(f"fused MoE: farthest {apart:.4f} of the largest value; counts {int(taken.sum())} of {TOKENS * TOPK}")
-        close("ds.moe_experts@1", got, want, args)
-        assert torch.equal(taken.long(), torch.bincount(indices.flatten(), minlength=EXPERTS))
-        # A slot is where an expert's weights are, not its number: the stacks' experts in another order.
-        order = torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(5)).cuda()
-        o13, r13, o2, r2 = (t[order].contiguous() for t in (m13, q13, m2, q2))
-        slot_of = torch.empty_like(order).scatter_(0, order, torch.arange(EXPERTS, device="cuda"))
-        elsewhere = mega.ep_experts(group, x, weights, indices, o13, r13, o2, r2, limit, slot_of[indices])
-        assert torch.equal(elsewhere, got)
-        assert mega.ep_experts(group, x[:0], weights[:0], indices[:0], m13, q13, m2, q2, limit).shape == (0, DIM)
-        # One token alone against the same token among the others.
-        alone = mega.ep_experts(group, x[:1], weights[:1], indices[:1], m13, q13, m2, q2, limit)
-        print(f"fused MoE: one token alone {'equals' if torch.equal(alone, got[:1]) else 'DIFFERS FROM'} its row of {TOKENS}")
+        symm = mega.symm(group, EXPERTS, TOPK, DIM, INTER)
+        same = (symm.topk_idx[:TOKENS].sort(dim=-1).values == chosen).all(dim=-1)
+        for name, a, b in (("input", y, want_y), ("stream", stream, want_stream), ("pre", pre, want_pre),
+                           ("post", post, want_post), ("comb", comb, want_comb), ("moe", out[same], want[same])):
+            apart = float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-12))
+            print(f"fused {name}: farthest {apart:.5f} of the largest value")
+            assert a.shape == b.shape and apart < (0.1 if name == "moe" else 0.03), (name, apart)
+        print(f"fused gate: {int(same.sum())} of {TOKENS} tokens chose the same experts; counted {int(taken.sum())}")
+        assert int(same.sum()) >= TOKENS * 0.9 and int(taken.sum()) == TOKENS * TOPK
+        assert torch.equal(taken.long(), torch.bincount(symm.topk_idx[:TOKENS].flatten(), minlength=EXPERTS))
+        assert fused_moe(group, y[:0], *fused).shape == (0, DIM)  # a rank without tokens launches the kernel too
         # Recorded and replayed on other inputs.
-        sx, sw, si = (t.clone() for t in (x[:4], weights[:4], indices[:4]))
-        fx, fw, fi = inputs("ds.moe_experts@1", 4, seed=1)[:3]
-        mega.ep_experts(group, sx, sw, si, m13, q13, m2, q2, limit)
+        held, _ = fused_case(4)
+        fresh, _ = fused_case(4, seed=1)
+        fused_moe(group, fused_step(*held, stage)[0], *fused)
         torch.cuda.synchronize()
-        graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
-        with torch.cuda.graph(graph, stream=stream):
-            out = mega.ep_experts(group, sx, sw, si, m13, q13, m2, q2, limit)
-        expect = mega.ep_experts(group, fx, fw, fi, m13, q13, m2, q2, limit)
-        for held, new in ((sx, fx), (sw, fw), (si, fi)):
-            held.copy_(new)
+        graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=stream_):
+            recorded = fused_moe(group, fused_step(*held, stage)[0], *fused)
+        expect = fused_moe(group, fused_step(*fresh, stage)[0], *fused)
+        for kept, new in zip(held, fresh, strict=True):
+            if isinstance(kept, torch.Tensor):
+                kept.copy_(new)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out, expect), float((out - expect).abs().max())
+        assert torch.equal(recorded, expect), float((recorded.float() - expect.float()).abs().max())
     finally:
         mega.close()
+

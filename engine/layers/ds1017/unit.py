@@ -41,7 +41,6 @@ import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -63,15 +62,10 @@ DECODE_ONLY = frozenset({"ds.cache_attn@1", "ds.index_topk_paged@1", "ds.compres
 DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grouped_linear@1", "ds.rms_norm@1",
                "ds.rope@1", "ds.sparse_attn@1", "ds.cache_attn@1", "ds.transform@1", "ds.store_cache@1",
                "ds.load_values@1", "ds.load_keys@1", "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk_paged@1",
-               "ds.compress@1", "ds.compress_decode@1", "ds.hc_mixes@1", "ds.hc_pre@1", "ds.hc_post@1",
-               "ds.moe_gate@1", "ds.moe_experts@1", "ds.shared_expert@1", "ds.engram_gate@1",
-               "ds.engram_hash@1")
+               "ds.compress@1", "ds.compress_decode@1", "ds.hc_step@1", "ds.hc_pre@1", "ds.hc_post@1",
+               "ds.moe@1", "ds.engram_gate@1", "ds.engram_hash@1")
 
-SPLIT = MappingProxyType({"ds.moe_experts@1": "ds.ep_experts@1"})
-"""On ranks that each hold part of a layer's experts (``comm.group@1`` of more than one rank): the
-kernel that reaches the other ranks' in place of the one that runs this rank's."""
-
-MEGA = frozenset({"deepinfer.ds.ep_experts@1"})
+MEGA = frozenset({"deepinfer.ds.moe@1"})
 """Solutions that read the expert stacks in the fused MoE kernel's row order (``formats.expert_layout``)."""
 
 Weights = Mapping[str, torch.Tensor]
@@ -210,8 +204,11 @@ class Layers:
         ratios = {r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r}
         # DeepGEMM's paged indexer takes blocks of 32, 64 or 128 keys: a page holds page / ratio.
         blocks = {page // r for r in ratios}
+        # DeepGEMM's fused MoE and Hyper-Connections kernels: four copies of the stream, widths their
+        # tiles divide (the stream in pieces of 1024 values, the scales of 128 rows together).
+        mega = cfg.hc_mult == 4 and cfg.hidden_size % 1024 == 0 and (2 * cfg.moe_intermediate_size) % 128 == 0
         shape = {"heads": cfg.num_attention_heads, "head_dim": cfg.head_dim, "index_head_dim": cfg.index_head_dim,
-                 "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0}
+                 "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0, "mega": int(mega)}
         names = self.definitions()
         calls = {"prefill": {name: shape for name in names if name not in DECODE_ONLY},
                  "decode": {name: shape for name in names if name not in PREFILL_ONLY}}
@@ -222,12 +219,10 @@ class Layers:
     def mega_experts(self) -> bool:
         """Whether the routed experts' kernel reads the expert stacks in the fused MoE kernel's row
         order: the model lays them out so (``formats.expert_layout``). One answer for every step."""
-        if self.group.size == 1:
-            return False
         if not self.chosen:
             raise RuntimeError("the layers' kernels are not resolved yet (core.plan does it at start)")
         answers = {solution.split(" ")[0] in MEGA for table in self.chosen.values()
-                   for definition, solution in table.items() if definition == "ds.ep_experts@1" and solution}
+                   for definition, solution in table.items() if definition == "ds.moe@1" and solution}
         if len(answers) > 1:
             raise ValueError("the routed experts' kernels of prefill and decode steps read the experts' weights "
                              "in different row orders: give both the same backend (dsv4.prefill_backend, "
@@ -235,12 +230,11 @@ class Layers:
         return answers == {True}
 
     def definitions(self) -> tuple[str, ...]:
-        """What the forward calls: alone, ``DEFINITIONS``; among ranks that share the experts and the
-        Engram tables, the kernels that reach the other ranks."""
-        if self.group.size == 1:
+        """What a step calls: ``DEFINITIONS``, and among ranks that share the Engram tables the
+        kernel that brings their rows in (the MoE's kernel reaches the other ranks' experts itself)."""
+        if self.group.size == 1 or not self.cfg.engram_layer_ids:
             return DEFINITIONS
-        return tuple(SPLIT.get(name, name) for name in DEFINITIONS) + \
-            (("ds.engram_fetch@1",) if self.cfg.engram_layer_ids else ())
+        return (*DEFINITIONS, "ds.engram_fetch@1")
 
     def k(self, definition: str) -> KernelFn:
         return self.kernels(self.table, definition)
@@ -474,10 +468,19 @@ class Layers:
     def norm(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self.k("ds.rms_norm@1")(x, weight, self.cfg.rms_norm_eps)
 
-    def hc_mixes(self, x: torch.Tensor, w: Weights, which: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def hc_step(self, x: torch.Tensor | None, stream: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
+                comb: torch.Tensor | None, w: Weights, which: str
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Between two sublayers (``ds.hc_step@1``): the output ``x`` of the one before written back to
+        the stream, the next coefficients, and the input of the sublayer ``which`` (``attn`` or
+        ``ffn``). Returns that input, the stream, and the new ``pre``, ``post`` and ``comb``."""
         cfg = self.cfg
-        return self.k("ds.hc_mixes@1")(x, w[f"hc_{which}_fn"], w[f"hc_{which}_scale"], w[f"hc_{which}_base"],
-                                        cfg.rms_norm_eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)
+        # A backend whose MoE kernel reads its input from a buffer of its own writes it there now.
+        stage = (self.group, self.placement.slots(cfg.n_routed_experts), cfg.num_experts_per_tok,
+                 cfg.moe_intermediate_size) if which == "ffn" else None
+        return self.k("ds.hc_step@1")(x, stream, pre, post, comb, w[f"hc_{which}_fn"], w[f"hc_{which}_scale"],
+                                       w[f"hc_{which}_base"], w[f"{which}_norm.weight"], cfg.rms_norm_eps,
+                                       cfg.hc_sinkhorn_iters, cfg.hc_eps, stage)
 
     def hc_pre(self, x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
         return self.k("ds.hc_pre@1")(x, pre)
@@ -503,20 +506,12 @@ class Layers:
     def moe(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``MoE.forward``: the routed experts' weighted sum and the shared expert."""
         cfg = self.cfg
-        weights, indices = self.k("ds.moe_gate@1")(x, w["ffn.gate.weight"], w["ffn.gate.bias"], cfg.num_experts_per_tok,
-                                                    cfg.routed_scaling_factor)
-        stacks = (w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
-                  w["ffn.experts.w2.packed"])
-        if self.group.size > 1:  # this rank's stacks hold its part of the layer's experts
-            placed = self.placement.active
-            y = self.k("ds.ep_experts@1")(self.group, x, weights, indices, *stacks, cfg.swiglu_limit,
-                                          self.placement.physical(layer, indices) if placed else None,
-                                          self.placement.count(layer) if placed else None)
-        else:
-            y = self.k("ds.moe_experts@1")(x, weights, indices, *stacks, cfg.swiglu_limit)
-        y = y + self.k("ds.shared_expert@1")(x, *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2")
-                                                  for part in ("weight", "scale", "packed")), cfg.swiglu_limit)
-        return y.to(x.dtype)
+        # Among ranks this rank's stacks hold its part of the layer's experts, where the placement says.
+        return self.k("ds.moe@1")(
+            self.group, x, w["ffn.gate.weight"], w["ffn.gate.bias"], w["ffn.gate.bf16"],
+            *(w[f"ffn.experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "packed")),
+            *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "scale", "packed")),
+            cfg.num_experts_per_tok, cfg.routed_scaling_factor, cfg.swiglu_limit, *self.placement.maps(layer))
 
     def idle(self, weights: Sequence[Weights]) -> None:
         """A step in which this rank has no rows, among ranks that share the experts and the Engram
@@ -528,18 +523,11 @@ class Layers:
         self.table = "decode"
         device = weights[0]["ffn.gate.weight"].device
         x = torch.empty(0, cfg.hidden_size, dtype=torch.bfloat16, device=device)
-        chosen = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.float32, device=device)
-        indices = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.int64, device=device)
         if cfg.engram_layer_ids:  # as ``fetch``, before the layers
             ids = torch.empty(0, len(cfg.engram_layer_ids), cfg.engram_hash_cols, dtype=torch.int64, device=device)
             self.k("ds.engram_fetch@1")(self.group, ids, *self.tables())
         for layer in range(cfg.num_hidden_layers):
-            w = weights[layer]
-            placed = self.placement.active
-            self.k("ds.ep_experts@1")(self.group, x, chosen, indices, w["ffn.experts.w13.weight"],
-                                      w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
-                                      w["ffn.experts.w2.packed"], cfg.swiglu_limit, indices if placed else None,
-                                      self.placement.count(layer) if placed else None)
+            self.moe(layer, x, weights[layer])
 
     # ------------------------------------------------------------------ attention
 

@@ -160,6 +160,18 @@ def expert_layout(w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: to
     place(p2, mega_rows(n2, False, True), 2)
 
 
+def shared_layout(w13: torch.Tensor, p13: torch.Tensor, p2: torch.Tensor, mega: bool) -> None:
+    """``expert_layout`` for the shared expert's FP8 weights ``w13`` ``[2 * inter, dim]`` and the packed
+    scales of both its matrices (its block scales, which only the references read, stay)."""
+    def place(t: torch.Tensor, rows: torch.Tensor, dim: int) -> None:
+        rows = (rows if mega else rows.argsort()).to(t.device)
+        t.copy_(t.index_select(dim, rows))
+
+    place(w13, mega_rows(w13.shape[0], True, False), 0)
+    place(p13, mega_rows(w13.shape[0], True, True), 1)  # packed scales: [K / 128, rows, 4]
+    place(p2, mega_rows(p2.shape[1], False, True), 1)
+
+
 def block_rows(scale: torch.Tensor, n: int) -> torch.Tensor:
     """An FP8 weight's 32 x 32 block scales ``[N / 32, K / 32]`` as one row of scales per weight row."""
     return scale.repeat_interleave(BLOCK, dim=-2)[..., :n, :]

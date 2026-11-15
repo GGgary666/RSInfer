@@ -4,9 +4,11 @@ TileKernels, DeepSelect), as solutions of the DS definitions (``kernels.ds1017``
 without either the unit registers nothing. Which library call solves which definition, and where its
 arithmetic differs from the references, is in ``ops``.
 
-Among ranks that share a layer's experts (``comm.group@1``), the routed experts are DeepGEMM's fused
-MoE kernel over a buffer the ranks share (``mega``); the Engram rows still travel through the
-group's collectives (``kernels.ds1017_ep``), which no graph records."""
+What the layers call between and for the sublayers' own work, ``ds.hc_step@1`` and ``ds.moe@1``, are
+DeepGEMM's fused kernels (``mega``): one kernel for a sublayer's step, and for the MoE the fused gate
+and the fused MoE kernel over a buffer the ranks of a group share (``comm.group@1``; on one rank too).
+The Engram rows of ranks that share the tables still travel through the group's collectives
+(``kernels.ds1017_ep``), before the forward."""
 
 from __future__ import annotations
 
@@ -76,14 +78,24 @@ class Unit:
         ctx.register("kernels.catalog@1", Implementation(
             Solution(FIXED, "ds.moe_experts@1", f"{ops.__name__}:{fn.__name__}", library=library("deep_gemm"),
                      capturable=True, requires=["cuda", "sm_100", CAPTURE]), fn), label=f"solution {FIXED}")
-        # Among ranks: the fused MoE kernel, with this instance's part of the ranks' shared buffer.
+        # DeepInfer's fused kernels, with this instance's part of the ranks' shared MoE buffer: a
+        # sublayer's step and the MoE, where the model's shapes are what the kernels are built for.
+        # Elsewhere, and for comparison, the same from the unfused kernels above ("unfused": after
+        # the fused ones in the catalog's order, so a model the fused kernels fit runs those).
         from kernels.deepinfer.mega import Mega
 
         mega = Mega(config["sched.token_budget"] + config["batch.max_rows"])
         ctx.effect(lambda: mega.close, label="fused MoE buffer")
-        for definition, fn, capturable in (("ds.ep_experts@1", mega.ep_experts, True),
-                                           ("ds.engram_fetch@1", ops.engram_fetch, False)):
-            solution = f"{BACKEND}.{definition}"
+        fused: dict[str, list[int]] = {"mega": [1]}
+        for solution, definition, fn, capturable, requires, shapes in (
+                (f"{BACKEND}.ds.hc_step@1", "ds.hc_step@1", mega.hc_step, True, [], fused),
+                (f"{BACKEND}.ds.moe@1", "ds.moe@1", mega.moe, True, [], fused),
+                (f"{BACKEND}.unfused.ds.hc_step@1", "ds.hc_step@1", ops.hc_step, True, [], {}),
+                (f"{BACKEND}.unfused.ds.moe@1", "ds.moe@1", ops.moe, False, [], {}),
+                (f"{BACKEND}.unfused.fixed.ds.moe@1", "ds.moe@1", ops.moe_fixed, True, [CAPTURE], {}),
+                (f"{BACKEND}.ds.ep_experts@1", "ds.ep_experts@1", ops.ep_experts, False, [], {}),
+                (f"{BACKEND}.ds.engram_fetch@1", "ds.engram_fetch@1", ops.engram_fetch, False, [], {})):
             ctx.register("kernels.catalog@1", Implementation(
                 Solution(solution, definition, f"{fn.__module__}:{fn.__qualname__}", library=library("deep_gemm"),
-                         capturable=capturable, requires=["cuda", "sm_100"]), fn), label=f"solution {solution}")
+                         shapes=shapes, capturable=capturable, requires=["cuda", "sm_100", *requires]), fn),
+                label=f"solution {solution}")

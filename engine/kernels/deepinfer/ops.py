@@ -61,6 +61,7 @@ from kernels.deepinfer.tilelang_ops.fused_transform import (
 )
 from kernels.deepinfer.tilelang_ops.load_paged_kv_cache import load_paged_kv_cache
 from kernels.deepinfer.tilelang_ops.store_kv_cache import store_kv_cache
+from kernels import ds1017_compose as compose
 from kernels import ds1017_ep as ep
 from kernels.ds1017_formats import BLOCK, packed_words
 
@@ -609,3 +610,46 @@ def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.T
     out = tile_kernels.engram.engram_hash(tokens.to(torch.int32).contiguous(), multipliers.contiguous(),
                                           primes.to(torch.int32).contiguous(), offsets.to(torch.int32).contiguous())
     return out.permute(1, 0, 2).long()
+
+
+# ---------------------------------------------------------------- compositions of the kernels above
+# What runs where the fused kernels (``mega``) do not fit a model's shapes, and what they are compared with.
+
+def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
+               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float, slots: torch.Tensor | None = None,
+               taken: torch.Tensor | None = None) -> torch.Tensor:
+    """``moe_experts`` on ranks that each hold part of the layer's experts, through the group's
+    collectives (``kernels.ds1017_ep``)."""
+    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit, slots, taken)
+
+
+def hc_step(x: torch.Tensor | None, residual: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
+            comb: torch.Tensor | None, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_weight: torch.Tensor,
+            norm_eps: float, iters: int, hc_eps: float, stage: Any = None
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return compose.hc_step(hc_post, hc_mixes, hc_pre, rms_norm, x, residual, pre, post, comb, fn, scale, base,
+                           norm_weight, norm_eps, iters, hc_eps)
+
+
+def moe(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch.Tensor, gate_bf16: torch.Tensor,
+        w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor, ss13: torch.Tensor,
+        sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int, route_scale: float,
+        limit: float, to_physical: torch.Tensor | None = None, copies: torch.Tensor | None = None,
+        taken: torch.Tensor | None = None) -> torch.Tensor:
+    return compose.moe(moe_gate, moe_experts, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
+                       (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
+                       copies, taken)
+
+
+def moe_fixed(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch.Tensor, gate_bf16: torch.Tensor,
+              w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor,
+              ss13: torch.Tensor, sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int,
+              route_scale: float, limit: float, to_physical: torch.Tensor | None = None,
+              copies: torch.Tensor | None = None, taken: torch.Tensor | None = None) -> torch.Tensor:
+    """``moe`` with the routed experts' fixed-row form: for a step replayed from a graph, on one rank."""
+    if group.size > 1:
+        raise ValueError("among ranks the unfused MoE is not recorded: its experts travel through the group's collectives")
+    return compose.moe(moe_gate, moe_experts_fixed, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
+                       (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
+                       copies, taken)
+

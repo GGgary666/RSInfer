@@ -85,7 +85,9 @@ def params(cfg: DSConfig, ranks: int = 1, slots: int = 0) -> list[WeightDecl]:
             out += [*fp8(p + "attn.indexer.wq_b", cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora_rank),
                     w(p + "attn.indexer.weights_proj.weight", cfg.index_n_heads, dim)]
         out += [w(p + "attn_norm.weight", dim), w(p + "ffn_norm.weight", dim),
-                w(p + "ffn.gate.weight", experts, dim, fmt="f32"), w(p + "ffn.gate.bias", experts, fmt="f32")]
+                w(p + "ffn.gate.weight", experts, dim, fmt="f32"), w(p + "ffn.gate.bias", experts, fmt="f32"),
+                # The gate's weight as the checkpoint stores it: a fused gate kernel's product is bf16.
+                w(p + "ffn.gate.bf16", experts, dim)]
         for m, (n, k) in (("w13", (2 * inter, dim)), ("w2", (dim, inter))):
             out += [w(p + f"ffn.experts.{m}.weight", held, n, k // 2, fmt="u8"),
                     w(p + f"ffn.experts.{m}.packed", held, *formats.packed_shape(n, k), fmt="u8")]
@@ -270,6 +272,9 @@ class DeepseekV41ForCausalLM:
                 raise ValueError(f"{raw} is {tuple(tensor.shape)} in the checkpoint, {tuple(param.shape)} in the config")
             param.copy_(as_bytes(tensor) if param.dtype == torch.uint8 else tensor.to(param.dtype))
             loaded.add(name)
+            if name.endswith("ffn.gate.weight") and name[:-len("weight")] + "bf16" in params_dict:
+                params_dict[name[:-len("weight")] + "bf16"].copy_(tensor.to(torch.bfloat16))
+                loaded.add(name[:-len("weight")] + "bf16")
             packed = params_dict.get(name[:-len("scale")] + "packed") if name.endswith(".scale") else None
             if packed is not None:
                 packed.copy_(formats.pack_scales(formats.block_rows(param, packed.shape[1])))
@@ -322,6 +327,8 @@ class DeepseekV41ForCausalLM:
                 for layer in views[:-1]:
                     formats.expert_layout(*(layer[f"ffn.experts.{m}.{part}"] for m in ("w13", "w2")
                                             for part in ("weight", "packed")), mega=mega)
+                    formats.shared_layout(layer["ffn.shared_experts.w13.weight"], layer["ffn.shared_experts.w13.packed"],
+                                          layer["ffn.shared_experts.w2.packed"], mega=mega)
                 marker.fill_(int(mega))
             # The weights are as the checkpoint's order lays them out (loaded, or loaded again).
             self.placement.start(self.cfg.num_hidden_layers, self.cfg.n_routed_experts,
@@ -354,20 +361,25 @@ class DeepseekV41ForCausalLM:
         # Each sublayer's mixes give the next sublayer its input: the first takes the stream's first copy.
         pre = torch.zeros(h.shape[0], cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre[:, 0] = 1.0
+        # A sublayer's output ``x`` waits to be written back to the stream ``h`` with the ``post`` and
+        # ``comb`` computed before it ran: the step before the next sublayer does it (DeepInfer's
+        # order, one kernel there), or it is done here where the stream itself is needed.
+        x: torch.Tensor | None = None
+        post = comb = None
         for i in range(cfg.num_hidden_layers):
             w = weights[i]
             if i in cfg.engram_layer_ids:
+                if x is not None:
+                    h, x = layers.hc_post(x, h, post, comb), None
                 h = layers.engram(i, h, w)
-            residual = h
-            attn_pre, post, comb = layers.hc_mixes(h, w, "attn")
-            x = layers.attention(i, layers.norm(layers.hc_pre(h, pre), w["attn_norm.weight"]), w)
-            h = layers.hc_post(x, residual, post, comb)
-            residual = h
-            pre, post, comb = layers.hc_mixes(h, w, "ffn")
-            x = layers.moe(i, layers.norm(layers.hc_pre(h, attn_pre), w["ffn_norm.weight"]), w)
-            h = layers.hc_post(x, residual, post, comb)
-        x = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
-        return layers.linear(x[last_index], top["head.weight"])
+            y, h, attn_pre, post, comb = layers.hc_step(x, h, pre, post, comb, w, "attn")
+            x = layers.attention(i, y, w)
+            y, h, pre, post, comb = layers.hc_step(x, h, attn_pre, post, comb, w, "ffn")
+            x = layers.moe(i, y, w)
+        if x is not None:
+            h = layers.hc_post(x, h, post, comb)
+        out = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
+        return layers.linear(out[last_index], top["head.weight"])
 
 
 def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:

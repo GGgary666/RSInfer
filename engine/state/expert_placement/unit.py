@@ -127,6 +127,15 @@ class Placement:
         which = torch.arange(indices.shape[0], device=indices.device).unsqueeze(-1) % copies
         return self.to_physical[layer][indices, which].long()
 
+    def maps(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """What a layer's MoE kernel takes: each expert's slots ``[logical, spare + 1]`` (``-1`` after
+        them), how many each has ``[logical]``, and where it adds the tokens each of this rank's slots
+        took ``[local]``; three ``None`` where the experts are not placed."""
+        if not self.active:
+            return None, None, None
+        assert self.to_physical is not None and self.copies is not None and self.counts is not None
+        return self.to_physical[layer], self.copies[layer], self.counts[layer]
+
     def count(self, layer: int) -> torch.Tensor:
         """``[local]`` int32: the routed-experts kernel adds the tokens each slot of this rank took."""
         assert self.counts is not None

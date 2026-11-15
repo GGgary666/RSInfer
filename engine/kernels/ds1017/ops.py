@@ -442,3 +442,39 @@ def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: to
 def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor
                 ) -> torch.Tensor:
     return compose.engram_hash(tokens, multipliers, primes, offsets)
+
+def hc_step(x: torch.Tensor | None, residual: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
+            comb: torch.Tensor | None, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_weight: torch.Tensor,
+            norm_eps: float, iters: int, hc_eps: float, stage: Any = None
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What stands between two sublayers of the stream (``compose.hc_step``); ``stage`` is for a backend
+    whose MoE reads its input from where this wrote it."""
+    return compose.hc_step(hc_post, hc_mixes, hc_pre, rms_norm, x, residual, pre, post, comb, fn, scale, base,
+                           norm_weight, norm_eps, iters, hc_eps)
+
+
+def moe(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch.Tensor, gate_bf16: torch.Tensor,
+        w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor, ss13: torch.Tensor,
+        sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int, route_scale: float,
+        limit: float, to_physical: torch.Tensor | None = None, copies: torch.Tensor | None = None,
+        taken: torch.Tensor | None = None) -> torch.Tensor:
+    """A layer's MoE on its normed input (``compose.moe``); ``gate_bf16`` is the gate's weight as a
+    fused gate kernel takes it, not read here."""
+    return compose.moe(moe_gate, moe_experts, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
+                       (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
+                       copies, taken)
+
+
+def moe_fixed(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch.Tensor, gate_bf16: torch.Tensor,
+              w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor,
+              ss13: torch.Tensor, sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int,
+              route_scale: float, limit: float, to_physical: torch.Tensor | None = None,
+              copies: torch.Tensor | None = None, taken: torch.Tensor | None = None) -> torch.Tensor:
+    """``moe`` with the routed experts' fixed-shape form (``moe_experts_masked``): for a step replayed
+    from a graph, on one rank."""
+    if group.size > 1:
+        raise ValueError("the references' MoE among ranks is not recorded: its experts travel through the host")
+    return compose.moe(moe_gate, moe_experts_masked, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
+                       (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
+                       copies, taken)
+
