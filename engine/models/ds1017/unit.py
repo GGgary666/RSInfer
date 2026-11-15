@@ -294,6 +294,10 @@ class Unit:
                 "layers.ds1017@1")
 
     def __init__(self, ctx: Any, config: Any) -> None:
+        if not config["weights.path"]:
+            raise ValueError("weights.path is empty, and DS 1017 takes no dummy weights: they fill floating-point "
+                             "tensors only, and its matrices are stored as FP8 and FP4 bytes with their scales "
+                             "(agxinfer checkpoint writes random weights in the checkpoint's formats)")
         cfg = DSConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))
         cfg.check()
         self.model = DeepseekV41ForCausalLM(cfg, config["model.dtype"], config["state.kv.page_size"],

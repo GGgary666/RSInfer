@@ -225,6 +225,56 @@ def test_a_kernel_change_that_cannot_run_rolls_back_and_the_engine_keeps_serving
         assert text() == baseline
 
 
+def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_unloads(model: Path, tokenizer: Path,
+                                                                                      tmp_path: Path) -> None:
+    """``serve`` lists the worker's units in the topology (those of its model's family), and the
+    control plane takes a role's listed units as they are. ``control apply`` therefore works the
+    list out again from the workspace it applies: a kernel unit added there runs in the worker
+    after the apply, and no longer after the apply of the workspace without it."""
+    args = ["--model", str(model), "--tokenizer", str(tokenizer), "--device", "cpu", "--dtype", "f32", "--conv-dtype", "f32",
+            "--page-size", "4", "--max-rows", "8", "--max-context", "64", "--token-budget", "8", "--cpu-bytes", str(4 << 20),
+            "--timeout", "120"]
+    run, workspace = tmp_path / "run", tmp_path / "workspace"
+    shutil.copytree(REPO / "engine", workspace / "engine", ignore=shutil.ignore_patterns("__pycache__"))
+    added = workspace / "engine" / "kernels" / "added"
+    body = {"model": "Qwen3.8-27B", "prompt": "w1 w2 w3 w4 w5", "max_tokens": 8, "temperature": 0.0, "ignore_eos": True}
+
+    def apply(*flags: str) -> dict[str, Any]:
+        return json.loads(cli("control", "apply", "--source", str(workspace), "--run", str(run), *flags))
+
+    def running() -> set[str]:
+        procs = json.loads(cli("control", "introspect", "--run", str(run)))["procs"]
+        return {u["unit"] for p in procs if p["proc"]["role"] == "worker" for u in p["units"] if u["state"] == "ACTIVE"}
+
+    def listed() -> list[str]:
+        roles = json.loads((run / "topology.json").read_text())["roles"]
+        return next(r["units"] for r in roles if r["name"] == "worker")
+
+    with served(run, *args) as url:
+        baseline = post(url + "/v1/completions", body)["choices"][0]["text"]
+        assert baseline and "kernels.reference" in running() and "kernels.added" not in running()
+        added.mkdir()
+        (added / "__init__.py").write_text("")
+        (added / "unit.toml").write_text('[unit]\nid = "kernels.added"\nkind = "logic"\nprocess = ["worker"]\n'
+                                         'entry = "kernels.added.unit:Unit"\n\n[provides]\nservices = ["kernels.added@1"]\n')
+        (added / "unit.py").write_text("from typing import Any\n\n\nclass Unit:\n"
+                                       "    def __init__(self, ctx: Any, config: Any) -> None:\n"
+                                       '        ctx.provide("kernels.added@1", self)\n')
+        assert apply("--dry-run")["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
+        assert "kernels.added" not in listed()  # a dry run leaves the run directory's topology
+        applied = apply()
+        assert applied["status"] == "committed" and applied["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
+        assert "kernels.added" in running() and "kernels.added" in listed()
+        assert "models.ds1017" not in running()  # still the units of this model's family alone
+        assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+
+        shutil.rmtree(added)
+        applied = apply()
+        assert applied["status"] == "committed" and applied["processes"]["host-a/worker/0"]["remove"] == ["kernels.added"]
+        assert "kernels.added" not in running() and "kernels.added" not in listed()
+        assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
+
+
 def test_the_cli_runs_an_engine_in_the_background_puts_it_to_sleep_and_stops_it(model: Path, tokenizer: Path,
                                                                               tmp_path: Path) -> None:
     """``agxinfer serve --detach`` returns once the engine is up. ``status``, ``control`` and the

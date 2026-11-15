@@ -14,6 +14,7 @@ services = ["kernels.catalog@1", "state.kv.paged@1", "state.swa.slots@1"]
 "dsv4.backend" = { type = "str", default = "auto", binding = "startup", doc = "DS 1017's layer kernels: auto, or a backend of the kernel catalog, e.g. reference or tilelang" }
 "dsv4.prefill_backend" = { type = "str", default = "", binding = "startup", doc = "For prefill and mixed steps; empty: dsv4.backend" }
 "dsv4.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps; empty: dsv4.backend" }
+"dsv4.token_map_path" = { type = "str", default = "", binding = "startup", doc = "Directory of Engram's compressed token map (engram_token_map.json) or of the tokenizer.json it is built from; empty: model.path, else weights.path" }
 
 [reads]
 config = ["model.path", "model.hf_config", "weights.path", "batch.max_context_len"]

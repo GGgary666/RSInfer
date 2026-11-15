@@ -45,9 +45,19 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
 
     from models.ds1017_config import DSConfig, states
 
+    if args.dummy:  # they fill floating-point tensors only: every quantized matrix and its scales would be zero
+        raise SystemExit("DS 1017 takes no dummy weights (its matrices are stored as FP8 and FP4 bytes): write random "
+                         "ones in the checkpoint's formats with `agxinfer checkpoint --config <model dir> [--layers N] "
+                         "--out <dir>` and serve that directory")
     decls = states(DSConfig.from_hf(cfg), args.page_size)
+    # Engram's compressed token map: the model's, the weights' or the tokenizer's directory, the first
+    # that has one, else the first with the tokenizer.json it is built from. The worker is not given
+    # the model's directory with --layers, and never the tokenizer's.
+    places = [d.resolve() for d in (model, args.weights, args.tokenizer) if d is not None]
+    found = next((d for name in ("engram_token_map.json", "tokenizer.json") for d in places if (d / name).is_file()), None)
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
             "alloc.radix_cache": False, "dsv4.backend": args.ds_backend,
+            **({"dsv4.token_map_path": str(found)} if found else {}),
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 
 

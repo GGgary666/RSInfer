@@ -6,7 +6,7 @@
 # texts must be the first's. SESSION_URL, SESSION_RUN and SESSION_PYTHON come from the session.
 set -u
 PY=${SESSION_PYTHON:-python3}
-SETTINGS=${SESSION_SETTINGS:-'{"dsv4.backend":"auto","plan.cuda_graph":"auto"} {"plan.cuda_graph":"off"} {"dsv4.backend":"tilelang"} {"dsv4.backend":"auto","plan.cuda_graph":"auto"}'}
+SETTINGS=${SESSION_SETTINGS:-'{"dsv4.backend":"auto","plan.cuda_graph":"auto"} {"plan.cuda_graph":"off"} {"dsv4.backend":"tilelang"} {"plan.cuda_graph":"auto"} {"dsv4.backend":"auto"}'}
 
 measure() {
   "$PY" - "$SESSION_URL" <<'PYEOF'

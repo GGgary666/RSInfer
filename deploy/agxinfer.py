@@ -37,13 +37,16 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
 from deploy.models import ds1017, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
+
+if TYPE_CHECKING:
+    from core.common.ids import UnitId
 
 RECIPES: tuple[types.ModuleType, ...] = (qwen38, ds1017)
 HOST = "host-a"
@@ -65,6 +68,15 @@ def recipe_for(cfg: dict[str, Any]) -> types.ModuleType:
 
 def env() -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": str(REPO / "engine")}
+
+
+def worker_units(source: Path, recipe: types.ModuleType) -> list[UnitId]:
+    """The worker's units in the workspace ``source``: the units of its model's family, so those only
+    another family runs stay out (two model units would both provide model@1)."""
+    from core.sourcetree import read_tree
+
+    others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
+    return [u for u in read_tree(source.resolve() / "engine").role_units(None, "worker") if u not in others]
 
 
 # ------------------------------------------------------------------ the run directory
@@ -184,23 +196,20 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
 
     from core.change.config import ChangeTunables
     from core.common.ids import HostId
-    from core.sourcetree import read_tree
     from core.supervisor import HostSpec, Mesh, RankPlacement, RoleSpec, Topology
 
     model = Path(args.model).resolve()
     cfg = read_config(model)
     recipe = recipe_for(cfg)
     args.page_size = args.page_size or recipe.PAGE_SIZE
-    # The worker runs the units of its model's family: those only another family runs stay out (two
-    # model units would both provide model@1).
-    others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
-    workers = [u for u in read_tree(args.source.resolve() / "engine").role_units(None, "worker") if u not in others]
+    workers = worker_units(args.source, recipe)
     if args.layers:
         cfg = cut(cfg, args.layers)
     weights = "" if args.dummy else str((args.weights or model).resolve())
     if weights and not list(Path(weights).glob("*.safetensors")):
         print(f"no *.safetensors in {weights}: dummy weights", file=sys.stderr)
         weights = ""
+    args.dummy = not weights
     run = args.run.resolve()
     run.mkdir(parents=True, exist_ok=True)
     cuda = args.device == "cuda"
@@ -414,13 +423,50 @@ def control_argv(args: argparse.Namespace) -> list[str]:
     return ["--control", args.control or control_address(args.run.resolve())]
 
 
+def changed_topology(run: Path, rest: list[str]) -> tuple[Path | None, bool]:
+    """The topology a ``check`` or ``apply`` of a workspace has to carry, and whether the change may
+    commit (an ``apply`` that is no dry run). ``serve`` lists the worker's units in the topology, and
+    the control plane takes a role's listed units as they are: a unit added to the workspace would
+    not load, and one removed would be missed. So the list is worked out again from the workspace;
+    where it differs from the run directory's topology, that topology with the new list is written
+    beside it."""
+    options = argparse.ArgumentParser(add_help=False)
+    options.add_argument("--source", type=Path)
+    options.add_argument("--topology")
+    options.add_argument("--dry-run", action="store_true")
+    given = options.parse_known_args(rest[1:])[0] if rest[:1] in (["check"], ["apply"]) else None
+    current = run / "topology.json"
+    recipe = next((r for r in RECIPES if r.NAME == engine_record(run).get("recipe")), None)
+    if given is None or given.source is None or given.topology or recipe is None or not current.is_file() \
+            or not (given.source / "engine").is_dir():
+        return None, False
+    topology = json.loads(current.read_text())
+    worker = next(r for r in topology["roles"] if r["name"] == "worker")
+    units = worker_units(given.source, recipe)
+    if units == worker["units"]:
+        return None, False
+    worker["units"] = units
+    changed = run / "topology.changed.json"
+    changed.write_text(json.dumps(topology))
+    return changed, rest[0] == "apply" and not given.dry_run
+
+
 def cmd_control(args: argparse.Namespace) -> int:
     from core.control.client import main as client
 
     rest = list(args.rest)
     if rest and rest[0] == "--":
         rest = rest[1:]
-    return client([*control_argv(args), *rest])
+    # An engine named by its address alone has no run directory to tell its topology by.
+    changed, commits = (None, False) if args.control else changed_topology(args.run.resolve(), rest)
+    try:
+        code = client([*control_argv(args), *rest, *(["--topology", str(changed)] if changed else [])])
+        if changed and commits and code == 0:  # committed: the engine's topology from now on
+            changed.replace(changed.with_name("topology.json"))
+        return code
+    finally:
+        if changed:
+            changed.unlink(missing_ok=True)
 
 
 def cmd_sleep(args: argparse.Namespace, asleep: bool) -> int:

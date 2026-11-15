@@ -92,6 +92,8 @@ HOST_DEPENDENT = frozenset({"ds.moe_experts@1", "ds.index_topk@1", "ds.compress@
                             "ds.load_keys@1"})
 """References that read the host or have shapes the values decide (which experts the tokens chose,
 the rows of a prefill): not capturable. Those of prefill only run in steps no graph records."""
+FIXED = "reference.fixed.ds.moe_experts@1"
+"""The routed experts of a captured step. Under the references' name: backend ``reference`` runs it there."""
 
 
 def reference_id(definition: str) -> str:
@@ -111,6 +113,5 @@ class Unit:
         # For a step replayed from a graph: every expert on every token, with fixed shapes.
         fn = ops.moe_experts_masked
         ctx.register("kernels.catalog@1", Implementation(
-            Solution("torch_graph.ds.moe_experts@1", "ds.moe_experts@1", f"{fn.__module__}:{fn.__name__}",
-                     library="torch", capturable=True, requires=[CAPTURE]), fn),
-            label="solution torch_graph.ds.moe_experts@1")
+            Solution(FIXED, "ds.moe_experts@1", f"{fn.__module__}:{fn.__name__}", library="torch", capturable=True,
+                     requires=[CAPTURE]), fn), label=f"solution {FIXED}")

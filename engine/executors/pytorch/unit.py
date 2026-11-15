@@ -267,5 +267,7 @@ class Unit:
         draft_tokens = spec_draft_tokens(config)
         spec = None
         if draft_tokens:
+            if not getattr(model, "draft_tokens", 0):
+                raise ValueError(f"spec.algorithm = {config['spec.algorithm']!r}: the model drafts no tokens")
             spec = Speculative(plans, batch, sampler, draft_tokens, model.hidden_size, model.dtype)
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec))

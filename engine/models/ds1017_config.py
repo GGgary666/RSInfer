@@ -78,6 +78,12 @@ class DSConfig(msgspec.Struct, frozen=True):
         if scoring != "sqrtsoftplus" or shared != 1 or not d.get("norm_topk_prob", True):
             raise ValueError(f"DS 1017 routes with sqrtsoftplus scores, normalized, and one shared expert; "
                              f"the config has {scoring}, {shared} shared, norm_topk_prob {d.get('norm_topk_prob')}")
+        # A config cut to its first layers keeps the Engram layers it still has. The hash layout draws
+        # each layer's primes in the list's order, so those kept must be the list's first.
+        engram, tables = tuple(d.get("engram_layer_ids", ())), tuple(d.get("engram_num_embeddings", ()))
+        kept = [i for i, layer in enumerate(engram) if layer < d["num_hidden_layers"]]
+        if kept != list(range(len(kept))):
+            raise ValueError(f"engram_layer_ids {list(engram)} must ascend for a model of {d['num_hidden_layers']} layers")
         return DSConfig(
             vocab_size=d["vocab_size"], hidden_size=d["hidden_size"], moe_intermediate_size=d["moe_intermediate_size"],
             num_hidden_layers=d["num_hidden_layers"], num_attention_heads=d["num_attention_heads"],
@@ -96,8 +102,8 @@ class DSConfig(msgspec.Struct, frozen=True):
             rope_beta_slow=rope.get("beta_slow", 1),
             rope_original_seq_len=rope.get("original_max_position_embeddings", 0),
             hc_mult=d.get("hc_mult", 4), hc_sinkhorn_iters=d.get("hc_sinkhorn_iters", 20), hc_eps=d.get("hc_eps", 1e-6),
-            engram_layer_ids=tuple(d.get("engram_layer_ids", ())),
-            engram_num_embeddings=tuple(d.get("engram_num_embeddings", ())),
+            engram_layer_ids=engram[:len(kept)],
+            engram_num_embeddings=tables[:len(kept)] if len(tables) == len(engram) else tables,
             engram_max_ngram_size=d.get("engram_max_ngram_size", 1), engram_vocab_size=d.get("engram_vocab_size", 0),
             engram_n_heads=d.get("engram_n_heads", 0), engram_head_dim=d.get("engram_head_dim", 0),
             engram_pad_token_id=d.get("engram_pad_token_id", 2),
@@ -138,6 +144,14 @@ class DSConfig(msgspec.Struct, frozen=True):
             _ = self.kv_source(layer), self.index_source(layer)
         if any(s not in self.index_source_layer_ids for s in self.kv_source_layer_ids if s < n):
             raise ValueError("every KV source layer runs an indexer (its keys come from that layer's latents)")
+        source = self.candidate_source_layer_id
+        if 0 <= source < n:  # its indexer picks the blocks the indexers after it choose in: of the same latents
+            if self.index_source(source) != source:
+                raise ValueError(f"candidate_source_layer_id = {source}: that layer runs no indexer")
+            for layer in range(source + 1, n):
+                if self.index_source(layer) == layer and self.ratio(layer) != self.ratio(source):
+                    raise ValueError(f"candidate_source_layer_id = {source}: the indexer of layer {layer} scores "
+                                     f"latents of another ratio ({self.ratio(layer)}, not {self.ratio(source)})")
         for dims in (self.hidden_size, self.head_dim, self.q_lora_rank, self.o_lora_rank, self.moe_intermediate_size,
                      self.index_head_dim or 32, self.engram_head_dim or 32):
             if dims % 32:

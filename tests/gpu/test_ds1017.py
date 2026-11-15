@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 import torch
 
+from core.contracts.plan import GRAPH
 from kernels import ds1017_formats as formats
 from platforms.cuda_graph import CudaGraphPlatform
 from tests.gpu.support import free_gpu
@@ -215,6 +216,33 @@ def test_decode_steps_replayed_from_graphs_give_what_eager_steps_give(checkpoint
                         platform=CudaGraphPlatform())
     assert replayed[0] == eager[0]
     same(replayed[1], eager[1])
+
+
+@pytest.mark.timeout(1800)
+def test_a_backend_no_graph_records_decodes_eagerly_with_its_own_kernels(checkpoint: Path) -> None:
+    """``tilelang`` named where graphs are recorded (``plan.cuda_graph`` is ``auto`` unless set): none
+    of its kernels is capturable, so no graph is recorded and a decode step runs them eagerly, with
+    the logits of the eager platform; ``required`` fails the start. No other backend's kernels stand
+    in for it in a captured step, whichever this device has (on SM 10.0, DeepInfer's libraries)."""
+    given, backend = prompt(300, 7), {"dsv4.backend": "tilelang"}
+    eager = generate(checkpoint, {0: given}, 8, {**backend, "plan.cuda_graph": "off"})
+    w = worker(small_config(), checkpoint, CudaGraphPlatform(), **{**ROWS, **backend})
+    try:
+        resolved = w.service("plan@1").resolved
+        assert resolved["cuda_graph"]["buckets"] == [] and "uncapturable decode kernels" in resolved["cuda_graph"]["reason"]
+        assert {s for name, s in resolved[GRAPH]["layers.ds1017@1"].items() if name != "backend"} == {""}
+        assert all(s.startswith("tilelang.") for name, s in resolved["decode"]["layers.ds1017@1"].items() if name != "backend")
+        d = driver(w)
+        d.add(0, given)
+        logits = d.generate([0], 8)
+        assert list(d.requests[0].outputs) == eager[0][0]
+        same(logits, eager[1])
+    finally:
+        w.close()
+        free_gpu()
+    with pytest.raises(Exception, match="plan.cuda_graph=required: uncapturable decode kernels"):
+        worker(small_config(), checkpoint, CudaGraphPlatform(), **{**ROWS, **backend, "plan.cuda_graph": "required"})
+    free_gpu()
 
 
 def per_row(fn: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor) -> Iterator[int]:

@@ -94,7 +94,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 需要在 SM100 上运行实验时，使用 [sm100-eval skill](../sm100-eval/SKILL.md) 和 `.github/scripts/gpu_job_runner.py` 客户端提交、查看日志并回收结果。
 
 **两族模型**（2026-11-14）：`models.qwen38` 和 `models.ds1017` 都提供 `model@1`，一个 worker 只能装一族。
-- `deploy/agxinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）。自己写拓扑时也要列，否则两个模型单元都会被装进去。
+- `deploy/agxinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `agxinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
 - `core.plan` 和 `executors.pytorch` 不再写死 Qwen 的状态种类和层：backend 和存储从模型拿（`model.backends`、`model.stores`）。
 - DS 的随机 checkpoint：`deploy/agxinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
 
@@ -121,7 +121,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `test_state_rebuild.py`：状态池原地重建（新池比旧池稍大）和撤回时旧权重、旧池重新装回（一次更大的尝试失败以后）都放得下，大小按设备空闲显存定（2026-11-10、2026-11-13 两份 framework-bugs 报告）。
   - `test_speculation.py`：投机解码（doc/specs/mtp.md）：真实结构 4 层、真 kernel、开重叠，fp32 下和不开投机逐 token 相同，bf16 下回放验证 graph 和 eager 相同；草稿来自预言（`tests/units/worker/support.py` 的 `Oracle`），checkpoint 的随机 MTP 权重几乎什么都不接受。
-  - `test_ds1017.py`：DS 1017 对照 checkpoint 自带的参照实现（`ds1017_reference/`，原样带进来）：用后端 `tilelang` 时 logits 逐位相同；参照 kernel 逐个在容差内；参照 kernel 下分块、多行、graph 回放逐位相同。要先在 GPU 环境里装 `tilelang==0.1.12`（不带依赖装，别换掉 torch：`uv pip install --no-deps tilelang==0.1.12 apache-tvm-ffi==0.1.11 torch-c-dlpack-ext==0.1.5 z3-solver==4.15.4.0 cloudpickle ml-dtypes psutil`）。小形状（1024 宽、16 头 × 128）在 4090 D 上能跑；真实形状的 attention kernel 要 SM 10.0。
+  - `test_ds1017.py`：DS 1017 对照 checkpoint 自带的参照实现（`ds1017_reference/`，原样带进来）：用后端 `tilelang` 时 logits 逐位相同（`cuda_graph=auto` 下也因不可捕获而退回 eager `tilelang`，不会录进别的后端）；参照 kernel 逐个在容差内；参照 kernel 下分块、多行、graph 回放逐位相同。要先在 GPU 环境里装 `tilelang==0.1.12`（不带依赖装，别换掉 torch：`uv pip install --no-deps tilelang==0.1.12 apache-tvm-ffi==0.1.11 torch-c-dlpack-ext==0.1.5 z3-solver==4.15.4.0 cloudpickle ml-dtypes psutil`）。小形状（1024 宽、16 头 × 128）在 4090 D 上能跑；真实形状的 attention kernel 要 SM 10.0。
   - `test_ds1017_deepinfer.py`：`kernels.deepinfer` 的每个 kernel 对参照（真实形状）、一个 token 的结果不随同一步的其他行变、录进 graph 换输入回放；缓存上的组合 definition 的用例在 `support_ds1017_cases.py`（`test_ds1017.py` 拿它们在小形状上对 TileLang 后端）。只能在 SM100 上 DeepInfer 的环境里跑。
   - `check_ds1017_real.py`：SM100 上手动跑的引擎级检查（真实形状的随机权重，或真 checkpoint 的前几层）。`--backends` 每个后端跑一遍（`+graph` 录 graph，`~direct` 把 MoE 换成 DeepInfer 的舍入方式）；`--shadow tilelang` 在每次 kernel 调用旁边用官方 kernel 在相同输入上再算一遍，逐个 definition 报相差多少。
   - `sm100_ds1017.sh`、`sm100_deepinfer_env.sh`：SM100 的任务入口（各步检查、建 DeepInfer 的环境）。

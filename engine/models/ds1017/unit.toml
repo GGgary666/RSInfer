@@ -12,4 +12,4 @@ services = ["state.weights@1", "state.holder@1", "state.kv.paged@1", "state.swa.
             "layers.ds1017@1"]
 
 [reads]
-config = ["model.path", "model.hf_config", "model.dtype", "state.kv.page_size"]
+config = ["model.path", "model.hf_config", "model.dtype", "state.kv.page_size", "weights.path"]

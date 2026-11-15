@@ -16,8 +16,12 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
+from core.contracts.kernels import Implementation, Solution
+from core.contracts.plan import GRAPH
+from deploy.models.hf import cut
 from kernels import ds1017_formats as formats
-from models.ds1017_config import DSConfig, states
+from layers.ds1017.unit import Layers
+from models.ds1017_config import DSConfig, engram_layout, states
 from tests.units.support.ds1017 import DSWorker, checkpoint, driver, tiny_config
 from tests.units.support.graphs import with_graphs
 
@@ -192,17 +196,29 @@ def test_a_checkpoint_missing_an_expert_is_refused(model: tuple[dict[str, Any], 
         fresh((model[0], tmp_path))
 
 
-def test_engram_without_its_token_map_fails_at_the_first_step_that_needs_it(model: tuple[dict[str, Any], Path],
-                                                                         tmp_path: Path) -> None:
+def test_engram_without_its_token_map_fails_the_start(model: tuple[dict[str, Any], Path], tmp_path: Path,
+                                                      worker: DSWorker) -> None:
+    """And the map may be in a directory of its own (``dsv4.token_map_path``): a model served from its
+    config alone (cut to its first layers) with dummy or separate weights, a tokenizer kept elsewhere."""
+    bare, maps = tmp_path / "bare", tmp_path / "maps"
+    bare.mkdir()
+    maps.mkdir()
     for file in model[1].glob("*"):
-        if file.name != "engram_token_map.json":
-            (tmp_path / file.name).write_bytes(file.read_bytes())
-    w = fresh((model[0], tmp_path))
+        (maps if file.name == "engram_token_map.json" else bare).joinpath(file.name).write_bytes(file.read_bytes())
+    with pytest.raises(Exception, match="compressed token map"):
+        fresh((model[0], bare))
+    w = fresh((model[0], bare), **{"dsv4.token_map_path": str(maps)})
     try:
-        with pytest.raises(RuntimeError, match="compressed token map"):
-            generate(w, [2])
+        assert generate(w, [2])[0] == generate(worker, [2])[0]
     finally:
         w.close()
+
+
+def test_dummy_weights_are_refused(model: tuple[dict[str, Any], Path]) -> None:
+    """The weights are the checkpoint's bytes: ``initialize_dummy_weights`` fills floating-point tensors
+    only, which would leave every quantized matrix and its scales zero."""
+    with pytest.raises(Exception, match="weights.path is empty, and DS 1017 takes no dummy weights"):
+        DSWorker(model[0], **{"dsv4.token_map_path": str(model[1])})
 
 
 def test_what_the_layers_store(worker: DSWorker) -> None:
@@ -239,12 +255,15 @@ def test_a_config_the_layers_cannot_run_is_refused() -> None:
         text(q_lora_rank=48).check()
     with pytest.raises(ValueError, match="sqrtsoftplus"):
         text(scoring_func="sigmoid")
+    with pytest.raises(ValueError, match="candidate_source_layer_id = 4: that layer runs no indexer"):
+        text(candidate_source_layer_id=4).check()
+    with pytest.raises(ValueError, match="candidate_source_layer_id = 1: the indexer of layer 3 scores latents of another ratio"):
+        text(candidate_source_layer_id=1).check()
 
 
 def test_a_model_cut_to_its_first_layers_reads_only_their_tensors(model: tuple[dict[str, Any], Path]) -> None:
     """The real checkpoint is hundreds of GiB: a config cut to a few layers must not read the rest."""
     from core.state.weights.unit import safetensors_files, safetensors_weights_iterator
-    from deploy.models.hf import cut
 
     w = DSWorker(cut(model[0], 3), **{"weights.path": str(model[1])})
     try:
@@ -261,3 +280,81 @@ def test_a_model_cut_to_its_first_layers_reads_only_their_tensors(model: tuple[d
         assert len(tokens[2]) == STEPS
     finally:
         w.close()
+
+
+def test_a_config_cut_to_its_first_layers_keeps_their_engram_layers_only(model: tuple[dict[str, Any], Path]) -> None:
+    """``--layers``: the Engram layers past the cut are not the model's (no state, no hash), and those
+    kept hash as they do in the whole model, whose layout draws each layer's primes in the list's order."""
+    whole, three = DSConfig.from_hf(model[0]), DSConfig.from_hf(cut(model[0], 3))
+    assert whole.engram_layer_ids == (1, 4) and three.engram_layer_ids == (1,)
+    assert three.engram_num_embeddings == whole.engram_num_embeddings[:1]
+    assert [part[:1] for part in engram_layout(whole)] == list(engram_layout(three))
+    three.check()
+    with pytest.raises(ValueError, match="engram_layer_ids .* ascend"):
+        DSConfig.from_hf(cut(tiny_config(engram_layer_ids=[4, 1]), 3))
+    # One layer: no Engram layer is left, and no compressed KV either.
+    one = cut(model[0], 1)
+    assert DSConfig.from_hf(one).engram_layer_ids == () and not any(d.kind == "kv.paged" for d in states(DSConfig.from_hf(one), 4))
+    w = DSWorker(one, **{"weights.path": str(model[1])})
+    try:
+        tokens, _ = generate(w, [0, 2])
+        assert len(tokens[0]) == len(tokens[2]) == STEPS
+    finally:
+        w.close()
+
+
+@pytest.mark.parametrize("backend", ["nope", "deepinfer", "tilelang"])
+def test_a_named_backend_that_cannot_run_here_fails_the_start(model: tuple[dict[str, Any], Path], backend: str) -> None:
+    """stage2-contract.md §5.5.3. Neither kernel library of this model runs on a CPU, and nothing
+    registers under a misspelt name: the start fails rather than run the references in their place."""
+    with pytest.raises(Exception, match=rf"dsv4.backend = '{backend}': backend '{backend}' has no solution"):
+        fresh(model, **{"dsv4.backend": backend})
+
+
+def test_a_captured_step_runs_the_named_backend_s_kernels_or_is_not_recorded(worker: DSWorker) -> None:
+    """A step replayed from a graph takes no other backend's kernel in the named one's place, whatever
+    else a graph could record. The references bring the routed experts' fixed-shape form under
+    their own name; a backend whose kernels a graph cannot record has no solution there (``""``:
+    ``core.plan`` records no graph and says which kernels are why)."""
+    catalog, layers = worker.service("kernels.catalog@1"), worker.service("layers.ds1017@1")
+    declared = worker.service("model@1").assembly.states
+    resolved = worker.service("plan@1").resolved
+    names = sorted({name for phase in ("prefill", "decode") for name in resolved[phase]["layers.ds1017@1"]} - {"backend"})
+    for name in names:  # two more backends: one a graph records, first by id, and one it does not
+        for backend, capturable in (("another", True), ("eager", False)):
+            catalog.register(Implementation(Solution(f"{backend}.{name}", name, "tests:kernel", capturable=capturable),
+                                            catalog.resolve(f"reference.{name}")))
+    graph = layers.resolve(declared)[GRAPH]
+    assert graph.pop("backend") == "reference" and graph["ds.moe_experts@1"] == "reference.fixed.ds.moe_experts@1"
+    assert all(solution.startswith("reference.") for solution in graph.values()), graph
+    config = {"dsv4.backend": "eager", "dsv4.prefill_backend": "", "dsv4.decode_backend": ""}
+    eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64).resolve(declared)
+    assert all(solution == f"eager.{name}" for phase in ("prefill", "decode")
+               for name, solution in eager[phase].items() if name != "backend"), eager
+    assert {solution for name, solution in eager[GRAPH].items() if name != "backend"} == {""}, eager[GRAPH]
+
+
+def test_a_decode_step_reads_no_page_past_a_row_s_own(model: tuple[dict[str, Any], Path], worker: DSWorker) -> None:
+    """A row's table keeps what a longer request left after the row's own pages (as SGLang's pool
+    does), which may be pages of a pool since made smaller. The indexer of a decode step is given
+    every row's table as wide as the longest row (a graph bucket: as the longest context) and reads
+    only the latents each row reaches."""
+    clean = generate(worker, [0, 2])
+    for buckets in ([], [4]):
+        w = fresh(model)
+        try:
+            if buckets:
+                with_graphs(w, buckets)
+            # Before any request has its pages: whatever a row is not given stays outside the pool.
+            table = w.service("worker.batch@1").binding.buffers()["req_to_token"]
+            table[1:] = 1000 * w.service("state.kv.paged@1").page_size
+            stale = generate(w, [0, 2])
+        finally:
+            w.close()
+        assert stale[0] == clean[0]
+        same(stale[1], clean[1], [0, 2])
+
+
+def test_speculation_is_refused_at_start_for_a_model_that_drafts_nothing(model: tuple[dict[str, Any], Path]) -> None:
+    with pytest.raises(Exception, match="spec.algorithm = 'eagle': the model drafts no tokens"):
+        fresh(model, **{"spec.algorithm": "eagle"})

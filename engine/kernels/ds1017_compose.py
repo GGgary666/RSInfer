@@ -247,10 +247,12 @@ def index_topk_paged(p: Pieces, q_data: torch.Tensor, q_scales: torch.Tensor, we
                      ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``MQA._topk_decode``: each query over the first ``width`` latents of its row, read through its
     pages ``block_table`` ``[n, pages]``, ``lens`` of them reached; the ``topk`` best as cache rows
-    ascending by position, ``-1`` after them; for a candidate source its candidate blocks."""
+    ascending by position, ``-1`` after them; for a candidate source its candidate blocks. The table
+    past a row's own pages is not read: it may hold what another request left, pages the cache no
+    longer has."""
     dim = q_data.shape[-1] * 2
     j = torch.arange(width, device=cache.device)
-    phys = block_table.long()[:, j // entries] * entries + j % entries
+    phys = torch.where(j < lens[:, None], block_table.long()[:, j // entries] * entries + j % entries, 0)
     held, held_scales = formats.key_sections(cache, entries, dim)
     keys = _values(held.flatten(0, 1)[phys], held_scales.flatten(0, 1)[phys])
     score = p.index_score(_values(q_data, q_scales)[:, None], keys, weights[:, None])[:, 0]

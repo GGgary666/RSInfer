@@ -143,7 +143,10 @@ class Layers:
         """Which of the fixed solutions the forward runs: a phase, or ``GRAPH`` for a bucket."""
         self.max_context_len = max_context_len
         self.engram_first = min(cfg.engram_layer_ids) if cfg.engram_layer_ids else -1
-        self.token_map_host = list(token_map) if token_map is not None else None
+        if cfg.engram_layer_ids and token_map is None:
+            raise ValueError("Engram needs the compressed token map: an engram_token_map.json or a tokenizer.json in "
+                             "dsv4.token_map_path, model.path or weights.path")
+        self.token_map_host = list(token_map or ())
         self.constants: dict[str, torch.Tensor] = {}
         self.fixed: dict[int, torch.Tensor] = {}
         """Bucket -> its rows' table indices, the one buffer a graph of that bucket reads."""
@@ -171,7 +174,6 @@ class Layers:
         self.fixed.clear()
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
-        # A named backend solves what it has a kernel for; the rest runs as ``auto`` would.
         cfg, page = self.cfg, self.kv.page_size
         ratios = {r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r}
         # DeepGEMM's paged indexer takes blocks of 32, 64 or 128 keys: a page holds page / ratio.
@@ -180,7 +182,7 @@ class Layers:
                  "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0}
         calls = {"prefill": {name: shape for name in DEFINITIONS if name not in DECODE_ONLY},
                  "decode": {name: shape for name in DEFINITIONS if name not in PREFILL_ONLY}}
-        return self.kernels.resolve(calls, shared=frozenset(DEFINITIONS))
+        return self.kernels.resolve(calls)
 
     def k(self, definition: str) -> KernelFn:
         return self.kernels(self.table, definition)
@@ -337,9 +339,6 @@ class Layers:
                     cfg.rope_beta_slow, device)
                 value = torch.cat([freqs.real, freqs.imag], dim=-1).contiguous()  # DeepInfer's cos_sin_cache
             elif name == "token_map":
-                if self.token_map_host is None:
-                    raise RuntimeError("Engram needs the compressed token map: a tokenizer.json or an "
-                                       "engram_token_map.json in the model directory")
                 value = torch.tensor(self.token_map_host, dtype=torch.int64, device=device)
             else:
                 primes, offsets, multipliers = engram_layout(cfg)
@@ -613,7 +612,7 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         cfg = DSConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))
         cfg.check()
-        directory = config["model.path"] or config["weights.path"]
+        directory = config["dsv4.token_map_path"] or config["model.path"] or config["weights.path"]
         ctx.provide("layers.ds1017@1", Layers(
             ctx.use("kernels.catalog@1"), config, cfg, ctx.use("state.kv.paged@1"), ctx.use("state.swa.slots@1"),
             token_map(directory, cfg), config["batch.max_context_len"]))

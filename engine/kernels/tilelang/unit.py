@@ -22,9 +22,9 @@ SOLUTIONS = ("ds.fake_quant_fp8@1", "ds.fake_quant_fp4@1", "ds.linear_fp8@1", "d
              "ds.compress_decode@1", "ds.silu@1", "ds.shared_expert@1", "ds.engram_hash@1")
 """The definitions it solves; the function in ``ops`` has the definition's name. From ``ds.linear@1`` on
 they are the torch products and reductions that implementation calls, not kernels of its own; from
-``ds.rope@1`` on, compositions of these (``kernels.ds1017_compose``). Every definition another backend
-solves is solved here too: a definition this backend left out would run as ``auto`` picks, which is
-another backend's kernel where there is one."""
+``ds.rope@1`` on, compositions of these (``kernels.ds1017_compose``). Every definition the layers call
+is solved here: a backend named in the config runs its own kernels only, and the start fails on a
+definition it left out (stage2-contract.md §5.5.3)."""
 
 
 class Unit:
