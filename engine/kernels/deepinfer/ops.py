@@ -34,6 +34,7 @@ The weights arrive as the checkpoint's bytes (``uint8``); a weight's scales as
 from __future__ import annotations
 
 from types import MappingProxyType
+from collections.abc import Sequence
 from typing import Any, cast
 
 import deep_gemm
@@ -595,11 +596,11 @@ def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: to
     return out.reshape(*x.shape[:-1], w2.shape[0])
 
 
-def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor]
                  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rows of an Engram table split over the ranks, through the group's collectives
     (``kernels.ds1017_ep``): DeepInfer's own way, ``deep_ep.EngramBuffer``, is not wired yet."""
-    return ep.engram_fetch(group, ids, weight, scale)
+    return ep.engram_fetch(group, ids, weights, scales)
 
 
 def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor

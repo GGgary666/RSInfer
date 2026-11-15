@@ -17,6 +17,7 @@ The kernels are compiled for bf16 activations, so every activation given must be
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -193,9 +194,9 @@ def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torc
     return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit, slots, taken)
 
 
-def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor]
                  ) -> tuple[torch.Tensor, torch.Tensor]:
-    return ep.engram_fetch(group, ids, weight, scale)
+    return ep.engram_fetch(group, ids, weights, scales)
 
 
 # ---------------------------------------------------------------- the compositions over the caches

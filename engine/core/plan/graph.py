@@ -60,6 +60,15 @@ def padding_row() -> BatchPlan:
                      Column.of("i64", [0]), Column.of("u8", [0]), "decode", 0)
 
 
+def fetch(backends: Sequence[Backend], input_ids: Tensor, positions: Tensor) -> None:
+    """``Backend.fetch`` of the backends that have one: after ``prepare``, before the forward or the
+    replay, outside the graph, with the step's inputs as the forward gets them."""
+    for backend in backends:
+        hook = getattr(backend, "fetch", None)
+        if hook is not None:
+            hook(input_ids, positions)
+
+
 def eager_padding_step(batch: PersistentBatch, model: Any, backends: Sequence[Backend], stores: Sequence[Any],
                        device: torch.device) -> None:
     """One eager decode step of the padding row, on the scratch items. What a kernel library
@@ -69,6 +78,7 @@ def eager_padding_step(batch: PersistentBatch, model: Any, backends: Sequence[Ba
     for backend in backends:
         backend.prepare(batch, padding_row(), PlanKey("decode", 0))
     token = torch.zeros(1, dtype=torch.int64, device=device)
+    fetch(backends, token, torch.zeros_like(token))
     with torch.inference_mode():
         model.forward(token, torch.zeros_like(token), torch.arange(1, device=device))
     for store in stores:
@@ -119,6 +129,7 @@ class GraphPlan:
         self.positions[:n].copy_(positions)
         self.inputs[n:].zero_()
         self.positions[n:].zero_()
+        fetch(self.backends, self.inputs, self.positions)
         self.graph.replay()
         assert self.output is not None
         return self.output[:n]
@@ -136,6 +147,7 @@ class GraphPlan:
             store.clear(store.scratch())
         for backend in self.backends:
             backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
+        fetch(self.backends, self.inputs, self.positions)
         with torch.inference_mode():
             return model.forward(self.inputs, self.positions, self.last_index)
 

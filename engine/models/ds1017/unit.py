@@ -183,6 +183,12 @@ class DeepseekV41ForCausalLM:
         self.weights.load()
         self._views = [self.weights.bind(f"layers.{i}.") for i in range(self.cfg.num_hidden_layers)]
         self._views.append(self.weights.bind(""))
+        self.layers.set_tables(self._engram_tables)
+
+    def _engram_tables(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """This rank's rows of the Engram layers' tables, weights and scales, in the layers' order."""
+        tables = [self._layer_weights()[i] for i in self.cfg.engram_layer_ids]
+        return [t["engram.embed.weight"] for t in tables], [t["engram.embed.scale"] for t in tables]
 
     # -------------------------------------------------------------- weights
 
@@ -332,6 +338,12 @@ class DeepseekV41ForCausalLM:
         self.layers.idle(self._layer_weights())
         self.placement.step()
 
+    def stepped(self) -> None:
+        """A forward of this rank's rows was run (or replayed from a graph): the executor calls it
+        after each, outside any graph. The experts' placement counts the step, and places them again
+        when it is time."""
+        self.placement.step()
+
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
         """``Transformer.forward``: logits ``[rows, vocab]`` in fp32 at each row's last token."""
         cfg, layers = self.cfg, self.layers
@@ -354,7 +366,6 @@ class DeepseekV41ForCausalLM:
             pre, post, comb = layers.hc_mixes(h, w, "ffn")
             x = layers.moe(i, layers.norm(layers.hc_pre(h, attn_pre), w["ffn_norm.weight"]), w)
             h = layers.hc_post(x, residual, post, comb)
-        self.placement.step()
         x = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
         return layers.linear(x[last_index], top["head.weight"])
 

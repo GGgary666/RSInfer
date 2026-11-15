@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
@@ -152,6 +152,15 @@ class Layers:
         """``expert.placement@1``: the slot of each expert, when they are placed by the tokens they take."""
         self.chosen: Mapping[str, Mapping[str, str]] = {}
         """``resolve``'s answer: phase -> definition -> solution."""
+        self.tables: Callable[[], tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]] = lambda: ((), ())
+        """This rank's rows of each Engram layer's table, weights and scales, as loaded now (``set_tables``)."""
+        self.bucket = 0
+        """The graph bucket of the step being prepared; 0: eager."""
+        self.fetched: tuple[torch.Tensor, torch.Tensor] | None = None
+        """Among ranks that share the Engram tables: the rows this step's tokens hash to, bytes and
+        scales ``[tokens, layers, cols, ...]``, brought in before the forward (``fetch``)."""
+        self.fetched_fixed: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        """Bucket -> the buffers a graph of that bucket reads them from."""
         if cfg.n_routed_experts % group.size:
             raise ValueError(f"comm.size = {group.size} does not divide the {cfg.n_routed_experts} routed experts")
         self.kernels = Kernels(catalog, config, "dsv4")
@@ -183,11 +192,18 @@ class Layers:
         return self
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {f"rows.{size}": t for size, t in self.fixed.items()}
+        return {**{f"rows.{size}": t for size, t in self.fixed.items()},
+                **{f"engram.{size}.{i}": t for size, pair in self.fetched_fixed.items() for i, t in enumerate(pair)}}
 
     def release_graphs(self) -> None:
         self.generation += bool(self.fixed)
         self.fixed.clear()
+        self.fetched_fixed.clear()
+
+    def set_tables(self, tables: Callable[[], tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]]) -> None:
+        """Where this rank's rows of the Engram layers' tables are, in the layers' order: asked at
+        every step, the model's weights may have been loaded again."""
+        self.tables = tables
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         cfg, page = self.cfg, self.kv.page_size
@@ -232,6 +248,7 @@ class Layers:
         if plan.draft_tokens:
             raise ValueError("layers.ds1017 runs no speculative step yet")
         self.table = GRAPH if key.bucket else key.phase
+        self.bucket = key.bucket
         self.batch_tables = batch.binding.buffers()
         device = self.batch_tables["req_to_token"].device
         rows = [int(r) + 1 for r in plan.rows.values()]
@@ -398,16 +415,38 @@ class Layers:
         assert rows is not None
         self.step = {"rows": rows, "pos": positions, "slot": slot_table[rows].long(),
                      "tok_slot": tables["req_to_token"][rows, positions].long()}
-        if self.cfg.engram_layer_ids:
-            self.step["hashes"] = self._hashes(input_ids, positions)
+        if self.cfg.engram_layer_ids and self.group.size == 1:  # among ranks: before the forward (fetch)
+            self.step["hashes"] = self._hashes(input_ids, positions, self.step["slot"])
 
-    def _hashes(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def fetch(self, input_ids: torch.Tensor, positions: torch.Tensor) -> None:
+        """After ``prepare`` and before the forward, outside any graph, with the step's inputs (a
+        bucket's padded ones): among ranks that share the Engram tables, the rows this step's tokens
+        hash to, from the ranks that hold them, in one exchange with the other ranks' own. A recorded
+        step reads them from the bucket's fixed buffers."""
+        if self.group.size == 1 or not self.cfg.engram_layer_ids:
+            return
+        rows = self.layout.rows if self.layout is not None else self.decode_rows
+        assert rows is not None
+        slot = self.batch_tables[f"slots.{SLOT_KIND}"][rows].long()
+        hashes = self._hashes(input_ids, positions, slot)
+        held, scales = self.kernels("decode", "ds.engram_fetch@1")(self.group, hashes.long(), *self.tables())
+        if self.bucket:
+            fixed = self.fetched_fixed.get(self.bucket)
+            if fixed is None:
+                fixed = self.fetched_fixed[self.bucket] = (held.clone(), scales.clone())
+                self.generation += 1
+            else:
+                fixed[0].copy_(held)
+                fixed[1].copy_(scales)
+            held, scales = fixed
+        self.fetched = (held, scales)
+
+    def _hashes(self, input_ids: torch.Tensor, positions: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
         """``NgramHashState.forward``: ``[tokens, engram layers, hash cols]`` rows of the layers' tables."""
         cfg, device = self.cfg, input_ids.device
         compressed = self.constant("token_map", device)[input_ids]
         pad = self.constant("token_map", device)[cfg.engram_pad_token_id]
         tail = self.slots.bind(self.engram_first).buffers()["tail"]
-        slot = self.step["slot"]
         ng = cfg.engram_max_ngram_size
         if self.layout is None:  # one token per row: every look-back is in the tail
             tokens = torch.cat([compressed[:, None], tail[slot]], dim=1)
@@ -449,11 +488,12 @@ class Layers:
         """``Engram.forward`` on the stream ``[tokens, hc, dim]``: the layer's table rows at the hash ids,
         dequantized, projected to one key per copy and a shared value, added through a gate."""
         cfg = self.cfg
-        ids = self.step["hashes"][:, cfg.engram_layer_ids.index(layer)]
-        if self.group.size > 1:  # the table's rows are split over the ranks
-            held, scales = self.k("ds.engram_fetch@1")(self.group, ids.long(), w["engram.embed.weight"],
-                                                       w["engram.embed.scale"])
+        index = cfg.engram_layer_ids.index(layer)
+        if self.group.size > 1:  # the table's rows are split over the ranks: brought in before the forward
+            assert self.fetched is not None
+            held, scales = self.fetched[0][:, index], self.fetched[1][:, index]
         else:
+            ids = self.step["hashes"][:, index]
             held, scales = w["engram.embed.weight"][ids], w["engram.embed.scale"][ids]
         rows = formats.dequant_rows_fp8(held, scales).to(x.dtype)
         kv = self.linear_fp8(rows.flatten(-2), w, "engram.wkv")
@@ -489,11 +529,11 @@ class Layers:
         x = torch.empty(0, cfg.hidden_size, dtype=torch.bfloat16, device=device)
         chosen = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.float32, device=device)
         indices = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.int64, device=device)
-        ids = torch.empty(0, cfg.engram_hash_cols, dtype=torch.int64, device=device)
+        if cfg.engram_layer_ids:  # as ``fetch``, before the layers
+            ids = torch.empty(0, len(cfg.engram_layer_ids), cfg.engram_hash_cols, dtype=torch.int64, device=device)
+            self.k("ds.engram_fetch@1")(self.group, ids, *self.tables())
         for layer in range(cfg.num_hidden_layers):
             w = weights[layer]
-            if layer in cfg.engram_layer_ids:
-                self.k("ds.engram_fetch@1")(self.group, ids, w["engram.embed.weight"], w["engram.embed.scale"])
             placed = self.placement.active
             self.k("ds.ep_experts@1")(self.group, x, chosen, indices, w["ffn.experts.w13.weight"],
                                       w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],

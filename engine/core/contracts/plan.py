@@ -113,7 +113,13 @@ class Backend(Protocol):
     with the metadata of the last ``prepare``. A mixed step runs as an extend, eagerly (§8.7).
 
     The fixed buffers are the graph's by-address dependencies (``binding``); the bucket and the
-    selected solutions are by-value ones (§8.5, §9.3)."""
+    selected solutions are by-value ones (§8.5, §9.3).
+
+    A backend may also have ``fetch(input_ids, positions)``: the plan calls it after ``prepare`` and
+    before the forward or the replay, outside any graph, with the step's inputs as the forward gets
+    them (a bucket's padded ones). It is for what a step needs from other ranks before it runs and
+    no graph can record (DS 1017's Engram rows, doc/specs/v1-ds1017.md stage 3); it writes into fixed
+    buffers as ``prepare`` does."""
 
     def release_graphs(self) -> None:
         """Drop the fixed buffers of the graph buckets (``binding`` moves on). The plan calls it once

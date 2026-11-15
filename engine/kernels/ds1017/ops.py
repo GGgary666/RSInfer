@@ -50,7 +50,7 @@ The number formats and their byte layouts are in ``kernels.ds1017_formats``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from typing import Any
 
@@ -317,10 +317,10 @@ def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torc
     return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit, slots, taken)
 
 
-def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor]
                  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rows of an Engram table split over the ranks, as bytes and scales (``kernels.ds1017_ep``)."""
-    return ep.engram_fetch(group, ids, weight, scale)
+    return ep.engram_fetch(group, ids, weights, scales)
 
 
 def moe_experts_masked(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,

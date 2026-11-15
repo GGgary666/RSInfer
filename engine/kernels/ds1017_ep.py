@@ -19,6 +19,7 @@ tokens may have chosen its experts.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -61,18 +62,22 @@ def ep_experts(experts: KernelFn, group: Any, x: torch.Tensor, weights: torch.Te
     return y
 
 
-def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor]
                  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``ds.engram_fetch@1``: the rows ``ids`` ``[tokens, cols]`` of an Engram table as their bytes
-    ``[tokens, cols, width]`` and scales. This rank holds the table's rows ``rank * part`` onwards,
-    ``part`` of them (``weight``, ``scale``): the table is split over the ranks in order."""
-    part = weight.shape[0]
+    """``ds.engram_fetch@1``: for each Engram layer ``l`` the rows ``ids[:, l]`` (``ids`` ``[tokens,
+    layers, cols]``) of its table, as their bytes ``[tokens, layers, cols, width]`` and scales. This
+    rank holds each table's rows ``rank * part`` onwards, ``part`` of them (``weights[l]``,
+    ``scales[l]``): a table is split over the ranks in order. One exchange for all the layers."""
     (every,), counts = group.gather([ids])
-    at = every - group.rank * part
-    held = ((at >= 0) & (at < part)).unsqueeze(-1)
-    at = at.clamp(0, part - 1)
-    # A row is on one rank: the others add zero. The collectives sum integers of 32 bits.
-    rows = group.reduce(torch.where(held, weight[at], 0).to(torch.int32))
-    scales = group.reduce(torch.where(held, scale[at], 0).to(torch.int32))
-    own = mine(counts, group.rank)
-    return rows[own].to(torch.uint8), scales[own].to(torch.uint8)
+    rows: list[torch.Tensor] = []
+    for layer, (weight, scale) in enumerate(zip(weights, scales, strict=True)):
+        part = weight.shape[0]
+        at = every[:, layer] - group.rank * part
+        held = ((at >= 0) & (at < part)).unsqueeze(-1)
+        at = at.clamp(0, part - 1)
+        # A row is on one rank: the others add zero.
+        rows.append(torch.cat([torch.where(held, weight[at], 0), torch.where(held, scale[at], 0)], dim=-1))
+    width = weights[0].shape[-1]
+    # The collectives sum integers of 32 bits.
+    both = group.reduce(torch.stack(rows, dim=1).to(torch.int32))[mine(counts, group.rank)].to(torch.uint8)
+    return both[..., :width].contiguous(), both[..., width:].contiguous()

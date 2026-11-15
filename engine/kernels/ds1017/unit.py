@@ -85,8 +85,8 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("ds.engram_hash@1", "Engram's n-gram hashes: rows of each Engram layer's tables", ops.engram_hash, EXACT, True),
     ("ds.ep_experts@1", "the routed experts' sum on ranks that each hold part of the layer's experts",
      ops.ep_experts, CHAINED, True),
-    ("ds.engram_fetch@1", "rows of an Engram table split over the ranks, as bytes and scales", ops.engram_fetch,
-     EXACT, True),
+    ("ds.engram_fetch@1", "rows of every Engram layer's table, the tables split over the ranks, as bytes and "
+     "scales", ops.engram_fetch, EXACT, True),
 )
 """(definition, doc, reference, tolerance, batch invariant). Every reference sums in a fixed order and
 multiplies a row on its own (``ops.total``, ``ops.matmul``), so a token's result does not depend on

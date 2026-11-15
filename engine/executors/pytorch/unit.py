@@ -144,12 +144,15 @@ class PyTorchExecutor:
     """``executor@1``."""
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
-                 spec: Speculative | None = None, idle: Callable[[], None] | None = None) -> None:
+                 spec: Speculative | None = None, idle: Callable[[], None] | None = None,
+                 stepped: Callable[[], None] | None = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
         self.spec = spec
         """Speculation (doc/specs/mtp.md); ``None`` off."""
         self.idle = idle
         """The model's part in a step this rank has no rows in (``model.idle``); ``None``: none."""
+        self.stepped = stepped
+        """What the model does after each forward, outside any graph (``model.stepped``); ``None``: nothing."""
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
         self.row_index: torch.Tensor | None = None
@@ -261,6 +264,8 @@ class PyTorchExecutor:
                 if chosen is eager or self.plans.required:
                     raise
                 logits = eager.run(self.batch, plan, input_ids, pos, last_index)
+            if self.stepped is not None:
+                self.stepped()
             next_token_ids = self.sampler.sample(logits, self.batch.sampling(rows),
                                                  [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)])
             self.batch.record(rows, next_token_ids)
@@ -304,4 +309,4 @@ class Unit:
                 raise ValueError(f"spec.algorithm = {config['spec.algorithm']!r}: the model drafts no tokens")
             spec = Speculative(plans, batch, sampler, draft_tokens, model.hidden_size, model.dtype)
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec,
-                                                  getattr(model, "idle", None)))
+                                                  getattr(model, "idle", None), getattr(model, "stepped", None)))
