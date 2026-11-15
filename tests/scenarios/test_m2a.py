@@ -276,6 +276,7 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
                                  "--topology", str(topo_file)], env=ENV, capture_output=True, text=True, timeout=300)
         assert direct.returncode == 0 and json.loads(direct.stdout)["restarted"] == ["host-a/worker/0"], direct.stdout
         assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept"}  # local file not touched by direct client
+        assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
         added.mkdir()
         (added / "__init__.py").write_text("")
