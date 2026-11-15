@@ -23,6 +23,7 @@ every rank, an empty one where a rank has no rows (``model.idle``).
 from __future__ import annotations
 
 import datetime
+import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -55,10 +56,11 @@ class Group:
         for t in tensors:
             if t.shape[0] != n:
                 raise ValueError("the tensors gathered together have one row count")
-            # As bytes: the collectives of gloo take few dtypes (no bf16).
-            rows = t.contiguous().view(torch.uint8).reshape(n, -1)
-            padded = torch.zeros(width, rows.shape[1], dtype=torch.uint8, device=t.device)
-            padded[:n] = rows
+            # As bytes: the collectives of gloo take few dtypes (no bf16). A rank without rows knows
+            # a row's size too.
+            size = t.element_size() * math.prod(t.shape[1:])
+            padded = torch.zeros(width, size, dtype=torch.uint8, device=t.device)
+            padded[:n] = t.contiguous().view(torch.uint8).reshape(n, size)
             every = self._all_gather(padded)
             kept = torch.cat([every[r * width:r * width + c] for r, c in enumerate(counts)])
             out.append(kept.view(t.dtype).reshape(sum(counts), *t.shape[1:]))

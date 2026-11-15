@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,40 @@ def test_requests_through_the_whole_engine_are_what_the_worker_units_compute(
     workers = next(r["units"] for r in topology["roles"] if r["name"] == "worker")
     assert "models.ds1017" in workers and "models.qwen38" not in workers and "layers.gdn" not in workers
     assert sum(len(t.split()) for t in want) >= 12, want  # the model generated, rather than stopped at once
+
+
+def test_two_ranks_that_hold_the_model_between_them_give_what_one_rank_gives(
+        model: tuple[dict[str, Any], Path], tokenizer: Path, tmp_path: Path) -> None:
+    """``--ranks 2`` (doc/specs/v1-ds1017.md stage 3): two workers, each with half of every layer's
+    routed experts and half of the Engram tables' rows, and with requests of its own (a scheduling
+    domain each). A token's experts and table rows are on either rank, so every step is computed by
+    both, also a step in which one of them has no request. The text is what one rank holding all of
+    it computes: an expert's term for a token is the same wherever it runs, and the token's own rank
+    adds its terms in the same order."""
+    cfg, checkpoint = model
+    tok = AutoTokenizer.from_pretrained(str(tokenizer))
+    prompts = ["w1 w2 w3 w4 w5", "w9 w8 w7", "w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38",
+               "w40 w41 w42 w43", "w50 w51", "w60 w61 w62 w63 w64 w65 w66"]
+    want = expected(cfg, checkpoint, tokenizer, tok, [list(tok.encode(p)) for p in prompts], 10)
+    args = ["--model", str(checkpoint), "--tokenizer", str(tokenizer), "--device", "cpu", "--page-size", "4",
+            "--max-rows", "4", "--max-context", "64", "--token-budget", "8", "--cpu-bytes", str(16 << 20),
+            "--timeout", "120", "--ds-backend", "reference", "--ranks", "2"]
+
+    def ask(prompt: str) -> str:
+        got = post(url + "/v1/completions", {"model": MODEL, "prompt": prompt, "max_tokens": 10, "temperature": 0.0})
+        return str(got["choices"][0]["text"])
+
+    with served(tmp_path / "run", *args) as url:
+        assert ask(prompts[0]) == want[0]  # alone: the other rank has no request, and runs its experts
+        with ThreadPoolExecutor(len(prompts)) as pool:  # together: both ranks have requests
+            assert list(pool.map(ask, prompts)) == want
+        topology = json.loads((tmp_path / "run" / "topology.json").read_text())
+        config = json.loads((tmp_path / "run" / "config.json").read_text())
+        logs = sorted((tmp_path / "run").glob("host-a/snapshots/.run/worker-*/log"))
+        ran = [log.read_text().count("core.plan:") for log in logs]
+    assert len(topology["placement"]) == 2 and config["sched.domains"] == 2 and config["comm.size"] == 2
+    assert len(config["sched.workers"]) == 2 and config["comm.rendezvous"].startswith("file://")
+    assert len(logs) == 2 and all(ran), (logs, ran)
 
 
 def test_serve_tells_the_worker_where_the_token_map_is_and_refuses_dummy_weights(model: tuple[dict[str, Any], Path],

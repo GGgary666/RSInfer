@@ -47,12 +47,17 @@ def fp8(name: str, out: int, into: int) -> list[WeightDecl]:
             WeightDecl(name + ".packed", formats.packed_shape(out, into), "u8")]
 
 
-def params(cfg: DSConfig) -> list[WeightDecl]:
+def params(cfg: DSConfig, ranks: int = 1) -> list[WeightDecl]:
     """The backbone's parameters, by the checkpoint's names; the routed experts of a layer as
     ``ffn.experts.w13.weight`` ``[experts, 2 * inter, dim / 2]`` (``w1`` over ``w3``) and
-    ``ffn.experts.w2.weight``, each with its ``packed`` scales."""
+    ``ffn.experts.w2.weight``, each with its ``packed`` scales.
+
+    One of ``ranks`` ranks that hold the model between them (``comm.group@1``) has its part of what
+    is split in order: of each layer's routed experts (``experts / ranks``), and of each Engram
+    table's rows (``shard`` of them, the last rank's part padded)."""
     dim, hd, heads, inter, experts = (cfg.hidden_size, cfg.head_dim, cfg.num_attention_heads,
                                       cfg.moe_intermediate_size, cfg.n_routed_experts)
+    held = experts // ranks
     mix = (2 + cfg.hc_mult) * cfg.hc_mult
 
     def w(name: str, *shape: int, fmt: str = "bf16") -> WeightDecl:
@@ -79,19 +84,27 @@ def params(cfg: DSConfig) -> list[WeightDecl]:
         out += [w(p + "attn_norm.weight", dim), w(p + "ffn_norm.weight", dim),
                 w(p + "ffn.gate.weight", experts, dim, fmt="f32"), w(p + "ffn.gate.bias", experts, fmt="f32")]
         for m, (n, k) in (("w13", (2 * inter, dim)), ("w2", (dim, inter))):
-            out += [w(p + f"ffn.experts.{m}.weight", experts, n, k // 2, fmt="u8"),
-                    w(p + f"ffn.experts.{m}.packed", experts, *formats.packed_shape(n, k), fmt="u8")]
+            out += [w(p + f"ffn.experts.{m}.weight", held, n, k // 2, fmt="u8"),
+                    w(p + f"ffn.experts.{m}.packed", held, *formats.packed_shape(n, k), fmt="u8")]
         # The shared expert's w1 over its w3, as DeepInfer's shared_gate_up_proj (one GEMM).
         out += [*fp8(p + "ffn.shared_experts.w13", 2 * inter, dim), *fp8(p + "ffn.shared_experts.w2", dim, inter)]
         for which in ("attn", "ffn"):
             out += [w(p + f"hc_{which}_fn", mix, cfg.hc_mult * dim, fmt="f32"), w(p + f"hc_{which}_base", mix, fmt="f32"),
                     w(p + f"hc_{which}_scale", 3, fmt="f32")]
         if i in cfg.engram_layer_ids:
-            rows, eh = cfg.engram_num_embeddings[cfg.engram_layer_ids.index(i)], cfg.engram_head_dim
+            rows, eh = shard(cfg.engram_num_embeddings[cfg.engram_layer_ids.index(i)], ranks), cfg.engram_head_dim
             out += [w(p + "engram.embed.weight", rows, eh, fmt="u8"), w(p + "engram.embed.scale", rows, eh // 32, fmt="u8"),
                     *fp8(p + "engram.wkv", dim * (cfg.hc_mult + 1), cfg.engram_hash_cols * eh),
                     w(p + "engram.q_weight", cfg.hc_mult, dim), w(p + "engram.k_weight", cfg.hc_mult, dim)]
     return out
+
+
+def shard(rows: int, ranks: int) -> int:
+    """Rows of a table of ``rows`` each of ``ranks`` ranks holds: rank ``r`` those from ``r * shard`` on."""
+    return -(-rows // ranks)
+
+
+ENGRAM = re.compile(r"layers\.(\d+)\.engram\.embed\.(weight|scale)")
 
 
 def checkpoint_name(name: str) -> str:
@@ -116,10 +129,15 @@ class DeepseekV41ForCausalLM:
             raise ValueError(f"model.dtype = {dtype!r}: DS 1017's activations are bf16 (its kernels quantize from it)")
         self.cfg, self._dtype = cfg, dtype
         s = services
+        self.ranks, self.rank = s["comm.group@1"].size, s["comm.group@1"].rank
+        """The ranks that hold the model between them, and which of them this is."""
+        if cfg.n_routed_experts % self.ranks:
+            raise ValueError(f"comm.size = {self.ranks} does not divide the {cfg.n_routed_experts} routed experts")
         self.weights, self.holder = s["state.weights@1"], s["state.holder@1"]
         self.kv, self.slots = s["state.kv.paged@1"], s["state.swa.slots@1"]
         self.embedding, self.layers = s["layers.embedding@1"], s["layers.ds1017@1"]
-        self._assembly = Assembly(["layers.ds1017@1"] * cfg.num_hidden_layers, states(cfg, page_size), params(cfg))
+        self._assembly = Assembly(["layers.ds1017@1"] * cfg.num_hidden_layers, states(cfg, page_size),
+                                  params(cfg, self.ranks))
         self._views: list[Any] = []
         self._cached: tuple[int, list[Mapping[str, torch.Tensor]]] = (-1, [])
 
@@ -159,11 +177,14 @@ class DeepseekV41ForCausalLM:
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], params_dict: Mapping[str, torch.Tensor]
                      ) -> set[str]:
         """``convert.py`` for one rank, into the declared tensors: quantized tensors as their bytes, a
-        layer's experts into their stacks, ``wo_a`` dequantized, everything else cast."""
+        layer's experts into their stacks, ``wo_a`` dequantized, everything else cast. Of what is split
+        over the ranks, this rank's part: its experts, and its rows of the Engram tables (given whole,
+        or as the rows ``weight_rows`` names)."""
         loaded: set[str] = set()
         stacked: dict[str, set[tuple[int, str, str]]] = {}
         halves: dict[str, torch.Tensor] = {}
         inter = self.cfg.moe_intermediate_size
+        first = self.rank * (self.cfg.n_routed_experts // self.ranks)
         for raw, tensor in weights:
             name = checkpoint_name(raw)
             if name.startswith(SKIPPED) or name.endswith("bias_vl"):
@@ -171,10 +192,10 @@ class DeepseekV41ForCausalLM:
             expert = EXPERT.fullmatch(name)
             if expert:
                 # w1 is the upper half of the ``w13`` stack, w3 the lower; a scale goes in packed.
-                index, matrix, part = int(expert[2]), expert[3], expert[4]
+                index, matrix, part = int(expert[2]) - first, expert[3], expert[4]
                 stack = f"{expert[1]}.{'w2' if matrix == 'w2' else 'w13'}"
                 target = f"{stack}.{'weight' if part == 'weight' else 'packed'}"
-                if target in params_dict and index < params_dict[target].shape[0]:
+                if target in params_dict and 0 <= index < params_dict[target].shape[0]:
                     rows = slice(inter, 2 * inter) if matrix == "w3" else slice(0, tensor.shape[0])
                     data = as_bytes(tensor)
                     if part == "weight":
@@ -218,6 +239,15 @@ class DeepseekV41ForCausalLM:
             param = params_dict.get(name)
             if param is None:
                 continue
+            rows = self.weight_rows(raw)
+            if rows is not None:  # this rank's rows of a table: the last rank's part may be short
+                if tensor.shape[0] != rows[1] - rows[0]:
+                    tensor = tensor[rows[0]:rows[1]]
+                data = as_bytes(tensor)
+                param[:data.shape[0]].copy_(data)
+                param[data.shape[0]:].zero_()
+                loaded.add(name)
+                continue
             if tuple(param.shape) != tuple(tensor.shape):
                 raise ValueError(f"{raw} is {tuple(tensor.shape)} in the checkpoint, {tuple(param.shape)} in the config")
             param.copy_(as_bytes(tensor) if param.dtype == torch.uint8 else tensor.to(param.dtype))
@@ -244,7 +274,21 @@ class DeepseekV41ForCausalLM:
         if name.startswith(SKIPPED) or name.endswith("bias_vl"):
             return False
         layer = LAYER.match(name)
-        return layer is None or int(layer[1]) < self.cfg.num_hidden_layers
+        if layer is not None and int(layer[1]) >= self.cfg.num_hidden_layers:
+            return False
+        expert = EXPERT.fullmatch(name)
+        held = self.cfg.n_routed_experts // self.ranks
+        return expert is None or self.rank * held <= int(expert[2]) < (self.rank + 1) * held
+
+    def weight_rows(self, raw: str) -> tuple[int, int] | None:
+        """The rows ``load_weights`` takes of the checkpoint tensor ``raw``, ``None`` for all of it:
+        of an Engram table split over the ranks, this rank's. The weight store reads those only."""
+        table = ENGRAM.fullmatch(checkpoint_name(raw))
+        if table is None or self.ranks == 1 or int(table[1]) not in self.cfg.engram_layer_ids:
+            return None
+        total = self.cfg.engram_num_embeddings[self.cfg.engram_layer_ids.index(int(table[1]))]
+        part = shard(total, self.ranks)
+        return min(self.rank * part, total), min((self.rank + 1) * part, total)
 
     def _layer_weights(self) -> list[Mapping[str, torch.Tensor]]:
         generation = self.weights.bind("").generation
@@ -253,6 +297,11 @@ class DeepseekV41ForCausalLM:
         return self._cached[1]
 
     # -------------------------------------------------------------- forward
+
+    def idle(self) -> None:
+        """A step in which this rank has no rows while other ranks of its group have: its part in
+        their forward (``Layers.idle``). The executor calls it for a plan without rows."""
+        self.layers.idle(self._layer_weights())
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
         """``Transformer.forward``: logits ``[rows, vocab]`` in fp32 at each row's last token."""
@@ -291,7 +340,7 @@ def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
 
 class Unit:
     SERVICES = ("state.weights@1", "state.holder@1", "state.kv.paged@1", "state.swa.slots@1", "layers.embedding@1",
-                "layers.ds1017@1")
+                "layers.ds1017@1", "comm.group@1")
 
     def __init__(self, ctx: Any, config: Any) -> None:
         if not config["weights.path"]:

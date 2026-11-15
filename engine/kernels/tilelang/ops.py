@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from kernels import ds1017_compose as compose
+from kernels import ds1017_ep as ep
 from kernels.ds1017_formats import unpack_kv, unpack_latent, unpack_scales
 from kernels.tilelang import kernel as K  # pyright: ignore[reportUnknownVariableType]
 
@@ -183,6 +184,17 @@ def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w
         hidden = weights[rows, top, None] * (F.silu(gate) * up)
         y[rows] += _gemm_fp4(hidden.to(x.dtype), w2[i], unpack_scales(p2[i], w2.shape[1], -(-inter // BLOCK)))
     return y
+
+
+def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
+               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
+    """``moe_experts`` on ranks that each hold part of the layer's experts (``kernels.ds1017_ep``)."""
+    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit)
+
+
+def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    return ep.engram_fetch(group, ids, weight, scale)
 
 
 # ---------------------------------------------------------------- the compositions over the caches

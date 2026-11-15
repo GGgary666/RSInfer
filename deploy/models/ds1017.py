@@ -13,6 +13,7 @@ import argparse
 import json
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,8 +59,19 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
     places = [d.resolve() for d in (model, args.weights) if d is not None]
     found = (tok if tok is not None and any((tok / name).is_file() for name in ("engram_token_map.json", "tokenizer.json"))
              else next((d for name in ("engram_token_map.json", "tokenizer.json") for d in places if (d / name).is_file()), None))
+    # Several workers hold the model between them (its routed experts and Engram tables, split in
+    # rank order): one communication group. Its ranks meet through a file of this run's, a new one each
+    # time the engine is planned; tensors travel over NCCL where every rank has a card of its own.
+    ranks = len(args.rank_gpus)
+    comm: dict[str, Any] = {}
+    if ranks > 1:
+        meet = args.run.resolve() / "comm"
+        meet.mkdir(parents=True, exist_ok=True)
+        own_cards = args.device == "cuda" and len(set(args.rank_gpus)) == ranks
+        comm = {"comm.size": ranks, "comm.rendezvous": f"file://{meet / uuid.uuid4().hex}",
+                "comm.device_backend": "nccl" if own_cards else "gloo"}
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
-            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend,
+            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend, **comm,
             **({"dsv4.token_map_path": str(found)} if found else {}),
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 

@@ -52,10 +52,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
 from kernels import ds1017_compose as compose
+from kernels import ds1017_ep as ep
 from kernels.ds1017_formats import (BLOCK, FP4_MAX, FP8_MAX, dequant_fp4, dequant_fp8, round_scale, to_fp4,
                                     unpack_kv, unpack_latent, unpack_scales,
                                     to_fp8)
@@ -305,6 +308,18 @@ def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w
         rows, top = torch.where(indices == i)
         y[rows] += _expert(xq[rows], weights[rows, top, None], *_halves(w13, p13, w2, p2, i), limit, x.dtype, direct)
     return y
+
+
+def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
+               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
+    """``moe_experts`` on ranks that each hold part of the layer's experts (``kernels.ds1017_ep``)."""
+    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit)
+
+
+def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rows of an Engram table split over the ranks, as bytes and scales (``kernels.ds1017_ep``)."""
+    return ep.engram_fetch(group, ids, weight, scale)
 
 
 def moe_experts_masked(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,

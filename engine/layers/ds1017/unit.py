@@ -41,6 +41,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -65,6 +66,10 @@ DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grou
                "ds.compress@1", "ds.compress_decode@1", "ds.hc_mixes@1", "ds.hc_pre@1", "ds.hc_post@1",
                "ds.moe_gate@1", "ds.moe_experts@1", "ds.shared_expert@1", "ds.engram_gate@1",
                "ds.engram_hash@1")
+
+SPLIT = MappingProxyType({"ds.moe_experts@1": "ds.ep_experts@1"})
+"""On ranks that each hold part of a layer's experts (``comm.group@1`` of more than one rank): the
+kernel that reaches the other ranks' in place of the one that runs this rank's."""
 
 Weights = Mapping[str, torch.Tensor]
 
@@ -136,8 +141,12 @@ class Layers:
     """``layers.ds1017@1``."""
 
     def __init__(self, catalog: Any, config: Any, cfg: DSConfig, kv: Any, slots: Any, token_map: Sequence[int] | None,
-                 max_context_len: int) -> None:
+                 max_context_len: int, group: Any) -> None:
         self.cfg, self.kv, self.slots = cfg, kv, slots
+        self.group = group
+        """``comm.group@1``: the ranks that hold this model's experts and Engram tables between them."""
+        if cfg.n_routed_experts % group.size:
+            raise ValueError(f"comm.size = {group.size} does not divide the {cfg.n_routed_experts} routed experts")
         self.kernels = Kernels(catalog, config, "dsv4")
         self.table = "prefill"
         """Which of the fixed solutions the forward runs: a phase, or ``GRAPH`` for a bucket."""
@@ -180,9 +189,18 @@ class Layers:
         blocks = {page // r for r in ratios}
         shape = {"heads": cfg.num_attention_heads, "head_dim": cfg.head_dim, "index_head_dim": cfg.index_head_dim,
                  "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0}
-        calls = {"prefill": {name: shape for name in DEFINITIONS if name not in DECODE_ONLY},
-                 "decode": {name: shape for name in DEFINITIONS if name not in PREFILL_ONLY}}
+        names = self.definitions()
+        calls = {"prefill": {name: shape for name in names if name not in DECODE_ONLY},
+                 "decode": {name: shape for name in names if name not in PREFILL_ONLY}}
         return self.kernels.resolve(calls)
+
+    def definitions(self) -> tuple[str, ...]:
+        """What the forward calls: alone, ``DEFINITIONS``; among ranks that share the experts and the
+        Engram tables, the kernels that reach the other ranks."""
+        if self.group.size == 1:
+            return DEFINITIONS
+        return tuple(SPLIT.get(name, name) for name in DEFINITIONS) + \
+            (("ds.engram_fetch@1",) if self.cfg.engram_layer_ids else ())
 
     def k(self, definition: str) -> KernelFn:
         return self.kernels(self.table, definition)
@@ -409,7 +427,12 @@ class Layers:
         dequantized, projected to one key per copy and a shared value, added through a gate."""
         cfg = self.cfg
         ids = self.step["hashes"][:, cfg.engram_layer_ids.index(layer)]
-        rows = formats.dequant_rows_fp8(w["engram.embed.weight"][ids], w["engram.embed.scale"][ids]).to(x.dtype)
+        if self.group.size > 1:  # the table's rows are split over the ranks
+            held, scales = self.k("ds.engram_fetch@1")(self.group, ids.long(), w["engram.embed.weight"],
+                                                       w["engram.embed.scale"])
+        else:
+            held, scales = w["engram.embed.weight"][ids], w["engram.embed.scale"][ids]
+        rows = formats.dequant_rows_fp8(held, scales).to(x.dtype)
         kv = self.linear_fp8(rows.flatten(-2), w, "engram.wkv")
         return self.k("ds.engram_gate@1")(x, kv, w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps)
 
@@ -418,11 +441,36 @@ class Layers:
         cfg = self.cfg
         weights, indices = self.k("ds.moe_gate@1")(x, w["ffn.gate.weight"], w["ffn.gate.bias"], cfg.num_experts_per_tok,
                                                     cfg.routed_scaling_factor)
-        y = self.k("ds.moe_experts@1")(x, weights, indices, w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"],
-                                       w["ffn.experts.w2.weight"], w["ffn.experts.w2.packed"], cfg.swiglu_limit)
+        stacks = (w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
+                  w["ffn.experts.w2.packed"])
+        if self.group.size > 1:  # this rank's stacks hold its part of the layer's experts
+            y = self.k("ds.ep_experts@1")(self.group, x, weights, indices, *stacks, cfg.swiglu_limit)
+        else:
+            y = self.k("ds.moe_experts@1")(x, weights, indices, *stacks, cfg.swiglu_limit)
         y = y + self.k("ds.shared_expert@1")(x, *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2")
                                                   for part in ("weight", "scale", "packed")), cfg.swiglu_limit)
         return y.to(x.dtype)
+
+    def idle(self, weights: Sequence[Weights]) -> None:
+        """A step in which this rank has no rows, among ranks that share the experts and the Engram
+        tables: its part in what the other ranks compute, layer by layer in the forward's order (their
+        tokens may have chosen its experts, or hash to its rows)."""
+        if self.group.size == 1:
+            return
+        cfg = self.cfg
+        self.table = "decode"
+        device = weights[0]["ffn.gate.weight"].device
+        x = torch.empty(0, cfg.hidden_size, dtype=torch.bfloat16, device=device)
+        chosen = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.float32, device=device)
+        indices = torch.empty(0, cfg.num_experts_per_tok, dtype=torch.int64, device=device)
+        ids = torch.empty(0, cfg.engram_hash_cols, dtype=torch.int64, device=device)
+        for layer in range(cfg.num_hidden_layers):
+            w = weights[layer]
+            if layer in cfg.engram_layer_ids:
+                self.k("ds.engram_fetch@1")(self.group, ids, w["engram.embed.weight"], w["engram.embed.scale"])
+            self.k("ds.ep_experts@1")(self.group, x, chosen, indices, w["ffn.experts.w13.weight"],
+                                      w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
+                                      w["ffn.experts.w2.packed"], cfg.swiglu_limit)
 
     # ------------------------------------------------------------------ attention
 
@@ -615,5 +663,5 @@ class Unit:
         directory = config["dsv4.token_map_path"] or config["model.path"] or config["weights.path"]
         ctx.provide("layers.ds1017@1", Layers(
             ctx.use("kernels.catalog@1"), config, cfg, ctx.use("state.kv.paged@1"), ctx.use("state.swa.slots@1"),
-            token_map(directory, cfg), config["batch.max_context_len"]))
+            token_map(directory, cfg), config["batch.max_context_len"], ctx.use("comm.group@1")))
 

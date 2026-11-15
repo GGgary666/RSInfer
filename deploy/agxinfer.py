@@ -177,6 +177,26 @@ def worker_gpu(requested: int | None) -> int:
     return int(first)
 
 
+def rank_gpus(args: argparse.Namespace) -> list[int]:
+    """The physical GPU of each worker (rank): ``--gpus`` names one a rank; else ``--ranks`` workers on
+    the one ``--gpu`` gives (or on the CPU: the numbers are then not used)."""
+    if args.gpus:
+        try:
+            gpus = [int(g) for g in args.gpus.split(",")]
+        except ValueError:
+            raise SystemExit(f"--gpus {args.gpus!r}: physical GPU indices separated by commas") from None
+        if args.gpu is not None or args.ranks not in (1, len(gpus)) or args.device != "cuda":
+            raise SystemExit("--gpus names one GPU a worker: not with --gpu, another --ranks, or --device cpu")
+        return gpus
+    if args.ranks < 1:
+        raise SystemExit("--ranks must be at least 1")
+    return [worker_gpu(args.gpu) if args.device == "cuda" else 0] * args.ranks
+
+
+def worker(rank: int) -> dict[str, Any]:
+    return {**WORKER, "index": rank}
+
+
 def parse_set(items: list[str]) -> dict[str, Any]:
     """``KEY=VALUE`` pairs; a value that parses as JSON is taken as such, else as a string."""
     out: dict[str, Any] = {}
@@ -216,9 +236,14 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     cuda = args.device == "cuda"
     host = HostId(HOST)
     graphs = cuda and args.cuda_graph != "off"
+    # Several workers are data parallel: each has requests of its own (a scheduling domain). Whether
+    # they also share the model between them (expert parallel) is the model family's (its recipe).
+    args.rank_gpus = rank_gpus(args)
+    ranks = len(args.rank_gpus)
     topology = Topology(
-        hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
-        placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
+        hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))],
+        mesh=Mesh({"tp": 1} if ranks == 1 else {"dp": ranks}),
+        placement=[RankPlacement(rank, host, gpu) for rank, gpu in enumerate(args.rank_gpus)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
                RoleSpec("worker", workers, per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
@@ -229,7 +254,8 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         "frontend.http_bind": args.host, "frontend.http_port": args.port, "frontend.scheduler": SCHED,
         "frontend.response_timeout_s": float(args.timeout),
         # scheduler host
-        "sched.workers": [WORKER], "sched.frontend_host": HOST, "sched.max_batch": args.max_rows,
+        "sched.workers": [worker(rank) for rank in range(ranks)], "sched.domains": ranks,
+        "sched.frontend_host": HOST, "sched.max_batch": args.max_rows,
         "sched.token_budget": args.token_budget, "sched.overlap": args.overlap,
         "alloc.radix_cache": not args.disable_radix_cache,
         # speculation (doc/specs/mtp.md), SGLang's flags
@@ -240,7 +266,9 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         "worker.scheduler": SCHED, "weights.path": weights,
         "state.kv.page_size": args.page_size, "state.kv.dtype": args.kv_dtype,
         "batch.max_rows": args.max_rows, "batch.max_context_len": args.max_context,
-        "holder.mem_fraction": args.mem_fraction, "holder.max_slots": args.max_slots, "holder.cpu_bytes": args.cpu_bytes,
+        # Workers on one card (--ranks) share its part between them.
+        "holder.mem_fraction": args.mem_fraction / max(args.rank_gpus.count(gpu) for gpu in args.rank_gpus),
+        "holder.max_slots": args.max_slots, "holder.cpu_bytes": args.cpu_bytes,
         "plan.cuda_graph": args.cuda_graph, "plan.graph_buckets": args.graph_buckets,
         "plan.graph_memory_bytes": args.graph_memory_bytes,
         **recipe.config(args, cfg, model),
@@ -581,6 +609,11 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     d.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     d.add_argument("--gpu", type=int, help="the worker's CUDA device, by physical index (default: the first of "
                    "CUDA_VISIBLE_DEVICES, else 0)")
+    d.add_argument("--gpus", help="several workers, one on each of these CUDA devices (physical indices separated by "
+                   "commas): each serves requests of its own (data parallel), and a model family that splits its "
+                   "weights over them does (DS 1017: its experts and Engram tables)")
+    d.add_argument("--ranks", type=int, default=1, help="that many workers on one device (--gpu, or the CPU): for "
+                   "trying several ranks where there is one card")
     d.add_argument("--mem-fraction", type=float, default=0.85, help="device share of weights and states "
                    "(holder.mem_fraction; SGLang's --mem-fraction-static)")
     d.add_argument("--page-size", type=int, default=0,

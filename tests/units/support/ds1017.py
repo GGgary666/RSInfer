@@ -16,7 +16,8 @@ from tests.units.support.worker import Driver, Worker
 
 DS_UNITS = ("core.kernels", "kernels.reference", "kernels.ds1017", "kernels.tilelang", "kernels.deepinfer",
             "core.state.weights",
-            "core.state.holder", "state.kv_paged", "state.swa_slots", "worker.batch", "layers.embedding", "layers.sampler",
+            "core.state.holder", "state.kv_paged", "state.swa_slots", "worker.batch", "worker.comm", "layers.embedding",
+            "layers.sampler",
             "layers.ds1017", "models.ds1017", "core.plan", "executors.pytorch")
 PAGE_SIZE = 4
 

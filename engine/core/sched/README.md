@@ -75,6 +75,24 @@
 - 所有 rank 都回答了，这一步才退休。token 用 rank 0 的；各 rank 的 `Sampled` 必须完全一样，否则算故障。
 - 容量取各 rank 报上来的最小值。所有 rank 都报过以后，才设给账本。
 
+## 调度域（2026-11-15，`sched.domains`）
+
+DS 1017 的多卡是 DP 加 EP（[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md) 阶段 3）：每个 rank 跑自己的请求，但每层的专家分在各个 rank 上，所以每一步所有 rank 要一起算。
+
+- `sched.domains` 把 `sched.workers` 按顺序等分成几个调度域。默认 1，就是上面「多 rank」说的：所有 rank 跑同一份计划。
+- 一个域里的 rank 仍然跑同一份计划、结果必须相同。不同的域跑不同的请求：
+  - 每个域有自己的 `sched.max_batch` 行。调度器内部给行统一编号（域 `d` 是 `d * max_batch` 起的那一段），发给 worker 和收回来时换成 worker 自己的 `0 .. max_batch - 1`。
+  - 每个域一本账（`ledger.domains@1`，`core.state.alloc` 按 `sched.domains` 建）：容量取这个域的 rank 报上来的最小值，条目的编号是这个域的 rank 自己的，前缀缓存也各是各的。
+  - 每个域单独给 compose 策略一份视图，token 预算是每个域的。一个域可以在算 prompt，另一个同时在 decode。
+- **等待的请求进哪个域**：先去掉行满了的域和账本永远放不下它的域；刚刚因为条目不够没收它的域排在最后；然后选前缀缓存命中最长的，再选剩余行最多的。没被收下的请求下一步重新选。
+  - 现在是调度器里写死的规则，不是策略单元。排序策略只在每个域自己的等待队列里排序。
+- **所有域一起走**：一步是给每个 rank 各发一份计划，没事做的域发一份空计划（没有行）。
+  - worker 收到空计划照样应用增量，什么都不采样；模型有 `idle` 的（专家分在各 rank 上），用它参与这一步。
+  - 所有域都没事做时不发计划。
+- **一个域拒了一步**（`Resync`）而别的域跑了：这一步对拒了的域算没跑（它的请求留在原地，下一份计划对所有域发全量增量），别的域照常退休。
+- **一个域的 worker 被换**：只结束这个域的请求；它在途的步由调度器替它记成拒绝，别的域在这些步里跑的照算。
+- **一个域的 worker 报故障**：和以前一样，整个引擎停止服务。一起算的 rank 少了一个，其他的也走不下去。
+
 ## Resync
 
 - 一步的所有 rank 都回了 `Resync`，这一步就算没跑：
@@ -143,7 +161,8 @@
 |---|---|---|---|
 | `sched.workers` | `[]` | startup | 每个 rank 的 worker 的 ProcId，rank 0 在前 |
 | `sched.frontend_host` | `""` | startup | 往读端 `requests` 写请求的前端在哪台主机 |
-| `sched.max_batch` | 32 | startup | 计划最多用多少行，不超过 worker 的 `batch.max_rows` |
+| `sched.max_batch` | 32 | startup | 计划最多用多少行（每个调度域），不超过 worker 的 `batch.max_rows` |
+| `sched.domains` | 1 | startup | 调度域的个数，见「调度域」 |
 | `sched.token_budget` | 2048 | startup | 每步最多算多少 prompt token |
 | `sched.overlap` | `false` | live | 一步重叠 |
 | `sched.step_timeout_s` | 3600 | startup | GPU 的第一步可能要编译好几分钟 |
@@ -201,6 +220,15 @@
   - 请求太大；
   - 准入守住 worker 每行的容量和行数；
   - worker 被换：空闲时换，以及占着行时换。占着行时换的那一组覆盖了计划通道先发现、结果通道先发现两种顺序，1 个和 2 个 rank，开或不开重叠。
+- `test_domains.py`：两个调度域（各一个 rank，另有一组各两个 rank）。覆盖：
+  - 每个域跑自己的请求、每个 rank 收到每一步；
+  - 没事做的域收到空计划；
+  - 一个域 prefill 的同时另一个域 decode；
+  - 每个域自己的行数和容量，放不下的请求去放得下的域，条目暂时不够时换一个域；
+  - 一个域拒了一步而另一个跑了（开或不开重叠）；
+  - 一个域的 worker 被换；
+  - 一个域的 worker 故障；
+  - 带投机。
 - `test_processes.py`：控制面真的启动调度宿主进程和两个夹具 worker 进程，worker 0 走共享内存，worker 1 走 TCP。开着重叠生成到一半，通过控制接口重载 `core.sched`；同一个请求在新旧两个身份下都收到了 token，和直接算出来的逐个一致。
 - 夹具 worker（`units/schedfix/worker`）：
   - 维护持久 batch；
