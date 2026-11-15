@@ -8,7 +8,8 @@ entry = "layers.ds1017.unit:Unit"
 services = ["layers.ds1017@1"]
 
 [requires]
-services = ["kernels.catalog@1", "state.kv.paged@1", "state.swa.slots@1", "comm.group@1"]
+services = ["kernels.catalog@1", "state.kv.paged@1", "state.swa.slots@1", "comm.group@1",
+            "expert.placement@1"]
 
 [config]
 "dsv4.backend" = { type = "str", default = "auto", binding = "startup", doc = "DS 1017's layer kernels: auto, or a backend of the kernel catalog, e.g. reference or tilelang" }

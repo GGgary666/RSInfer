@@ -331,7 +331,8 @@ def test_a_captured_step_runs_the_named_backend_s_kernels_or_is_not_recorded(wor
     assert graph.pop("backend") == "reference" and graph["ds.moe_experts@1"] == "reference.fixed.ds.moe_experts@1"
     assert all(solution.startswith("reference.") for solution in graph.values()), graph
     config = {"dsv4.backend": "eager", "dsv4.prefill_backend": "", "dsv4.decode_backend": ""}
-    eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64, layers.group).resolve(declared)
+    eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64, layers.group,
+                   layers.placement).resolve(declared)
     assert all(solution == f"eager.{name}" for phase in ("prefill", "decode")
                for name, solution in eager[phase].items() if name != "backend"), eager
     assert {solution for name, solution in eager[GRAPH].items() if name != "backend"} == {""}, eager[GRAPH]

@@ -98,14 +98,19 @@ def test_requests_through_the_whole_engine_are_what_the_worker_units_compute(
     assert sum(len(t.split()) for t in want) >= 12, want  # the model generated, rather than stopped at once
 
 
+@pytest.mark.parametrize("balanced", [False, True])
 def test_two_ranks_that_hold_the_model_between_them_give_what_one_rank_gives(
-        model: tuple[dict[str, Any], Path], tokenizer: Path, tmp_path: Path) -> None:
+        model: tuple[dict[str, Any], Path], tokenizer: Path, tmp_path: Path, balanced: bool) -> None:
     """``--ranks 2`` (doc/specs/v1-ds1017.md stage 3): two workers, each with half of every layer's
     routed experts and half of the Engram tables' rows, and with requests of its own (a scheduling
     domain each). A token's experts and table rows are on either rank, so every step is computed by
     both, also a step in which one of them has no request. The text is what one rank holding all of
     it computes: an expert's term for a token is the same wherever it runs, and the token's own rank
-    adds its terms in the same order."""
+    adds its terms in the same order.
+
+    ``balanced``: with expert parallel load balancing. Each layer has two spare slots for copies, and
+    every four steps the experts are placed again by the tokens they took, their weights moved between
+    the ranks while requests run. The text is still the same."""
     cfg, checkpoint = model
     tok = AutoTokenizer.from_pretrained(str(tokenizer))
     prompts = ["w1 w2 w3 w4 w5", "w9 w8 w7", "w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38",
@@ -114,6 +119,8 @@ def test_two_ranks_that_hold_the_model_between_them_give_what_one_rank_gives(
     args = ["--model", str(checkpoint), "--tokenizer", str(tokenizer), "--device", "cpu", "--page-size", "4",
             "--max-rows", "4", "--max-context", "64", "--token-budget", "8", "--cpu-bytes", str(16 << 20),
             "--timeout", "120", "--ds-backend", "reference", "--ranks", "2"]
+    if balanced:
+        args += ["--set", "eplb.interval=4", "--set", "eplb.window=4", "--set", "eplb.extra_experts=2"]
 
     def ask(prompt: str) -> str:
         got = post(url + "/v1/completions", {"model": MODEL, "prompt": prompt, "max_tokens": 10, "temperature": 0.0})
@@ -127,9 +134,11 @@ def test_two_ranks_that_hold_the_model_between_them_give_what_one_rank_gives(
         config = json.loads((tmp_path / "run" / "config.json").read_text())
         logs = sorted((tmp_path / "run").glob("host-a/snapshots/.run/worker-*/log"))
         ran = [log.read_text().count("core.plan:") for log in logs]
+        placed = logs[0].read_text().count("experts placed again")
     assert len(topology["placement"]) == 2 and config["sched.domains"] == 2 and config["comm.size"] == 2
     assert len(config["sched.workers"]) == 2 and config["comm.rendezvous"].startswith("file://")
     assert len(logs) == 2 and all(ran), (logs, ran)
+    assert (placed >= 3) if balanced else placed == 0, placed
 
 
 def test_serve_tells_the_worker_where_the_token_map_is_and_refuses_dummy_weights(model: tuple[dict[str, Any], Path],

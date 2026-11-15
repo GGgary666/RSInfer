@@ -1,0 +1,19 @@
+[unit]
+id = "state.expert_placement"
+kind = "state"
+process = ["worker"]
+entry = "state.expert_placement.unit:Unit"
+
+[provides]
+services = ["expert.placement@1"]
+
+[requires]
+services = ["comm.group@1", "policy.rebalance@1"]
+
+[config]
+"eplb.interval" = { type = "int", default = 0, binding = "startup", doc = "Steps between two placements of the experts over the ranks (expert parallel load balancing); 0: they stay where the checkpoint's order puts them" }
+"eplb.window" = { type = "int", default = 100, binding = "startup", doc = "Steps whose token counts a placement is decided from, the latest ones; at most eplb.interval" }
+"eplb.extra_experts" = { type = "int", default = 0, binding = "startup", doc = "Spare slots of a layer, over all ranks, for copies of the experts that take most tokens; rounded up so that every rank has the same number of slots" }
+
+[state]
+drain_on_reload = false

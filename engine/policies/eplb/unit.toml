@@ -1,0 +1,8 @@
+[unit]
+id = "policies.eplb"
+kind = "logic"
+process = ["worker"]
+entry = "policies.eplb.unit:Unit"
+
+[provides]
+services = ["policy.rebalance@1"]

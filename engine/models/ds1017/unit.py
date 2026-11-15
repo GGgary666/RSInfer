@@ -47,17 +47,18 @@ def fp8(name: str, out: int, into: int) -> list[WeightDecl]:
             WeightDecl(name + ".packed", formats.packed_shape(out, into), "u8")]
 
 
-def params(cfg: DSConfig, ranks: int = 1) -> list[WeightDecl]:
+def params(cfg: DSConfig, ranks: int = 1, slots: int = 0) -> list[WeightDecl]:
     """The backbone's parameters, by the checkpoint's names; the routed experts of a layer as
     ``ffn.experts.w13.weight`` ``[experts, 2 * inter, dim / 2]`` (``w1`` over ``w3``) and
     ``ffn.experts.w2.weight``, each with its ``packed`` scales.
 
     One of ``ranks`` ranks that hold the model between them (``comm.group@1``) has its part of what
-    is split in order: of each layer's routed experts (``experts / ranks``), and of each Engram
-    table's rows (``shard`` of them, the last rank's part padded)."""
+    is split in order: of each layer's slots for routed experts (``slots / ranks``; ``slots`` is the
+    experts, and spare slots for copies with ``expert.placement@1``), and of each Engram table's rows
+    (``shard`` of them, the last rank's part padded)."""
     dim, hd, heads, inter, experts = (cfg.hidden_size, cfg.head_dim, cfg.num_attention_heads,
                                       cfg.moe_intermediate_size, cfg.n_routed_experts)
-    held = experts // ranks
+    held = (slots or experts) // ranks
     mix = (2 + cfg.hc_mult) * cfg.hc_mult
 
     def w(name: str, *shape: int, fmt: str = "bf16") -> WeightDecl:
@@ -133,11 +134,20 @@ class DeepseekV41ForCausalLM:
         """The ranks that hold the model between them, and which of them this is."""
         if cfg.n_routed_experts % self.ranks:
             raise ValueError(f"comm.size = {self.ranks} does not divide the {cfg.n_routed_experts} routed experts")
+        self.placement = s["expert.placement@1"]
+        slots = self.placement.slots(cfg.n_routed_experts)
+        self.held = slots // self.ranks
+        """Slots for routed experts this rank has in each layer."""
+        # Slot -> the expert the checkpoint's order puts there; this rank's slots of each expert.
+        order = [*range(cfg.n_routed_experts), *(i % cfg.n_routed_experts for i in range(slots - cfg.n_routed_experts))]
+        self.slots_of: dict[int, list[int]] = {}
+        for slot in range(self.rank * self.held, (self.rank + 1) * self.held):
+            self.slots_of.setdefault(order[slot], []).append(slot - self.rank * self.held)
         self.weights, self.holder = s["state.weights@1"], s["state.holder@1"]
         self.kv, self.slots = s["state.kv.paged@1"], s["state.swa.slots@1"]
         self.embedding, self.layers = s["layers.embedding@1"], s["layers.ds1017@1"]
         self._assembly = Assembly(["layers.ds1017@1"] * cfg.num_hidden_layers, states(cfg, page_size),
-                                  params(cfg, self.ranks))
+                                  params(cfg, self.ranks, slots))
         self._views: list[Any] = []
         self._cached: tuple[int, list[Mapping[str, torch.Tensor]]] = (-1, [])
 
@@ -184,7 +194,6 @@ class DeepseekV41ForCausalLM:
         stacked: dict[str, set[tuple[int, str, str]]] = {}
         halves: dict[str, torch.Tensor] = {}
         inter = self.cfg.moe_intermediate_size
-        first = self.rank * (self.cfg.n_routed_experts // self.ranks)
         for raw, tensor in weights:
             name = checkpoint_name(raw)
             if name.startswith(SKIPPED) or name.endswith("bias_vl"):
@@ -192,17 +201,18 @@ class DeepseekV41ForCausalLM:
             expert = EXPERT.fullmatch(name)
             if expert:
                 # w1 is the upper half of the ``w13`` stack, w3 the lower; a scale goes in packed.
-                index, matrix, part = int(expert[2]) - first, expert[3], expert[4]
+                matrix, part = expert[3], expert[4]
                 stack = f"{expert[1]}.{'w2' if matrix == 'w2' else 'w13'}"
                 target = f"{stack}.{'weight' if part == 'weight' else 'packed'}"
-                if target in params_dict and 0 <= index < params_dict[target].shape[0]:
+                if target in params_dict:
                     rows = slice(inter, 2 * inter) if matrix == "w3" else slice(0, tensor.shape[0])
                     data = as_bytes(tensor)
-                    if part == "weight":
-                        params_dict[target][index, rows].copy_(data)
-                    else:
-                        params_dict[target][index, :, rows].copy_(formats.pack_scales(data)[:, :data.shape[0]])
-                    stacked.setdefault(stack, set()).add((index, matrix, part))
+                    for index in self.slots_of.get(int(expert[2]), ()):  # every slot of this rank that starts with it
+                        if part == "weight":
+                            params_dict[target][index, rows].copy_(data)
+                        else:
+                            params_dict[target][index, :, rows].copy_(formats.pack_scales(data)[:, :data.shape[0]])
+                        stacked.setdefault(stack, set()).add((index, matrix, part))
                 continue
             shared = SHARED.fullmatch(name)
             if shared:  # w1 is the upper half of w13, w3 the lower; a scale's rows and its packed rows too
@@ -277,8 +287,7 @@ class DeepseekV41ForCausalLM:
         if layer is not None and int(layer[1]) >= self.cfg.num_hidden_layers:
             return False
         expert = EXPERT.fullmatch(name)
-        held = self.cfg.n_routed_experts // self.ranks
-        return expert is None or self.rank * held <= int(expert[2]) < (self.rank + 1) * held
+        return expert is None or int(expert[2]) in self.slots_of
 
     def weight_rows(self, raw: str) -> tuple[int, int] | None:
         """The rows ``load_weights`` takes of the checkpoint tensor ``raw``, ``None`` for all of it:
@@ -293,7 +302,13 @@ class DeepseekV41ForCausalLM:
     def _layer_weights(self) -> list[Mapping[str, torch.Tensor]]:
         generation = self.weights.bind("").generation
         if self._cached[0] != generation:
-            self._cached = (generation, [v.buffers() for v in self._views])
+            views = [v.buffers() for v in self._views]
+            self._cached = (generation, views)
+            # The weights are as the checkpoint's order lays them out (loaded, or loaded again).
+            self.placement.start(self.cfg.num_hidden_layers, self.cfg.n_routed_experts,
+                                 lambda layer: [views[layer][f"ffn.experts.{m}.{part}"] for m in ("w13", "w2")
+                                                for part in ("weight", "packed")],
+                                 views[0]["ffn.gate.weight"].device)
         return self._cached[1]
 
     # -------------------------------------------------------------- forward
@@ -302,6 +317,7 @@ class DeepseekV41ForCausalLM:
         """A step in which this rank has no rows while other ranks of its group have: its part in
         their forward (``Layers.idle``). The executor calls it for a plan without rows."""
         self.layers.idle(self._layer_weights())
+        self.placement.step()
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, last_index: torch.Tensor) -> torch.Tensor:
         """``Transformer.forward``: logits ``[rows, vocab]`` in fp32 at each row's last token."""
@@ -323,8 +339,9 @@ class DeepseekV41ForCausalLM:
             h = layers.hc_post(x, residual, post, comb)
             residual = h
             pre, post, comb = layers.hc_mixes(h, w, "ffn")
-            x = layers.moe(layers.norm(layers.hc_pre(h, attn_pre), w["ffn_norm.weight"]), w)
+            x = layers.moe(i, layers.norm(layers.hc_pre(h, attn_pre), w["ffn_norm.weight"]), w)
             h = layers.hc_post(x, residual, post, comb)
+        self.placement.step()
         x = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
         return layers.linear(x[last_index], top["head.weight"])
 
@@ -340,7 +357,7 @@ def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
 
 class Unit:
     SERVICES = ("state.weights@1", "state.holder@1", "state.kv.paged@1", "state.swa.slots@1", "layers.embedding@1",
-                "layers.ds1017@1", "comm.group@1")
+                "layers.ds1017@1", "comm.group@1", "expert.placement@1")
 
     def __init__(self, ctx: Any, config: Any) -> None:
         if not config["weights.path"]:

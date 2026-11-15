@@ -141,10 +141,12 @@ class Layers:
     """``layers.ds1017@1``."""
 
     def __init__(self, catalog: Any, config: Any, cfg: DSConfig, kv: Any, slots: Any, token_map: Sequence[int] | None,
-                 max_context_len: int, group: Any) -> None:
+                 max_context_len: int, group: Any, placement: Any) -> None:
         self.cfg, self.kv, self.slots = cfg, kv, slots
         self.group = group
         """``comm.group@1``: the ranks that hold this model's experts and Engram tables between them."""
+        self.placement = placement
+        """``expert.placement@1``: the slot of each expert, when they are placed by the tokens they take."""
         if cfg.n_routed_experts % group.size:
             raise ValueError(f"comm.size = {group.size} does not divide the {cfg.n_routed_experts} routed experts")
         self.kernels = Kernels(catalog, config, "dsv4")
@@ -436,7 +438,7 @@ class Layers:
         kv = self.linear_fp8(rows.flatten(-2), w, "engram.wkv")
         return self.k("ds.engram_gate@1")(x, kv, w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps)
 
-    def moe(self, x: torch.Tensor, w: Weights) -> torch.Tensor:
+    def moe(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``MoE.forward``: the routed experts' weighted sum and the shared expert."""
         cfg = self.cfg
         weights, indices = self.k("ds.moe_gate@1")(x, w["ffn.gate.weight"], w["ffn.gate.bias"], cfg.num_experts_per_tok,
@@ -444,7 +446,10 @@ class Layers:
         stacks = (w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
                   w["ffn.experts.w2.packed"])
         if self.group.size > 1:  # this rank's stacks hold its part of the layer's experts
-            y = self.k("ds.ep_experts@1")(self.group, x, weights, indices, *stacks, cfg.swiglu_limit)
+            placed = self.placement.active
+            y = self.k("ds.ep_experts@1")(self.group, x, weights, indices, *stacks, cfg.swiglu_limit,
+                                          self.placement.physical(layer, indices) if placed else None,
+                                          self.placement.count(layer) if placed else None)
         else:
             y = self.k("ds.moe_experts@1")(x, weights, indices, *stacks, cfg.swiglu_limit)
         y = y + self.k("ds.shared_expert@1")(x, *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2")
@@ -468,9 +473,11 @@ class Layers:
             w = weights[layer]
             if layer in cfg.engram_layer_ids:
                 self.k("ds.engram_fetch@1")(self.group, ids, w["engram.embed.weight"], w["engram.embed.scale"])
+            placed = self.placement.active
             self.k("ds.ep_experts@1")(self.group, x, chosen, indices, w["ffn.experts.w13.weight"],
                                       w["ffn.experts.w13.packed"], w["ffn.experts.w2.weight"],
-                                      w["ffn.experts.w2.packed"], cfg.swiglu_limit)
+                                      w["ffn.experts.w2.packed"], cfg.swiglu_limit, indices if placed else None,
+                                      self.placement.count(layer) if placed else None)
 
     # ------------------------------------------------------------------ attention
 
@@ -663,5 +670,6 @@ class Unit:
         directory = config["dsv4.token_map_path"] or config["model.path"] or config["weights.path"]
         ctx.provide("layers.ds1017@1", Layers(
             ctx.use("kernels.catalog@1"), config, cfg, ctx.use("state.kv.paged@1"), ctx.use("state.swa.slots@1"),
-            token_map(directory, cfg), config["batch.max_context_len"], ctx.use("comm.group@1")))
+            token_map(directory, cfg), config["batch.max_context_len"], ctx.use("comm.group@1"),
+            ctx.use("expert.placement@1")))
 

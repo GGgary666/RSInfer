@@ -9,7 +9,7 @@ services = ["model@1"]
 
 [requires]
 services = ["state.weights@1", "state.holder@1", "state.kv.paged@1", "state.swa.slots@1", "layers.embedding@1",
-            "layers.ds1017@1", "comm.group@1"]
+            "layers.ds1017@1", "comm.group@1", "expert.placement@1"]
 
 [reads]
 config = ["model.path", "model.hf_config", "model.dtype", "state.kv.page_size", "weights.path"]

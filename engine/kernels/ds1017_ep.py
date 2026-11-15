@@ -33,22 +33,28 @@ def mine(counts: list[int], rank: int) -> slice:
 
 
 def ep_experts(experts: KernelFn, group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
-               w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
-    """``ds.ep_experts@1``: ``ds.moe_experts@1`` where ``w13`` and ``w2`` stack this rank's experts
-    only, experts ``rank * local`` onwards of the layer's; ``indices`` number the layer's experts."""
+               w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float,
+               slots: torch.Tensor | None = None, taken: torch.Tensor | None = None) -> torch.Tensor:
+    """``ds.ep_experts@1``: ``ds.moe_experts@1`` where ``w13`` and ``w2`` stack the experts in this
+    rank's slots only, slots ``rank * local`` onwards of the layer's; ``indices`` number the layer's
+    experts. ``slots`` ``[tokens, k]``: the slot that runs each chosen expert (``expert.placement@1``);
+    ``None``: slot ``i`` holds expert ``i``. ``taken`` ``[local]`` int32: the tokens each of this
+    rank's slots ran are added to it."""
     local = w13.shape[0]
     first = group.rank * local
-    (xs, ws, idx), counts = group.gather([x, weights, indices])
-    held = (idx >= first) & (idx < first + local)
-    terms = torch.zeros(*idx.shape, x.shape[-1], dtype=torch.float32, device=x.device)
-    for slot in range(idx.shape[1]):  # one choice of a token at a time: each call returns that term alone
+    (xs, ws, at), counts = group.gather([x, weights, indices if slots is None else slots])
+    held = (at >= first) & (at < first + local)
+    terms = torch.zeros(*at.shape, x.shape[-1], dtype=torch.float32, device=x.device)
+    for slot in range(at.shape[1]):  # one choice of a token at a time: each call returns that term alone
         rows = torch.nonzero(held[:, slot]).flatten()
         if rows.numel():
-            terms[rows, slot] = experts(xs[rows], ws[rows, slot:slot + 1], idx[rows, slot:slot + 1] - first,
+            terms[rows, slot] = experts(xs[rows], ws[rows, slot:slot + 1], at[rows, slot:slot + 1] - first,
                                         w13, p13, w2, p2, limit)
+    if taken is not None:
+        taken += torch.bincount((at[held] - first).flatten(), minlength=local).to(taken.dtype)
     own = mine(counts, group.rank)
-    terms, idx = group.reduce(terms)[own], idx[own]
-    order = idx.argsort(dim=-1)  # a token chooses an expert once: the experts' order
+    terms, idx = group.reduce(terms)[own], indices
+    order = idx.argsort(dim=-1)  # a token chooses an expert once: the experts' order, wherever they ran
     y = torch.zeros(terms.shape[0], x.shape[-1], dtype=torch.float32, device=x.device)
     for place in range(idx.shape[1]):
         y += torch.gather(terms, 1, order[:, place, None, None].expand(-1, 1, terms.shape[-1])).squeeze(1)

@@ -140,6 +140,12 @@ def main() -> int:
         problems += [f"prompt {i}: {text!r} does not start with {want!r}" for i, (text, want) in
                      enumerate(zip(ranked, args.expect, strict=False)) if not text.startswith(want)]
         words = sum(len(t.split()) for t in ranked)
+        # Expert parallel load balancing, where it is on: what rank 0 said each time the experts were placed again.
+        placed = [line for log in (work / f"{backend}-ranks").glob("host-a/snapshots/.run/worker-0-*/log")
+                  for line in log.read_text(errors="replace").splitlines() if "experts placed again" in line]
+        if placed:
+            entry["placed"] = placed
+            print(f"placed {backend}: {len(placed)} times; the last: {placed[-1]}", flush=True)
         entry["problems"] = problems
         report["backends"][backend] = entry
         failed |= bool(problems)

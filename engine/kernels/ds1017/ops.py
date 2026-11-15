@@ -311,9 +311,10 @@ def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w
 
 
 def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
-               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float) -> torch.Tensor:
+               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float, slots: torch.Tensor | None = None,
+               taken: torch.Tensor | None = None) -> torch.Tensor:
     """``moe_experts`` on ranks that each hold part of the layer's experts (``kernels.ds1017_ep``)."""
-    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit)
+    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit, slots, taken)
 
 
 def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
