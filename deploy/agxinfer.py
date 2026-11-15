@@ -246,7 +246,8 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         placement=[RankPlacement(rank, host, gpu) for rank, gpu in enumerate(args.rank_gpus)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
                RoleSpec("worker", workers, per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
-                        platform_options={"cuda": 1} if cuda else {})])
+                        platform_options={"cuda": 1} if cuda else {},
+                        env=dict(getattr(recipe, "WORKER_ENV", {})) if cuda else {})])
     config: dict[str, Any] = {
         # frontend
         "frontend.model": args.served_model_name or recipe.SERVED_NAME,

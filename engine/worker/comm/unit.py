@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -97,6 +98,10 @@ def join(size: int, rank: int, rendezvous: str, device_backend: str, timeout_s: 
         raise ValueError(f"rank {rank} of a group of comm.size = {size}")
     if device_backend not in BACKENDS:
         raise ValueError(f"comm.device_backend = {device_backend!r}: one of {BACKENDS}")
+    # Every rank is a process that sees its one card as device 0. torch's symmetric memory (the buffer
+    # DeepGEMM's fused MoE kernel shares between the ranks) takes ranks with the same device index for
+    # ranks on one card unless told otherwise; DeepInfer sets the same (deepinfer/__init__.py).
+    os.environ.setdefault("TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES", "1")
     if dist.is_initialized():  # a reload of this unit: the process joined already
         if dist.get_world_size() != size or dist.get_rank() != rank:
             raise ValueError(f"this process is rank {dist.get_rank()} of {dist.get_world_size()}, and a group is "

@@ -28,6 +28,9 @@ MODEL_TYPES = frozenset({"deepseek_v41", "deepseek_v41_text"})
 WORKER_ONLY = frozenset({"models.ds1017", "layers.ds1017", "state.swa_slots", "kernels.ds1017", "kernels.tilelang",
                          "kernels.deepinfer", "state.expert_placement", "policies.eplb"})
 """Worker units of this family alone: a worker serving another family does not load them."""
+WORKER_ENV = {"CUDA_SCALE_LAUNCH_QUEUES": "4x"}
+"""The workers' environment, as DeepInfer sets it before CUDA starts (deepinfer/__init__.py): room for
+the many kernel launches of a step that is queued while the one before runs."""
 
 
 def matches(cfg: dict[str, Any]) -> bool:
