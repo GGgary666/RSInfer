@@ -112,7 +112,7 @@ def plan_change(w: Worker, key: str, value: Any) -> ProcActions:
     from core.change.state import IdentityManifest
     from core.change.types import ChangeSet
     from core.common.framework import FrameworkModules
-    from core.common.ids import Identity
+    from core.common.ids import Identity, UnitId
     from core.common.result import Ok
     from core.deps.planner import World, plan
     from core.sourcetree import read_tree
@@ -123,7 +123,7 @@ def plan_change(w: Worker, key: str, value: Any) -> ProcActions:
 
     intro = introspection(w.runtime, PROC, Identity("b"))
     topo = Topology([HostSpec(PROC.host, "addr", "/snapshots", gpus=[0])], Mesh({"tp": 1}),
-                    [RankPlacement(0, PROC.host, 0)], [RoleSpec("worker", [], per_rank=True)])
+                    [RankPlacement(0, PROC.host, 0)], [RoleSpec("worker", [UnitId(u) for u in w.UNITS], per_rank=True)])
     tree = read_tree(ENGINE)
     config = {**intro.config, key: value}
     r = plan(World(ChangeSet(base=Identity("b"), config=config), IdentityManifest(topology=topo),

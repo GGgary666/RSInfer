@@ -182,7 +182,7 @@ class Unit:
         mode, budget = config["plan.cuda_graph"], config["plan.graph_memory_bytes"]
         model = ctx.use("model@1")
         names = list(dict.fromkeys(model.assembly.layers))
-        backends: list[Backend] = [ctx.use(name) for name in names]
+        backends: list[Backend] = [model.backends[name] for name in names]
         self.model, self.backends = model, backends
         self.catalog = ctx.use("kernels.catalog@1")
         self.batch, self.weights = ctx.use("worker.batch@1"), ctx.use("state.weights@1")
@@ -190,8 +190,7 @@ class Unit:
             # Record graph dependencies after all batch buffers exist; the executor's
             # initialization must not invalidate the verify graphs just captured here.
             self.batch.prepare_spec(steps, model.hidden_size, model.dtype)
-        self.stores = {kind: ctx.use(service) for kind, service in
-                       (("kv.paged", "state.kv.paged@1"), ("gdn.slots", "state.gdn.slots@1"))
+        self.stores = {kind: store for kind, store in model.stores.items()
                        if any(d.kind == kind for d in model.assembly.states)}
         self.plans = Plans(model, backends, required=mode == "required",
                            attention=[b for n, b in zip(names, backends, strict=True) if n == "layers.attn@1"],

@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -37,15 +38,18 @@ import types
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
-from deploy.models import qwen38  # noqa: E402
+from deploy.models import ds1017, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
 
-RECIPES: tuple[types.ModuleType, ...] = (qwen38,)
+if TYPE_CHECKING:
+    from core.common.ids import UnitId
+
+RECIPES: tuple[types.ModuleType, ...] = (qwen38, ds1017)
 HOST = "host-a"
 SCHED = {"host": HOST, "role": "sched", "index": 0}
 SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
@@ -65,6 +69,15 @@ def recipe_for(cfg: dict[str, Any]) -> types.ModuleType:
 
 def env() -> dict[str, str]:
     return {**os.environ, "PYTHONPATH": str(REPO / "engine")}
+
+
+def worker_units(source: Path, recipe: types.ModuleType) -> list[UnitId]:
+    """The worker's units in the workspace ``source``: the units of its model's family, so those only
+    another family runs stay out (two model units would both provide model@1)."""
+    from core.sourcetree import read_tree
+
+    others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
+    return [u for u in read_tree(source.resolve() / "engine").role_units(None, "worker") if u not in others]
 
 
 # ------------------------------------------------------------------ the run directory
@@ -189,12 +202,15 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     model = Path(args.model).resolve()
     cfg = read_config(model)
     recipe = recipe_for(cfg)
+    args.page_size = args.page_size or recipe.PAGE_SIZE
+    workers = worker_units(args.source, recipe)
     if args.layers:
         cfg = cut(cfg, args.layers)
     weights = "" if args.dummy else str((args.weights or model).resolve())
     if weights and not list(Path(weights).glob("*.safetensors")):
         print(f"no *.safetensors in {weights}: dummy weights", file=sys.stderr)
         weights = ""
+    args.dummy = not weights
     run = args.run.resolve()
     run.mkdir(parents=True, exist_ok=True)
     cuda = args.device == "cuda"
@@ -204,7 +220,7 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
         hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))], mesh=Mesh({"tp": 1}),
         placement=[RankPlacement(0, host, worker_gpu(args.gpu) if cuda else 0)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
-               RoleSpec("worker", [], per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
+               RoleSpec("worker", workers, per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
                         platform_options={"cuda": 1} if cuda else {})])
     config: dict[str, Any] = {
         # frontend
@@ -408,13 +424,74 @@ def control_argv(args: argparse.Namespace) -> list[str]:
     return ["--control", args.control or control_address(args.run.resolve())]
 
 
+def running_topology(run: Path) -> dict[str, Any] | None:
+    """The topology the engine in ``run`` runs under now: the ``plan.topology`` of the last committed
+    change that carried one (the control plane's event log, including changes applied through
+    ``core.control.client`` directly), else ``topology.json``."""
+    import sqlite3
+
+    db = run / "control" / "events.sqlite"
+    if db.is_file():
+        with sqlite3.connect(db) as conn:
+            for (raw,) in conn.execute("SELECT plan_json FROM changes WHERE status = 'committed' "
+                                       "AND plan_json IS NOT NULL ORDER BY id DESC"):
+                topology = json.loads(raw).get("topology")
+                if topology is not None:
+                    return dict(topology)
+    current = run / "topology.json"
+    return json.loads(current.read_text()) if current.is_file() else None
+
+
+def changed_topology(run: Path, rest: list[str]) -> tuple[Path | None, Path | None, bool]:
+    """For ``check`` or ``apply``: a temporary topology file to add (when ``--source`` changes the
+    worker's units), the topology file the change carries (explicit ``--topology`` or that one), and
+    whether the change commits (an ``apply`` that is no dry run). ``serve`` lists the worker's units
+    in the topology, and the control plane takes a role's listed units as they are: a unit added to
+    the workspace would not load, and one removed would be missed. So the list is worked out again
+    from the workspace over ``running_topology(run)``."""
+    options = argparse.ArgumentParser(add_help=False)
+    options.add_argument("--source", type=Path)
+    options.add_argument("--topology", type=Path)
+    options.add_argument("--dry-run", action="store_true")
+    given = options.parse_known_args(rest[1:])[0] if rest[:1] in (["check"], ["apply"]) else None
+    if given is None:
+        return None, None, False
+    commits = rest[0] == "apply" and not given.dry_run
+    if given.topology is not None:
+        return None, given.topology.resolve(), commits
+    recipe = next((r for r in RECIPES if r.NAME == engine_record(run).get("recipe")), None)
+    topology = running_topology(run) if recipe is not None and given.source is not None else None
+    if topology is None or recipe is None or given.source is None or not (given.source / "engine").is_dir():
+        return None, None, False
+    workers = [r for r in topology["roles"] if r["name"] == "worker"]
+    units = worker_units(given.source, recipe)
+    if not workers or not workers[0]["units"] or units == workers[0]["units"]:
+        return None, None, False
+    workers[0]["units"] = units
+    changed = run / "topology.changed.json"
+    changed.write_text(json.dumps(topology))
+    return changed, changed, commits
+
+
 def cmd_control(args: argparse.Namespace) -> int:
     from core.control.client import main as client
 
     rest = list(args.rest)
     if rest and rest[0] == "--":
         rest = rest[1:]
-    return client([*control_argv(args), *rest])
+    run = args.run.resolve()
+    # An engine named by its address alone has no run directory to tell its topology by.
+    added, carried, commits = (None, None, False) if args.control else changed_topology(run, rest)
+    try:
+        code = client([*control_argv(args), *rest, *(["--topology", str(added)] if added else [])])
+        if carried is not None and commits and code == 0 and run.is_dir():
+            target = run / "topology.json"
+            if carried != target:  # committed: keep the run directory's topology.json in sync
+                shutil.copyfile(carried, target)
+        return code
+    finally:
+        if added is not None:
+            added.unlink(missing_ok=True)
 
 
 def cmd_sleep(args: argparse.Namespace, asleep: bool) -> int:
@@ -506,7 +583,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
                    "CUDA_VISIBLE_DEVICES, else 0)")
     d.add_argument("--mem-fraction", type=float, default=0.85, help="device share of weights and states "
                    "(holder.mem_fraction; SGLang's --mem-fraction-static)")
-    d.add_argument("--page-size", type=int, default=16)
+    d.add_argument("--page-size", type=int, default=0,
+                   help="tokens a KV page (default: the model family's, 16 for Qwen, 128 for DS 1017)")
     d.add_argument("--kv-dtype", default="auto", help="state.kv.dtype (SGLang's --kv-cache-dtype)")
     d.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
     d.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")

@@ -8,7 +8,7 @@ weight store, so a refit changes contents in place and no graph needs recording 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 import msgspec
 
@@ -74,6 +74,18 @@ class Model(Protocol):
 
     @property
     def assembly(self) -> Assembly: ...
+
+    @property
+    def backends(self) -> Mapping[str, Any]:
+        """The backends of ``assembly.layers`` by their service names (``Backend``, plan.py): what the
+        plan prepares before a step and records graphs over."""
+        ...
+
+    @property
+    def stores(self) -> Mapping[str, Any]:
+        """The stores of ``assembly.states`` by state kind (``StateStore``, storage.py): what the
+        executor clears, copies and reports the capacity of."""
+        ...
 
     def forward(self, input_ids: Tensor, positions: Tensor, last_index: Tensor) -> Tensor:
         """``input_ids``, ``positions`` ``[tokens]``; logits ``[rows, vocab]`` at ``last_index``,

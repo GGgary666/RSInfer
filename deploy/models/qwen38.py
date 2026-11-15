@@ -4,7 +4,7 @@ layout for tests.
 
 A recipe is what ``agxinfer`` knows about one model family: ``matches`` a ``config.json``,
 ``add_arguments`` for the flags only it has, ``config`` for the config keys only its units read,
-and ``checkpoint``.
+``WORKER_ONLY`` for the worker units only it runs, and ``checkpoint``.
 """
 
 from __future__ import annotations
@@ -20,8 +20,14 @@ from deploy.models.hf import TOKENIZER_FILES, cut, read_config, text_config
 
 NAME = "qwen38"
 SERVED_NAME = "Qwen3.8-27B"
+PAGE_SIZE = 16
+"""``--page-size`` by default: SGLang's page size here."""
 ARCHITECTURES = frozenset({"Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM"})
 MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
+WORKER_ONLY = frozenset({"models.qwen38", "layers.attn", "layers.gdn", "layers.linear", "layers.norm", "layers.rope",
+                         "layers.activation", "state.gdn_slots", "kernels.triton", "kernels.flashinfer", "kernels.cuda",
+                         "kernels.torch_graph"})
+"""Worker units of this family alone: a worker serving another family does not load them."""
 
 
 def matches(cfg: dict[str, Any]) -> bool:

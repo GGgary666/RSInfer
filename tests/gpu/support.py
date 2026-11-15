@@ -12,12 +12,14 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
 from safetensors.torch import load_file
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+if TYPE_CHECKING:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
 os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
 torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
@@ -48,7 +50,12 @@ def make_checkpoint(tmp: pytest.TempPathFactory, layers: int, seed: int = 1) -> 
 
 
 def hf_model_from(checkpoint: Path, dtype: torch.dtype) -> Qwen3_5ForCausalLM:
-    """HF's text model on the GPU with a checkpoint's weights (a real one, or ``make_checkpoint``'s)."""
+    """HF's text model on the GPU with a checkpoint's weights (a real one, or ``make_checkpoint``'s).
+    HF's Qwen classes are imported here: the DS 1017 tests share this module and also run where
+    transformers has no Qwen3.5 (DeepInfer's environment on the SM100)."""
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
     cfg = json.loads((checkpoint / "config.json").read_text())
     text = cfg.get("text_config", cfg)
     with torch.device("cuda"):

@@ -1,11 +1,17 @@
 # Copyright 2023-2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""``state.kv_paged``: paged KV of the full-attention layers (``state.kv.paged@1``). Adapted from
+"""``state.kv_paged``: paged KV of the attention layers (``state.kv.paged@1``). Adapted from
 SGLang's ``MHATokenToKVPool`` (srt/mem_cache/memory_pool.py, e838360; LICENSE.sglang): per layer
-one K and one V buffer ``[size + page_size, kv_heads, head_dim]`` indexed by token slot, the page of
-slot 0 absorbing padded-token writes. An item is a page: item ``i`` is page ``i + 1``, the pages
-SGLang's ``PagedTokenToKVPoolAllocator`` hands out, so its slots are ``(i + 1) * page_size + j``
+one buffer ``[size + page_size, ...]`` indexed by token slot for each tensor the layer declares, the
+page of slot 0 absorbing padded-token writes. An item is a page: item ``i`` is page ``i + 1``, the
+pages SGLang's ``PagedTokenToKVPoolAllocator`` hands out, so its slots are ``(i + 1) * page_size + j``
 and page 0 is the scratch item ``-1``.
+
+Qwen3.8's full-attention layers declare ``k`` and ``v`` ``[page_size, kv_heads, head_dim]``. DS 1017's
+layers that produce compressed KV declare the latent ``kv`` and the indexer's key ``ik`` (2026-11-14):
+a latent stands for ``ratio`` tokens, so a page holds ``page_size / ratio`` of them, as DeepInfer's
+cache does (a tensor declared ``[entries, ...]`` with ``entries`` dividing ``page_size``): the buffer
+is ``[(pages + 1) * entries, ...]``, entry ``e`` of page ``p`` at row ``p * entries + e``.
 """
 
 from __future__ import annotations
@@ -32,14 +38,21 @@ def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class LayerBuffers:
-    """``Binding`` of one layer: ``k`` and ``v``."""
+    """``Binding`` of one layer: its tensors by the names it declared them with."""
 
     generation: int
-    k: torch.Tensor
-    v: torch.Tensor
+    tensors: Mapping[str, torch.Tensor]
+
+    @property
+    def k(self) -> torch.Tensor:
+        return self.tensors["k"]
+
+    @property
+    def v(self) -> torch.Tensor:
+        return self.tensors["v"]
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {"k": self.k, "v": self.v}
+        return self.tensors
 
 
 @dataclass
@@ -53,8 +66,8 @@ class KVPool:
     at every declaration (``_count``)."""
     holder: Any = None
     decls: dict[int, StateDecl] = field(default_factory=dict[int, StateDecl])
-    k_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
-    v_buffer: dict[int, torch.Tensor] = field(default_factory=dict[int, torch.Tensor])
+    tensors: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict[int, dict[str, torch.Tensor]])
+    """Layer -> name -> its buffer."""
     allocated: dict[int, list[Any]] = field(default_factory=dict[int, list[Any]])
     generation: int = 0
     sized_from: dict[str, Any] = field(default_factory=dict[str, Any])
@@ -71,6 +84,15 @@ class KVPool:
     def size(self) -> int:
         """Token slots requests can use."""
         return self.pages * self.page_size
+
+    @property
+    def k_buffer(self) -> dict[int, torch.Tensor]:
+        """Each layer's ``k``, of the layers that declare one."""
+        return {layer: t["k"] for layer, t in self.tensors.items() if "k" in t}
+
+    @property
+    def v_buffer(self) -> dict[int, torch.Tensor]:
+        return {layer: t["v"] for layer, t in self.tensors.items() if "v" in t}
 
     def _count(self) -> int:
         """The pages to hold. The model sizes the states again each time it allocates its weights
@@ -97,6 +119,10 @@ class KVPool:
         for d in decls:
             if d.kind != KIND or d.tokens_per_item != self.page_size:
                 raise ValueError(f"{KIND} holds pages of {self.page_size} tokens, not {d.kind} {d.tokens_per_item}")
+            for name, (shape, _) in d.tensors.items():
+                if not shape or self.page_size % shape[0]:
+                    raise ValueError(f"{KIND}: layer {d.layer}'s {name} has {shape[:1]} entries a page, which does not "
+                                     f"divide a page of {self.page_size} tokens")
             if self.decls.get(d.layer) != d:
                 changed.append(d)
         for d in changed:
@@ -106,17 +132,15 @@ class KVPool:
             # change rebuilds) back before allocating, or these allocations may split them.
             torch.cuda.empty_cache()
         for d in changed:
-            (k_shape, k_dtype), (v_shape, v_dtype) = d.tensors["k"], d.tensors["v"]
             # The padded page (slot 0's page) absorbs dummy padded-token writes.
-            total_slots = self.size + self.page_size
-            k = self.platform.alloc(0, 0, shape=(total_slots, *k_shape[1:]), dtype=k_dtype)
-            v = self.platform.alloc(0, 0, shape=(total_slots, *v_shape[1:]), dtype=v_dtype)
-            self.allocated[d.layer] = [k, v]
-            self.k_buffer[d.layer], self.v_buffer[d.layer] = self.platform.tensor(k), self.platform.tensor(v)
+            bufs = {name: self.platform.alloc(0, 0, shape=((self.pages + 1) * shape[0], *shape[1:]), dtype=dtype)
+                    for name, (shape, dtype) in d.tensors.items()}
+            self.allocated[d.layer] = list(bufs.values())
+            self.tensors[d.layer] = {name: self.platform.tensor(buf) for name, buf in bufs.items()}
             self.decls[d.layer] = d
 
     def bind(self, layer: int) -> LayerBuffers:
-        return LayerBuffers(self.generation, self.k_buffer[layer], self.v_buffer[layer])
+        return LayerBuffers(self.generation, self.tensors[layer])
 
     def capacity(self) -> int:
         return self.pages
@@ -124,18 +148,21 @@ class KVPool:
     def scratch(self) -> Sequence[int]:
         return [-1]
 
-    def slots(self, items: Sequence[int]) -> torch.Tensor:
-        """The token slots of ``items``, in order, on the device of the buffers."""
-        device = next(iter(self.k_buffer.values())).device if self.k_buffer else torch.device("cpu")
-        return on_device(((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * self.page_size
-                          + torch.arange(self.page_size)).flatten(), device)
+    def slots(self, items: Sequence[int], entries: int = 0) -> torch.Tensor:
+        """The rows of ``items``, in order, on the device of the buffers: their token slots, or with
+        ``entries`` the rows of a tensor holding that many entries a page."""
+        per = entries or self.page_size
+        first = next(iter(self.tensors.values()), None)
+        device = next(iter(first.values())).device if first else torch.device("cpu")
+        return on_device(((torch.tensor(list(items), dtype=torch.int64)[:, None] + 1) * per
+                          + torch.arange(per)).flatten(), device)
 
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
-        """``move_kv_cache`` by page: every layer's ``buffer[dst slots] = buffer[src slots]``."""
-        src_loc, tgt_loc = self.slots(src), self.slots(dst)
-        for layer in self.k_buffer:
-            self.k_buffer[layer][tgt_loc] = self.k_buffer[layer][src_loc]
-            self.v_buffer[layer][tgt_loc] = self.v_buffer[layer][src_loc]
+        """``move_kv_cache`` by page: every layer's ``buffer[dst rows] = buffer[src rows]``."""
+        for layer, tensors in self.tensors.items():
+            for name, buffer in tensors.items():
+                per = self.decls[layer].tensors[name][0][0]
+                buffer[self.slots(dst, per)] = buffer[self.slots(src, per)]
 
     def clear(self, items: Sequence[int]) -> None:
         """Nothing: attention reads only the slots a request wrote (SGLang never zeroes KV)."""
@@ -150,8 +177,7 @@ class KVPool:
         for buf in bufs:
             self.platform.free(buf)
         self.generation += bool(bufs)  # its bindings are stale
-        self.k_buffer.pop(layer, None)
-        self.v_buffer.pop(layer, None)
+        self.tensors.pop(layer, None)
         self.decls.pop(layer, None)
 
     def free(self) -> None:

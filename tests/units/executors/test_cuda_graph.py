@@ -5,8 +5,7 @@ kernels of a captured step (``kernels.torch_graph``). The real capture is in ``t
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,6 +22,7 @@ from core.plan.unit import Plans
 from executors.pytorch.unit import check_plan
 from platforms.base import StaleGraph
 from tests.framework.support import PROC
+from tests.units.support.graphs import with_graphs
 from tests.units.support.worker import Driver, Worker, hf_model, save_checkpoint, tiny_config
 from unit.runtime.proxy import Provision, ServiceProxy
 
@@ -197,68 +197,6 @@ def test_a_backend_without_a_capturable_decode_kernel_is_named() -> None:
 
 
 # ---------------------------------------------------------------- a captured step, on the CPU
-
-class StandInGraph:
-    """``Graph`` where nothing was recorded: a replay runs ``forward`` again."""
-
-    def __init__(self, forward: Callable[[], None], replays: list[int], size: int) -> None:
-        self.forward, self.replays, self.size = forward, replays, size
-        self.closed = False
-
-    def replay(self) -> None:
-        if self.closed:
-            raise StaleGraph("closed")
-        self.replays.append(self.size)
-        self.forward()
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class StandInRecorder:
-    """``GraphRecorder`` for one stand-in graph. The forward inside ``capture`` runs here, so what
-    it did to the padding items is taken back: a real capture records without running."""
-
-    def __init__(self, graph: StandInGraph, undo: Callable[[], None]) -> None:
-        self.graph, self.undo = graph, undo
-
-    @contextmanager
-    def warmup(self) -> Generator[None]:
-        yield
-
-    @contextmanager
-    def capture(self) -> Generator[StandInGraph]:
-        yield self.graph
-        self.undo()
-
-
-def with_graphs(w: Worker, sizes: list[int]) -> list[int]:
-    """Give ``w``'s plans a graph per bucket, recorded by the stand-in; the buckets replayed since."""
-    plans, model, batch = w.service("plan@1"), w.service("model@1"), w.service("worker.batch@1")
-    stores = [w.service("state.kv.paged@1"), w.service("state.gdn.slots@1")]
-    batch.prepare(["kv.paged", "gdn.slots"])
-    replays: list[int] = []
-    graphs: dict[int, GraphPlan] = {}
-
-    def undo() -> None:
-        for store in stores:
-            store.clear(store.scratch())
-
-    for size in sorted(sizes, reverse=True):
-        graph = GraphPlan(size, torch.device("cpu"), plans.eager.backends)
-
-        def forward(graph: GraphPlan = graph) -> None:
-            assert graph.output is not None
-            with torch.inference_mode():
-                graph.output.copy_(model.forward(graph.inputs, graph.positions, graph.last_index))
-
-        graph.capture(batch, model, stores, StandInRecorder(StandInGraph(forward, replays, size), undo))
-        graphs[size] = graph
-    replays.clear()
-    plans.graphs = dict(sorted(graphs.items()))
-    plans.deps = Dependencies([batch, *stores], [lambda: batch.binding], w.service("kernels.catalog@1"))
-    return replays
-
 
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory: pytest.TempPathFactory) -> Path:

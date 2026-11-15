@@ -8,7 +8,7 @@ entry = "core.plan.unit:Unit"
 services = ["plan@1"]
 
 [requires]
-services = ["model@1", "layers.attn@1", "layers.gdn@1", "worker.batch@1", "state.weights@1", "state.kv.paged@1", "state.gdn.slots@1", "kernels.catalog@1"]
+services = ["model@1", "worker.batch@1", "state.weights@1", "kernels.catalog@1"]
 
 [capabilities]
 captures_graph = true
