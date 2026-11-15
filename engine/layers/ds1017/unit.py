@@ -71,6 +71,9 @@ SPLIT = MappingProxyType({"ds.moe_experts@1": "ds.ep_experts@1"})
 """On ranks that each hold part of a layer's experts (``comm.group@1`` of more than one rank): the
 kernel that reaches the other ranks' in place of the one that runs this rank's."""
 
+MEGA = frozenset({"deepinfer.ds.ep_experts@1"})
+"""Solutions that read the expert stacks in the fused MoE kernel's row order (``formats.expert_layout``)."""
+
 Weights = Mapping[str, torch.Tensor]
 
 
@@ -147,6 +150,8 @@ class Layers:
         """``comm.group@1``: the ranks that hold this model's experts and Engram tables between them."""
         self.placement = placement
         """``expert.placement@1``: the slot of each expert, when they are placed by the tokens they take."""
+        self.chosen: Mapping[str, Mapping[str, str]] = {}
+        """``resolve``'s answer: phase -> definition -> solution."""
         if cfg.n_routed_experts % group.size:
             raise ValueError(f"comm.size = {group.size} does not divide the {cfg.n_routed_experts} routed experts")
         self.kernels = Kernels(catalog, config, "dsv4")
@@ -194,7 +199,23 @@ class Layers:
         names = self.definitions()
         calls = {"prefill": {name: shape for name in names if name not in DECODE_ONLY},
                  "decode": {name: shape for name in names if name not in PREFILL_ONLY}}
-        return self.kernels.resolve(calls)
+        self.chosen = self.kernels.resolve(calls)
+        return self.chosen
+
+    def mega_experts(self) -> bool:
+        """Whether the routed experts' kernel reads the expert stacks in the fused MoE kernel's row
+        order: the model lays them out so (``formats.expert_layout``). One answer for every step."""
+        if self.group.size == 1:
+            return False
+        if not self.chosen:
+            raise RuntimeError("the layers' kernels are not resolved yet (core.plan does it at start)")
+        answers = {solution.split(" ")[0] in MEGA for table in self.chosen.values()
+                   for definition, solution in table.items() if definition == "ds.ep_experts@1" and solution}
+        if len(answers) > 1:
+            raise ValueError("the routed experts' kernels of prefill and decode steps read the experts' weights "
+                             "in different row orders: give both the same backend (dsv4.prefill_backend, "
+                             "dsv4.decode_backend)")
+        return answers == {True}
 
     def definitions(self) -> tuple[str, ...]:
         """What the forward calls: alone, ``DEFINITIONS``; among ranks that share the experts and the

@@ -34,7 +34,7 @@ The weights arrive as the checkpoint's bytes (``uint8``); a weight's scales as
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import cast
+from typing import Any, cast
 
 import deep_gemm
 import flash_mla
@@ -60,6 +60,7 @@ from kernels.deepinfer.tilelang_ops.fused_transform import (
 )
 from kernels.deepinfer.tilelang_ops.load_paged_kv_cache import load_paged_kv_cache
 from kernels.deepinfer.tilelang_ops.store_kv_cache import store_kv_cache
+from kernels import ds1017_ep as ep
 from kernels.ds1017_formats import BLOCK, packed_words
 
 E4M3 = torch.float8_e4m3fn
@@ -592,6 +593,13 @@ def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: to
     out = _out(rows.shape[0], w2.shape[0], BF16, x.device)
     deep_gemm.fp8_fp4_gemm_nt(hidden, (w2.view(E4M3), packed_words(p2, w2.shape[0])), out, None, recipe=(1, 1, BLOCK))
     return out.reshape(*x.shape[:-1], w2.shape[0])
+
+
+def engram_fetch(group: Any, ids: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rows of an Engram table split over the ranks, through the group's collectives
+    (``kernels.ds1017_ep``): DeepInfer's own way, ``deep_ep.EngramBuffer``, is not wired yet."""
+    return ep.engram_fetch(group, ids, weight, scale)
 
 
 def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor

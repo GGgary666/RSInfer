@@ -64,7 +64,9 @@ def params(cfg: DSConfig, ranks: int = 1, slots: int = 0) -> list[WeightDecl]:
     def w(name: str, *shape: int, fmt: str = "bf16") -> WeightDecl:
         return WeightDecl(name, shape, fmt)
 
-    out = [w("embed.weight", cfg.vocab_size, dim), w("head.weight", cfg.vocab_size, dim, fmt="f32"), w("norm.weight", dim)]
+    out = [w("embed.weight", cfg.vocab_size, dim), w("head.weight", cfg.vocab_size, dim, fmt="f32"), w("norm.weight", dim),
+           # 0: the expert stacks' rows are in the checkpoint's order; 1: in the fused MoE kernel's.
+           w("experts.layout", 1, fmt="u8")]
     for i in range(cfg.num_hidden_layers):
         p = f"layers.{i}."
         out += [*fp8(p + "attn.wq_a", cfg.q_lora_rank, dim), *fp8(p + "attn.wq_b", heads * hd, cfg.q_lora_rank),
@@ -266,6 +268,9 @@ class DeepseekV41ForCausalLM:
             if packed is not None:
                 packed.copy_(formats.pack_scales(formats.block_rows(param, packed.shape[1])))
                 loaded.add(name[:-len("scale")] + "packed")
+        if "experts.layout" in params_dict:  # as read: the checkpoint's row order
+            params_dict["experts.layout"].zero_()
+            loaded.add("experts.layout")
         for stack, seen in stacked.items():
             experts = params_dict[stack + ".weight"].shape[0]
             for matrix in (("w2",) if stack.endswith("w2") else ("w1", "w3")):
@@ -304,6 +309,14 @@ class DeepseekV41ForCausalLM:
         if self._cached[0] != generation:
             views = [v.buffers() for v in self._views]
             self._cached = (generation, views)
+            # The expert stacks' rows in the order the routed experts' kernel reads them: a row
+            # permutation in place, undone when another backend's kernel reads them again.
+            marker, mega = views[-1]["experts.layout"], self.layers.mega_experts()
+            if bool(int(marker[0])) != mega:
+                for layer in views[:-1]:
+                    formats.expert_layout(*(layer[f"ffn.experts.{m}.{part}"] for m in ("w13", "w2")
+                                            for part in ("weight", "packed")), mega=mega)
+                marker.fill_(int(mega))
             # The weights are as the checkpoint's order lays them out (loaded, or loaded again).
             self.placement.start(self.cfg.num_hidden_layers, self.cfg.n_routed_experts,
                                  lambda layer: [views[layer][f"ffn.experts.{m}.{part}"] for m in ("w13", "w2")

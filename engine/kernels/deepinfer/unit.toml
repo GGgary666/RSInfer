@@ -6,3 +6,7 @@ entry = "kernels.deepinfer.unit:Unit"
 
 [requires]
 services = ["kernels.catalog@1"]
+
+[reads]
+# How many tokens a rank brings to one step at most: the size of its part of the fused MoE buffer.
+config = ["sched.token_budget", "batch.max_rows"]

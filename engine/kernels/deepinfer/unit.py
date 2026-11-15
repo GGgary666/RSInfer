@@ -2,7 +2,11 @@
 TileKernels, DeepSelect), as solutions of the DS definitions (``kernels.ds1017``): the backend
 ``deepinfer``. They need a GPU of SM 10.0 and the four libraries in the engine's Python environment;
 without either the unit registers nothing. Which library call solves which definition, and where its
-arithmetic differs from the references, is in ``ops``."""
+arithmetic differs from the references, is in ``ops``.
+
+Among ranks that share a layer's experts (``comm.group@1``), the routed experts are DeepGEMM's fused
+MoE kernel over a buffer the ranks share (``mega``); the Engram rows still travel through the
+group's collectives (``kernels.ds1017_ep``), which no graph records."""
 
 from __future__ import annotations
 
@@ -72,3 +76,14 @@ class Unit:
         ctx.register("kernels.catalog@1", Implementation(
             Solution(FIXED, "ds.moe_experts@1", f"{ops.__name__}:{fn.__name__}", library=library("deep_gemm"),
                      capturable=True, requires=["cuda", "sm_100", CAPTURE]), fn), label=f"solution {FIXED}")
+        # Among ranks: the fused MoE kernel, with this instance's part of the ranks' shared buffer.
+        from kernels.deepinfer.mega import Mega
+
+        mega = Mega(config["sched.token_budget"] + config["batch.max_rows"])
+        ctx.effect(lambda: mega.close, label="fused MoE buffer")
+        for definition, fn, capturable in (("ds.ep_experts@1", mega.ep_experts, True),
+                                           ("ds.engram_fetch@1", ops.engram_fetch, False)):
+            solution = f"{BACKEND}.{definition}"
+            ctx.register("kernels.catalog@1", Implementation(
+                Solution(solution, definition, f"{fn.__module__}:{fn.__qualname__}", library=library("deep_gemm"),
+                         capturable=capturable, requires=["cuda", "sm_100"]), fn), label=f"solution {solution}")

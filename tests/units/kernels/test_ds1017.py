@@ -248,3 +248,33 @@ def test_attention_in_the_caches_is_attention_on_what_they_hold() -> None:
     alone = ops.cache_attn(q, window, window_idx, None, None, sink, 0.125)
     listed = torch.where(window_idx >= 0, torch.arange(8) + 8 * torch.arange(6)[:, None], -1)
     assert torch.equal(alone, ops.sparse_attn(q, kv[window_idx.clamp_min(0)].reshape(-1, 64), listed, sink, 0.125))
+
+
+def test_the_fused_moe_kernels_row_order_is_deepgemms_and_is_undone_in_place() -> None:
+    """``formats.expert_layout`` against DeepGEMM's own transforms (``deep_gemm/mega/__init__.py`` at
+    1fc9c66, MIT; written out here: the library needs an SM 10.0 card to import)."""
+    def interleave(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+        g, n, *rest = t.shape
+        half = n // 2
+        gate = t[:, :half].reshape(g, half // gran, gran, *rest)
+        up = t[:, half:].reshape(g, half // gran, gran, *rest)
+        return torch.stack([gate, up], dim=2).reshape(g, n, *rest).contiguous()
+
+    def utccp(sf: torch.Tensor) -> torch.Tensor:
+        groups, mn, k = sf.shape
+        return sf.reshape(groups, -1, 4, 32, k).transpose(2, 3).reshape(groups, mn, k).contiguous()
+
+    g = torch.Generator().manual_seed(0)
+    experts, inter, dim = 3, 256, 512
+    w13 = torch.randint(0, 255, (experts, 2 * inter, dim // 2), dtype=torch.uint8, generator=g)
+    w2 = torch.randint(0, 255, (experts, dim, inter // 2), dtype=torch.uint8, generator=g)
+    p13 = formats.pack_scales(torch.randint(100, 140, (experts, 2 * inter, dim // 32), dtype=torch.uint8, generator=g))
+    p2 = formats.pack_scales(torch.randint(100, 140, (experts, dim, inter // 32), dtype=torch.uint8, generator=g))
+    before = [t.clone() for t in (w13, p13, w2, p2)]
+    want = (interleave(w13), utccp(interleave(formats.packed_words(p13, 2 * inter).contiguous())),
+            utccp(formats.packed_words(p2, dim).contiguous()))
+    formats.expert_layout(w13, p13, w2, p2, mega=True)
+    assert torch.equal(w13, want[0]) and torch.equal(formats.packed_words(p13, 2 * inter), want[1])
+    assert torch.equal(w2, before[2]) and torch.equal(formats.packed_words(p2, dim), want[2])
+    formats.expert_layout(w13, p13, w2, p2, mega=False)
+    assert all(torch.equal(a, b) for a, b in zip((w13, p13, w2, p2), before, strict=True))

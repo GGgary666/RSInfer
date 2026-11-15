@@ -310,3 +310,58 @@ def test_deepinfers_decode_operators_replay_from_a_graph_on_new_inputs(case: str
         problem = f"{type(e).__name__}: {str(e)[:300]}"
     print(f"{case}: {'replays from a graph' if not problem else 'NOT CAPTURABLE: ' + problem}")
     assert not problem
+
+
+@pytest.mark.timeout(1800)
+def test_the_fused_moe_kernel_on_one_rank_computes_the_routed_experts() -> None:
+    """``ds.ep_experts@1`` of this backend (``mega``: ``deep_gemm.fp8_fp4_mega_moe``) for a group of
+    one rank, against the routed experts' reference with DeepInfer's rounding: the expert stacks in the
+    fused kernel's row order, the tokens each slot took counted, slots that are not the experts'
+    numbers, a step without tokens, and the kernel recorded in a graph and replayed on other values.
+    It adds a token's terms in bf16 with fast math, so it agrees to the routed experts' tolerance,
+    not to the bit."""
+    from types import SimpleNamespace
+
+    from kernels.deepinfer.mega import Mega
+
+    args = inputs("ds.moe_experts@1")
+    x, weights, indices, w13, p13, w2, p2, limit = args
+    want = reference.moe_experts(*args, direct=True)
+    m13, q13, m2, q2 = (t.clone() for t in (w13, p13, w2, p2))
+    formats.expert_layout(m13, q13, m2, q2, mega=True)
+    group = SimpleNamespace(size=1, rank=0, device_group=None)
+    mega = Mega(256)
+    try:
+        taken = torch.zeros(EXPERTS, dtype=torch.int32, device="cuda")
+        got = mega.ep_experts(group, x, weights, indices, m13, q13, m2, q2, limit, None, taken)
+        torch.cuda.synchronize()
+        apart = float((got - want).abs().max() / want.abs().max())
+        print(f"fused MoE: farthest {apart:.4f} of the largest value; counts {int(taken.sum())} of {TOKENS * TOPK}")
+        close("ds.moe_experts@1", got, want, args)
+        assert torch.equal(taken.long(), torch.bincount(indices.flatten(), minlength=EXPERTS))
+        # A slot is where an expert's weights are, not its number: the stacks' experts in another order.
+        order = torch.randperm(EXPERTS, generator=torch.Generator().manual_seed(5)).cuda()
+        o13, r13, o2, r2 = (t[order].contiguous() for t in (m13, q13, m2, q2))
+        slot_of = torch.empty_like(order).scatter_(0, order, torch.arange(EXPERTS, device="cuda"))
+        elsewhere = mega.ep_experts(group, x, weights, indices, o13, r13, o2, r2, limit, slot_of[indices])
+        assert torch.equal(elsewhere, got)
+        assert mega.ep_experts(group, x[:0], weights[:0], indices[:0], m13, q13, m2, q2, limit).shape == (0, DIM)
+        # One token alone against the same token among the others.
+        alone = mega.ep_experts(group, x[:1], weights[:1], indices[:1], m13, q13, m2, q2, limit)
+        print(f"fused MoE: one token alone {'equals' if torch.equal(alone, got[:1]) else 'DIFFERS FROM'} its row of {TOKENS}")
+        # Recorded and replayed on other inputs.
+        sx, sw, si = (t.clone() for t in (x[:4], weights[:4], indices[:4]))
+        fx, fw, fi = inputs("ds.moe_experts@1", 4, seed=1)[:3]
+        mega.ep_experts(group, sx, sw, si, m13, q13, m2, q2, limit)
+        torch.cuda.synchronize()
+        graph, stream = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=stream):
+            out = mega.ep_experts(group, sx, sw, si, m13, q13, m2, q2, limit)
+        expect = mega.ep_experts(group, fx, fw, fi, m13, q13, m2, q2, limit)
+        for held, new in ((sx, fx), (sw, fw), (si, fi)):
+            held.copy_(new)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expect), float((out - expect).abs().max())
+    finally:
+        mega.close()
