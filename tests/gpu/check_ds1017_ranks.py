@@ -99,6 +99,10 @@ def main() -> int:
     p.add_argument("--page-size", type=int, default=0)
     p.add_argument("--timeout", type=int, default=1800, help="seconds an engine may take to come up")
     p.add_argument("--serve", action="append", default=[], help="another argument for agxinfer serve (repeatable)")
+    p.add_argument("--balanced", default="", metavar="INTERVAL,WINDOW,EXTRA",
+                   help="serve on several ranks once more with expert parallel load balancing (eplb.interval, "
+                        "eplb.window, eplb.extra_experts): the experts are placed again while it generates, and the "
+                        "text has to be what it is without")
     p.add_argument("--out", type=Path)
     args = p.parse_args()
     if (args.model is None) == (args.random is None):
@@ -140,12 +144,23 @@ def main() -> int:
         problems += [f"prompt {i}: {text!r} does not start with {want!r}" for i, (text, want) in
                      enumerate(zip(ranked, args.expect, strict=False)) if not text.startswith(want)]
         words = sum(len(t.split()) for t in ranked)
-        # Expert parallel load balancing, where it is on: what rank 0 said each time the experts were placed again.
-        placed = [line for log in (work / f"{backend}-ranks").glob("host-a/snapshots/.run/worker-0-*/log")
-                  for line in log.read_text(errors="replace").splitlines() if "experts placed again" in line]
-        if placed:
-            entry["placed"] = placed
-            print(f"placed {backend}: {len(placed)} times; the last: {placed[-1]}", flush=True)
+        if args.balanced:
+            interval, window, extra = args.balanced.split(",")
+            eplb = ["--set", f"eplb.interval={interval}", "--set", f"eplb.window={window}", "--set",
+                    f"eplb.extra_experts={extra}"]
+            moved, moved_together, moved_rate = generate(work / f"{backend}-balanced", [*serve, *several, *eplb], prompts,
+                                                         args.max_tokens, name, args.timeout)
+            # What rank 0 said each time the experts were placed again.
+            placed = [line for log in (work / f"{backend}-balanced").glob("host-a/snapshots/.run/worker-0-*/log")
+                      for line in log.read_text(errors="replace").splitlines() if "experts placed again" in line]
+            entry.update(balanced=moved, balanced_together=moved_together, balanced_tokens_per_s=round(moved_rate, 2),
+                         placed=placed)
+            problems += [f"prompt {i}: {a!r} with the experts placed again, {b!r} without" for i, (a, b) in
+                         enumerate(zip(moved, ranked, strict=True)) if a != b]
+            if not placed:
+                problems.append("the experts were never placed again")
+            print(f"placed {backend}: {len(placed)} times, {moved_rate:.1f} tokens/s with {len(prompts)} at once; "
+                  f"the last: {placed[-1] if placed else ''}", flush=True)
         entry["problems"] = problems
         report["backends"][backend] = entry
         failed |= bool(problems)

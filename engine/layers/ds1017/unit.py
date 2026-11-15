@@ -215,7 +215,8 @@ class Layers:
         names = self.definitions()
         calls = {"prefill": {name: shape for name in names if name not in DECODE_ONLY},
                  "decode": {name: shape for name in names if name not in PREFILL_ONLY}}
-        self.chosen = self.kernels.resolve(calls)
+        # Among ranks the Engram rows are brought in before the forward (``fetch``): no graph records that.
+        self.chosen = self.kernels.resolve(calls, outside=frozenset({"ds.engram_fetch@1"}))
         return self.chosen
 
     def mega_experts(self) -> bool:
