@@ -108,6 +108,9 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - 一个变更里，同一个角色的进程是一起启动的（`core.change`）：通信组的 rank 在加载单元时要互相等。
 - 用参照或 `tilelang` 后端时，分开的专家经 `torch.distributed` 交换，录不进 graph，`plan.cuda_graph = auto` 会退回 eager 并在 `core.plan` 那一行里写明是哪个 kernel。
 - 没有请求的 rank 每一步也要跑（`model.idle`）：别的 rank 的 token 可能选了它的专家。所以一个 rank 出错，其他 rank 会卡在那一层，直到 `comm.timeout_s`。
+- 后端 `deepinfer` 在多 rank 下用 DeepGEMM 的融合 kernel（`kernels/deepinfer/mega.py`），能录进 graph：要显式给 `--cuda-graph auto`（默认 off），桶默认到 8 行，更大的 batch 给 `--graph-buckets 1 2 4 8 16 32 64`。各 rank 同时录、同时回放；融合 MoE kernel 在 kernel 里等别的 rank，等 60 秒是设备断言。
+- 模型层的三个钩子（都是可选的方法，没有就不调）：`model.idle()`（executor 收到空计划时）、`model.stepped()`（每个 forward 之后、graph 之外：EPLB 计数）、backend 的 `fetch(input_ids, positions)`（`core.plan` 在 `prepare` 之后、forward 或回放之前调：多 rank 时取 Engram 的行）。
+- 记录：[doc/rsi/2026-11-15-ds1017-several-gpus.md](../../../doc/rsi/2026-11-15-ds1017-several-gpus.md)；没做完的在 specs 的 10.8 节。
 
 ### `tests/`
 
