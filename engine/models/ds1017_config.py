@@ -79,11 +79,11 @@ class DSConfig(msgspec.Struct, frozen=True):
             raise ValueError(f"DS 1017 routes with sqrtsoftplus scores, normalized, and one shared expert; "
                              f"the config has {scoring}, {shared} shared, norm_topk_prob {d.get('norm_topk_prob')}")
         # A config cut to its first layers keeps the Engram layers it still has. The hash layout draws
-        # each layer's primes in the list's order, so those kept must be the list's first.
+        # each layer's primes in the list's order, so the layer ids must strictly ascend from 0.
         engram, tables = tuple(d.get("engram_layer_ids", ())), tuple(d.get("engram_num_embeddings", ()))
-        kept = [i for i, layer in enumerate(engram) if layer < d["num_hidden_layers"]]
-        if kept != list(range(len(kept))):
-            raise ValueError(f"engram_layer_ids {list(engram)} must ascend for a model of {d['num_hidden_layers']} layers")
+        if any(layer < 0 for layer in engram) or any(a >= b for a, b in zip(engram, engram[1:])):
+            raise ValueError(f"engram_layer_ids {list(engram)} must ascend from 0 without duplicates")
+        kept = sum(1 for layer in engram if layer < d["num_hidden_layers"])
         return DSConfig(
             vocab_size=d["vocab_size"], hidden_size=d["hidden_size"], moe_intermediate_size=d["moe_intermediate_size"],
             num_hidden_layers=d["num_hidden_layers"], num_attention_heads=d["num_attention_heads"],
@@ -102,8 +102,8 @@ class DSConfig(msgspec.Struct, frozen=True):
             rope_beta_slow=rope.get("beta_slow", 1),
             rope_original_seq_len=rope.get("original_max_position_embeddings", 0),
             hc_mult=d.get("hc_mult", 4), hc_sinkhorn_iters=d.get("hc_sinkhorn_iters", 20), hc_eps=d.get("hc_eps", 1e-6),
-            engram_layer_ids=engram[:len(kept)],
-            engram_num_embeddings=tables[:len(kept)] if len(tables) == len(engram) else tables,
+            engram_layer_ids=engram[:kept],
+            engram_num_embeddings=tables[:kept] if len(tables) == len(engram) else tables,
             engram_max_ngram_size=d.get("engram_max_ngram_size", 1), engram_vocab_size=d.get("engram_vocab_size", 0),
             engram_n_heads=d.get("engram_n_heads", 0), engram_head_dim=d.get("engram_head_dim", 0),
             engram_pad_token_id=d.get("engram_pad_token_id", 2),

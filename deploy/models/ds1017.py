@@ -50,11 +50,14 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
                          "ones in the checkpoint's formats with `agxinfer checkpoint --config <model dir> [--layers N] "
                          "--out <dir>` and serve that directory")
     decls = states(DSConfig.from_hf(cfg), args.page_size)
-    # Engram's compressed token map: the model's, the weights' or the tokenizer's directory, the first
-    # that has one, else the first with the tokenizer.json it is built from. The worker is not given
+    # Engram's compressed token map: an explicit --tokenizer overrides the model's directory (as it
+    # does for frontend.tokenizer_path); otherwise the model's or the weights' directory, preferring a
+    # prebuilt engram_token_map.json to the tokenizer.json it is built from. The worker is not given
     # the model's directory with --layers, and never the tokenizer's.
-    places = [d.resolve() for d in (model, args.weights, args.tokenizer) if d is not None]
-    found = next((d for name in ("engram_token_map.json", "tokenizer.json") for d in places if (d / name).is_file()), None)
+    tok = args.tokenizer.resolve() if args.tokenizer is not None else None
+    places = [d.resolve() for d in (model, args.weights) if d is not None]
+    found = (tok if tok is not None and any((tok / name).is_file() for name in ("engram_token_map.json", "tokenizer.json"))
+             else next((d for name in ("engram_token_map.json", "tokenizer.json") for d in places if (d / name).is_file()), None))
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
             "alloc.radix_cache": False, "dsv4.backend": args.ds_backend,
             **({"dsv4.token_map_path": str(found)} if found else {}),

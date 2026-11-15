@@ -109,5 +109,14 @@ def test_serve_tells_the_worker_where_the_token_map_is_and_refuses_dummy_weights
     config = json.loads((run / "config.json").read_text())
     assert config["dsv4.token_map_path"] == str(tokenizer.resolve()) and "model.path" not in config
     assert config["model.hf_config"]["text_config"]["num_hidden_layers"] == 3 and config["weights.path"] == str(model[1].resolve())
+    # An explicit --tokenizer overrides a stand-in map in the model directory, matching frontend.tokenizer_path.
+    with_stand_in = tmp_path / "stand_in_model"
+    with_stand_in.mkdir()
+    with_stand_in.joinpath("config.json").write_text(json.dumps(model[0]))
+    with_stand_in.joinpath("engram_token_map.json").write_text("[0, 0]")
+    cli("serve", str(with_stand_in), "--weights", str(model[1]), "--tokenizer", str(tokenizer), "--device", "cpu",
+        "--run", str(tmp_path / "run_override"), "--dry-run")
+    override = json.loads((tmp_path / "run_override" / "config.json").read_text())
+    assert override["dsv4.token_map_path"] == override["frontend.tokenizer_path"] == str(tokenizer.resolve())
     out = subprocess.run([sys.executable, str(CLI), *serve, "--dummy"], env=ENV, capture_output=True, text=True, timeout=60)
     assert out.returncode != 0 and "DS 1017 takes no dummy weights" in out.stderr and "checkpoint" in out.stderr, out.stderr

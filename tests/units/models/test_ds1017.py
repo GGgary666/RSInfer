@@ -290,8 +290,11 @@ def test_a_config_cut_to_its_first_layers_keeps_their_engram_layers_only(model: 
     assert three.engram_num_embeddings == whole.engram_num_embeddings[:1]
     assert [part[:1] for part in engram_layout(whole)] == list(engram_layout(three))
     three.check()
-    with pytest.raises(ValueError, match="engram_layer_ids .* ascend"):
-        DSConfig.from_hf(cut(tiny_config(engram_layer_ids=[4, 1]), 3))
+    for bad in ([4, 1], [1, 1], [-1, 1]):
+        with pytest.raises(ValueError, match="engram_layer_ids .* ascend"):
+            DSConfig.from_hf(tiny_config(engram_layer_ids=bad))
+        with pytest.raises(ValueError, match="engram_layer_ids .* ascend"):
+            DSConfig.from_hf(cut(tiny_config(engram_layer_ids=bad), 3))
     # One layer: no Engram layer is left, and no compressed KV either.
     one = cut(model[0], 1)
     assert DSConfig.from_hf(one).engram_layer_ids == () and not any(d.kind == "kv.paged" for d in states(DSConfig.from_hf(one), 4))

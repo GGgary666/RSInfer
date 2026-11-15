@@ -556,9 +556,9 @@ def index_topk_paged(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torc
         valid = lens32
         idx = _top(logits, topk, valid).contiguous()
     # convert_kv_index lays a row out over 128 threads: DeepInfer's lists are 512 long; a shorter one is
-    # padded with none (an entry past the valid ones stays none).
+    # padded with none (an entry past min(valid, topk) stays none).
     idx = F.pad(idx, (0, -topk % 128), value=-1)[:, None].contiguous()
-    convert_kv_index(idx, entries, valid[:, None].contiguous(), table)
+    convert_kv_index(idx, entries, valid.clamp_max(topk)[:, None].contiguous(), table)
     return idx[:, 0, :topk].long(), picked
 
 
