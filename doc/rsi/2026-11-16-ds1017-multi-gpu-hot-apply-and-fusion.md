@@ -97,3 +97,4 @@ Codex 在双 rank 引擎上复现：EPLB 重排以后热重载 `models.ds1017`�
 
 - 预热以后每卡约 1.1 万 tok/s，是上午数的 4 倍多，仍是 DeepInfer（44,952，进程内只计 `llm_engine.step()`）的约四分之一。每卡一轮约 6 万 token、两步，约 2.6 s 一步；DeepInfer 的同样一步是 727 ms。
 - 单卡单独量的融合算子（`M = 32,768`，40 层的 `hc_step`、`sparse_attn_out`、`hc_step + moe` 加起来 435 ms）说明大头不在这几个 kernel。还没逐项量的候选：每个压缩层都重新 `load_values` 反量化 latent（38 层；DeepInfer 只在 4 个 KV 源层装一次、后面的层复用），每层两次 `torch.cat` 拼 attention 的源，indexer、压缩器、Engram 的 prefill 路径，主机上的 `lay_out`（约 10 ms 一步），以及 HTTP 和分词。下一步在跑着的引擎上加 profiler 热改进去量。
+- 量的结果和之后的稳态吞吐见 [2026-11-16-ds1017-prefill-overhead.md](2026-11-16-ds1017-prefill-overhead.md)：大头是主机上的 `lay_out`，上面列的几个候选都不是。
