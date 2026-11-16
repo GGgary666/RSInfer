@@ -95,7 +95,7 @@ Antigravity 13:57 的 Kineto trace，按发出 kernel 的引擎源码行归并�
 - 14:54，每步 32,768 个 token、模型自己的路由、开重叠，提示词刚从随机 token 换成 50 个词，回答了 133 条请求以后，rank 3 的第 2258 步 OOM：要 2.00 GiB，卡上空 1.93 GiB，PyTorch 已分配 160.46 GiB，另有 5.24 GiB 留在缓存里但是碎的，进程一共占 176.23 GiB（卡 178.35 GiB）。
 - 另外三个 rank 这一步卡在融合 MoE kernel 的屏障里等 rank 3，60 秒后是设备断言（`deep_gemm/comm/barrier.cuh:21 Timeout`），接着 `CUDA error: unspecified launch failure`，进程 `terminate` 退出。rank 3 的进程还活着，空转。
 - 之后的请求都回 400。我接着发的 `apply --config '{"sched.overlap": false}'`（变更 24）等不到三个 worker 对 Pause 和 Abort 的回答，结果是 `failed`，诊断里有 `change.abort_unacknowledged` 和 `change.recovery_required`。进程已经没了，这是规格里写明的结果，不是更新机制的 bug，所以没有写 framework-bugs 报告。
-- 15:03 `agxinfer stop`（干净返回，四张卡的显存都放了），崩掉的运行目录改名留在 n1 的 `/workspace/agxinfer-env/run-ep-crashed-20261116-1456`，再用同样的参数 `serve`，15:23 起来，20.5 分钟。
+- 15:03 `agxinfer stop`（干净返回，四张卡的显存都放了），崩掉的运行目录改名成 n1 的 `/workspace/agxinfer-env/run-ep-crashed-20261116-1456`（当天稍后按用户的要求删了），再用同样的参数 `serve`，15:23 起来，20.5 分钟。
 
 一个 rank 出错、其他 rank 跟着退出，是 10.9 节里已经列着的「没有做组内恢复」。
 
@@ -150,4 +150,4 @@ Antigravity 13:57 的 Kineto trace，按发出 kernel 的引擎源码行归并�
 - 真实路由比强制随机一步多的约 75 ms：Antigravity 的 profile 里 MoE 从 264 ms 到 373 ms，应是各 rank 的专家负载不均，这个分解我没有复测；EPLB 带冗余槽位以后的 prefill 没量。
 - 开重叠以后和 DeepInfer 还差的 2%，没有细分。
 - 稳态 prefill 的压测脚本没有进仓库。
-- n1 上 Antigravity 留下的 `probe-ws` 和 `/tmp` 里的临时文件、我留下的 `/tmp/devin-ab`、`devin-ref-ws`、`devin-probe-ws` 和崩掉的运行目录，都还在。
+- n1 上 Antigravity 留下的 `probe-ws` 和 `/tmp` 里的临时文件、我留下的 `/tmp/devin-ab`、`devin-ref-ws`、`devin-probe-ws`，都还在。
