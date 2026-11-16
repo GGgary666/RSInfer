@@ -78,3 +78,22 @@
    - `models.ds1017.start()` 原先先扩权重后缩状态池；
    - `Placement._move()` 跨卡搬迁专家时单次 `Group.gather` 拼齐全部离开槽位产生数 GiB 临时缓冲尖峰。
    - 四处均已在单元侧修好，补了 GPU 单测 `test_state_rebuild.py`（**3/3 通过**）与 CPU 多块重排单测，并补充记录到 [../framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md](../framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md)。
+
+## 补充（2026-11-16 午）：Codex 评审的修复，以及 prefill 重测
+
+### EPLB 重排后热重载模型
+
+Codex 在双 rank 引擎上复现：EPLB 重排以后热重载 `models.ds1017`，映射回到初始顺序而权重留在搬过的位置，输出全变。修复和验证见 [../framework-bugs/2026-11-16-eplb-model-reload-resets-maps-without-restoring-weights.md](../framework-bugs/2026-11-16-eplb-model-reload-resets-maps-without-restoring-weights.md)：专家位置随权重保存在 `experts.placed`，模型或 `state.expert_placement` 重载时按它重建映射。SM100 4 卡上重排 44,202 个槽位后，热重载模型（4.3 s）、关掉 EPLB（4.5 s）、恢复源码（3.7 s），三次文本都和重排后逐字相同。在线增加 EP 卡数约定整引擎重启。
+
+### prefill 重测（同一个引擎，热改 `sched.token_budget`）
+
+上午表里的 2,665.6 tok/s/卡是 `sched.token_budget = 4096`（每卡每步只放一条约 3,800 token 的请求）、而且测量窗里混着第一次遇到的 `M` 档位的 JIT 编译。这次热改成 DeepInfer benchmark 的 32,768（71 s，`kernels.deepinfer` 按新预算重建缓冲区、`core.plan` 重录图），64 个约 3,801 token 的请求经 HTTP 连问三轮（每轮新的提示词，形状相同）：
+
+| 轮 | 用时 | 每卡 tok/s |
+|---|---:|---:|
+| 0（第一次遇到这些形状，有 JIT 编译） | 29.46 s | 2,064 |
+| 1 | 5.31 s | **11,459** |
+| 2 | 5.56 s | **10,941** |
+
+- 预热以后每卡约 1.1 万 tok/s，是上午数的 4 倍多，仍是 DeepInfer（44,952，进程内只计 `llm_engine.step()`）的约四分之一。每卡一轮约 6 万 token、两步，约 2.6 s 一步；DeepInfer 的同样一步是 727 ms。
+- 单卡单独量的融合算子（`M = 32,768`，40 层的 `hc_step`、`sparse_attn_out`、`hc_step + moe` 加起来 435 ms）说明大头不在这几个 kernel。还没逐项量的候选：每个压缩层都重新 `load_values` 反量化 latent（38 层；DeepInfer 只在 4 个 KV 源层装一次、后面的层复用），每层两次 `torch.cat` 拼 attention 的源，indexer、压缩器、Engram 的 prefill 路径，主机上的 `lay_out`（约 10 ms 一步），以及 HTTP 和分词。下一步在跑着的引擎上加 profiler 热改进去量。

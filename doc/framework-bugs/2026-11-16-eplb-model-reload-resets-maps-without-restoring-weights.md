@@ -69,3 +69,16 @@ w23 w94 w54 w90 w109 w216 w127 w30 w265 w244 w230 w46
   - `tests/units/state/test_expert_placement.py::test_a_placement_started_again_reads_where_the_experts_were_moved_from_the_record`：两个 rank 重排以后，新的 `Placement`（还在重排的和已关掉的各一组）按记录建映射，每个专家的映射指向装着它的行；初始布局的记录不需要映射。
   - `tests/scenarios/test_ds1017.py::test_a_reload_after_the_experts_were_placed_again_finds_them_where_they_were_moved`：报告里的复现写成了测试。CPU、reference 后端、`--ranks 2`、EPLB 重排以后，热重载 `models.ds1017`（加一行注释），再关掉 EPLB（槽位数不变），三次的文本都和一个 rank 算的逐字相同。拿掉修复，这条在第一次热重载后失败。
 - 在线增加 EP 卡数（报告附带的代码走查结论）：不修，约定整引擎重启，写在 `.claude/skills/agxinfer/SKILL.md` 和 `doc/specs/v1-ds1017.md` 10.9。
+
+### SM100 上的验证（2026-11-16）
+
+4 张 SM100、整个模型、`--ds-backend deepinfer --cuda-graph auto --graph-buckets 1 2 4 8 16 32 64`，从修复后的 `4794e13` 冷启动一次，之后全部热改。三个提示词（英文、中文、代码）一个一个问，贪心 32 个 token：
+
+| 变更（change id） | worker 的计划 | 耗时 | 文本 |
+|---|---|---:|---|
+| 2：`eplb.interval=16, window=16, extra_experts=0` | 重载 `state.expert_placement` | 5.1 s | 8 路并发请求里重排 3 次，共 44,202 个槽位换了专家；之后的文本记作 A（也和开 EPLB 前相同） |
+| 3：`models/ds1017/unit.py` 末尾加一行注释，`apply --source` | 重载 `models.ds1017`（`changed_modules: models.ds1017.unit`） | 4.3 s | 与 A 逐字相同（本报告的情形） |
+| 4：`eplb.interval=0`（槽位数不变，权重留在搬过的位置） | 重载 `state.expert_placement` | 4.5 s | 与 A 逐字相同 |
+| 5：注释去掉，`apply --source` | 重载 `models.ds1017` | 3.7 s | 与 A 逐字相同 |
+
+四次都 `committed`，权重没有重读。
