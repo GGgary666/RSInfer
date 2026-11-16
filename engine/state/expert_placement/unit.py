@@ -14,12 +14,15 @@ DeepInfer's ``model_executor/eplb`` (a679bb8).
   ranks sum their windows per expert, ``policy.rebalance@1`` decides the new placement, and each layer's
   weights are moved: within a rank by copies, between ranks through one ``gather`` of the rows that
   change rank. Every rank computes the same moves from the same maps.
+- Where the experts are is kept with the weights (``record``, the model's ``experts.placed``), and
+  written with every move: a reload of the model or of this unit finds the experts where the last
+  moves put them, and only weights loaded again are back in the initial layout.
 
 Moving an expert does not change what the model computes: its weights are the same in every slot,
 and a token's term is the same on whichever rank computes it.
 
-Without spare slots and with ``eplb.interval = 0``, or on one rank, nothing is kept and the experts
-are where the checkpoint's order puts them (``active`` is false).
+Without spare slots and with ``eplb.interval = 0``, or on one rank, nothing is placed again (``active``
+is false); the kernels still read the maps while the weights are where earlier moves put them.
 """
 
 from __future__ import annotations
@@ -79,6 +82,12 @@ class Placement:
         """``[layers, local]``: tokens each of this rank's slots took in the step so far."""
         self.window: torch.Tensor | None = None
         self.stacks: Callable[[int], Sequence[torch.Tensor]] | None = None
+        self.record: torch.Tensor | None = None
+        """``[layers, physical]`` int32 kept with the weights (the model's ``experts.placed``): the expert
+        each slot's rows hold. Moving the rows writes it too, so whatever reads the weights later (a
+        reloaded model, a reloaded placement) finds the experts where they are."""
+        self.mapped = False
+        """The kernels read the maps: placing is on, or the weights are not in the initial layout."""
         self.steps = 0
         self.placed = 0
         """How many times the experts were placed again."""
@@ -94,31 +103,48 @@ class Placement:
         ranks = self.group.size
         return -(-(logical + self.extra) // ranks) * ranks
 
-    def start(self, layers: int, logical: int, stacks: Callable[[int], Sequence[torch.Tensor]], device: torch.device
-              ) -> None:
-        """The weights are as loaded: every slot holds its ``initial`` expert. ``stacks(layer)`` are the
-        layer's tensors with one row per slot of this rank."""
+    def start(self, layers: int, logical: int, stacks: Callable[[int], Sequence[torch.Tensor]], device: torch.device,
+              record: torch.Tensor | None = None) -> None:
+        """Where the experts are: as ``record`` says (``[layers, physical]``, kept with the weights and
+        written where they were loaded, ``initial`` then), else in the ``initial`` layout.
+        ``stacks(layer)`` are the layer's tensors with one row per slot of this rank. Called again
+        whenever the weights' tensors or contents change, and by every new instance of the model."""
         self.layers, self.logical, self.stacks = layers, logical, stacks
         self.slots_all = self.slots(logical)
         self.local = self.slots_all // self.group.size
         self.steps = 0
-        if not self.active:
-            return
-        spare = self.slots_all - logical
-        # ``start`` may run inside CUDA graph warmup/capture (``torch.inference_mode``), while ``step``
-        # mutates these buffers in place from ``model.stepped`` outside inference mode.
+        # ``start`` may run inside CUDA graph warmup (``torch.inference_mode``), while ``step`` and
+        # ``rebalance`` change these in place from ``model.stepped`` outside it. Buffers of the same
+        # shape are written in place: a graph recorded over them keeps reading them.
         with torch.inference_mode(False):
-            held = torch.tensor(initial(logical, self.slots_all), dtype=torch.int64)
-            to_physical = torch.full((logical, spare + 1), -1, dtype=torch.int32)
-            copies = torch.zeros(logical, dtype=torch.int32)
-            for slot, expert in enumerate(held.tolist()):
-                to_physical[expert, copies[expert]] = slot
-                copies[expert] += 1
-            self.held = held.expand(layers, -1).contiguous()
-            self.to_physical = to_physical.expand(layers, -1, -1).contiguous().to(device)
-            self.copies = copies.expand(layers, -1).contiguous().to(device)
-            self.counts = torch.zeros(layers, self.local, dtype=torch.int32, device=device)
-            self.window = torch.zeros(max(1, self.window_steps), layers, self.local, dtype=torch.int32, device=device)
+            first = initial(logical, self.slots_all)
+            self.record = record if record is not None and tuple(record.shape) == (layers, self.slots_all) else None
+            held = (self.record.cpu().to(torch.int64) if self.record is not None
+                    else torch.tensor(first, dtype=torch.int64).expand(layers, -1).contiguous())
+            self.held = held
+            self.mapped = self.group.size > 1 and (self.active or not bool((held == torch.tensor(first)).all()))
+            if not self.mapped:
+                return
+            spare = self.slots_all - logical
+            where: list[list[list[int]]] = []
+            for row in held.tolist():
+                each: list[list[int]] = [[] for _ in range(logical)]
+                for slot, expert in enumerate(row):
+                    each[expert].append(slot)
+                where.append([slots + [-1] * (spare + 1 - len(slots)) for slots in each])
+            to_physical = torch.tensor(where, dtype=torch.int32)
+            copies = (to_physical >= 0).sum(-1, dtype=torch.int32)
+            self.to_physical = self._put(self.to_physical, to_physical, device)
+            self.copies = self._put(self.copies, copies, device)
+            self.counts = self._put(self.counts, torch.zeros(layers, self.local, dtype=torch.int32), device)
+            self.window = self._put(self.window, torch.zeros(max(1, self.window_steps), layers, self.local,
+                                                             dtype=torch.int32), device)
+
+    @staticmethod
+    def _put(old: torch.Tensor | None, value: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if old is not None and old.shape == value.shape and old.device == torch.device(device):
+            return old.copy_(value)
+        return value.to(device)
 
     # ------------------------------------------------------------------ what the kernels read
 
@@ -133,11 +159,12 @@ class Placement:
     def maps(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """What a layer's MoE kernel takes: each expert's slots ``[logical, spare + 1]`` (``-1`` after
         them), how many each has ``[logical]``, and where it adds the tokens each of this rank's slots
-        took ``[local]``; three ``None`` where the experts are not placed."""
-        if not self.active:
+        took ``[local]`` (``None`` while not placing again: nothing would read the counts); three
+        ``None`` where every slot holds its initial expert and nothing is placed again."""
+        if not self.mapped:
             return None, None, None
         assert self.to_physical is not None and self.copies is not None and self.counts is not None
-        return self.to_physical[layer], self.copies[layer], self.counts[layer]
+        return self.to_physical[layer], self.copies[layer], self.counts[layer] if self.active else None
 
     def count(self, layer: int) -> torch.Tensor:
         """``[local]`` int32: the routed-experts kernel adds the tokens each slot of this rank took."""
@@ -181,6 +208,8 @@ class Placement:
         self.held = held
         self.to_physical.copy_(to_physical.to(device))
         self.copies.copy_(copies.to(device))
+        if self.record is not None:  # with the weights, which now hold the experts as ``held`` says
+            self.record.copy_(held.to(self.record.device, self.record.dtype))
         self.placed += 1
 
     def _move(self, stacks: Sequence[torch.Tensor], old: Sequence[int], new: Sequence[int]) -> int:

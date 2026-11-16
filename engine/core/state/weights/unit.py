@@ -114,6 +114,10 @@ class WeightStore:
     loaders: Registry[WeightLoader] = field(default_factory=lambda: Registry[WeightLoader]("weights.loaders"))
     generation: int = 0
     loads: int = 0
+    fills: int = 0
+    """How many times the contents were written (``fill``), a refit's abort too; unlike ``loads`` never
+    put back. What a model derives from the contents in place (a row order, where EPLB put an
+    expert) is derived again when it changes."""
     loaded_from: str = ""
     source: str = ""
     """What ``fill`` last read: a checkpoint path, or ``""`` for the dummy weights."""
@@ -185,6 +189,7 @@ class WeightStore:
         self.source = path
         self.filled = set(self.decls)
         self.loads += 1
+        self.fills += 1
 
     def bind(self, prefix: str) -> Views:
         return Views(self, prefix)

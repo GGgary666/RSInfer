@@ -106,6 +106,8 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - 每个 worker 是一个调度域（`sched.domains`），跑自己的请求。
 - 模型在不在各 worker 之间分，由配方定：DS 1017 把每层的路由专家和 Engram 表按 rank 的顺序分开（`comm.size`），每一步所有 rank 一起算；Qwen 不分，每个 worker 是完整的一份。
 - 一个变更里，同一个角色的进程是一起启动的（`core.change`）：通信组的 rank 在加载单元时要互相等。
+- **改 EP 的卡数（worker 个数、`comm.size`）要整引擎重启**（`stop` 再 `serve`），不在线扩缩（2026-11-16 约定）。协调者先等要重启的旧 rank 起来，再起新增的 rank，而通信组要所有 rank 一起加入，两边会互相等到 `comm.timeout_s`。只改 `comm.size` 不加进程时，已加入的进程在 `worker.comm` 重载时直接报错，变更撤回。
+- EPLB 搬过的专家在哪，记在权重存储里（`experts.placed`，2026-11-16）：重载模型或 `state.expert_placement`（改代码、改 `eplb.*` 而槽位数不变）都按它重建映射，只有权重重新装载（或 `refit`）才回到初始布局。关掉 EPLB 而槽位数不变时，kernel 仍按搬过的位置读，只是不再重排。
 - 用参照或 `tilelang` 后端时，分开的专家经 `torch.distributed` 交换，录不进 graph，`plan.cuda_graph = auto` 会退回 eager 并在 `core.plan` 那一行里写明是哪个 kernel。
 - 没有请求的 rank 每一步也要跑（`model.idle`）：别的 rank 的 token 可能选了它的专家。所以一个 rank 出错，其他 rank 会卡在那一层，直到 `comm.timeout_s`。
 - 后端 `deepinfer` 在多 rank 下用 DeepGEMM 的融合 kernel（`kernels/deepinfer/mega.py`），能录进 graph：要显式给 `--cuda-graph auto`（默认 off），桶默认到 8 行，更大的 batch 给 `--graph-buckets 1 2 4 8 16 32 64`。各 rank 同时录、同时回放；融合 MoE kernel 在 kernel 里等别的 rank，等 60 秒是设备断言。

@@ -188,3 +188,49 @@ def test_placement_started_inside_inference_mode_steps_and_rebalances_outside_it
         return p.placed
 
     assert bus.run(run_steps) == [1, 1]
+
+
+@pytest.mark.parametrize("interval", [4, 0])
+def test_a_placement_started_again_reads_where_the_experts_were_moved_from_the_record(interval: int) -> None:
+    """The record of where the experts are is kept with the weights (the model's ``experts.placed``)
+    and written with every move. A placement started again over the same weights (a reloaded model,
+    a reloaded placement, also one that places nothing again any more) maps each expert to the slots
+    that hold its rows."""
+    ranks, layers, logical = 2, 2, 8
+    bus = Ranks(ranks)
+    placements = [Placement(bus.of(r), Greedy(), 4, 4, 0) for r in range(ranks)]
+    weights = [stacks(p, r, layers, logical) for r, p in enumerate(placements)]
+    records = [torch.tensor(initial(logical, logical), dtype=torch.int32).expand(layers, -1).contiguous()
+               for _ in range(ranks)]
+    for r, p in enumerate(placements):
+        p.start(layers, logical, lambda layer, r=r: weights[r][layer], torch.device("cpu"), records[r])
+    load = torch.arange(1, logical + 1).flip(0).expand(layers, -1) * 10  # the first experts are the busy ones
+
+    def steps(rank: int) -> int:
+        p = placements[rank]
+        for _ in range(2):
+            for layer in range(layers):
+                held = p.held[layer, rank * p.local:(rank + 1) * p.local]  # type: ignore[index]
+                p.count(layer).add_(load[layer][held].to(torch.int32))
+            p.step()
+        return p.placed
+
+    assert bus.run(steps) == [1, 1]
+    moved = placements[0].held
+    assert moved is not None and not torch.equal(moved[0], torch.arange(logical))  # rows really moved
+    for record in records:
+        assert torch.equal(record, moved.to(torch.int32))
+    again = [Placement(bus.of(r), Greedy(), interval, 4, 0) for r in range(ranks)]
+    for r, p in enumerate(again):
+        p.start(layers, logical, lambda layer, r=r: weights[r][layer], torch.device("cpu"), records[r])
+        assert p.held is not None and torch.equal(p.held, moved)
+        for layer in range(layers):
+            maps, copies, _ = p.maps(layer)
+            assert maps is not None and copies is not None  # moved weights: the kernels read the maps
+            rows = torch.cat([weights[q][layer][0][:, 0, 0] for q in range(ranks)]) - 1000 * layer
+            for expert in range(logical):
+                assert [int(rows[s]) for s in maps[expert].tolist() if s >= 0] == [expert] * int(copies[expert])
+    fresh = Placement(bus.of(0), Greedy(), 0, 4, 0)
+    fresh.start(layers, logical, lambda layer: [], torch.device("cpu"),
+                torch.tensor(initial(logical, logical), dtype=torch.int32).expand(layers, -1))
+    assert fresh.maps(0) == (None, None, None)  # loaded again: the initial layout, nothing to map

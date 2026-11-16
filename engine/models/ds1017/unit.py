@@ -70,7 +70,10 @@ def params(cfg: DSConfig, ranks: int = 1, slots: int = 0) -> list[WeightDecl]:
 
     out = [w("embed.weight", cfg.vocab_size, dim), w("head.weight", cfg.vocab_size, dim, fmt="f32"), w("norm.weight", dim),
            # 0: the expert stacks' rows are in the checkpoint's order; 1: in the fused MoE kernel's.
-           w("experts.layout", 1, fmt="u8")]
+           w("experts.layout", 1, fmt="u8"),
+           # The expert each slot of each layer holds, over all ranks: as loaded, the checkpoint's
+           # order (``expert.placement@1``'s initial layout); EPLB writes it when it moves the rows.
+           w("experts.placed", cfg.num_hidden_layers, slots or experts, fmt="i32")]
     for i in range(cfg.num_hidden_layers):
         p = f"layers.{i}."
         out += [*fp8(p + "attn.wq_a", cfg.q_lora_rank, dim), *fp8(p + "attn.wq_b", heads * hd, cfg.q_lora_rank),
@@ -148,6 +151,7 @@ class DeepseekV41ForCausalLM:
         """Slots for routed experts this rank has in each layer."""
         # Slot -> the expert the checkpoint's order puts there; this rank's slots of each expert.
         order = [*range(cfg.n_routed_experts), *(i % cfg.n_routed_experts for i in range(slots - cfg.n_routed_experts))]
+        self.order = order
         self.slots_of: dict[int, list[int]] = {}
         for slot in range(self.rank * self.held, (self.rank + 1) * self.held):
             self.slots_of.setdefault(order[slot], []).append(slot - self.rank * self.held)
@@ -157,7 +161,7 @@ class DeepseekV41ForCausalLM:
         self._assembly = Assembly(["layers.ds1017@1"] * cfg.num_hidden_layers, states(cfg, page_size),
                                   params(cfg, self.ranks, slots))
         self._views: list[Any] = []
-        self._cached: tuple[int, list[Mapping[str, torch.Tensor]]] = (-1, [])
+        self._cached: tuple[tuple[int, int], list[Mapping[str, torch.Tensor]]] = ((-1, -1), [])
 
     @property
     def assembly(self) -> Assembly:
@@ -204,7 +208,7 @@ class DeepseekV41ForCausalLM:
 
     def close(self) -> None:
         """Drop cached views of the weight store and hooks into long-lived services on unload."""
-        self._cached = (-1, [])
+        self._cached = ((-1, -1), [])
         self._views.clear()
         self.placement.stacks = None
         self.layers.set_tables(lambda: ([], []))
@@ -304,6 +308,10 @@ class DeepseekV41ForCausalLM:
         if "experts.layout" in params_dict:  # as read: the checkpoint's row order
             params_dict["experts.layout"].zero_()
             loaded.add("experts.layout")
+        if "experts.placed" in params_dict:  # as read: every slot holds the expert the order puts there
+            params_dict["experts.placed"].copy_(torch.tensor(self.order, dtype=torch.int32).expand(
+                self.cfg.num_hidden_layers, -1))
+            loaded.add("experts.placed")
         for stack, seen in stacked.items():
             experts = params_dict[stack + ".weight"].shape[0]
             for matrix in (("w2",) if stack.endswith("w2") else ("w1", "w3")):
@@ -338,10 +346,12 @@ class DeepseekV41ForCausalLM:
         return min(self.rank * part, total), min((self.rank + 1) * part, total)
 
     def _layer_weights(self) -> list[Mapping[str, torch.Tensor]]:
-        generation = self.weights.bind("").generation
-        if self._cached[0] != generation:
+        # Tensors made again (generation) or filled again from the checkpoint (fills, a refit too):
+        # what is derived from their contents below is derived again.
+        key = (self.weights.bind("").generation, self.weights.fills)
+        if self._cached[0] != key:
             views = [v.buffers() for v in self._views]
-            self._cached = (generation, views)
+            self._cached = (key, views)
             # The expert stacks' rows in the order the routed experts' kernel reads them: a row
             # permutation in place, undone when another backend's kernel reads them again.
             marker, mega = views[-1]["experts.layout"], self.layers.mega_experts()
@@ -352,11 +362,12 @@ class DeepseekV41ForCausalLM:
                     formats.shared_layout(layer["ffn.shared_experts.w13.weight"], layer["ffn.shared_experts.w13.packed"],
                                           layer["ffn.shared_experts.w2.packed"], mega=mega)
                 marker.fill_(int(mega))
-            # The weights are as the checkpoint's order lays them out (loaded, or loaded again).
+            # Where the experts are, as kept with the weights: the checkpoint's order where they were
+            # loaded, where EPLB moved them otherwise (a reload of this unit keeps the weights).
             self.placement.start(self.cfg.num_hidden_layers, self.cfg.n_routed_experts,
                                  lambda layer: [views[layer][f"ffn.experts.{m}.{part}"] for m in ("w13", "w2")
                                                 for part in ("weight", "packed")],
-                                 views[0]["ffn.gate.weight"].device)
+                                 views[0]["ffn.gate.weight"].device, views[-1]["experts.placed"])
         return self._cached[1]
 
     # -------------------------------------------------------------- forward

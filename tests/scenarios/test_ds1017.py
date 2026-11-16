@@ -11,6 +11,8 @@ units of this model family alone; the Engram token map comes from the tokenizer.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +25,7 @@ from transformers import AutoTokenizer
 
 from deploy.models.hf import TOKENIZER_FILES
 from models.ds1017_config import compressed_token_map
-from tests.scenarios.deploy import CLI, ENV, cli, post, served
+from tests.scenarios.deploy import CLI, ENV, REPO, cli, post, served
 from tests.units.support.ds1017 import DSWorker, driver, tiny_config
 from tests.units.support.tokenizer import save_tokenizer
 
@@ -139,6 +141,45 @@ def test_two_ranks_that_hold_the_model_between_them_give_what_one_rank_gives(
     assert len(config["sched.workers"]) == 2 and config["comm.rendezvous"].startswith("file://")
     assert len(logs) == 2 and all(ran), (logs, ran)
     assert (placed >= 3) if balanced else placed == 0, placed
+
+
+def test_a_reload_after_the_experts_were_placed_again_finds_them_where_they_were_moved(
+        model: tuple[dict[str, Any], Path], tokenizer: Path, tmp_path: Path) -> None:
+    """Expert parallel load balancing moves experts' weights between slots; the weights stay in
+    ``state.weights@1`` across reloads of the units that read them. A change that reloads the model
+    (its code) or the placement (``eplb.interval`` off, the same slots, nothing placed again) keeps the weights where the
+    moves put them, so the maps the kernels read have to say the same: the text is still what one
+    rank computes. Until 2026-11-16 a reloaded model put the maps back in the initial layout over
+    moved weights (doc/framework-bugs/2026-11-16-eplb-model-reload-resets-maps-without-restoring-weights.md)."""
+    cfg, checkpoint = model
+    tok = AutoTokenizer.from_pretrained(str(tokenizer))
+    prompts = ["w1 w2 w3 w4 w5", "w9 w8 w7", "w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30", "w40 w41 w42 w43"]
+    want = expected(cfg, checkpoint, tokenizer, tok, [list(tok.encode(p)) for p in prompts], 10)
+    source = tmp_path / "source"
+    shutil.copytree(REPO / "engine", source / "engine", ignore=shutil.ignore_patterns("__pycache__"))
+    run = tmp_path / "run"
+    args = ["--model", str(checkpoint), "--tokenizer", str(tokenizer), "--device", "cpu", "--page-size", "4",
+            "--max-rows", "4", "--max-context", "64", "--token-budget", "8", "--cpu-bytes", str(16 << 20),
+            "--timeout", "120", "--ds-backend", "reference", "--ranks", "2", "--source", str(source),
+            "--set", "eplb.interval=4", "--set", "eplb.window=4", "--set", "eplb.extra_experts=0"]
+
+    def ask(prompt: str) -> str:
+        got = post(url + "/v1/completions", {"model": MODEL, "prompt": prompt, "max_tokens": 10, "temperature": 0.0})
+        return str(got["choices"][0]["text"])
+
+    with served(run, *args) as url:
+        with ThreadPoolExecutor(len(prompts)) as pool:
+            assert list(pool.map(ask, prompts)) == want
+        log = sorted(run.glob("host-a/snapshots/.run/worker-*/log"))[0]
+        moved = [int(m) for m in re.findall(r"experts placed again at step \d+: (\d+) slots changed", log.read_text())]
+        assert len(moved) >= 3 and sum(moved) > 0, moved
+        unit = source / "engine" / "models" / "ds1017" / "unit.py"
+        unit.write_text(unit.read_text() + "\n# reloaded by the test\n")
+        cli("control", "apply", "--source", str(source), "--run", str(run), "--intent", "reload the model")
+        assert [ask(p) for p in prompts] == want  # the model reloaded, the weights kept
+        cli("control", "apply", "--config", json.dumps({"eplb.interval": 0}), "--run", str(run),
+            "--intent", "stop placing again; the slots stay")
+        assert [ask(p) for p in prompts] == want  # the placement reloaded and off, the weights kept
 
 
 def test_serve_tells_the_worker_where_the_token_map_is_and_refuses_dummy_weights(model: tuple[dict[str, Any], Path],
