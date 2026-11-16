@@ -36,7 +36,7 @@ from core.contracts.state import StateDecl
 from core.contracts.tensor import Tensor
 from platforms.base import StaleGraph
 from core.plan.graph import (Dependencies, DraftExtendGraphPlan, DraftGraphPlan, GraphPlan, VerifyGraphPlan,
-                             buckets, eager_draft_padding_steps, eager_padding_step, eager_verify_padding_step)
+                             buckets, eager_draft_padding_steps, eager_padding_step, eager_verify_padding_step, fetch)
 from unit.runtime.proxy import provision_of
 
 
@@ -56,6 +56,7 @@ class EagerPlan:
         key = PlanKey(phase_of(plan), 0)
         for backend in self.backends:
             backend.prepare(batch, plan, key)
+        fetch(self.backends, input_ids, positions)
         return self.model.forward(input_ids, positions, last_index)
 
 

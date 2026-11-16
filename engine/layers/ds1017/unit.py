@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,17 +54,18 @@ from layers.solutions import Kernels
 from models.ds1017_config import SLOT_KIND, DSConfig, compressed_token_map, engram_layout
 
 PREFILL_ONLY = frozenset({"ds.transform@1", "ds.load_values@1", "ds.load_keys@1", "ds.index_topk@1", "ds.compress@1",
-                          "ds.sparse_attn@1"})
+                          "ds.sparse_attn_out@1"})
 """What only a step laid out on the host runs."""
-DECODE_ONLY = frozenset({"ds.cache_attn@1", "ds.index_topk_paged@1", "ds.compress_decode@1"})
+DECODE_ONLY = frozenset({"ds.cache_attn_out@1", "ds.index_topk_paged@1", "ds.compress_decode@1"})
 """What only a decode step runs: a graph records these, not the others."""
 
-DEFINITIONS = ("ds.fake_quant_fp8@1", "ds.linear_fp8@1", "ds.linear@1", "ds.grouped_linear@1", "ds.rms_norm@1",
-               "ds.rope@1", "ds.sparse_attn@1", "ds.cache_attn@1", "ds.transform@1", "ds.store_cache@1",
-               "ds.load_values@1", "ds.load_keys@1", "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk_paged@1",
-               "ds.compress@1", "ds.compress_decode@1", "ds.hc_mixes@1", "ds.hc_pre@1", "ds.hc_post@1",
-               "ds.moe_gate@1", "ds.moe_experts@1", "ds.shared_expert@1", "ds.engram_gate@1",
-               "ds.engram_hash@1")
+DEFINITIONS = ("ds.linear@1", "ds.rms_norm@1", "ds.transform@1", "ds.store_cache@1", "ds.load_values@1",
+               "ds.load_keys@1", "ds.quant_index_q@1", "ds.index_topk@1", "ds.index_topk_paged@1", "ds.compress@1",
+               "ds.compress_decode@1", "ds.hc_step@1", "ds.hc_pre@1", "ds.hc_post@1", "ds.moe@1",
+               "ds.engram_hash@1", "ds.attn_qkv@1", "ds.cache_attn_out@1", "ds.sparse_attn_out@1", "ds.engram@1")
+
+MEGA = frozenset({"deepinfer.ds.moe@1"})
+"""Solutions that read the expert stacks in the fused MoE kernel's row order (``formats.expert_layout``)."""
 
 Weights = Mapping[str, torch.Tensor]
 
@@ -136,8 +137,25 @@ class Layers:
     """``layers.ds1017@1``."""
 
     def __init__(self, catalog: Any, config: Any, cfg: DSConfig, kv: Any, slots: Any, token_map: Sequence[int] | None,
-                 max_context_len: int) -> None:
+                 max_context_len: int, group: Any, placement: Any) -> None:
         self.cfg, self.kv, self.slots = cfg, kv, slots
+        self.group = group
+        """``comm.group@1``: the ranks that hold this model's experts and Engram tables between them."""
+        self.placement = placement
+        """``expert.placement@1``: the slot of each expert, when they are placed by the tokens they take."""
+        self.chosen: Mapping[str, Mapping[str, str]] = {}
+        """``resolve``'s answer: phase -> definition -> solution."""
+        self.tables: Callable[[], tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]] = lambda: ((), ())
+        """This rank's rows of each Engram layer's table, weights and scales, as loaded now (``set_tables``)."""
+        self.bucket = 0
+        """The graph bucket of the step being prepared; 0: eager."""
+        self.fetched: tuple[torch.Tensor, torch.Tensor] | None = None
+        """Among ranks that share the Engram tables: the rows this step's tokens hash to, bytes and
+        scales ``[tokens, layers, cols, ...]``, brought in before the forward (``fetch``)."""
+        self.fetched_fixed: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        """Bucket -> the buffers a graph of that bucket reads them from."""
+        if cfg.n_routed_experts % group.size:
+            raise ValueError(f"comm.size = {group.size} does not divide the {cfg.n_routed_experts} routed experts")
         self.kernels = Kernels(catalog, config, "dsv4")
         self.table = "prefill"
         """Which of the fixed solutions the forward runs: a phase, or ``GRAPH`` for a bucket."""
@@ -150,6 +168,10 @@ class Layers:
         self.constants: dict[str, torch.Tensor] = {}
         self.fixed: dict[int, torch.Tensor] = {}
         """Bucket -> its rows' table indices, the one buffer a graph of that bucket reads."""
+        self.attn_staged: dict[str, bool] = {}
+        self.engram_staged: dict[str, bool] = {}
+        self._resolved_version = -1
+        self._warmed_prefill_version = -1
         self.generation = 0
         # The step in progress.
         self.batch_tables: Mapping[str, torch.Tensor] = {}
@@ -167,22 +189,174 @@ class Layers:
         return self
 
     def buffers(self) -> Mapping[str, torch.Tensor]:
-        return {f"rows.{size}": t for size, t in self.fixed.items()}
+        return {**{f"rows.{size}": t for size, t in self.fixed.items()},
+                **{f"engram.{size}.{i}": t for size, pair in self.fetched_fixed.items() for i, t in enumerate(pair)}}
 
     def release_graphs(self) -> None:
         self.generation += bool(self.fixed)
         self.fixed.clear()
+        self.fetched_fixed.clear()
+
+    def set_tables(self, tables: Callable[[], tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]]) -> None:
+        """Where this rank's rows of the Engram layers' tables are, in the layers' order: asked at
+        every step, the model's weights may have been loaded again."""
+        self.tables = tables
+
+    def _sync_flags(self) -> None:
+        if self.kernels.calls and self.kernels.catalog.version != self.kernels.version:
+            self.chosen = self.kernels.resolve(self.kernels.calls, self.kernels.shared, self.kernels.outside)
+        if self.kernels.version != self._resolved_version:
+            self.attn_staged = {
+                t: (m.get("ds.hc_step@1", "").split(" ")[0] == "deepinfer.ds.hc_step@1"
+                    and m.get("ds.attn_qkv@1", "").split(" ")[0] == "deepinfer.ds.attn_qkv@1")
+                for t, m in self.chosen.items()
+            }
+            self.engram_staged = {
+                t: (self.group.size > 1 and bool(self.cfg.engram_layer_ids)
+                    and m.get("ds.engram_fetch@1", "").split(" ")[0] == "deepinfer.ds.engram_fetch@1"
+                    and m.get("ds.engram@1", "").split(" ")[0] == "deepinfer.ds.engram@1")
+                for t, m in self.chosen.items()
+            }
+            self._resolved_version = self.kernels.version
+
+    def _warm_prefill(self) -> None:
+        """Warm single-GPU prefill operators on tiny scratch tensors at worker startup so cold TileLang
+        and DeepGEMM caches compile in parallel across all ranks instead of stalling one rank mid-flight."""
+        if self._warmed_prefill_version == self.kernels.version:
+            return
+        if getattr(getattr(self.slots, "holder", None), "asleep", False):
+            return
+        prefill = self.chosen.get("prefill", {})
+        if not any(v.startswith("deepinfer.") for k, v in prefill.items() if k != "backend"):
+            return
+        slot_tensors = getattr(self.slots, "tensors", None)
+        if not slot_tensors:
+            return
+        sample = next(iter(next(iter(slot_tensors.values())).values()), None)
+        if sample is None or sample.device.type != "cuda" or sample.is_meta:
+            return
+        device = sample.device
+        cfg, page, win = self.cfg, self.kv.page_size, self.cfg.sliding_window
+        n, hd, rd, eps = 8, cfg.head_dim, cfg.qk_rope_head_dim, cfg.rms_norm_eps
+        with torch.inference_mode(False):
+            pos = torch.arange(n, dtype=torch.int64, device=device)
+            cos_sin = self.cos_sin(0, device)
+            norm_hd = torch.ones(hd, dtype=torch.bfloat16, device=device)
+            x_hd = torch.zeros(n, hd, dtype=torch.bfloat16, device=device)
+            rows_neg1 = torch.full((n,), -1, dtype=torch.int64, device=device)
+            ring_scratch = torch.zeros(win, hd + hd // formats.BLOCK, dtype=torch.uint8, device=device)
+            seg = torch.tensor([[0, 0, min(n, win), 0]], dtype=torch.int32, device=device)
+            self.kernels("prefill", "ds.transform@1")(x_hd, norm_hd, eps, cos_sin, pos, rd, "fp8")
+            self.kernels("prefill", "ds.store_cache@1")(x_hd, None, eps, None, None, 0, ring_scratch, rows_neg1, "fp8",
+                                                        win, False)
+            self.kernels("prefill", "ds.load_values@1")(ring_scratch, win, seg, min(n, win), "fp8")
+            q = torch.zeros(n, cfg.num_attention_heads, hd, dtype=torch.bfloat16, device=device)
+            src = torch.zeros(16, hd, dtype=torch.bfloat16, device=device)
+            idx = torch.zeros(n, 8, dtype=torch.int64, device=device)
+            sink = torch.zeros(cfg.num_attention_heads, dtype=torch.float32, device=device)
+            wo_a = torch.zeros(cfg.o_groups * cfg.o_lora_rank, cfg.num_attention_heads * hd // cfg.o_groups,
+                               dtype=torch.bfloat16, device=device)
+            wo_b = torch.zeros(cfg.hidden_size, cfg.o_groups * cfg.o_lora_rank, dtype=torch.uint8, device=device)
+            so_b = torch.full((-(-cfg.hidden_size // 32), -(-(cfg.o_groups * cfg.o_lora_rank) // 32)), 127,
+                              dtype=torch.uint8, device=device)
+            po_b = formats.pack_scales(formats.block_rows(so_b, cfg.hidden_size))
+            self.kernels("prefill", "ds.sparse_attn_out@1")(
+                q, cos_sin, pos, rd, src, idx, sink, hd ** -0.5, cfg.o_groups, wo_a, wo_b, so_b, po_b)
+            ratios = sorted({r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r})
+            if ratios:
+                ih, idim = cfg.index_n_heads, cfg.index_head_dim
+                iq = torch.full((n, ih, idim), 0.01, dtype=torch.bfloat16, device=device)
+                q_data, q_scales = self.kernels("prefill", "ds.quant_index_q@1")(iq, cos_sin, pos, rd)
+                iw = torch.full((n, ih), 0.01, dtype=torch.bfloat16, device=device)
+                norm_ik = torch.ones(idim, dtype=torch.bfloat16, device=device)
+                x_ik = torch.full((n, idim), 0.01, dtype=torch.bfloat16, device=device)
+                for ratio in ratios:
+                    entries = page // ratio
+                    kv_s = torch.zeros(entries, hd // 2 + hd // formats.LATENT_BLOCK, dtype=torch.uint8, device=device)
+                    ik_s = torch.zeros(entries, idim // 2 + idim // formats.BLOCK, dtype=torch.uint8, device=device)
+                    seg_r = torch.tensor([[0, 0, min(n, entries), 0]], dtype=torch.int32, device=device)
+                    self.kernels("prefill", "ds.store_cache@1")(x_hd, norm_hd, eps, cos_sin, pos, rd, kv_s, rows_neg1,
+                                                                "latent", entries, True)
+                    self.kernels("prefill", "ds.store_cache@1")(x_ik, norm_ik, eps, cos_sin, pos, rd, ik_s, rows_neg1,
+                                                                "key", entries, False)
+                    self.kernels("prefill", "ds.load_values@1")(kv_s, entries, seg_r, min(n, entries), "latent")
+                    self.kernels("prefill", "ds.load_keys@1")(ik_s, entries, seg_r, min(n, entries), idim)
+                    if ratio > 1:
+                        c_score = torch.zeros(ratio, hd, dtype=torch.float32, device=device)
+                        c_kv = torch.zeros(ratio, hd, dtype=torch.float32, device=device)
+                        c_state = torch.zeros(1, ratio - 1, 2, hd, dtype=torch.float32, device=device)
+                        z0 = torch.zeros(1, dtype=torch.int64, device=device)
+                        cu = torch.tensor([0, ratio], dtype=torch.int64, device=device)
+                        cu_c = torch.tensor([0, 1], dtype=torch.int64, device=device)
+                        self.kernels("prefill", "ds.compress@1")(c_score, c_kv, c_state, z0, cu, cu, cu_c, z0, ratio)
+                modes = sorted({
+                    (cfg.ratio(i), "source" if i == cfg.candidate_source_layer_id
+                     else "user" if 0 <= cfg.candidate_source_layer_id < i else "dense")
+                    for i in cfg.index_source_layer_ids if i < cfg.num_hidden_layers
+                })
+                for ratio, mode in modes:
+                    m_keys = max(n, cfg.candidate_block_size)
+                    kd = torch.zeros(m_keys, idim // 2, dtype=torch.uint8, device=device)
+                    ks_s = torch.full((m_keys, idim // formats.BLOCK), 127, dtype=torch.uint8, device=device)
+                    ks = torch.zeros(n, dtype=torch.int64, device=device)
+                    ke = torch.arange(1, n + 1, dtype=torch.int64, device=device).clamp_max(m_keys)
+                    cand: torch.Tensor | None = None
+                    if mode == "user":
+                        cand = torch.full((n, cfg.candidate_topk_blocks), -1, dtype=torch.int64, device=device)
+                        cand[:, 0] = 0
+                    self.kernels("prefill", "ds.index_topk@1")(
+                        q_data, q_scales, iw, kd, ks_s, ks, ke, self.max_context_len // ratio,
+                        min(cfg.index_topk, m_keys), mode, cand, cfg.candidate_topk_blocks, cfg.candidate_block_size)
+            torch.cuda.synchronize(device)
+        self._warmed_prefill_version = self.kernels.version
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         cfg, page = self.cfg, self.kv.page_size
         ratios = {r for r in cfg.compress_ratios[:cfg.num_hidden_layers] if r}
         # DeepGEMM's paged indexer takes blocks of 32, 64 or 128 keys: a page holds page / ratio.
         blocks = {page // r for r in ratios}
+        # DeepGEMM's fused MoE and Hyper-Connections kernels: four copies of the stream, widths their
+        # tiles divide (the stream in pieces of 1024 values, the scales of 128 rows together).
+        mega = cfg.hc_mult == 4 and cfg.hidden_size % 1024 == 0 and (2 * cfg.moe_intermediate_size) % 128 == 0
+        mega_attn = (mega and cfg.num_attention_heads in (64, 128) and cfg.head_dim == 512
+                     and cfg.qk_rope_head_dim == 64 and cfg.q_lora_rank >= 128 and cfg.q_lora_rank % 128 == 0
+                     and cfg.num_attention_heads % cfg.o_groups == 0
+                     and (cfg.num_attention_heads * cfg.head_dim // cfg.o_groups) % 128 == 0
+                     and cfg.o_lora_rank >= 32 and cfg.o_lora_rank % 32 == 0
+                     and (cfg.o_groups * cfg.o_lora_rank) % 128 == 0)
+        mega_engram = mega and cfg.engram_head_dim >= 128 and cfg.engram_head_dim % 128 == 0
         shape = {"heads": cfg.num_attention_heads, "head_dim": cfg.head_dim, "index_head_dim": cfg.index_head_dim,
-                 "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0}
-        calls = {"prefill": {name: shape for name in DEFINITIONS if name not in DECODE_ONLY},
-                 "decode": {name: shape for name in DEFINITIONS if name not in PREFILL_ONLY}}
-        return self.kernels.resolve(calls)
+                 "index_block": min(blocks) if blocks and blocks <= {32, 64, 128} else 0, "mega": int(mega),
+                 "mega_attn": int(mega_attn), "mega_engram": int(mega_engram)}
+        names = self.definitions()
+        calls = {"prefill": {name: shape for name in names if name not in DECODE_ONLY},
+                 "decode": {name: shape for name in names if name not in PREFILL_ONLY}}
+        # Among ranks the Engram rows are brought in before the forward (``fetch``) unless the backend
+        # stages its own capturable fetch inside ``begin``.
+        self.chosen = self.kernels.resolve(calls, outside=frozenset({"ds.engram_fetch@1"}))
+        self._sync_flags()
+        self._warm_prefill()
+        return self.chosen
+
+    def mega_experts(self) -> bool:
+        """Whether the routed experts' kernel reads the expert stacks in the fused MoE kernel's row
+        order: the model lays them out so (``formats.expert_layout``). One answer for every step."""
+        if not self.chosen:
+            raise RuntimeError("the layers' kernels are not resolved yet (core.plan does it at start)")
+        answers = {solution.split(" ")[0] in MEGA for table in self.chosen.values()
+                   for definition, solution in table.items() if definition == "ds.moe@1" and solution}
+        if len(answers) > 1:
+            raise ValueError("the routed experts' kernels of prefill and decode steps read the experts' weights "
+                             "in different row orders: give both the same backend (dsv4.prefill_backend, "
+                             "dsv4.decode_backend)")
+        return answers == {True}
+
+    def definitions(self) -> tuple[str, ...]:
+        """What a step calls: ``DEFINITIONS``, and among ranks that share the Engram tables the
+        kernel that brings their rows in (the MoE's kernel reaches the other ranks' experts itself)."""
+        if self.group.size == 1 or not self.cfg.engram_layer_ids:
+            return DEFINITIONS
+        return (*DEFINITIONS, "ds.engram_fetch@1")
 
     def k(self, definition: str) -> KernelFn:
         return self.kernels(self.table, definition)
@@ -190,7 +364,9 @@ class Layers:
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         if plan.draft_tokens:
             raise ValueError("layers.ds1017 runs no speculative step yet")
+        self._sync_flags()
         self.table = GRAPH if key.bucket else key.phase
+        self.bucket = key.bucket
         self.batch_tables = batch.binding.buffers()
         device = self.batch_tables["req_to_token"].device
         rows = [int(r) + 1 for r in plan.rows.values()]
@@ -222,15 +398,24 @@ class Layers:
 
     def lay_out(self, rows: Sequence[int], counts: Sequence[int], starts: Sequence[int], decoding: Sequence[bool],
                 device: torch.device) -> Layout:
+        """The step's index tensors. Per row the plan's few numbers go to the device, and every per-token
+        tensor is computed there: on the host the ``[tokens, window]`` arithmetic of a 32K-token step
+        took over a second (2026-11-16, SM100), longer than the step's forward. Nothing is read back from
+        the device, sizes included (``torch.nonzero``): that would wait for the work queued there, with
+        ``sched.overlap`` for the step still running."""
         cfg, w = self.cfg, self.cfg.sliding_window
-        n = torch.tensor(counts)
-        p0 = torch.tensor(starts)
-        base = torch.cumsum(n, 0) - n
-        tok_row, tok_p0, tok_base = (torch.repeat_interleave(torch.tensor(v) if isinstance(v, list) else v, n)
-                                     for v in (list(rows), p0, base))
-        tok_n = torch.repeat_interleave(n, n)
-        pos = torch.cat([torch.arange(p, p + c) for p, c in zip(starts, counts, strict=True)])
-        end = tok_p0 + tok_n - 1  # the row's last position of this step
+        total = sum(counts)
+
+        def put(values: Sequence[Any] | torch.Tensor, dtype: torch.dtype = torch.int64) -> torch.Tensor:
+            return on_device(values if isinstance(values, torch.Tensor) else torch.tensor(list(values), dtype=dtype),
+                             device)
+
+        n_host, p0_host = torch.tensor(list(counts)), torch.tensor(list(starts))
+        base_host = torch.cumsum(n_host, 0) - n_host
+        n, p0, base = put(n_host), put(p0_host), put(base_host)
+        tok_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), n, output_size=total)
+        tok_row, tok_p0, tok_base = put(rows)[tok_seq], p0[tok_seq], base[tok_seq]
+        pos = tok_p0 + torch.arange(total, device=device) - tok_base
 
         # The window, ``w`` columns. A prefilling row lists a token's keys as a prefill of the reference
         # does: ascending from max(0, p - w + 1), those that exist first. A decoding row lists them
@@ -240,25 +425,28 @@ class Layers:
         # prompt would, wherever the chunk starts and ends. (For a prompt shorter than the window
         # the reference lists only as many columns as the prompt has tokens, so its compressed
         # keys follow in earlier columns than here: the same keys, another last bit.)
-        ahead = ~torch.repeat_interleave(torch.tensor(list(decoding), dtype=torch.bool), n)
-        col = torch.arange(w)
+        ahead = ~put(decoding, torch.bool)[tok_seq]
+        col = torch.arange(w, device=device)
         keys = torch.where(ahead[:, None], (pos - w + 1).clamp_min(0)[:, None] + col, pos[:, None] - w + 1 + col)
         valid = (keys >= 0) & (keys <= pos[:, None])
         in_chunk = keys >= tok_p0[:, None]
-        chunk = (tok_base[:, None] + keys - tok_p0[:, None]).clamp(0, int(n.sum()) - 1)
-        keep = torch.nonzero(pos > end - w).flatten()
+        chunk = (tok_base[:, None] + keys - tok_p0[:, None]).clamp(0, total - 1)
+        kept_host = n_host.clamp_max(w)  # a row keeps the last tokens of its chunk, a window of them at most
+        kept, kept_total = put(kept_host), int(kept_host.sum())
+        kept_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), kept, output_size=kept_total)
+        keep = ((base + n - kept - put(torch.cumsum(kept_host, 0) - kept_host))[kept_seq]
+                + torch.arange(kept_total, device=device))
         # The rings of the rows with earlier tokens are loaded whole, one after the other.
         earlier = [i for i, p in enumerate(starts) if p > 0]
-        ring_base = torch.zeros(len(rows), dtype=torch.int64)
-        ring_base[earlier] = torch.arange(len(earlier)) * w
+        ring_base_host = torch.zeros(len(rows), dtype=torch.int64)
+        ring_base_host[earlier] = torch.arange(len(earlier)) * w
         ring_total = len(earlier) * w
-        tok_seq = torch.repeat_interleave(torch.arange(len(rows)), n)
-        window_index = torch.where(valid, torch.where(in_chunk, ring_total + chunk, ring_base[tok_seq][:, None] + keys % w),
-                                   -1)
+        window_index = torch.where(valid, torch.where(in_chunk, ring_total + chunk, put(ring_base_host)[tok_seq][:, None]
+                                                      + keys % w), -1)
         slot_table = self.batch_tables[f"slots.{SLOT_KIND}"]
-        ring_rows = on_device(torch.tensor([rows[i] for i in earlier], dtype=torch.int64), device)
+        ring_rows = put([rows[i] for i in earlier])
         ring_segments = torch.stack([slot_table[ring_rows].long(), torch.zeros_like(ring_rows),
-                                     torch.full_like(ring_rows, w), on_device(ring_base[earlier], device)], dim=1).int()
+                                     torch.full_like(ring_rows, w), put(ring_base_host[earlier])], dim=1).int()
 
         latents: dict[int, Latents] = {}
         table = self.batch_tables["req_to_token"]
@@ -268,62 +456,53 @@ class Layers:
             seg_row: list[int] = []
             seg_col: list[int] = []
             seg_rest: list[tuple[int, int, int]] = []
-            ks, ke = torch.zeros(len(pos), dtype=torch.int64), torch.zeros(len(pos), dtype=torch.int64)
-            c_seq: list[int] = []
-            first: list[int] = []
-            real: list[bool] = []
-            cu_c = [0]
+            row_k: list[int] = []
+            done: list[int] = []  # per row: the groups this step completes, an entry each (one reserved at least)
             base_k = 0
             width = 0
-            for i, (b, c, p, r) in enumerate(zip(base.tolist(), counts, starts, rows, strict=True)):
+            for c, p, r in zip(counts, starts, rows, strict=True):
                 count = (p + c) // ratio
                 for j in range(-(-count // entries)):
                     seg_row.append(r)
                     seg_col.append(j * page)
                     seg_rest.append((0, min(entries, count - j * entries), base_k + j * entries))
-                ks[b:b + c] = base_k
-                ke[b:b + c] = base_k + (pos[b:b + c] + 1) // ratio
-                groups = list(range(p // ratio, (p + c) // ratio))
-                reserved = max(len(groups), 1)
-                c_seq += [i] * reserved
-                first += [g * ratio for g in groups] + [0] * (reserved - len(groups))
-                real += [True] * len(groups) + [False] * (reserved - len(groups))
-                cu_c.append(cu_c[-1] + reserved)
+                row_k.append(base_k)
+                done.append(count - p // ratio)
                 base_k += count
                 width = max(width, count)
-            seg_rows = on_device(torch.tensor(seg_row, dtype=torch.int64), device)
-            seg_cols = on_device(torch.tensor(seg_col, dtype=torch.int64), device)
-            rest = on_device(torch.tensor(seg_rest, dtype=torch.int64).view(-1, 3), device)
-            segments = torch.cat([(table[seg_rows, seg_cols].long() // page)[:, None], rest], dim=1).int()
-            c_seq_t = torch.tensor(c_seq, dtype=torch.int64)
-
-            def put(values: list[Any] | torch.Tensor, dtype: torch.dtype = torch.int64) -> torch.Tensor:
-                return on_device(values if isinstance(values, torch.Tensor) else torch.tensor(values, dtype=dtype), device)
-
+            rest = put(torch.tensor(seg_rest, dtype=torch.int64).view(-1, 3))
+            segments = torch.cat([(table[put(seg_row), put(seg_col)].long() // page)[:, None], rest], dim=1).int()
+            # The compressor's entries, per row as many as it reserves, on the device (a 32K-token step
+            # has as many entries as tokens at ratio 1: lists of them on the host took tens of ms).
+            reserved_host = [max(d, 1) for d in done]
+            cu_host = [0]
+            for v in reserved_host:
+                cu_host.append(cu_host[-1] + v)
+            done_t, reserved = put(done), put(reserved_host)
+            cu_c = put(cu_host)
+            c_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), reserved, output_size=cu_host[-1])
+            j = torch.arange(cu_host[-1], device=device) - cu_c[:-1][c_seq]
+            real = j < done_t[c_seq]
+            first = torch.where(real, (p0[c_seq] // ratio + j) * ratio, 0)
+            ks = put(row_k)[tok_seq]
             latents[ratio] = Latents(
-                segments=segments, total=base_k, width=width, ks=put(ks), ke=put(ke), seq_token=put(base),
-                cu_q=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(n, 0)])),
-                cu_k=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(p0 + n, 0)])),
-                cu_c=put(cu_c), c_seq=put(c_seq_t), first=put(first), real=put(real, torch.bool),
-                entry_token=put(base[c_seq_t]))
+                segments=segments, total=base_k, width=width, ks=ks, ke=ks + (pos + 1) // ratio, seq_token=base,
+                cu_q=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(n_host, 0)])),
+                cu_k=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(p0_host + n_host, 0)])),
+                cu_c=cu_c, c_seq=c_seq, first=first, real=real, entry_token=base[c_seq])
 
         # Engram: an n-gram ending at p looks back to p - s; the row's tail holds what earlier steps ran.
         ng = max(cfg.engram_max_ngram_size, 1)
-        back = pos[:, None] - torch.arange(ng)
+        back = pos[:, None] - torch.arange(ng, device=device)
         ngram_from = torch.where(back < 0, 2, torch.where(back >= tok_p0[:, None], 0, 1))
         ngram = torch.where(ngram_from == 0, tok_base[:, None] + back - tok_p0[:, None], tok_p0[:, None] - 1 - back)
         row_end = p0 + n - 1
-        after = row_end[:, None] - torch.arange(max(ng - 1, 1))
+        after = row_end[:, None] - torch.arange(max(ng - 1, 1), device=device)
         tail_from = torch.where(after < 0, 2, torch.where(after >= p0[:, None], 0, 1))
         tail = torch.where(tail_from == 0, base[:, None] + after - p0[:, None], p0[:, None] - 1 - after)
-
-        def dev(t: torch.Tensor) -> torch.Tensor:
-            return on_device(t, device)
-
-        return Layout(rows=dev(tok_row), start=dev(tok_p0), ring_segments=ring_segments, ring_total=ring_total,
-                      window_index=dev(window_index), keep=dev(keep), latents=latents, ngram=dev(ngram.clamp_min(0)),
-                      ngram_from=dev(ngram_from), last=dev(base + n - 1), tail=dev(tail.clamp_min(0)),
-                      tail_from=dev(tail_from))
+        return Layout(rows=tok_row, start=tok_p0, ring_segments=ring_segments, ring_total=ring_total,
+                      window_index=window_index, keep=keep, latents=latents, ngram=ngram.clamp_min(0),
+                      ngram_from=ngram_from, last=base + n - 1, tail=tail.clamp_min(0), tail_from=tail_from)
 
     # ------------------------------------------------------------------ constants
 
@@ -358,15 +537,40 @@ class Layers:
         self.step = {"rows": rows, "pos": positions, "slot": slot_table[rows].long(),
                      "tok_slot": tables["req_to_token"][rows, positions].long()}
         if self.cfg.engram_layer_ids:
-            self.step["hashes"] = self._hashes(input_ids, positions)
+            if self.group.size == 1:
+                self.step["hashes"] = self._hashes(input_ids, positions, self.step["slot"])
+            elif self.engram_staged.get(self.table, False):
+                hashes = self._hashes(input_ids, positions, self.step["slot"])
+                self.k("ds.engram_fetch@1")(self.group, hashes.long(), *self.tables(), True)
 
-    def _hashes(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def fetch(self, input_ids: torch.Tensor, positions: torch.Tensor) -> None:
+        """After ``prepare`` and before the forward, outside any graph, with the step's inputs (a
+        bucket's padded ones): among ranks that share the Engram tables, the rows this step's tokens
+        hash to, from the ranks that hold them, when the backend's fetch is not staged in the forward."""
+        if self.group.size == 1 or not self.cfg.engram_layer_ids or self.engram_staged.get(self.table, False):
+            return
+        rows = self.layout.rows if self.layout is not None else self.decode_rows
+        assert rows is not None
+        slot = self.batch_tables[f"slots.{SLOT_KIND}"][rows].long()
+        hashes = self._hashes(input_ids, positions, slot)
+        held, scales = self.kernels("decode", "ds.engram_fetch@1")(self.group, hashes.long(), *self.tables())
+        if self.bucket:
+            fixed = self.fetched_fixed.get(self.bucket)
+            if fixed is None:
+                fixed = self.fetched_fixed[self.bucket] = (held.clone(), scales.clone())
+                self.generation += 1
+            else:
+                fixed[0].copy_(held)
+                fixed[1].copy_(scales)
+            held, scales = fixed
+        self.fetched = (held, scales)
+
+    def _hashes(self, input_ids: torch.Tensor, positions: torch.Tensor, slot: torch.Tensor) -> torch.Tensor:
         """``NgramHashState.forward``: ``[tokens, engram layers, hash cols]`` rows of the layers' tables."""
         cfg, device = self.cfg, input_ids.device
         compressed = self.constant("token_map", device)[input_ids]
         pad = self.constant("token_map", device)[cfg.engram_pad_token_id]
         tail = self.slots.bind(self.engram_first).buffers()["tail"]
-        slot = self.step["slot"]
         ng = cfg.engram_max_ngram_size
         if self.layout is None:  # one token per row: every look-back is in the tail
             tokens = torch.cat([compressed[:, None], tail[slot]], dim=1)
@@ -384,19 +588,30 @@ class Layers:
         return self.k("ds.engram_hash@1")(tokens, self.constant("engram.multipliers", device),
                                           self.constant("engram.primes", device), self.constant("engram.offsets", device))
 
-    def linear_fp8(self, x: torch.Tensor, w: Weights, name: str) -> torch.Tensor:
-        return self.k("ds.linear_fp8@1")(x, w[name + ".weight"], w[name + ".scale"], w[name + ".packed"])
-
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self.k("ds.linear@1")(x, weight)
 
     def norm(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return self.k("ds.rms_norm@1")(x, weight, self.cfg.rms_norm_eps)
 
-    def hc_mixes(self, x: torch.Tensor, w: Weights, which: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def hc_step(self, x: torch.Tensor | None, stream: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
+                comb: torch.Tensor | None, w: Weights, which: str
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Between two sublayers (``ds.hc_step@1``): the output ``x`` of the one before written back to
+        the stream, the next coefficients, and the input of the sublayer ``which`` (``attn`` or
+        ``ffn``). Returns that input, the stream, and the new ``pre``, ``post`` and ``comb``."""
         cfg = self.cfg
-        return self.k("ds.hc_mixes@1")(x, w[f"hc_{which}_fn"], w[f"hc_{which}_scale"], w[f"hc_{which}_base"],
-                                        cfg.rms_norm_eps, cfg.hc_sinkhorn_iters, cfg.hc_eps)
+        # A backend whose MoE or Attention reads its FP8 input staged by this step writes it there now.
+        if which == "ffn":
+            stage: Any = (self.group, self.placement.slots(cfg.n_routed_experts), cfg.num_experts_per_tok,
+                          cfg.moe_intermediate_size)
+        elif which == "attn" and self.attn_staged.get(self.table, False):
+            stage = "attn"
+        else:
+            stage = None
+        return self.k("ds.hc_step@1")(x, stream, pre, post, comb, w[f"hc_{which}_fn"], w[f"hc_{which}_scale"],
+                                       w[f"hc_{which}_base"], w[f"{which}_norm.weight"], cfg.rms_norm_eps,
+                                       cfg.hc_sinkhorn_iters, cfg.hc_eps, stage)
 
     def hc_pre(self, x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
         return self.k("ds.hc_pre@1")(x, pre)
@@ -406,23 +621,45 @@ class Layers:
 
     def engram(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``Engram.forward`` on the stream ``[tokens, hc, dim]``: the layer's table rows at the hash ids,
-        dequantized, projected to one key per copy and a shared value, added through a gate."""
+        projected to one key per copy and a shared value, added through a gate."""
         cfg = self.cfg
-        ids = self.step["hashes"][:, cfg.engram_layer_ids.index(layer)]
-        rows = formats.dequant_rows_fp8(w["engram.embed.weight"][ids], w["engram.embed.scale"][ids]).to(x.dtype)
-        kv = self.linear_fp8(rows.flatten(-2), w, "engram.wkv")
-        return self.k("ds.engram_gate@1")(x, kv, w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps)
+        index = cfg.engram_layer_ids.index(layer)
+        held = scales = ids = None
+        if self.group.size == 1:
+            ids = self.step["hashes"][:, index]
+        elif not self.engram_staged.get(self.table, False):
+            assert self.fetched is not None
+            held, scales = self.fetched[0][:, index], self.fetched[1][:, index]
+        return self.k("ds.engram@1")(index, x, held, scales, ids, w["engram.embed.weight"], w["engram.embed.scale"],
+                                     w["engram.wkv.weight"], w["engram.wkv.scale"], w["engram.wkv.packed"],
+                                     w["engram.q_weight"], w["engram.k_weight"], cfg.rms_norm_eps)
 
-    def moe(self, x: torch.Tensor, w: Weights) -> torch.Tensor:
+    def moe(self, layer: int, x: torch.Tensor, w: Weights) -> torch.Tensor:
         """``MoE.forward``: the routed experts' weighted sum and the shared expert."""
         cfg = self.cfg
-        weights, indices = self.k("ds.moe_gate@1")(x, w["ffn.gate.weight"], w["ffn.gate.bias"], cfg.num_experts_per_tok,
-                                                    cfg.routed_scaling_factor)
-        y = self.k("ds.moe_experts@1")(x, weights, indices, w["ffn.experts.w13.weight"], w["ffn.experts.w13.packed"],
-                                       w["ffn.experts.w2.weight"], w["ffn.experts.w2.packed"], cfg.swiglu_limit)
-        y = y + self.k("ds.shared_expert@1")(x, *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2")
-                                                  for part in ("weight", "scale", "packed")), cfg.swiglu_limit)
-        return y.to(x.dtype)
+        # Among ranks this rank's stacks hold its part of the layer's experts, where the placement says.
+        return self.k("ds.moe@1")(
+            self.group, x, w["ffn.gate.weight"], w["ffn.gate.bias"], w["ffn.gate.bf16"],
+            *(w[f"ffn.experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "packed")),
+            *(w[f"ffn.shared_experts.{m}.{part}"] for m in ("w13", "w2") for part in ("weight", "scale", "packed")),
+            cfg.num_experts_per_tok, cfg.routed_scaling_factor, cfg.swiglu_limit, *self.placement.maps(layer))
+
+    def idle(self, weights: Sequence[Weights]) -> None:
+        """A step in which this rank has no rows, among ranks that share the experts and the Engram
+        tables: its part in what the other ranks compute, layer by layer in the forward's order (their
+        tokens may have chosen its experts, or hash to its rows)."""
+        if self.group.size == 1:
+            return
+        self._sync_flags()
+        cfg = self.cfg
+        self.table = "decode"
+        device = weights[0]["ffn.gate.weight"].device
+        x = torch.empty(0, cfg.hidden_size, dtype=torch.bfloat16, device=device)
+        if cfg.engram_layer_ids:  # as ``fetch`` / ``begin``, before the layers
+            ids = torch.empty(0, len(cfg.engram_layer_ids), cfg.engram_hash_cols, dtype=torch.int64, device=device)
+            self.k("ds.engram_fetch@1")(self.group, ids, *self.tables(), self.engram_staged.get("decode", False))
+        for layer in range(cfg.num_hidden_layers):
+            self.moe(layer, x, weights[layer])
 
     # ------------------------------------------------------------------ attention
 
@@ -436,11 +673,15 @@ class Layers:
         heads, dim, rd, eps = cfg.num_attention_heads, cfg.head_dim, cfg.qk_rope_head_dim, cfg.rms_norm_eps
         pos, slot = step["pos"], step["slot"]
         table = self.cos_sin(layer, pos.device)
-        rope = self.k("ds.rope@1")
-
-        qr = self.norm(self.linear_fp8(x, w, "attn.wq_a"), w["attn.q_norm.weight"])
-        q = rope(self.linear_fp8(qr, w, "attn.wq_b").unflatten(-1, (heads, dim)), table, pos, rd)
-        kv = self.linear_fp8(x, w, "attn.wkv")
+        has_iq = layer in cfg.index_source_layer_ids
+        q, kv, iq = self.k("ds.attn_qkv@1")(
+            x, w["attn.wq_a.weight"], w["attn.wq_a.scale"], w["attn.wq_a.packed"],
+            w["attn.wkv.weight"], w["attn.wkv.scale"], w["attn.wkv.packed"], w["attn.q_norm.weight"], eps,
+            w["attn.wq_b.weight"], w["attn.wq_b.scale"], w["attn.wq_b.packed"],
+            w["attn.indexer.wq_b.weight"] if has_iq else None,
+            w["attn.indexer.wq_b.scale"] if has_iq else None,
+            w["attn.indexer.wq_b.packed"] if has_iq else None,
+            heads, dim)
         ring = self.slots.bind(layer).buffers()["ring"]  # [slots, window, record]: a page a request
         win = cfg.sliding_window
         sink = w["attn.attn_sink"]
@@ -453,33 +694,29 @@ class Layers:
             window = torch.where(at >= 0, slot[:, None] * win + at % win, -1)
             latents = chosen = None
             if cfg.ratio(layer):
-                latents, chosen = self._compressed(layer, x, qr, w)
-            o = self.k("ds.cache_attn@1")(q, ring, window, latents, chosen, sink, dim ** -0.5)
-        else:
-            # A step laid out on the host attends over one source of keys, as DeepInfer's prefill does:
-            # the window's earlier keys loaded out of the rings, this step's own, the latents loaded.
-            # The ring is read before this step's keys go into it (they may take the same entries).
-            lay = self.layout
-            kv = self.k("ds.transform@1")(kv, w["attn.kv_norm.weight"], eps, table, pos, rd, "fp8")
-            held = (self.k("ds.load_values@1")(ring.flatten(0, 1), win, lay.ring_segments, lay.ring_total, "fp8")
-                    if lay.ring_total else kv[:0])
-            store(kv[lay.keep], None, eps, None, None, 0, ring.flatten(0, 1),
-                  slot[lay.keep] * win + pos[lay.keep] % win, "fp8", win)
-            parts, idx = [held, kv], lay.window_index
-            if cfg.ratio(layer):
-                latents, chosen = self._compressed(layer, x, qr, w)
-                parts.append(latents)
-                idx = torch.cat([idx, torch.where(chosen >= 0, chosen + lay.ring_total + kv.shape[0], -1)], dim=1)
-            o = self.k("ds.sparse_attn@1")(q, torch.cat(parts), idx, sink, dim ** -0.5)
-        o = rope(o, table, pos, rd, True)
+                latents, chosen = self._compressed(layer, x, iq, w)
+            return self.k("ds.cache_attn_out@1")(
+                q, table, pos, rd, ring, window, latents, chosen, sink, dim ** -0.5, cfg.o_groups,
+                w["attn.wo_a.weight"], w["attn.wo_b.weight"], w["attn.wo_b.scale"], w["attn.wo_b.packed"])
+        # A step laid out on the host attends over one source of keys, as DeepInfer's prefill does:
+        # the window's earlier keys loaded out of the rings, this step's own, the latents loaded.
+        # The ring is read before this step's keys go into it (they may take the same entries).
+        lay = self.layout
+        kv = self.k("ds.transform@1")(kv, w["attn.kv_norm.weight"], eps, table, pos, rd, "fp8")
+        held = (self.k("ds.load_values@1")(ring.flatten(0, 1), win, lay.ring_segments, lay.ring_total, "fp8")
+                if lay.ring_total else kv[:0])
+        store(kv[lay.keep], None, eps, None, None, 0, ring.flatten(0, 1),
+              slot[lay.keep] * win + pos[lay.keep] % win, "fp8", win)
+        parts, idx = [held, kv], lay.window_index
+        if cfg.ratio(layer):
+            latents, chosen = self._compressed(layer, x, iq, w)
+            parts.append(latents)
+            idx = torch.cat([idx, torch.where(chosen >= 0, chosen + lay.ring_total + kv.shape[0], -1)], dim=1)
+        return self.k("ds.sparse_attn_out@1")(
+            q, table, pos, rd, torch.cat(parts), idx, sink, dim ** -0.5, cfg.o_groups,
+            w["attn.wo_a.weight"], w["attn.wo_b.weight"], w["attn.wo_b.scale"], w["attn.wo_b.packed"])
 
-        # wo_a projects each group's heads on their own, on o quantized.
-        groups = cfg.o_groups
-        o = self.k("ds.fake_quant_fp8@1")(o.reshape(o.shape[0], groups, -1), 32)
-        o = self.k("ds.grouped_linear@1")(o, w["attn.wo_a.weight"].view(groups, cfg.o_lora_rank, -1))
-        return self.linear_fp8(o.flatten(1), w, "attn.wo_b")
-
-    def _compressed(self, layer: int, x: torch.Tensor, qr: torch.Tensor, w: Weights
+    def _compressed(self, layer: int, x: torch.Tensor, iq: torch.Tensor | None, w: Weights
                     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``Attention._compress_kv``. A source layer compresses first; an index source chooses, and the
         layers after it take its choice. In a decode step: the source layer's latent cache by its pages
@@ -493,7 +730,8 @@ class Layers:
         if layer == source:
             self._compress(layer, x, w, pool, entries)
         if layer == cfg.index_source(layer):
-            step["chosen", ratio] = self._index(layer, x, qr, w, pool["ik"], entries)
+            assert iq is not None
+            step["chosen", ratio] = self._index(layer, x, iq, w, pool["ik"], entries)
         chosen = step["chosen", ratio]
         if self.layout is None:
             return pool["kv"].unflatten(0, (-1, entries)), chosen
@@ -539,7 +777,7 @@ class Layers:
         store(linear(latent, w["attn.indexer.wk.weight"]), w["attn.indexer.k_norm.weight"], eps, freqs, first.clamp_min(0),
               rd, pool["ik"], dest, "key", entries)
 
-    def _index(self, layer: int, x: torch.Tensor, qr: torch.Tensor, w: Weights, keys: torch.Tensor, entries: int
+    def _index(self, layer: int, x: torch.Tensor, iq: torch.Tensor, w: Weights, keys: torch.Tensor, entries: int
                ) -> torch.Tensor:
         """``MQA.forward``: per token the ``index_topk`` best latents of its row it reaches, ascending by
         position (in a decode step as cache rows, else as indices into the step's loaded latents),
@@ -548,7 +786,7 @@ class Layers:
         cfg, step = self.cfg, self.step
         ratio, rd, h, d = cfg.ratio(layer), cfg.qk_rope_head_dim, cfg.index_n_heads, cfg.index_head_dim
         pos, rows = step["pos"], step["rows"]
-        q = self.linear_fp8(qr, w, "attn.indexer.wq_b").unflatten(-1, (h, d))
+        q = iq.unflatten(-1, (h, d))
         q_data, q_scales = self.k("ds.quant_index_q@1")(q, self.cos_sin(layer, pos.device), pos, rd)
         weights = self.k("ds.linear@1")(x, w["attn.indexer.weights_proj.weight"]) * (d ** -0.5 * h ** -0.5)
         source, uses = layer == cfg.candidate_source_layer_id, 0 <= cfg.candidate_source_layer_id < layer
@@ -615,5 +853,6 @@ class Unit:
         directory = config["dsv4.token_map_path"] or config["model.path"] or config["weights.path"]
         ctx.provide("layers.ds1017@1", Layers(
             ctx.use("kernels.catalog@1"), config, cfg, ctx.use("state.kv.paged@1"), ctx.use("state.swa.slots@1"),
-            token_map(directory, cfg), config["batch.max_context_len"]))
+            token_map(directory, cfg), config["batch.max_context_len"], ctx.use("comm.group@1"),
+            ctx.use("expert.placement@1")))
 

@@ -26,7 +26,7 @@ Rotation takes a ``cos_sin`` table ``[positions, rotary]`` fp32 (cosines, then s
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -346,3 +346,116 @@ def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.T
         rolling = torch.bitwise_xor(rolling, products[..., i])
         hashes.append(rolling.unsqueeze(-1) % primes[:, i - 1])
     return torch.cat(hashes, dim=-1) + offsets
+
+
+# ---------------------------------------------------------------- a sublayer's input, and the MoE
+
+def hc_step(post: Fn, mixes: Fn, pre_fn: Fn, norm: Fn, x: torch.Tensor | None, residual: torch.Tensor, pre: torch.Tensor,
+            post_mix: torch.Tensor | None, comb: torch.Tensor | None, fn: torch.Tensor, scale: torch.Tensor,
+            base: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float, iters: int, hc_eps: float
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``ds.hc_step@1``: what stands between two sublayers of the Hyper-Connections stream, in the
+    order DeepInfer runs it (``HCLayerMixin._hc_fused_post_pre``; its ``mega_mhc`` is all of it in one
+    kernel):
+
+    - the sublayer output ``x`` ``[tokens, dim]`` written back to the stream ``residual`` ``[tokens,
+      hc, dim]`` with the coefficients ``post_mix`` and ``comb`` the sublayer before it left (``x`` is
+      ``None`` where nothing waits: the first sublayer, or the stream was written already);
+    - the next coefficients from the stream as it is then (``fn``, ``scale``, ``base``): the ``pre``
+      mix the sublayer after this one takes its input with, and this one's own ``post`` and ``comb``;
+    - this sublayer's input: the stream's copies mixed with ``pre`` (the mix handed in: the sublayer
+      before computed it), normed.
+
+    Returns the input, the stream, and the three new coefficients. The same kernels in the same order
+    as the reference implementation's block: only grouped differently."""
+    stream = residual if x is None else post(x, residual, post_mix, comb)
+    new_pre, new_post, new_comb = mixes(stream, fn, scale, base, norm_eps, iters, hc_eps)
+    return norm(pre_fn(stream, pre), norm_weight, norm_eps), stream, new_pre, new_post, new_comb
+
+
+def slots(to_physical: torch.Tensor, copies: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """The slot that runs each chosen expert ``[tokens, k]`` (``expert.placement@1``'s maps of a
+    layer): of an expert's copies, by the token's place in the step."""
+    which = torch.arange(indices.shape[0], device=indices.device).unsqueeze(-1) % copies[indices]
+    return to_physical[indices, which].long()
+
+
+def moe(gate: Fn, experts: Fn, ep_experts: Fn, shared: Fn, group: Any, x: torch.Tensor, gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor, stacks: Sequence[torch.Tensor], shared_weights: Sequence[torch.Tensor], topk: int,
+        route_scale: float, limit: float, to_physical: torch.Tensor | None, copies: torch.Tensor | None,
+        taken: torch.Tensor | None) -> torch.Tensor:
+    """``ds.moe@1``, ``MoE.forward``: the gate's choice, the routed experts' weighted sum (among
+    ranks that share the layer's experts, from the ranks that hold them), and the shared expert; in
+    ``x``'s dtype. ``stacks``: the routed experts' ``w13``, its packed scales, ``w2``, its packed
+    scales; ``shared_weights``: the shared expert's six tensors. ``to_physical``, ``copies``,
+    ``taken``: the layer's maps and counts of ``expert.placement@1``, ``None`` without it."""
+    weights, indices = gate(x, gate_weight, gate_bias, topk, route_scale)
+    if group.size > 1:
+        where = slots(to_physical, copies, indices) if to_physical is not None and copies is not None else None
+        y = ep_experts(group, x, weights, indices, *stacks, limit, where, taken)
+    else:
+        y = experts(x, weights, indices, *stacks, limit)
+    y = y + shared(x, *shared_weights, limit)
+    return y.to(x.dtype)
+
+
+# ---------------------------------------------------------------- attention projections and Engram
+
+def attn_qkv(p: Pieces, x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torch.Tensor,
+             wkv: torch.Tensor, skv: torch.Tensor, pkv: torch.Tensor, q_norm: torch.Tensor, eps: float,
+             wq_b: torch.Tensor, sq_b: torch.Tensor, pq_b: torch.Tensor, iwq_b: torch.Tensor | None,
+             isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """``ds.attn_qkv@1``: ``wq_a`` and ``q_norm``, ``wq_b`` ``[tokens, heads, head_dim]`` (before
+    rotation), ``wkv`` ``[tokens, head_dim]``, and on an index-source layer ``indexer.wq_b``."""
+    qr = p.rms_norm(p.linear_fp8(x, wq_a, sq_a, pq_a), q_norm, eps)
+    q = p.linear_fp8(qr, wq_b, sq_b, pq_b).unflatten(-1, (heads, head_dim))
+    kv = p.linear_fp8(x, wkv, skv, pkv)
+    iq = p.linear_fp8(qr, iwq_b, isq_b, ipq_b) if iwq_b is not None and isq_b is not None else None
+    return q, kv, iq
+
+
+def attn_out(p: Pieces, grouped_linear: Fn, o: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor,
+             rotary: int, groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor
+             ) -> torch.Tensor:
+    """``Attention.forward`` after the attention kernel: inverse rotation, FP8 per 32, ``wo_a`` per
+    group, and ``wo_b``."""
+    o = rope(p, o, cos_sin, positions, rotary, True)
+    o = p.fake_quant_fp8(o.reshape(o.shape[0], groups, -1), formats.BLOCK)
+    o = grouped_linear(o, wo_a.view(groups, wo_a.shape[0] // groups, -1))
+    return p.linear_fp8(o.flatten(1), wo_b, so_b, po_b)
+
+
+def cache_attn_out(p: Pieces, cache_attn: Fn, grouped_linear: Fn, q: torch.Tensor, cos_sin: torch.Tensor,
+                   positions: torch.Tensor, rotary: int, window: torch.Tensor, window_idx: torch.Tensor,
+                   latents: torch.Tensor | None, latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float,
+                   groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor
+                   ) -> torch.Tensor:
+    """``ds.cache_attn_out@1``: query rotation, ``cache_attn``, inverse rotation, ``wo_a`` and ``wo_b``."""
+    o = cache_attn(rope(p, q, cos_sin, positions, rotary), window, window_idx, latents, latent_idx, sink, scale)
+    return attn_out(p, grouped_linear, o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def sparse_attn_out(p: Pieces, sparse_attn: Fn, grouped_linear: Fn, q: torch.Tensor, cos_sin: torch.Tensor,
+                    positions: torch.Tensor, rotary: int, source: torch.Tensor, idx: torch.Tensor,
+                    sink: torch.Tensor, scale: float, groups: int, wo_a: torch.Tensor, wo_b: torch.Tensor,
+                    so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    """``ds.sparse_attn_out@1``: query rotation, ``sparse_attn``, inverse rotation, ``wo_a`` and ``wo_b``."""
+    o = sparse_attn(rope(p, q, cos_sin, positions, rotary), source, idx, sink, scale)
+    return attn_out(p, grouped_linear, o, cos_sin, positions, rotary, groups, wo_a, wo_b, so_b, po_b)
+
+
+def engram(p: Pieces, gate: Fn, index: int, x: torch.Tensor, held: torch.Tensor | None, scales: torch.Tensor | None,
+           ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
+           wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
+           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """``ds.engram@1``: an Engram layer's table rows (``held`` and ``scales`` brought in from the ranks,
+    or looked up at ``ids`` here), projected through ``wkv`` and gated onto the stream ``x``."""
+    if held is None or scales is None:
+        assert ids is not None
+        held, scales = embed_weight[ids], embed_scale[ids]
+    rows = formats.dequant_rows_fp8(held, scales).to(x.dtype)
+    kv = p.linear_fp8(rows.flatten(-2), wkv_w, wkv_s, wkv_p)
+    return gate(x, kv, q_weight, k_weight, eps)
+
+

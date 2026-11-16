@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Any, Protocol
 
 import msgspec
@@ -510,20 +511,19 @@ class Coordinator:
                 self.recovery_required = True
                 raise _Abort(r.diagnostics)
             run.stopped.append(proc)
-        for pa in run.plan.procs:
-            if pa.restart is None:
-                continue
+        # The processes of one role start together, role after role: units of ranks that compute
+        # together wait for each other while they load (a communication group's rendezvous).
+        restarts = [pa.restart for pa in run.plan.procs if pa.restart is not None]
+        for _, plans in groupby(restarts, key=lambda plan: plan.proc.role):
             assert topo is not None
-            run.restarted.append(pa.proc)
-            r = await self.sup.relaunch(pa.restart, run.identity, topo, start_paused=True)
-            if isinstance(r, Failed):
-                raise _Abort(r.diagnostics)
-        for plan in run.plan.spawn:
+            together = list(plans)
+            run.restarted += [plan.proc for plan in together]
+            await self._started(self.sup.relaunch(plan, run.identity, topo, start_paused=True) for plan in together)
+        for _, plans in groupby(run.plan.spawn, key=lambda plan: plan.proc.role):
             assert topo is not None
-            run.spawned.append(plan.proc)
-            r = await self.sup.launch(plan, run.identity, topo, start_paused=True)
-            if isinstance(r, Failed):
-                raise _Abort(r.diagnostics)
+            together = list(plans)
+            run.spawned += [plan.proc for plan in together]
+            await self._started(self.sup.launch(plan, run.identity, topo, start_paused=True) for plan in together)
         if run.plan.topology is not None:
             self.sup.topology = run.plan.topology
         if run.plan.control is not None and self.local is not None:
@@ -531,6 +531,12 @@ class Coordinator:
             if isinstance(local, Failed):
                 raise _Abort(local.diagnostics)
         run.lap("execute")
+
+    @staticmethod
+    async def _started(starts: Iterable[Awaitable[Result[None]]]) -> None:
+        failed = [d for r in await asyncio.gather(*starts) if isinstance(r, Failed) for d in r.diagnostics]
+        if failed:
+            raise _Abort(failed)
 
     async def _confirm(self, run: _Run, procs: list[ProcId], *, resume: bool,
                        deadline: float) -> tuple[list[Diagnostic], dict[ProcId, Resumed]]:

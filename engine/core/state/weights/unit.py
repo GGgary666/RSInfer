@@ -47,16 +47,26 @@ def safetensors_files(path: str) -> list[str]:
     return files
 
 
-def safetensors_weights_iterator(hf_weights_files: Sequence[str], wants: Callable[[str], bool] | None = None
+def safetensors_weights_iterator(hf_weights_files: Sequence[str], wants: Callable[[str], bool] | None = None,
+                                 rows: Callable[[str], tuple[int, int] | None] | None = None
                                  ) -> Iterator[tuple[str, torch.Tensor]]:
     """Iterate over the weights in the model safetensor files; with ``wants``, only over the tensors
     whose names it takes, the others not read (a model cut to its first layers on a checkpoint of
-    hundreds of GiB)."""
+    hundreds of GiB); with ``rows``, of a tensor it names only those rows (a rank's part of a table
+    of tens of GiB)."""
     for st_file in hf_weights_files:
         with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:  # pyright: ignore[reportUnknownMemberType]
             for name in f.keys():  # noqa: SIM118
-                if wants is None or wants(name):
+                if wants is not None and not wants(name):
+                    continue
+                part = rows(name) if rows is not None else None
+                if part is None:
                     yield name, f.get_tensor(name)
+                    continue
+                try:
+                    yield name, f.get_slice(name)[part[0]:part[1]]  # pyright: ignore[reportUnknownMemberType]
+                except Exception:  # noqa: BLE001 - a dtype the slices do not read: the whole tensor, cut here
+                    yield name, f.get_tensor(name)[part[0]:part[1]]
 
 
 def initialize_dummy_weights(params: Mapping[str, torch.Tensor], low: float = -1e-3, high: float = 1e-3,
@@ -104,6 +114,10 @@ class WeightStore:
     loaders: Registry[WeightLoader] = field(default_factory=lambda: Registry[WeightLoader]("weights.loaders"))
     generation: int = 0
     loads: int = 0
+    fills: int = 0
+    """How many times the contents were written (``fill``), a refit's abort too; unlike ``loads`` never
+    put back. What a model derives from the contents in place (a row order, where EPLB put an
+    expert) is derived again when it changes."""
     loaded_from: str = ""
     source: str = ""
     """What ``fill`` last read: a checkpoint path, or ``""`` for the dummy weights."""
@@ -120,6 +134,9 @@ class WeightStore:
         existing = bool(self.decls)
         decls = [d for d in decls if self.decls.get(d.name) != d]
         for d in decls:
+            self.tensors.pop(d.name, None)
+            self.decls.pop(d.name, None)
+            self.filled.discard(d.name)
             if d.name in self.buffers_:
                 self.platform.free(self.buffers_.pop(d.name))
                 moved = True
@@ -157,9 +174,11 @@ class WeightStore:
             loaders = self.loaders.items()
             if len(loaders) != 1:
                 raise RuntimeError(f"weights need exactly one registered loader, got {len(loaders)}")
-            # A loader that is a model's method may say which checkpoint tensors it reads (``wants_weight``).
-            wants = getattr(getattr(loaders[0], "__self__", None), "wants_weight", None)
-            loaded = loaders[0](safetensors_weights_iterator(safetensors_files(path), wants), self.tensors)
+            # A loader that is a model's method may say which checkpoint tensors it reads (``wants_weight``),
+            # and which rows of one (``weight_rows``).
+            owner = getattr(loaders[0], "__self__", None)
+            wants, rows = getattr(owner, "wants_weight", None), getattr(owner, "weight_rows", None)
+            loaded = loaders[0](safetensors_weights_iterator(safetensors_files(path), wants, rows), self.tensors)
             missing = sorted(set(self.decls) - loaded)
             if missing:
                 raise RuntimeError(f"the checkpoint at {path} has no weights for {missing[:8]}")
@@ -170,6 +189,7 @@ class WeightStore:
         self.source = path
         self.filled = set(self.decls)
         self.loads += 1
+        self.fills += 1
 
     def bind(self, prefix: str) -> Views:
         return Views(self, prefix)

@@ -45,7 +45,8 @@ from unit.runtime import ProcessPlan, ReloadPlan, UnitRuntime, UnitSpec
 ENGINE = Path(__file__).resolve().parents[3] / "engine"
 BIND = "127.0.0.1"
 SCHED = ProcId(HostId("host-a"), "sched", 0)
-WORKERS = (ProcId(HostId("host-b"), "worker", 0), ProcId(HostId("host-c"), "worker", 1))
+WORKERS = (ProcId(HostId("host-b"), "worker", 0), ProcId(HostId("host-c"), "worker", 1),
+           ProcId(HostId("host-d"), "worker", 2), ProcId(HostId("host-e"), "worker", 3))
 CLIENT = HostId("frontend")
 TUN = IpcTunables(peer_timeout_s=5.0, rpc_timeout_s=1.0, close_timeout_s=0.2, lookup_retry_s=0.01)
 
@@ -272,6 +273,11 @@ class Engine:
     def ledger(self) -> JointLedger:
         return cast(JointLedger, self.runtime.lookup("ledger@1"))
 
+    @property
+    def ledgers(self) -> list[JointLedger]:
+        """One per scheduling domain (``sched.domains``); the first is ``ledger``."""
+        return list(cast(list[JointLedger], self.runtime.lookup("ledger.domains@1")))
+
     def reload(self, *units: UnitSpec) -> None:
         """As a change would: the loop finishes its steps first, then the units reload."""
         self.loop.quiesce()
@@ -310,12 +316,12 @@ class Bed:
 
     def idle(self) -> bool:
         """No request left and every item back in the ledger (or, with the prefix cache, in its tree)."""
-        ledger: Any = self.engine.ledger
-        if not hasattr(ledger, "pools"):  # RadixLedger
+        ledgers: list[Any] = list(self.engine.ledgers)
+        if not hasattr(ledgers[0], "pools"):  # RadixLedger
             return not list(self.engine.table.entries()) and not self.engine.loop.flights and \
-                not ledger.holdings and ledger.check() == []
+                all(not ledger.holdings and ledger.check() == [] for ledger in ledgers)
         return not list(self.engine.table.entries()) and not self.engine.loop.flights and \
-            all(len(p.free) == p.capacity and not p.holdings for p in ledger.pools.values())
+            all(len(p.free) == p.capacity and not p.holdings for ledger in ledgers for p in ledger.pools.values())
 
     def errors(self) -> list[str]:
         return [e for w in self.workers for e in w.fixture.errors]
@@ -336,8 +342,9 @@ class Bed:
 
 
 @contextmanager
-def bed(*, ranks: int = 2, delay_s: float = 0.0, capacity: dict[str, int] | None = None,
+def bed(*, ranks: int = 2, delay_s: float = 0.0, capacity: dict[str, int] | Sequence[dict[str, int]] | None = None,
         **engine: Any) -> Generator[Bed]:
+    """``capacity``: every worker's, or one per rank."""
     directory = Directory()
     workers: list[WorkerThread] = []
     client: Client | None = None
@@ -346,12 +353,13 @@ def bed(*, ranks: int = 2, delay_s: float = 0.0, capacity: dict[str, int] | None
         e = Engine(directory, ranks=ranks, **engine)
         max_batch = e.config["sched.max_batch"].value
         control = e.control
+        per_rank = [dict(capacity or CAPACITY)] * ranks if capacity is None or isinstance(capacity, dict) else \
+            [dict(c) for c in capacity]
         workers = [WorkerThread(directory, r, identity=lambda: str(control.identity), max_batch=max_batch,
-                                capacity=dict(capacity or CAPACITY),
-                                delay_s=delay_s) for r in range(ranks)]
+                                capacity=per_rank[r], delay_s=delay_s) for r in range(ranks)]
         client = Client(directory)
         b = Bed(e, workers, client)
-        b.run_until(lambda: e.ledger.ready, what="capacity")
+        b.run_until(lambda: all(ledger.ready for ledger in e.ledgers), what="capacity")
         yield b
     finally:
         problems: list[AssertionError] = []

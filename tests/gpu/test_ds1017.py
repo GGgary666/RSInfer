@@ -33,6 +33,7 @@ from tests.gpu.support_ds1017 import reference_greedy, reference_model, small_co
 from tests.gpu.support_ds1017_cases import SMALL, cases, compare, observe
 from tests.units.support.ds1017 import checkpoint as make_checkpoint
 from tests.units.support.ds1017 import driver, expert_stacks
+from worker.comm.unit import Group
 
 CONTEXT = 1024
 ROWS: dict[str, Any] = {"batch.max_context_len": CONTEXT, "state.kv.pages": 1024, "state.swa.slots": 6, "batch.max_rows": 4}
@@ -137,6 +138,23 @@ def inputs(name: str) -> tuple[Any, ...]:
                 stacks += [torch.stack([p[0] for p in pairs]).cuda(), torch.stack([p[1] for p in pairs]).cuda()]
             w1, s1, w2, s2, w3, s3 = stacks
             return (x, weights, indices, *expert_stacks(w1, s1, w2, s2, w3, s3), 10.0)
+        case "ds.ep_experts@1":  # a group of one rank: the exchange's own arithmetic, with nobody to exchange with
+            return (Group(), *inputs("ds.moe_experts@1"))
+        case "ds.engram_fetch@1":
+            tables = [torch.randint(0, 255, (500, 64), generator=g, dtype=torch.uint8).cuda() for _ in range(2)]
+            scales = [torch.randint(100, 140, (500, 2), generator=g, dtype=torch.uint8).cuda() for _ in range(2)]
+            return (Group(), torch.randint(0, 500, (70, 2, 6), generator=g).cuda(), tables, scales)
+        case "ds.hc_step@1":
+            x, residual, post, comb = inputs("ds.hc_post@1")
+            return (x, residual, torch.rand(70, 4, generator=g).cuda(), post, comb, *inputs("ds.hc_mixes@1")[1:4],
+                    1 + rand(1024, scale=0.1), 1e-20, 20, 1e-6)
+        case "ds.moe@1":
+            x, _, _, *stacks, limit = inputs("ds.moe_experts@1")
+            gate = rand(8, 1024, scale=1 / 32, dtype=f32)
+            (d13, s13), (d2, s2) = fp8(2048, 1024), fp8(1024, 1024)
+            shared = (d13, s13, formats.pack_scales(formats.block_rows(s13, 2048)), d2, s2,
+                      formats.pack_scales(formats.block_rows(s2, 1024)))
+            return (Group(), x, gate, rand(8, scale=0.1, dtype=f32), gate.to(torch.bfloat16), *stacks, *shared, 2, 1.5, limit)
         case "ds.silu@1":
             return (rand(70, 1024, dtype=f32),)
         case "ds.pool@1":

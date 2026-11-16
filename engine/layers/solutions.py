@@ -27,18 +27,23 @@ class Kernels:
         self.fns: dict[tuple[str, str], KernelFn] = {}
         self.calls: Mapping[str, Mapping[str, Mapping[str, int]]] = {}
         self.shared: frozenset[str] = frozenset()
+        self.outside: frozenset[str] = frozenset()
         self.version = -1
         """The catalog's version when the solutions were fixed."""
 
     def resolve(self, calls: Mapping[str, Mapping[str, Mapping[str, int]]],
-                shared: frozenset[str] = frozenset()) -> dict[str, dict[str, str]]:
+                shared: frozenset[str] = frozenset(), outside: frozenset[str] = frozenset()
+                ) -> dict[str, dict[str, str]]:
         """``calls``: phase -> definition -> the shape it is called with. Returns phase -> the backend
         and each definition's solution, a fallback to the reference marked; and under ``GRAPH`` the
         decode definitions again for a captured step, ``""`` where nothing capturable fits.
 
         ``shared``: the definitions that are not the backend's own kernels (the store into the
         KV pool, which in SGLang is the pool's ``set_kv_buffer`` under every attention backend). A
-        named backend that brings none runs them as ``auto`` would."""
+        named backend that brings none runs them as ``auto`` would.
+
+        ``outside``: the definitions a step calls before its forward, outside any graph (a backend's
+        ``fetch``): a captured step runs the decode step's solution of them, capturable or not."""
         version = self.catalog.version
         fns: dict[tuple[str, str], KernelFn] = {}
         out: dict[str, dict[str, str]] = {}
@@ -46,13 +51,14 @@ class Kernels:
             backend = self.backends[phase]
             chosen = {"backend": backend}
             for definition, shape in calls.get(phase, {}).items():
+                capture = table == GRAPH and definition not in outside
                 try:
                     try:
-                        selected = self.catalog.select(definition, shape, backend, capture=table == GRAPH)
+                        selected = self.catalog.select(definition, shape, backend, capture=capture)
                     except LookupError:
                         if definition not in shared:
                             raise
-                        selected = self.catalog.select(definition, shape, capture=table == GRAPH)
+                        selected = self.catalog.select(definition, shape, capture=capture)
                 except LookupError as e:
                     if table == GRAPH:  # the plan records no graph, and says which kernel is why
                         chosen[definition] = ""
@@ -61,15 +67,15 @@ class Kernels:
                 fns[table, definition] = self.catalog.resolve(selected.solution)
                 chosen[definition] = selected.solution + (" (fallback)" if selected.fallback else "")
             out[table] = chosen
-        self.fns, self.calls, self.shared, self.version = fns, calls, shared, version
+        self.fns, self.calls, self.shared, self.outside, self.version = fns, calls, shared, outside, version
         return out
 
     def __call__(self, phase: str, definition: str) -> KernelFn:
         """The fixed solution; resolved again first if the catalog's registrations changed since (a
         kernel unit reloaded), so that the new code runs."""
         if self.calls and self.catalog.version != self.version:
-            print(f"layers: kernels resolved again: {self.resolve(self.calls, self.shared)}", file=sys.stderr,
-                  flush=True)
+            print(f"layers: kernels resolved again: {self.resolve(self.calls, self.shared, self.outside)}",
+                  file=sys.stderr, flush=True)
         try:
             return self.fns[phase, definition]
         except KeyError:

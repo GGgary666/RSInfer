@@ -125,6 +125,53 @@ def packed_words(packed: torch.Tensor, n: int) -> torch.Tensor:
     return packed.view(torch.int32).squeeze(-1).transpose(-2, -1)[..., :n, :]
 
 
+def mega_rows(n: int, halves: bool, scales: bool) -> torch.Tensor:
+    """Row ``i`` of a weight ``[n, k]`` (or of its scales by row) in the layout DeepGEMM's fused MoE
+    kernel reads is row ``mega_rows(...)[i]`` of the checkpoint's order
+    (``deep_gemm.transform_weights_for_mega_moe``, DeepGEMM 1fc9c66, MIT):
+
+    - ``halves`` (``w13``, an expert's ``w1`` over its ``w3``): the two halves interleaved eight rows
+      at a time, so that a gate row and its up row are in one tile;
+    - ``scales``: within every 128 rows, row ``a * 32 + b`` (``a`` < 4) at ``b * 4 + a``, the order
+      the kernel's scale tiles are loaded in."""
+    rows = torch.arange(n)
+    if halves:
+        tile, at = rows // 16, rows % 16
+        rows = torch.where(at < 8, tile * 8 + at, n // 2 + tile * 8 + at - 8)
+    if scales:
+        if n % 128:
+            raise ValueError(f"the fused MoE kernel takes scales of weights with a multiple of 128 rows, not {n}")
+        chunk, at = torch.arange(n) // 128, torch.arange(n) % 128
+        rows = rows[chunk * 128 + (at % 4) * 32 + at // 4]
+    return rows
+
+
+def expert_layout(w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, mega: bool) -> None:
+    """An expert stack's weights and packed scales, in place, from the checkpoint's row order to the
+    fused MoE kernel's (``mega``) or back. Row permutations of each expert: which slot holds which
+    expert is not touched."""
+    def place(t: torch.Tensor, rows: torch.Tensor, dim: int) -> None:
+        rows = (rows if mega else rows.argsort()).to(t.device)
+        t.copy_(t.index_select(dim, rows))
+
+    n13, n2 = w13.shape[1], w2.shape[1]
+    place(w13, mega_rows(n13, True, False), 1)
+    place(p13, mega_rows(n13, True, True), 2)  # packed scales: [experts, K / 128, rows, 4]
+    place(p2, mega_rows(n2, False, True), 2)
+
+
+def shared_layout(w13: torch.Tensor, p13: torch.Tensor, p2: torch.Tensor, mega: bool) -> None:
+    """``expert_layout`` for the shared expert's FP8 weights ``w13`` ``[2 * inter, dim]`` and the packed
+    scales of both its matrices (its block scales, which only the references read, stay)."""
+    def place(t: torch.Tensor, rows: torch.Tensor, dim: int) -> None:
+        rows = (rows if mega else rows.argsort()).to(t.device)
+        t.copy_(t.index_select(dim, rows))
+
+    place(w13, mega_rows(w13.shape[0], True, False), 0)
+    place(p13, mega_rows(w13.shape[0], True, True), 1)  # packed scales: [K / 128, rows, 4]
+    place(p2, mega_rows(p2.shape[1], False, True), 1)
+
+
 def block_rows(scale: torch.Tensor, n: int) -> torch.Tensor:
     """An FP8 weight's 32 x 32 block scales ``[N / 32, K / 32]`` as one row of scales per weight row."""
     return scale.repeat_interleave(BLOCK, dim=-2)[..., :n, :]

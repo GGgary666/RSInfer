@@ -15,6 +15,16 @@ What is ours (stage2-contract.md §4):
   once its last step retired.
 - **Ranks.** Every rank gets the same plan, its own ``rank`` in the record. A step retires once
   every rank answered it; the tokens are rank 0's, and every rank must have sampled the same.
+- **Domains** (``sched.domains``, doc/specs/v1-ds1017.md stage 3). The ranks are split into
+  scheduling domains, one by default. The ranks of a domain are what the line above says. Domains
+  hold different requests (data parallel): each has ``max_batch`` rows of its own, a ledger of its
+  own (its ranks' stores), and a view of its own for the compose policy, so one domain may compute
+  prompts in a step in which another decodes. A waiting request goes to the domain whose prefix
+  cache holds most of it, then to the one with most free rows; the order policy orders each
+  domain's waiting requests. All domains step together: a step is one plan to every rank, an empty
+  one to a domain with nothing to run, because ranks that share experts compute each layer
+  together. A domain that refused a step (``Resync``) did not run it while the others did: its
+  requests stay where they were.
 - **Resync.** A step every rank answered with ``Resync`` did not run. The steps sent after it are
   refused too, so the next plan waits for them and goes out with nothing in flight, as a full
   delta. Ranks that disagree (one ran it, one did not) cannot be put back together: that is a
@@ -207,8 +217,9 @@ class Flight:
     """Decode rows that verify drafts: planned at ``draft_tokens`` tokens (``counts``), the most they
     advance; how far they went is their ``Sampled`` count."""
     answers: dict[int, Answer] = field(default_factory=dict[int, Answer])
-    void: bool = False
-    """Sent after a step the workers refused (``Resync``): they refuse this one too."""
+    void: set[int] = field(default_factory=set[int])
+    """Domains this step was sent to after a step their workers refused (``Resync``): they refuse
+    this one too."""
     written: dict[int, int] = field(default_factory=dict[int, int])
     """rank -> the generation of the plan connection it went over."""
     refused_by: set[int] = field(default_factory=set[int])
@@ -249,22 +260,34 @@ class Outbox:
 
 
 class Scheduler:
-    def __init__(self, *, table: Table, ledger: Ledger, order: OrderPolicy, compose: ComposePolicy,
+    def __init__(self, *, table: Table, order: OrderPolicy, compose: ComposePolicy,
                  requests: Reader, results: Sequence[Reader], plans: Sequence[Writer],
                  tokens_to: Callable[[StreamAddress], Writer], discard: Callable[[StreamAddress], None],
-                 identity: Callable[[], str], depth: Callable[[], int] = lambda: 1,
+                 identity: Callable[[], str], ledger: Ledger | None = None, ledgers: Sequence[Ledger] | None = None,
+                 depth: Callable[[], int] = lambda: 1,
                  settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
         if not plans or len(plans) != len(results):
             raise ValueError("one plan writer and one result reader per rank")
         if settings.max_batch < 1 or settings.token_budget < 1:
             raise ValueError("sched.max_batch and sched.token_budget must be positive")
-        if settings.token_budget % ledger.align:
+        if (ledger is None) == (ledgers is None):
+            raise ValueError("one ledger, or one per scheduling domain")
+        self.ledgers: Sequence[Ledger] = ledgers if ledgers is not None else [cast(Ledger, ledger)]
+        """One per scheduling domain (``ledger.domains@1``, read through its proxy every time)."""
+        if not len(self.ledgers) or len(plans) % len(self.ledgers):
+            raise ValueError(f"{len(plans)} rank(s) do not split evenly into {len(self.ledgers)} scheduling "
+                             "domain(s) (sched.domains)")
+        per = len(plans) // len(self.ledgers)
+        self.domains = [list(range(d * per, (d + 1) * per)) for d in range(len(self.ledgers))]
+        """The ranks of each domain, in order."""
+        align = self.ledgers[0].align
+        if settings.token_budget % align:
             # A chunk that does not end its prompt ends on a page (_carry_out): a smaller budget
             # never computes one. SGLang: chunked_prefill_size must be divisible by page_size.
             raise ValueError(f"sched.token_budget = {settings.token_budget} must be a multiple of the prefix "
-                             f"cache's page, state.kv.page_size = {ledger.align} (as SGLang's "
+                             f"cache's page, state.kv.page_size = {align} (as SGLang's "
                              "chunked_prefill_size), or alloc.radix_cache = false")
-        self.table, self.ledger, self.order, self.compose = table, ledger, order, compose
+        self.table, self.order, self.compose = table, order, compose
         self.requests, self.results = requests, list(results)
         self.plans = [Outbox(w) for w in plans]
         self.tokens_to, self.discard, self.identity = tokens_to, discard, identity
@@ -297,6 +320,11 @@ class Scheduler:
         self.capacity_wanted: set[int] = set()
         """Ranks whose ``Capacity`` under the identity served now has not come since a change committed:
         their stores may have been rebuilt with another size. No step is planned meanwhile."""
+        self.recheck = False
+        """A step was answered without a record arriving (a replaced rank's part given up): see
+        whether it can retire."""
+        self.turned_away: dict[int, int] = {}
+        """Waiting request -> the domain whose ledger last had no room for it: it tries another next."""
 
     # ------------------------------------------------------------------ the loop
 
@@ -347,6 +375,22 @@ class Scheduler:
     def _epoch(self) -> int | None:
         return self.table.last_retired if self.table.last_retired >= 1 else None
 
+    def _domain(self, row: int) -> int:
+        """The domain a row belongs to: domain ``d`` has the rows ``d * max_batch`` onwards, which
+        its ranks know as ``0 .. max_batch - 1``."""
+        return row // self.settings.max_batch
+
+    def _of(self, rank: int) -> int:
+        return rank // len(self.domains[0])
+
+    def _ledger(self, request: Request) -> Ledger:
+        assert request.row is not None
+        return self.ledgers[self._domain(request.row)]
+
+    @property
+    def _ready(self) -> bool:
+        return all(ledger.ready for ledger in self.ledgers)
+
     def occupancy(self) -> tuple[int, int, int]:
         """Requests running, requests waiting, steps in flight. A request ended (or cancelled)
         no longer counts, but a step still in flight does: it may write what the request held.
@@ -354,6 +398,11 @@ class Scheduler:
         live = [r for r in self.table.entries() if not r.finished()]
         running = sum(1 for r in live if r.row is not None)
         return running, len(live) - running, 0 if self.fault is not None else len(self.flights)
+
+    def flush_ledgers(self) -> None:
+        """What the workers' stores hold may be gone or stale: every domain's prefix cache goes."""
+        for ledger in self.ledgers:
+            ledger.flush()
 
     def end_all(self, message: str) -> int:
         """End every request with ``message`` as its error; how many."""
@@ -395,7 +444,8 @@ class Scheduler:
         self.adopted = True
         for request in self.table.entries():
             if request.row is not None:
-                self.home[request.input.request] = dict(enumerate(self.plan_gens))
+                self.home[request.input.request] = {rank: self.plan_gens[rank]
+                                                    for rank in self.domains[self._domain(request.row)]}
         for epoch in sorted(self.table.steps):
             rows = dict(cast(Mapping[int, int], self.table.steps[epoch].rows))
             for rid in rows.values():
@@ -403,7 +453,8 @@ class Scheduler:
                 if request is not None and not request.finished() and request.route is not None:
                     self._error(request, f"step {epoch} never came back from the workers; "
                                          "the request's state on the device is unknown")
-            self.ledger.retire(epoch, ran=False)
+            for ledger in self.ledgers:
+                ledger.retire(epoch, ran=False)
             for rid in self.table.retire(epoch, ran=False):
                 self._reap(rid)
             self._note(f"took over: step {epoch} was abandoned, its requests ended")
@@ -419,7 +470,8 @@ class Scheduler:
                     break
                 got = True
                 self._take_result(rank, raw)
-        if got:
+        if got or self.recheck:
+            self.recheck = False
             self._retire_ready()
         return got
 
@@ -458,17 +510,21 @@ class Scheduler:
             self._fail(record.epoch, rank, f"worker failed: {answer.reason}")
 
     def _capacity(self, rank: int, items: dict[str, int]) -> None:
+        """A domain's ledger counts what the smallest of its ranks holds, once they all said."""
         self.capacity[rank] = items
-        if len(self.capacity) < len(self.results):
+        domain = self._of(rank)
+        said = [self.capacity[r] for r in self.domains[domain] if r in self.capacity]
+        if len(said) < len(self.domains[domain]):
             return
-        kinds = set.intersection(*(set(c) for c in self.capacity.values()))
-        lowest = {k: min(c[k] for c in self.capacity.values()) for k in sorted(kinds)}
+        kinds = set.intersection(*(set(c) for c in said))
+        lowest = {k: min(c[k] for c in said) for k in sorted(kinds)}
+        ledger = self.ledgers[domain]
         try:
-            self.ledger.set_capacity(lowest)
+            ledger.set_capacity(lowest)
         except ValueError as e:
             self._note(f"capacity {lowest} not taken: {e}")
             return
-        cap = self.ledger.max_requests
+        cap = ledger.max_requests
         if cap is not None and cap < self.settings.max_batch:
             self._note(f"at most {cap} requests run at once, not sched.max_batch = {self.settings.max_batch}: "
                        f"the prefix cache's slots per request (as SGLang's max_running_requests)")
@@ -501,20 +557,23 @@ class Scheduler:
     def _lose(self, rank: int, old: Callable[[int], bool], why: str) -> None:
         """End the requests whose plans went to ``rank`` over the old connection, and give up the
         steps sent there that it did not answer (their answers may never come)."""
+        domain = self._of(rank)
+        ledger = self.ledgers[domain]
         lost = {rid for rid, first in self.home.items() if rank in first and old(first[rank])}
         void = [f for f in self.flights if rank in f.written and old(f.written[rank]) and rank not in f.answers]
-        self.ledger.flush()  # a new worker: what the old one's stores held is gone
+        ledger.flush()  # a new worker: what the old one's stores held is gone
         for f in void:
-            lost |= set(f.rows.values())
+            lost |= {rid for row, rid in f.rows.items() if self._domain(row) == domain}
         restarted = 0
         for request in self.table.entries():
             # Computed tokens but none of them went over the old connection: they came from the
             # prefix cache, which was the old worker's too. It starts over from 0, as a request
             # with nothing computed does (Antigravity, #59), or ends.
             rid = request.input.request
-            if rid in lost or request.row is None or request.finished() or request.computed == 0:
+            if rid in lost or request.row is None or self._domain(request.row) != domain or request.finished() \
+                    or request.computed == 0:
                 continue
-            if self.ledger.restart(rid):
+            if ledger.restart(rid):
                 request.computed = 0
                 restarted += 1
             else:
@@ -525,6 +584,14 @@ class Scheduler:
         for f in self.flights:  # not given up: on their way to the new worker, which refuses them
             if f not in void and rank not in f.answers:
                 f.refused_by.add(rank)
+        if len(self.domains) > 1:
+            # What the other domains ran of these steps counts: only this rank's answer is given up,
+            # as if its worker had refused them (its domain's requests on them end below).
+            for f in void:
+                f.answers[rank] = Resync(why)
+                f.refused_by.add(rank)
+            void = []
+            self.recheck = True
         if not lost:
             self._note(f"{why}; no request was on it")
             return
@@ -535,7 +602,7 @@ class Scheduler:
         tags = {f.epoch for f in void}
         for f in void:
             self.flights.remove(f)
-            self.ledger.retire(f.epoch, ran=False)
+            ledger.retire(f.epoch, ran=False)
             for rid in self.table.retire(f.epoch, ran=False):
                 self._reap(rid)
         for outbox in self.plans:
@@ -552,96 +619,126 @@ class Scheduler:
 
     def _retire(self, flight: Flight) -> None:
         answers = [flight.answers[r] for r in range(len(self.results))]
+        everywhere = set(range(len(self.domains)))
         if all(isinstance(a, Resync) for a in answers):
-            self.ledger.retire(flight.epoch, ran=False)
+            for ledger in self.ledgers:
+                ledger.retire(flight.epoch, ran=False)
             ready = self.table.retire(flight.epoch, ran=False)
             self.full = True
             for later in self.flights:
-                later.void = True
+                later.void |= everywhere
             self._note(f"step {flight.epoch} not run: {cast(Resync, answers[0]).reason or 'Resync'}")
             for rid in ready:
                 self._reap(rid)
             return
-        refused = {r for r, a in enumerate(answers) if isinstance(a, Resync)}
-        if refused and refused <= flight.refused_by and all(isinstance(a, (Resync, Sampled)) for a in answers):
-            self._ran_on_some(flight, refused)
-            return
-        if flight.void:
-            self.flights.appendleft(flight)
-            self._fail(flight.epoch, None, f"step {flight.epoch} ran after the workers refused the step "
-                                           "before it, without a full delta")
-            return
-        if not all(isinstance(a, Sampled) for a in answers):
-            kinds = {r: type(a).__name__ for r, a in enumerate(answers)}
-            self.flights.appendleft(flight)
-            self._fail(flight.epoch, None, f"ranks disagree whether step {flight.epoch} ran: {kinds}")
-            return
-        sampled = cast(Sampled, answers[0])
-        if any(msgspec.msgpack.encode(a) != msgspec.msgpack.encode(sampled) for a in answers[1:]):
-            self.flights.appendleft(flight)
-            self._fail(flight.epoch, None, f"ranks sampled different tokens in step {flight.epoch}")
-            return
-        kept = self._kept(flight, sampled)
-        if kept is None:
-            self.flights.appendleft(flight)
-            self._fail(flight.epoch, 0, f"step {flight.epoch} sampled rows "
-                                        f"{sorted(int(x) for x in sampled.rows.values())}, not its rows "
-                                        f"{sorted(flight.rows)}")
-            return
-        advanced = self._advanced(flight, kept)
+        # A domain's ranks ran one plan: they sampled the same, or all refused it (it did not run
+        # there), or the new workers of replaced ranks refused it while the others ran it.
+        ran: dict[int, tuple[list[int], list[int], list[int]]] = {}
+        refused_by: set[int] = set()
+        split: set[int] = set()
+        for domain, ranks in enumerate(self.domains):
+            mine = [answers[r] for r in ranks]
+            refused = {r for r in ranks if isinstance(answers[r], Resync)}
+            if len(refused) == len(ranks):
+                continue
+            if refused and refused <= flight.refused_by and all(isinstance(a, (Resync, Sampled)) for a in mine):
+                refused_by |= refused
+                split.add(domain)
+                continue
+            if domain in flight.void:
+                self.flights.appendleft(flight)
+                self._fail(flight.epoch, None, f"step {flight.epoch} ran after the workers refused the step "
+                                               "before it, without a full delta")
+                return
+            if not all(isinstance(a, Sampled) for a in mine):
+                kinds = {r: type(answers[r]).__name__ for r in ranks}
+                self.flights.appendleft(flight)
+                self._fail(flight.epoch, None, f"ranks disagree whether step {flight.epoch} ran: {kinds}")
+                return
+            sampled = cast(Sampled, mine[0])
+            if any(msgspec.msgpack.encode(a) != msgspec.msgpack.encode(sampled) for a in mine[1:]):
+                self.flights.appendleft(flight)
+                self._fail(flight.epoch, None, f"ranks sampled different tokens in step {flight.epoch}")
+                return
+            kept = self._kept(flight, domain, sampled)
+            if kept is None:
+                base = domain * self.settings.max_batch
+                self.flights.appendleft(flight)
+                self._fail(flight.epoch, ranks[0], f"step {flight.epoch} sampled rows "
+                                                   f"{sorted(int(x) + base for x in sampled.rows.values())}, not its rows "
+                                                   f"{sorted(row for row in flight.rows if self._domain(row) == domain)}")
+                return
+            ran[domain] = kept
+        merged = Sampled(Column.of("i32", [row for rows, _, _ in ran.values() for row in rows]),
+                         Column.of("i32", [n for _, counts, _ in ran.values() for n in counts]),
+                         Column.of("i64", [t for _, _, tokens in ran.values() for t in tokens]))
+        advanced = self._advanced(flight, merged, ran)
         if advanced is None:
             self.flights.appendleft(flight)
             self._fail(flight.epoch, 0, f"step {flight.epoch} accepted more than its {self.settings.draft_tokens} "
                                         "draft tokens in a row, or none")
             return
-        events = self.table.sample(flight.epoch, self.identity(), kept)
-        self.ledger.retire(flight.epoch, advanced={flight.rows[row]: n for row, n in advanced.items()})
-        ready = self.table.retire(flight.epoch, advanced=advanced)
+        stayed = everywhere - set(ran)
+        events = self.table.sample(flight.epoch, self.identity(), merged) if ran else None
+        for domain, ledger in enumerate(self.ledgers):
+            if domain in ran:
+                ledger.retire(flight.epoch, advanced={flight.rows[row]: n for row, n in advanced.items()
+                                                      if self._domain(row) == domain})
+            else:
+                ledger.retire(flight.epoch, ran=False)
+        # A row of a domain that did not run the step computed nothing.
+        ready = self.table.retire(flight.epoch, advanced={
+            **advanced, **{row: 0 for row in flight.rows if self._domain(row) in stayed}})
+        if stayed:
+            self._stayed(flight, stayed, split, refused_by)
         for row in flight.prefills:  # checkpoint_kv_cache
             request = self.table.get(flight.rows[row])
-            if request is not None and not request.finished():
-                self.ledger.commit(request.input.request, request.prompt_tokens)
-        self._emit(events, flight.epoch)
+            if self._domain(row) in ran and request is not None and not request.finished():
+                self._ledger(request).commit(request.input.request, request.prompt_tokens)
+        if events is not None:
+            self._emit(events, flight.epoch)
         for rid in ready:
             self._reap(rid)
 
-    def _ran_on_some(self, flight: Flight, refused: set[int]) -> None:
-        """A replaced rank's new worker refused ``flight`` and the others ran it. It counts as not
-        run. A request with nothing computed starts over from position 0 on every rank, and
-        starting from 0 clears its state first. A request further on now has a different state on
-        different ranks: it ends."""
-        self.ledger.retire(flight.epoch, ran=False)
-        ready = self.table.retire(flight.epoch, ran=False)
-        for rid in flight.rows.values():
+    def _stayed(self, flight: Flight, stayed: set[int], split: set[int], refused: set[int]) -> None:
+        """The domains ``stayed`` did not run ``flight`` (the others did): their requests are where
+        they were, and they get a full delta. In a domain of ``split`` a replaced rank's new worker
+        refused it and the domain's other ranks ran it: a request with nothing computed starts over
+        from position 0 on every rank, and starting from 0 clears its state first; a request further
+        on now has a different state on different ranks: it ends."""
+        for row, rid in flight.rows.items():
             request = self.table.get(rid)
-            if request is not None and not request.finished() and request.computed > 0:
+            if self._domain(row) in split and request is not None and not request.finished() and request.computed > 0:
                 self._error(request, f"rank(s) {sorted(refused)} were replaced and refused step {flight.epoch}, "
                                      "which the others ran: the request's state differs between ranks")
         self.full = True
         for later in self.flights:
-            later.void = True
-        self._note(f"step {flight.epoch} not run: refused by the new worker(s) of rank(s) {sorted(refused)}")
-        for rid in ready:
-            self._reap(rid)
+            later.void |= stayed
+        if len(self.domains) == 1:
+            self._note(f"step {flight.epoch} not run: refused by the new worker(s) of rank(s) {sorted(refused)}")
+        else:
+            self._note(f"step {flight.epoch} not run by domain(s) {sorted(stayed)}: their workers refused it")
 
-    def _advanced(self, flight: Flight, kept: Sampled) -> dict[int, int] | None:
-        """Row -> tokens each speculative decode row accepted: its count, 1 to ``draft_tokens``.
-        ``None``: a count out of that range."""
+    def _advanced(self, flight: Flight, kept: Sampled, ran: Iterable[int]) -> dict[int, int] | None:
+        """Row -> tokens each speculative decode row of the domains ``ran`` accepted: its count, 1 to
+        ``draft_tokens``. ``None``: a count out of that range."""
         counts = dict(zip((int(x) for x in kept.rows.values()), (int(x) for x in kept.counts.values()), strict=True))
-        out = {row: counts.get(row, 0) for row in flight.speculative}
+        domains = set(ran)
+        out = {row: counts.get(row, 0) for row in flight.speculative if self._domain(row) in domains}
         if any(not 1 <= n <= self.settings.draft_tokens for n in out.values()):
             return None
         return out
 
-    @staticmethod
-    def _kept(flight: Flight, sampled: Sampled) -> Sampled | None:
-        """The tokens of the rows that sample: every row of the plan answers, and a row whose
-        chunk did not end its prompt has its token dropped (``Sampled``). ``None``: the rows are
-        not the plan's."""
-        rows = [int(x) for x in sampled.rows.values()]
+    def _kept(self, flight: Flight, domain: int, sampled: Sampled) -> tuple[list[int], list[int], list[int]] | None:
+        """What a domain sampled, as rows, counts and tokens, the rows as the scheduler numbers them:
+        the tokens of the rows that sample. Every row of the plan answers, and a row whose chunk did
+        not end its prompt has its token dropped (``Sampled``). ``None``: the rows are not the plan's."""
+        base = domain * self.settings.max_batch
+        rows = [int(x) + base for x in sampled.rows.values()]
         counts = [int(x) for x in sampled.counts.values()]
         tokens = [int(x) for x in sampled.tokens.values()]
-        if sorted(rows) != sorted(flight.rows) or len(counts) != len(rows) or sum(counts) != len(tokens):
+        planned = sorted(row for row in flight.rows if self._domain(row) == domain)
+        if sorted(rows) != planned or len(counts) != len(rows) or sum(counts) != len(tokens):
             return None
         keep_rows: list[int] = []
         keep_counts: list[int] = []
@@ -653,7 +750,7 @@ class Scheduler:
                 keep_counts.append(count)
                 keep_tokens.extend(tokens[offset:offset + count])
             offset += count
-        return Sampled(Column.of("i32", keep_rows), Column.of("i32", keep_counts), Column.of("i64", keep_tokens))
+        return keep_rows, keep_counts, keep_tokens
 
     def _check_timeout(self) -> None:
         if self.fault is not None or not self.flights:
@@ -668,14 +765,15 @@ class Scheduler:
         """A ledger without capacity while requests hold rows was rebuilt under them (a change
         reloaded ``core.state.alloc``): what they hold is unknown, and admitting anything would
         give their items away again. Until changes refuse that (stage 2's step 5), say so."""
-        if self.ledger.ready or self.fault is not None:
+        if self._ready or self.fault is not None:
             return
         held = sum(1 for r in self.table.entries() if r.row is not None)
         if held:
             self._fail(self.table.last_submitted, None, f"the ledger has no capacity while {held} request(s) hold "
                                                         "rows: it was rebuilt under them")
         elif len(self.capacity) == len(self.results):
-            self._capacity(0, self.capacity[0])  # nothing held: what the workers said still holds
+            for ranks in self.domains:  # nothing held: what the workers said still holds
+                self._capacity(ranks[0], self.capacity[ranks[0]])
 
     def _fail(self, step: int, rank: int | None, reason: str) -> None:
         if self.fault is not None:
@@ -752,7 +850,7 @@ class Scheduler:
             if not added.ok:
                 self._refuse(route, new.request, "; ".join(d.reason for d in added.diagnostics))
                 continue
-            if self.ledger.ready and (why := self._too_long(self._extent(len(new.prompt), new.max_tokens))):
+            if self._ready and (why := self._too_long(self._extent(len(new.prompt), new.max_tokens))):
                 self._error(added.value, why)
         for abort in requests.abort:
             request = self.table.get(abort.request)
@@ -771,7 +869,7 @@ class Scheduler:
     def _too_long(self, extent: int) -> str:
         """Why a request of ``extent`` tokens (``_extent``) can never run, or ``""``."""
         what = "prompt plus max_tokens" + (" plus the speculation window" if self.settings.draft_tokens else "")
-        if not self.ledger.fits(extent):
+        if not any(ledger.fits(extent) for ledger in self.ledgers):
             return f"{extent} tokens ({what}) need more state than the engine has"
         if self.settings.max_context and extent > self.settings.max_context:
             return f"{extent} tokens ({what}); a row of the workers holds {self.settings.max_context}"
@@ -847,10 +945,13 @@ class Scheduler:
         if request is None or not request.reclaimable:
             return
         computed = [*request.prompt_tokens, *request.output_ids][:request.computed]
-        self.ledger.release(rid, self.table.last_retired, computed)
+        # A request without a row holds nothing; every ledger forgets what it matched of it.
+        for ledger in (self.ledgers if request.row is None else [self._ledger(request)]):
+            ledger.release(rid, self.table.last_retired, computed)
         if request.row is not None:
             self.removed.append(request.row)
         self.home.pop(rid, None)
+        self.turned_away.pop(rid, None)
         self.table.reap(rid)
 
     # ------------------------------------------------------------------ planning
@@ -874,12 +975,13 @@ class Scheduler:
                 flight = flights.get(epoch)
                 if flight is not None:
                     flight.written[rank] = gen
-                    for rid in flight.rows.values():
-                        self.home.setdefault(rid, {}).setdefault(rank, gen)
+                    for row, rid in flight.rows.items():
+                        if self._domain(row) == self._of(rank):
+                            self.home.setdefault(rid, {}).setdefault(rank, gen)
         self._flush_routes()
 
     def _plan(self) -> bool:
-        if self.fault is not None or self.settings.asleep or not self.ledger.ready or \
+        if self.fault is not None or self.settings.asleep or not self._ready or \
                 len(self.flights) >= max(1, self.depth()):
             return False
         if self.capacity_wanted:
@@ -910,40 +1012,63 @@ class Scheduler:
         return tokens, samples
 
     def _view(self, tokens: Mapping[int, int], samples: Mapping[int, int]
-              ) -> tuple[dict[int, tuple[Kind, Request, int]], list[Candidate], list[Candidate], list[Candidate], int]:
+              ) -> tuple[dict[int, tuple[Kind, Request, int]], list[_View]]:
+        """What can run, and each domain's view of it."""
         kinds: dict[int, tuple[Kind, Request, int]] = {}
-        waiting: list[Candidate] = []
-        prefilling: list[Candidate] = []
-        decoding: list[Candidate] = []
-        used: set[int] = set()
+        views = [_View() for _ in self.domains]
         for request in self.table.entries():
             if request.row is not None:
-                used.add(request.row)
-        room = len(used) < self.settings.max_batch  # a waiting request can be admitted: where it starts
+                views[self._domain(request.row)].free_rows -= 1
+        for view in views:
+            view.free_rows += self.settings.max_batch
+        room = [view.free_rows for view in views]  # where a waiting request can be admitted: where it starts
         for arrival, request in enumerate(self.table.entries()):
             if request.finished():
                 continue
             rid = request.input.request
             prompt = len(request.prompt_tokens)
             if request.row is not None:
+                view = views[self._domain(request.row)]
                 planned = request.computed + tokens.get(rid, 0)
             else:
-                planned = self.ledger.match(rid, request.prompt_tokens) if room else 0
+                domain, planned = self._route(request, views, room)
+                view = views[domain]
             output = len(request.output_ids) + samples.get(rid, 0)
             c = Candidate(rid, arrival, prompt, min(planned, prompt), output, request.input.max_tokens)
             if request.row is None:
                 kind: Kind = "waiting"
-                waiting.append(c)
+                view.waiting.append(c)
             elif planned < prompt:
                 kind = "prefilling"
-                prefilling.append(c)
+                view.prefilling.append(c)
             elif output < request.input.max_tokens:
                 kind = "decoding"
-                decoding.append(c)
+                view.decoding.append(c)
             else:
                 continue  # its last token is being sampled
             kinds[rid] = kind, request, planned
-        return kinds, waiting, prefilling, decoding, max(0, self.settings.max_batch - len(used))
+        for view in views:
+            view.free_rows = max(0, view.free_rows)
+        return kinds, views
+
+    def _route(self, request: Request, views: Sequence[_View], room: list[int]) -> tuple[int, int]:
+        """The domain a waiting request would be admitted to, and how much of its prompt that
+        domain's prefix cache holds. Of the domains with a free row whose ledger can hold it at all:
+        not the one that just had no room for it, if there is another; then the one whose cache
+        holds most of its prompt; of equals, the one with most room left after the requests routed
+        before it. Without such a domain it waits where fewest wait, and starts at 0."""
+        rid, prompt = request.input.request, request.prompt_tokens
+        extent = self._extent(len(prompt), request.input.max_tokens)
+        open_ = [d for d, view in enumerate(views) if view.free_rows > 0 and
+                 (len(views) == 1 or self.ledgers[d].fits(extent))]
+        if not open_:
+            domain = max(range(len(room)), key=lambda d: (room[d], -d))
+            room[domain] -= 1
+            return domain, 0
+        matches = {d: self.ledgers[d].match(rid, prompt) for d in open_}
+        domain = max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], room[d], -d))
+        room[domain] -= 1
+        return domain, matches[domain]
 
     def _decide(self, waiting: list[Candidate], prefilling: list[Candidate], decoding: list[Candidate],
                 free_rows: int) -> list[Take]:
@@ -979,38 +1104,45 @@ class Scheduler:
 
     def _plan_step(self) -> bool:
         tokens, samples = self._in_flight()
-        kinds, waiting, prefilling, decoding, free_rows = self._view(tokens, samples)
+        kinds, views = self._view(tokens, samples)
         if not kinds:
             return False
         epoch = max(self.table.last_submitted, 0) + 1
         used = {r.row for r in self.table.entries() if r.row is not None}
-        free = [row for row in range(self.settings.max_batch) if row not in used]
-        takes = self._decide(waiting, prefilling, decoding, free_rows)
-        if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
-            # No mixed step with speculation (SGLang disables mixed chunks): the prompts go first.
-            takes = [t for t in takes if kinds[t.request][0] != "decoding"]
-        step = _Step(epoch)
+        batch = self.settings.max_batch
+        steps = [_Step(epoch, domain * batch) for domain in range(len(self.domains))]
         try:
-            refused = self._carry_out(step, takes, kinds, tokens, free)
-            if not step.rows and refused:
-                takes = self._decide([], prefilling, decoding, free_rows)
-                self._carry_out(step, takes, kinds, tokens, free)
-            if not step.rows:
+            for step, view in zip(steps, views, strict=True):
+                if not (view.waiting or view.prefilling or view.decoding):
+                    continue
+                free = [row for row in range(step.base, step.base + batch) if row not in used]
+                takes = self._decide(view.waiting, view.prefilling, view.decoding, view.free_rows)
+                if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
+                    # No mixed step with speculation (SGLang disables mixed chunks): the prompts go first.
+                    takes = [t for t in takes if kinds[t.request][0] != "decoding"]
+                refused = self._carry_out(step, takes, kinds, tokens, free)
+                if not step.rows and refused:
+                    takes = self._decide([], view.prefilling, view.decoding, view.free_rows)
+                    self._carry_out(step, takes, kinds, tokens, free)
+            if not any(step.rows for step in steps):
                 return False
-            self._send_plan(step)
+            self._send_plan(steps)
         except BaseException:  # nothing of this step went out: give back what it took
-            for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
-                self.ledger.cancel(rid, epoch)
-            for request in step.admitted:
-                request.row = None
-                request.computed = 0
+            for step in steps:
+                ledger = self.ledgers[step.base // batch]
+                for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
+                    ledger.cancel(rid, epoch)
+                for request in step.admitted:
+                    request.row = None
+                    request.computed = 0
             raise
         return True
 
     def _carry_out(self, step: _Step, takes: list[Take], kinds: Mapping[int, tuple[Kind, Request, int]],
                    in_flight: Mapping[int, int], free: list[int]) -> bool:
-        """Admit and reserve for each take, in order; after the first waiting request that does
-        not fit, no later waiting request is admitted. Returns whether one did not fit."""
+        """Admit and reserve for each take of one domain, in order; after the first waiting request
+        that does not fit, no later waiting request is admitted. Returns whether one did not fit."""
+        ledger = self.ledgers[step.base // self.settings.max_batch]
         refused = False
         for take in takes:
             kind, request, planned = kinds[take.request]
@@ -1025,12 +1157,14 @@ class Scheduler:
                 # Where it would start now (an admission before it in this step may have evicted
                 # part of its prefix): a chunk that reaches no page does not run, and admitting it
                 # would only evict from the cache (Antigravity, #59; PrefillAdder checks first too).
-                if self._chunk(request, self.ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
+                if self._chunk(request, ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
                     continue
-                got = self.ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
+                got = ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
                 if got is None:
                     refused = True
+                    self.turned_away[rid] = step.base // self.settings.max_batch
                     continue
+                self.turned_away.pop(rid, None)
                 request.row = free.pop(0)
                 request.computed = planned = got.prefix  # the cached prefix is computed
                 step.admitted.append(request)
@@ -1043,12 +1177,12 @@ class Scheduler:
                 self._chunk(request, planned, take.tokens)
             if n <= 0:
                 if kind == "waiting":
-                    self.ledger.cancel(rid, step.epoch)
+                    ledger.cancel(rid, step.epoch)
                     step.unadmit(request, free)
                 continue
             # Speculative: planned counts the steps in flight at D tokens each, the most they go, so
             # this reserves the window of the furthest this one can start at (2 x D with overlap).
-            extra = self.ledger.reserve(rid, planned + n, step.epoch, speculative=speculative)
+            extra = ledger.reserve(rid, planned + n, step.epoch, speculative=speculative)
             if extra is None:  # what step.epoch took for it is back in the ledger
                 if kind == "waiting":
                     step.unadmit(request, free)
@@ -1091,46 +1225,76 @@ class Scheduler:
         left = len(request.prompt_tokens) - planned
         n = min(tokens, left)
         if n < left:
-            n = (planned + n) // self.ledger.align * self.ledger.align - planned
+            align = self.ledgers[0].align
+            n = (planned + n) // align * align - planned
         return n
 
-    def _send_plan(self, step: _Step) -> None:
+    def _send_plan(self, steps: Sequence[_Step]) -> None:
+        """One step: each domain's part to its ranks, an empty one to a domain with nothing to run."""
+        epoch = steps[0].epoch
         if self.full:
-            step.added = []
-            step.assign = {}
+            for step in steps:
+                step.added, step.assign = [], {}
             for request in self.table.entries():
                 if request.row is not None and not request.finished():
+                    step = steps[self._domain(request.row)]
                     step.added.append(AddedRow(request.row, request.input.request, request.input.sampling))
-                    step.assign_all(request.row, self.ledger.items(request.input.request))
+                    step.assign_all(request.row, self._ledger(request).items(request.input.request))
+        records = [self._record(step) for step in steps]
+        rows = {row: rid for step in steps for row, rid in step.rows.items()}
+        counts = {row: n for step in steps for row, n in step.counts.items()}
+        self.table.start_step(epoch, rows, counts)
+        now = self.clock()
+        for ranks, record in zip(self.domains, records, strict=True):
+            for rank in ranks:
+                self.plans[rank].put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)),
+                                     now, epoch)
+        self.flights.append(Flight(epoch, rows, counts, frozenset(row for step in steps for row in step.samples), now,
+                                   frozenset(row for step in steps for row in step.prefill_rows),
+                                   frozenset(row for step in steps for row in step.speculative)))
+        self.full = False
+        self.removed.clear()
+
+    def _record(self, step: _Step) -> OpenRecord:
+        """A domain's part of a step, its rows as its ranks number them."""
+        base = step.base
         phase: Literal["prefill", "decode", "mixed"] = (
             "decode" if not step.prefills else "prefill" if not step.decodes else "mixed")
         counts = [1 if row in step.speculative else n for row, n in step.counts.items()]
-        batch = BatchPlan(Column.of("i32", step.rows), Column.of("i32", counts),
+        batch = BatchPlan(Column.of("i32", [row - base for row in step.rows]), Column.of("i32", counts),
                           Column.of("i32", step.positions), Column.of("i64", step.tokens),
                           Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens,
                           Column.of("i64", step.next_tokens if self.settings.draft_tokens else []))
-        state = StateOps([StateAssign(kind, Column.of("i32", per_row), *ragged("i32", per_row.values()))
-                          for kind, per_row in step.assign.items()],
+        state = StateOps([StateAssign(kind, Column.of("i32", [row - base for row in per_row]),
+                                      *ragged("i32", per_row.values())) for kind, per_row in step.assign.items()],
                          [StateCopy(kind, "before", Column.of("i32", [c[1] for c in cs]),
                                     Column.of("i32", [c[2] for c in cs])) for kind, cs in step.copies.items()],
-                         [StateTrack(kind, Column.of("i32", [t[0] for t in ts]), Column.of("i32", [t[1] for t in ts]),
+                         [StateTrack(kind, Column.of("i32", [t[0] - base for t in ts]), Column.of("i32", [t[1] for t in ts]),
                                      Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()])
-        delta = RowDelta(step.added, Column.of("i32", [] if self.full else self.removed), self.full)
-        record = (RecordBuilder(STEP_PLAN, step.epoch).add(RowDelta.SECTION, delta)
-                  .add(BatchPlan.SECTION, batch).add(StateOps.SECTION, state).build())
-        self.table.start_step(step.epoch, step.rows, step.counts)
-        now = self.clock()
-        for rank, outbox in enumerate(self.plans):
-            outbox.put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)), now, step.epoch)
-        self.flights.append(Flight(step.epoch, dict(step.rows), dict(step.counts), frozenset(step.samples), now,
-                                   frozenset(step.prefill_rows), frozenset(step.speculative)))
-        self.full = False
-        self.removed.clear()
+        removed = [] if self.full else [row - base for row in self.removed
+                                        if base <= row < base + self.settings.max_batch]
+        delta = RowDelta([AddedRow(a.row - base, a.request, a.sampling) for a in step.added],
+                         Column.of("i32", removed), self.full)
+        return (RecordBuilder(STEP_PLAN, step.epoch).add(RowDelta.SECTION, delta)
+                .add(BatchPlan.SECTION, batch).add(StateOps.SECTION, state).build())
+
+
+@dataclass
+class _View:
+    """One domain's part of what can run (``StepView``)."""
+
+    waiting: list[Candidate] = field(default_factory=list[Candidate])
+    prefilling: list[Candidate] = field(default_factory=list[Candidate])
+    decoding: list[Candidate] = field(default_factory=list[Candidate])
+    free_rows: int = 0
 
 
 @dataclass
 class _Step:
+    """One domain's part of a step; rows as the scheduler numbers them (``base`` onwards)."""
+
     epoch: int
+    base: int = 0
     rows: dict[int, int] = field(default_factory=dict[int, int])
     counts: dict[int, int] = field(default_factory=dict[int, int])
     positions: list[int] = field(default_factory=list[int])

@@ -317,7 +317,8 @@ def test_a_named_backend_that_cannot_run_here_fails_the_start(model: tuple[dict[
 def test_a_captured_step_runs_the_named_backend_s_kernels_or_is_not_recorded(worker: DSWorker) -> None:
     """A step replayed from a graph takes no other backend's kernel in the named one's place, whatever
     else a graph could record. The references bring the routed experts' fixed-shape form under
-    their own name; a backend whose kernels a graph cannot record has no solution there (``""``:
+    their own name (in the MoE's composition); a backend whose kernels a graph cannot record has no
+    solution there (``""``:
     ``core.plan`` records no graph and says which kernels are why)."""
     catalog, layers = worker.service("kernels.catalog@1"), worker.service("layers.ds1017@1")
     declared = worker.service("model@1").assembly.states
@@ -328,10 +329,11 @@ def test_a_captured_step_runs_the_named_backend_s_kernels_or_is_not_recorded(wor
             catalog.register(Implementation(Solution(f"{backend}.{name}", name, "tests:kernel", capturable=capturable),
                                             catalog.resolve(f"reference.{name}")))
     graph = layers.resolve(declared)[GRAPH]
-    assert graph.pop("backend") == "reference" and graph["ds.moe_experts@1"] == "reference.fixed.ds.moe_experts@1"
+    assert graph.pop("backend") == "reference" and graph["ds.moe@1"] == "reference.fixed.ds.moe@1"
     assert all(solution.startswith("reference.") for solution in graph.values()), graph
     config = {"dsv4.backend": "eager", "dsv4.prefill_backend": "", "dsv4.decode_backend": ""}
-    eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64).resolve(declared)
+    eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64, layers.group,
+                   layers.placement).resolve(declared)
     assert all(solution == f"eager.{name}" for phase in ("prefill", "decode")
                for name, solution in eager[phase].items() if name != "backend"), eager
     assert {solution for name, solution in eager[GRAPH].items() if name != "backend"} == {""}, eager[GRAPH]

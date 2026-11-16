@@ -37,3 +37,27 @@ def test_chat_and_completion_encode_and_decode_whole_words(tmp_path: Path) -> No
     assert tok.tokenizer.convert_ids_to_tokens(ids) == ["<|im_start|>", "user", "w1", "w2", "<|im_end|>",
                                                         "<|im_start|>", "assistant"]
     assert tok.decode(tok.encode("w3 w4 w5")) == "w3 w4 w5"
+
+
+def test_a_template_file_its_arguments_and_a_bos_the_tokenizer_does_not_add(tmp_path: Path) -> None:
+    """DS 1017's checkpoint: the chat template in ``chat_template.jinja`` beside the tokenizer, the
+    template's own arguments from the config, and a plain prompt started with BOS (its tokenizer
+    config says not to add one; the chat template writes its own)."""
+    directory = save_tokenizer(tmp_path / "tok", 64)
+    settings = json.loads((directory / "tokenizer_config.json").read_text())
+    settings.pop("chat_template", None)
+    settings["bos_token"] = "<|im_start|>"
+    (directory / "tokenizer_config.json").write_text(json.dumps(settings))
+    for name in ("chat_template.jinja", "chat_template.json"):  # however this transformers saved it
+        (directory / name).unlink(missing_ok=True)
+    (directory / "chat_template.jinja").write_text(
+        "<|im_start|> {% for m in messages %}{{ m['content'] }} {% endfor %}"
+        "{% if mode is defined and mode == 'short' %}w1{% else %}w2{% endif %}")
+    plain = HFTokenizer(str(directory))
+    bos = plain.tokenizer.bos_token_id
+    assert plain.encode("w3 w4")[0] != bos  # the tokenizer itself adds none
+    tok = HFTokenizer(str(directory), add_bos=True, template_kwargs={"mode": "short"})
+    assert tok.encode("w3 w4") == [bos, *plain.encode("w3 w4")]
+    chat = tok.chat([Message("user", "w5")])
+    assert chat == [bos, *plain.encode("w5 w1")]  # the template's BOS, not a second one
+    assert HFTokenizer(str(directory), add_bos=True).chat([Message("user", "w5")]) == [bos, *plain.encode("w5 w2")]

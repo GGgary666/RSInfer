@@ -310,3 +310,342 @@ def test_deepinfers_decode_operators_replay_from_a_graph_on_new_inputs(case: str
         problem = f"{type(e).__name__}: {str(e)[:300]}"
     print(f"{case}: {'replays from a graph' if not problem else 'NOT CAPTURABLE: ' + problem}")
     assert not problem
+
+
+def fused_case(tokens: int, seed: int = 0) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """A sublayer step before the MoE and that MoE, at the released model's shapes: the step's
+    arguments (without ``stage``) and the MoE's after its input, the weights in the checkpoint's row
+    order."""
+    g = torch.Generator().manual_seed(77 + seed)
+    f32 = torch.float32
+    mix = (2 + HC) * HC
+    step = (rand(g, tokens, DIM), rand(g, tokens, HC, DIM), torch.rand(tokens, HC, generator=g).cuda(),
+            torch.rand(tokens, HC, generator=g).cuda(), torch.rand(tokens, HC, HC, generator=g).cuda(),
+            rand(g, mix, HC * DIM, scale=1 / 64, dtype=f32), 1 + rand(g, 3, scale=0.2, dtype=f32),
+            rand(g, mix, scale=0.5, dtype=f32), 1 + rand(g, DIM, scale=0.1), 1e-6, 20, 1e-6)
+    gate = rand(g, EXPERTS, DIM, scale=1 / 16)
+    shared: list[torch.Tensor] = []
+    for n, k in ((2 * INTER, DIM), (DIM, INTER)):
+        data, scale = formats.quantize_fp8(torch.randn(n, k, generator=g).cuda() * k ** -0.5)
+        shared += [data, scale, formats.pack_scales(formats.block_rows(scale, n))]
+    return step, (gate.float(), rand(g, EXPERTS, scale=0.1, dtype=f32), gate, *experts(g), *shared, TOPK, 2.5, 10.0)
+
+
+def mega_weights(moe: tuple[Any, ...]) -> tuple[Any, ...]:
+    """The MoE's arguments with the expert stacks and the shared expert's weights in the fused kernel's row order."""
+    gate, bias, gate16, w13, p13, w2, p2, sw13, ss13, sp13, sw2, ss2, sp2, *rest = moe
+    w13, p13, w2, p2, sw13, sp13, sp2 = (t.clone() for t in (w13, p13, w2, p2, sw13, sp13, sp2))
+    formats.expert_layout(w13, p13, w2, p2, mega=True)
+    formats.shared_layout(sw13, sp13, sp2, mega=True)
+    return (gate, bias, gate16, w13, p13, w2, p2, sw13, ss13, sp13, sw2, ss2, sp2, *rest)
+
+
+@pytest.mark.timeout(1800)
+def test_the_fused_sublayer_step_and_moe_compute_what_the_unfused_kernels_compute() -> None:
+    """``ds.hc_step@1`` and ``ds.moe@1`` of this backend (``mega``: ``deep_gemm.mega_mhc``,
+    ``bf16_mega_gate``, ``fp8_fp4_mega_moe`` with the shared expert, for a group of one rank) against
+    the same from DeepInfer's unfused kernels (``ops.hc_step``, ``ops.moe``): the step writes the MoE's
+    FP8 input into the MoE buffer, the gate its choice, and the MoE kernel reads both. The fused gate's
+    product is bf16, so a token whose experts are nearly tied may choose others: compared are the
+    tokens that chose the same. Also: the tokens each slot took, a step without tokens, and the pair
+    recorded in a graph and replayed on other values."""
+    from kernels.deepinfer.mega import Mega
+    from worker.comm.unit import Group
+
+    group = Group()
+    step, moe = fused_case(TOKENS)
+    stage = (group, EXPERTS, TOPK, INTER)
+    unfused_step: Any = ops.hc_step  # the arguments are built as tuples: called as they are
+    unfused_moe: Any = ops.moe
+    want_y, want_stream, want_pre, want_post, want_comb = unfused_step(*step)
+    want = unfused_moe(group, want_y, *moe)
+    chosen = ops.moe_gate(want_y, moe[0], moe[1], TOPK, 2.5)[1].sort(dim=-1).values
+    fused = mega_weights(moe)
+    mega = Mega(256)
+    fused_step: Any = mega.hc_step
+    fused_moe: Any = mega.moe
+    try:
+        taken = torch.zeros(EXPERTS, dtype=torch.int32, device="cuda")
+        y, stream, pre, post, comb = fused_step(*step, stage)
+        out = fused_moe(group, y, *fused, None, None, taken)
+        torch.cuda.synchronize()
+        symm = mega.symm(group, EXPERTS, TOPK, DIM, INTER)
+        same = (symm.topk_idx[:TOKENS].sort(dim=-1).values == chosen).all(dim=-1)
+        for name, a, b in (("input", y, want_y), ("stream", stream, want_stream), ("pre", pre, want_pre),
+                           ("post", post, want_post), ("comb", comb, want_comb), ("moe", out[same], want[same])):
+            apart = float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-12))
+            print(f"fused {name}: farthest {apart:.5f} of the largest value")
+            assert a.shape == b.shape and apart < (0.1 if name == "moe" else 0.03), (name, apart)
+        print(f"fused gate: {int(same.sum())} of {TOKENS} tokens chose the same experts; counted {int(taken.sum())}")
+        assert int(same.sum()) >= TOKENS * 0.9 and int(taken.sum()) == TOKENS * TOPK
+        assert torch.equal(taken.long(), torch.bincount(symm.topk_idx[:TOKENS].flatten(), minlength=EXPERTS))
+        assert fused_moe(group, y[:0], *fused).shape == (0, DIM)  # a rank without tokens launches the kernel too
+        # Recorded and replayed on other inputs.
+        held, _ = fused_case(4)
+        fresh, _ = fused_case(4, seed=1)
+        graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        # The fused kernels keep a small buffer per stream, made at their first launch on it: not
+        # inside a capture. The engine's recorder warms a step up on its capture stream too.
+        with torch.cuda.stream(stream_):
+            fused_moe(group, fused_step(*held, stage)[0], *fused)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=stream_):
+            recorded = fused_moe(group, fused_step(*held, stage)[0], *fused)
+        expect = fused_moe(group, fused_step(*fresh, stage)[0], *fused)
+        for kept, new in zip(held, fresh, strict=True):
+            if isinstance(kept, torch.Tensor):
+                kept.copy_(new)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(recorded, expect), float((recorded.float() - expect.float()).abs().max())
+        # Hot-applying eplb.extra_experts changes slot count on the same Mega instance: SymmBuffer rebuilds cleanly.
+        rebuilt = mega.symm(group, EXPERTS + 8, TOPK, DIM, INTER)
+        assert mega.made_for == (1, EXPERTS + 8, TOPK, DIM, INTER) and rebuilt is mega.buffer
+    finally:
+        mega.close()
+
+
+def _fp8_weight(g: torch.Generator, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    data, scale = formats.quantize_fp8(torch.randn(n, k, generator=g).cuda() * k ** -0.5)
+    return data, scale, formats.pack_scales(formats.block_rows(scale, n))
+
+
+def fused_attn_case(tokens: int, seed: int = 0) -> dict[str, Any]:
+    """Arguments for ``hc_step(..., 'attn')`` + ``attn_qkv`` + ``{cache,sparse}_attn_out`` at released shapes."""
+    g = torch.Generator().manual_seed(177 + seed)
+    q_lora, o_groups, o_lora, rotary, index_heads, index_dim = 1536, 8, 1024, 64, 32, 128
+    step, _ = fused_case(tokens, seed=10 + seed)
+    freqs = formats.rope_table(rotary, 4096, 0, 10000.0, 1.0, 32, 1, torch.device("cuda"))
+    cos_sin = torch.cat([freqs.real, freqs.imag], dim=-1).contiguous()
+    pos = torch.randint(0, 2048, (tokens,), generator=g).cuda()
+    window = formats.pack_kv(rand(g, 8 * 128, HEAD_DIM, scale=0.3)).view(8, 128, -1)
+    latents = formats.pack_latent(rand(g, 900, HEAD_DIM, scale=0.3)).view(60, 15, -1)
+    held = torch.randint(1, 129, (tokens,), generator=g)
+    at = torch.arange(128) - 128 + held[:, None]
+    window_idx = torch.where(at >= 0, (torch.arange(tokens) % 8)[:, None] * 128 + at, -1).cuda()
+    latent_idx = torch.stack([torch.randperm(900, generator=g)[:470] for _ in range(tokens)])
+    latent_idx[torch.arange(470) >= torch.randint(0, 471, (tokens, 1), generator=g)] = -1
+    sparse_src = rand(g, 900, HEAD_DIM, scale=0.3)
+    sparse_idx = torch.stack([torch.randperm(900, generator=g)[:598] for _ in range(tokens)])
+    sparse_idx[torch.rand(tokens, 598, generator=g) < 0.2] = -1
+    sparse_idx[0, 5:] = -1
+    return {
+        "step": step,
+        "wq_a": _fp8_weight(g, q_lora, DIM),
+        "wkv": _fp8_weight(g, HEAD_DIM, DIM),
+        "q_norm": 1 + rand(g, q_lora, scale=0.1),
+        "wq_b": _fp8_weight(g, HEADS * HEAD_DIM, q_lora),
+        "iwq_b": _fp8_weight(g, index_heads * index_dim, q_lora),
+        "wo_a": rand(g, o_groups * o_lora, HEADS * HEAD_DIM // o_groups, scale=(HEADS * HEAD_DIM // o_groups) ** -0.5),
+        "wo_b": _fp8_weight(g, DIM, o_groups * o_lora),
+        "sink": rand(g, HEADS, dtype=F32),
+        "cos_sin": cos_sin,
+        "pos": pos,
+        "rotary": rotary,
+        "o_groups": o_groups,
+        "window": window,
+        "window_idx": window_idx,
+        "latents": latents,
+        "latent_idx": latent_idx.cuda(),
+        "sparse_src": sparse_src,
+        "sparse_idx": sparse_idx.cuda(),
+    }
+
+
+@pytest.mark.timeout(1800)
+def test_the_fused_attention_computes_what_the_unfused_kernels_compute() -> None:
+    """``Mega.hc_step(..., 'attn')`` + ``Mega.attn_qkv`` + ``Mega.{cache,sparse}_attn_out`` against
+    ``ops.*`` at the released model's shapes: decode (with and without latents), prefill sparse
+    attention, 0-token idle step, in-place weight refit invalidating ``_cached``, and CUDA graph replay."""
+    from kernels.deepinfer.mega import Mega
+
+    c = fused_attn_case(TOKENS)
+    mega = Mega(256)
+    scale = HEAD_DIM ** -0.5
+    unfused_step: Any = ops.hc_step
+    unfused_qkv: Any = ops.attn_qkv
+    fused_step: Any = mega.hc_step
+    fused_qkv: Any = mega.attn_qkv
+    try:
+        uy = unfused_step(*c["step"])[0]
+        uq, ukv, uiq = unfused_qkv(uy, *c["wq_a"], *c["wkv"], c["q_norm"], 1e-6, *c["wq_b"], *c["iwq_b"], HEADS, HEAD_DIM)
+        want_decode = ops.cache_attn_out(uq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                         c["latents"], c["latent_idx"], c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+        want_win = ops.cache_attn_out(uq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                      None, None, c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+        want_prefill = ops.sparse_attn_out(uq, c["cos_sin"], c["pos"], c["rotary"], c["sparse_src"], c["sparse_idx"],
+                                           c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+
+        fy = fused_step(*c["step"], "attn")[0]
+        fq, fkv, fiq = fused_qkv(fy, *c["wq_a"], *c["wkv"], c["q_norm"], 1e-6, *c["wq_b"], *c["iwq_b"], HEADS, HEAD_DIM)
+        got_decode = mega.cache_attn_out(fq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                         c["latents"], c["latent_idx"], c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+        got_win = mega.cache_attn_out(fq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                      None, None, c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+        got_prefill = mega.sparse_attn_out(fq, c["cos_sin"], c["pos"], c["rotary"], c["sparse_src"], c["sparse_idx"],
+                                           c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"])
+        assert fiq is not None and uiq is not None
+        for name, a, b, lim in (("kv", fkv, ukv, 0.03), ("iq", fiq, uiq, 0.03), ("decode", got_decode, want_decode, 0.08),
+                                ("decode_win", got_win, want_win, 0.08), ("prefill", got_prefill, want_prefill, 0.08)):
+            apart = float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-12))
+            print(f"fused attn {name}: farthest {apart:.5f} of the largest value")
+            assert a.shape == b.shape and apart < lim, (name, apart)
+
+        # Zero-token idle rank returns empty tensors cleanly.
+        eq, ekv, eiq = fused_qkv(fy[:0], *c["wq_a"], *c["wkv"], c["q_norm"], 1e-6, *c["wq_b"], None, None, None, HEADS, HEAD_DIM)
+        assert eq.shape == (0, HEADS, HEAD_DIM) and ekv.shape == (0, HEAD_DIM) and eiq is None
+        assert mega.cache_attn_out(eq, c["cos_sin"], c["pos"][:0], c["rotary"], c["window"], c["window_idx"][:0],
+                                   None, None, c["sink"], scale, c["o_groups"], c["wo_a"], *c["wo_b"]).shape == (0, DIM)
+
+        # In-place weight update bumps _version and invalidates Mega._cached.
+        wo_a_mut = c["wo_a"].clone()
+        out1 = mega.cache_attn_out(fq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                   None, None, c["sink"], scale, c["o_groups"], wo_a_mut, *c["wo_b"])
+        wo_a_mut.zero_()
+        out2 = mega.cache_attn_out(fq, c["cos_sin"], c["pos"], c["rotary"], c["window"], c["window_idx"],
+                                   None, None, c["sink"], scale, c["o_groups"], wo_a_mut, *c["wo_b"])
+        assert not torch.equal(out1, out2) and float(out2.float().abs().max()) == 0.0
+
+        # CUDA graph capture + replay on fresh activation inputs (weights stay fixed across steps).
+        d0, d1 = fused_attn_case(4, seed=2), fused_attn_case(4, seed=3)
+        for wk in ("wq_a", "wkv", "q_norm", "wq_b", "iwq_b", "wo_a", "wo_b", "sink", "cos_sin"):
+            d1[wk] = d0[wk]
+
+        def run_decode(d: dict[str, Any]) -> torch.Tensor:
+            y0 = fused_step(*d["step"], "attn")[0]
+            q0, _, _ = fused_qkv(y0, *d["wq_a"], *d["wkv"], d["q_norm"], 1e-6, *d["wq_b"], *d["iwq_b"], HEADS, HEAD_DIM)
+            return mega.cache_attn_out(q0, d["cos_sin"], d["pos"], d["rotary"], d["window"], d["window_idx"],
+                                       d["latents"], d["latent_idx"], d["sink"], scale, d["o_groups"], d["wo_a"], *d["wo_b"])
+
+        graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.stream(stream_):
+            run_decode(d0)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=stream_):
+            recorded = run_decode(d0)
+        expect = run_decode(d1)
+        for k in ("step", "pos", "window", "window_idx", "latents", "latent_idx"):
+            v = d0[k]
+            if isinstance(v, torch.Tensor):
+                v.copy_(d1[k])
+            elif isinstance(v, tuple):
+                for a, b in zip(v, d1[k], strict=True):
+                    if isinstance(a, torch.Tensor):
+                        a.copy_(b)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(recorded, expect), float((recorded.float() - expect.float()).abs().max())
+    finally:
+        mega.close()
+
+
+def _engram_ep_worker(rank: int, port: int) -> None:
+    import torch.distributed as dist
+    from kernels.deepinfer.mega import Mega
+    from worker.comm.unit import join, leave
+
+    torch.cuda.set_device(rank)
+    group = join(2, rank, f"tcp://127.0.0.1:{port}", "nccl", 60.0)
+    mega = Mega(64)
+    try:
+        g = torch.Generator().manual_seed(500)
+        rows, cols, eh = 256, 8, 256
+        full_w, full_s = formats.quantize_rows_fp8(torch.randn(rows, eh, generator=g).cuda() * 0.2)
+        part = rows // 2
+        local_w = full_w[rank * part:(rank + 1) * part].contiguous()
+        local_s = full_s[rank * part:(rank + 1) * part].contiguous()
+        wkv = _fp8_weight(g, (HC + 1) * DIM, cols * eh)
+        qw, kw = 1 + rand(g, HC, DIM, scale=0.1), 1 + rand(g, HC, DIM, scale=0.1)
+
+        rg = torch.Generator().manual_seed(600 + rank)
+        x = rand(rg, 8, HC, DIM)
+        ids = torch.randint(0, rows, (8, 1, cols), generator=rg).cuda()
+        want = ops.engram(0, x, full_w[ids[:, 0]], full_s[ids[:, 0]], None, local_w, local_s, *wkv, qw, kw, 1e-6)
+
+        mega.engram_fetch(group, ids, [local_w], [local_s], stage=True)
+        got = mega.engram(0, x, None, None, None, local_w, local_s, *wkv, qw, kw, 1e-6)
+        apart = float((got.float() - want.float()).abs().max() / want.float().abs().max().clamp_min(1e-12))
+        assert got.shape == want.shape and apart < 0.02, (rank, apart)
+
+        # CUDA graph capture + replay with EngramBuffer.fetch inside the graph.
+        ids2 = torch.randint(0, rows, (8, 1, cols), generator=rg).cuda()
+        x2 = rand(rg, 8, HC, DIM)
+        graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.stream(stream_):
+            mega.engram_fetch(group, ids, [local_w], [local_s], stage=True)
+            mega.engram(0, x, None, None, None, local_w, local_s, *wkv, qw, kw, 1e-6)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=stream_):
+            mega.engram_fetch(group, ids, [local_w], [local_s], stage=True)
+            rec = mega.engram(0, x, None, None, None, local_w, local_s, *wkv, qw, kw, 1e-6)
+        mega.engram_fetch(group, ids2, [local_w], [local_s], stage=True)
+        exp = mega.engram(0, x2, None, None, None, local_w, local_s, *wkv, qw, kw, 1e-6)
+        ids.copy_(ids2)
+        x.copy_(x2)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(rec, exp)
+    finally:
+        mega.close()
+        leave(group)
+        dist.destroy_process_group()
+
+
+@pytest.mark.timeout(1800)
+def test_the_fused_engram_computes_what_the_unfused_kernels_compute() -> None:
+    """``Mega.engram`` (and on >=2 GPUs with ``deep_ep``, ``Mega.engram_fetch`` over ``EngramBuffer``)
+    against ``ops.engram``: direct ``fp8_fp4_gemm_nt`` without bf16 round-trip, 0-token step, weight
+    refit invalidation, and CUDA graph replay."""
+    import importlib.util
+    import socket
+    from torch.multiprocessing.spawn import spawn
+    from kernels.deepinfer.mega import Mega
+
+    g = torch.Generator().manual_seed(301)
+    rows, cols, eh = 256, 8, 256
+    embed_w, embed_s = formats.quantize_rows_fp8(torch.randn(rows, eh, generator=g).cuda() * 0.2)
+    wkv = _fp8_weight(g, (HC + 1) * DIM, cols * eh)
+    qw, kw = 1 + rand(g, HC, DIM, scale=0.1), 1 + rand(g, HC, DIM, scale=0.1)
+    x = rand(g, TOKENS, HC, DIM)
+    ids = torch.randint(0, rows, (TOKENS, cols), generator=g).cuda()
+    mega = Mega(256)
+    try:
+        want = ops.engram(0, x, None, None, ids, embed_w, embed_s, *wkv, qw, kw, 1e-6)
+        got = mega.engram(0, x, None, None, ids, embed_w, embed_s, *wkv, qw, kw, 1e-6)
+        apart = float((got.float() - want.float()).abs().max() / want.float().abs().max().clamp_min(1e-12))
+        print(f"fused engram: farthest {apart:.5f} of the largest value")
+        assert got.shape == want.shape and apart < 0.02, apart
+        assert mega.engram(0, x[:0], None, None, ids[:0], embed_w, embed_s, *wkv, qw, kw, 1e-6).shape == (0, HC, DIM)
+
+        # In-place weight update bumps _version and invalidates cached fused_weight.
+        qw_mut = qw.clone()
+        out1 = mega.engram(0, x, None, None, ids, embed_w, embed_s, *wkv, qw_mut, kw, 1e-6)
+        qw_mut.neg_()
+        out2 = mega.engram(0, x, None, None, ids, embed_w, embed_s, *wkv, qw_mut, kw, 1e-6)
+        assert not torch.equal(out1, out2)
+
+        # CUDA graph capture + replay on fresh inputs.
+        x0, ids0 = rand(g, 4, HC, DIM), torch.randint(0, rows, (4, cols), generator=g).cuda()
+        x1, ids1 = rand(g, 4, HC, DIM), torch.randint(0, rows, (4, cols), generator=g).cuda()
+        graph, stream_ = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+        with torch.cuda.stream(stream_):
+            mega.engram(0, x0, None, None, ids0, embed_w, embed_s, *wkv, qw, kw, 1e-6)
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=stream_):
+            rec = mega.engram(0, x0, None, None, ids0, embed_w, embed_s, *wkv, qw, kw, 1e-6)
+        exp = mega.engram(0, x1, None, None, ids1, embed_w, embed_s, *wkv, qw, kw, 1e-6)
+        x0.copy_(x1)
+        ids0.copy_(ids1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(rec, exp)
+    finally:
+        mega.close()
+
+    if torch.cuda.device_count() >= 2 and importlib.util.find_spec("deep_ep") is not None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        spawn(_engram_ep_worker, args=(port,), nprocs=2, join=True)
+
+

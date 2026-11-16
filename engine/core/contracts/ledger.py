@@ -7,6 +7,9 @@ the ledger never touches device memory.
 Steps are numbered by the scheduler (the record epoch) and retire in order: a step retires once
 every rank answered it. With one step of overlap (§4.4) a request can be planned in step
 ``N + 1`` before step ``N`` retired.
+
+With several scheduling domains (``sched.domains``: ranks that hold different requests) there is one
+ledger per domain, ``ledger.domains@1``, a list of these; every one of them is told of every step.
 """
 
 from collections.abc import Mapping, Sequence

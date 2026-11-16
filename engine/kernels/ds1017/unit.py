@@ -83,17 +83,36 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("ds.shared_expert@1", "the shared expert: its w1 over w3 (FP8), the clamped SwiGLU, w2", ops.shared_expert,
      CHAINED, True),
     ("ds.engram_hash@1", "Engram's n-gram hashes: rows of each Engram layer's tables", ops.engram_hash, EXACT, True),
+    ("ds.hc_step@1", "between two sublayers of the Hyper-Connections stream: the output before written back, "
+     "the next coefficients, this sublayer's normed input", ops.hc_step, LOOSE, True),
+    ("ds.moe@1", "a layer's MoE on its normed input: the gate, the routed experts (among ranks, from those that "
+     "hold them) and the shared expert", ops.moe, CHAINED, True),
+    ("ds.ep_experts@1", "the routed experts' sum on ranks that each hold part of the layer's experts",
+     ops.ep_experts, CHAINED, True),
+    ("ds.engram_fetch@1", "rows of every Engram layer's table, the tables split over the ranks, as bytes and "
+     "scales", ops.engram_fetch, EXACT, True),
+    ("ds.attn_qkv@1", "attention's Q/KV projections, q_norm and (on an index-source layer) indexer.wq_b",
+     ops.attn_qkv, LOOSE, True),
+    ("ds.cache_attn_out@1", "decode attention in the caches with query/output RoPE, wo_a and wo_b",
+     ops.cache_attn_out, LOOSE, True),
+    ("ds.sparse_attn_out@1", "prefill sparse attention over listed keys with query/output RoPE, wo_a and wo_b",
+     ops.sparse_attn_out, LOOSE, True),
+    ("ds.engram@1", "an Engram layer's table rows projected to keys and value and added through its gate",
+     ops.engram, LOOSE, True),
 )
 """(definition, doc, reference, tolerance, batch invariant). Every reference sums in a fixed order and
 multiplies a row on its own (``ops.total``, ``ops.matmul``), so a token's result does not depend on
 the rest of the step."""
 
 HOST_DEPENDENT = frozenset({"ds.moe_experts@1", "ds.index_topk@1", "ds.compress@1", "ds.load_values@1",
-                            "ds.load_keys@1"})
+                            "ds.load_keys@1", "ds.ep_experts@1", "ds.engram_fetch@1", "ds.moe@1"})
 """References that read the host or have shapes the values decide (which experts the tokens chose,
-the rows of a prefill): not capturable. Those of prefill only run in steps no graph records."""
+the rows of a prefill), or that talk to the other ranks through the host: not capturable. Those of
+prefill only run in steps no graph records; with the last two, no step is recorded."""
 FIXED = "reference.fixed.ds.moe_experts@1"
 """The routed experts of a captured step. Under the references' name: backend ``reference`` runs it there."""
+FIXED_MOE = "reference.fixed.ds.moe@1"
+"""A layer's MoE in a captured step: the same with the gate and the shared expert around it."""
 
 
 def reference_id(definition: str) -> str:
@@ -115,3 +134,7 @@ class Unit:
         ctx.register("kernels.catalog@1", Implementation(
             Solution(FIXED, "ds.moe_experts@1", f"{fn.__module__}:{fn.__name__}", library="torch", capturable=True,
                      requires=[CAPTURE]), fn), label=f"solution {FIXED}")
+        fn = ops.moe_fixed
+        ctx.register("kernels.catalog@1", Implementation(
+            Solution(FIXED_MOE, "ds.moe@1", f"{fn.__module__}:{fn.__name__}", library="torch", capturable=True,
+                     requires=[CAPTURE]), fn), label=f"solution {FIXED_MOE}")

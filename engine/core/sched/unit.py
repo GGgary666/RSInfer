@@ -2,11 +2,14 @@
 
 Readers it owns: ``requests`` (from the frontend host) and ``results.<rank>`` (from each worker).
 Writers: to each worker's reader ``plans``, and to the token reader of each frontend's
-``ReturnRoute``. The rank of a worker is its place in ``sched.workers``.
+``ReturnRoute``. The rank of a worker is its place in ``sched.workers``; ``sched.domains`` splits the
+ranks, in that order, into scheduling domains of equal size, each with its ledger of
+``ledger.domains@1``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import msgspec
@@ -25,6 +28,9 @@ class Unit:
         workers = msgspec.convert(config["sched.workers"], list[ProcId])
         if not workers:
             raise ValueError("sched.workers lists no worker")
+        if len(workers) % config["sched.domains"]:
+            raise ValueError(f"sched.domains = {config['sched.domains']} does not divide the {len(workers)} worker(s) "
+                             "of sched.workers")
         channels = cast(Channels, ctx.use("proc.streams@1"))
         control = ctx.use("proc.control@1")
         settings = Settings(max_batch=min(config["sched.max_batch"], config["batch.max_rows"]),
@@ -35,7 +41,7 @@ class Unit:
                             idle_wait_s=config["sched.idle_wait_s"], asleep=config["holder.sleep"],
                             draft_tokens=config["spec.num_draft_tokens"] if config["spec.algorithm"] else 0)
         self.loop = Scheduler(
-            table=cast(Table, ctx.use("sched.reqs@1")), ledger=cast(Ledger, ctx.use("ledger@1")),
+            table=cast(Table, ctx.use("sched.reqs@1")), ledgers=cast(Sequence[Ledger], ctx.use("ledger.domains@1")),
             order=cast(OrderPolicy, ctx.use(ORDER)), compose=cast(ComposePolicy, ctx.use(COMPOSE)),
             requests=channels.reader("requests", HostId(config["sched.frontend_host"])),
             results=[channels.reader(f"results.{rank}", w.host) for rank, w in enumerate(workers)],

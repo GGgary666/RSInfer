@@ -17,12 +17,14 @@ The kernels are compiled for bf16 activations, so every activation given must be
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
 from kernels import ds1017_compose as compose
+from kernels import ds1017_ep as ep
 from kernels.ds1017_formats import unpack_kv, unpack_latent, unpack_scales
 from kernels.tilelang import kernel as K  # pyright: ignore[reportUnknownVariableType]
 
@@ -185,6 +187,18 @@ def moe_experts(x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w
     return y
 
 
+def ep_experts(group: Any, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor, w13: torch.Tensor,
+               p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, limit: float, slots: torch.Tensor | None = None,
+               taken: torch.Tensor | None = None) -> torch.Tensor:
+    """``moe_experts`` on ranks that each hold part of the layer's experts (``kernels.ds1017_ep``)."""
+    return ep.ep_experts(moe_experts, group, x, weights, indices, w13, p13, w2, p2, limit, slots, taken)
+
+
+def engram_fetch(group: Any, ids: torch.Tensor, weights: Sequence[torch.Tensor], scales: Sequence[torch.Tensor],
+                 stage: bool = False) -> Any:
+    return ep.engram_fetch(group, ids, weights, scales)
+
+
 # ---------------------------------------------------------------- the compositions over the caches
 
 def rotate(x: torch.Tensor, freqs: torch.Tensor, rotary: int, inverse: bool = False) -> torch.Tensor:
@@ -267,3 +281,58 @@ def shared_expert(x: torch.Tensor, w13: torch.Tensor, s13: torch.Tensor, p13: to
 def engram_hash(tokens: torch.Tensor, multipliers: torch.Tensor, primes: torch.Tensor, offsets: torch.Tensor
                 ) -> torch.Tensor:
     return compose.engram_hash(tokens, multipliers, primes, offsets)
+
+def hc_step(x: torch.Tensor | None, residual: torch.Tensor, pre: torch.Tensor, post: torch.Tensor | None,
+            comb: torch.Tensor | None, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, norm_weight: torch.Tensor,
+            norm_eps: float, iters: int, hc_eps: float, stage: Any = None
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What stands between two sublayers of the stream (``compose.hc_step``); ``stage`` is for a backend
+    whose MoE reads its input from where this wrote it."""
+    return compose.hc_step(hc_post, hc_mixes, hc_pre, rms_norm, x, residual, pre, post, comb, fn, scale, base,
+                           norm_weight, norm_eps, iters, hc_eps)
+
+
+def moe(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch.Tensor, gate_bf16: torch.Tensor,
+        w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor, ss13: torch.Tensor,
+        sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int, route_scale: float,
+        limit: float, to_physical: torch.Tensor | None = None, copies: torch.Tensor | None = None,
+        taken: torch.Tensor | None = None) -> torch.Tensor:
+    """A layer's MoE on its normed input (``compose.moe``); ``gate_bf16`` is the gate's weight as a
+    fused gate kernel takes it, not read here."""
+    return compose.moe(moe_gate, moe_experts, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
+                       (w13, p13, w2, p2), (sw13, ss13, sp13, sw2, ss2, sp2), topk, route_scale, limit, to_physical,
+                       copies, taken)
+
+
+def attn_qkv(x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torch.Tensor,
+             wkv: torch.Tensor, skv: torch.Tensor, pkv: torch.Tensor, q_norm: torch.Tensor, eps: float,
+             wq_b: torch.Tensor, sq_b: torch.Tensor, pq_b: torch.Tensor, iwq_b: torch.Tensor | None,
+             isq_b: torch.Tensor | None, ipq_b: torch.Tensor | None, heads: int, head_dim: int
+             ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    return compose.attn_qkv(PIECES, x, wq_a, sq_a, pq_a, wkv, skv, pkv, q_norm, eps, wq_b, sq_b, pq_b,
+                            iwq_b, isq_b, ipq_b, heads, head_dim)
+
+
+def cache_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
+                   window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
+                   latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float, groups: int,
+                   wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    return compose.cache_attn_out(PIECES, cache_attn, grouped_linear, q, cos_sin, positions, rotary, window,
+                                  window_idx, latents, latent_idx, sink, scale, groups, wo_a, wo_b, so_b, po_b)
+
+
+def sparse_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
+                    source: torch.Tensor, idx: torch.Tensor, sink: torch.Tensor, scale: float, groups: int,
+                    wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+    return compose.sparse_attn_out(PIECES, sparse_attn, grouped_linear, q, cos_sin, positions, rotary, source, idx,
+                                   sink, scale, groups, wo_a, wo_b, so_b, po_b)
+
+
+def engram(index: int, x: torch.Tensor, held: torch.Tensor | None, scales: torch.Tensor | None,
+           ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
+           wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
+           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float) -> torch.Tensor:
+    return compose.engram(PIECES, engram_gate, index, x, held, scales, ids, embed_weight, embed_scale,
+                          wkv_w, wkv_s, wkv_p, q_weight, k_weight, eps)
+
+

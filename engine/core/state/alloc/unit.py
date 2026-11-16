@@ -4,6 +4,10 @@
 Each kind's ``Pool`` keeps its own ids; a request is admitted only when every kind has what it
 needs, and what one kind gave is given back at once when another refuses (§5.3). No tensors and
 no model execution: items are ids the worker's storage units map to memory.
+
+``ledger.domains@1`` is one such ledger per scheduling domain (``sched.domains``), ``ledger@1`` the
+first of them: each domain's ranks have stores of their own, so its items and its prefix cache are
+its own.
 """
 
 from __future__ import annotations
@@ -121,8 +125,18 @@ class Unit:
             # A verify step crosses one tracking boundary at most (SGLang's mamba_hook).
             raise ValueError(f"alloc.mamba_track_interval = {config['alloc.mamba_track_interval']} must be at least "
                              f"spec.num_draft_tokens = {config['spec.num_draft_tokens']} (as SGLang's)")
-        if config["alloc.radix_cache"]:
-            ctx.provide("ledger@1", RadixLedger(declarations, track_interval=config["alloc.mamba_track_interval"],
-                                                max_states_per_path=config["alloc.mamba_max_states_per_path"]))
-        else:
-            ctx.provide("ledger@1", JointLedger(declarations))
+        domains = config["sched.domains"]
+        if domains < 1:
+            raise ValueError(f"sched.domains = {domains} must be at least 1")
+
+        def ledger() -> JointLedger | RadixLedger:
+            if config["alloc.radix_cache"]:
+                return RadixLedger(declarations, track_interval=config["alloc.mamba_track_interval"],
+                                   max_states_per_path=config["alloc.mamba_max_states_per_path"])
+            return JointLedger(declarations)
+
+        # One ledger per scheduling domain: a domain's ranks hold its requests' items, and what one
+        # domain's prefix cache keeps is on its own ranks only.
+        ledgers = [ledger() for _ in range(domains)]
+        ctx.provide("ledger@1", ledgers[0])
+        ctx.provide("ledger.domains@1", ledgers)

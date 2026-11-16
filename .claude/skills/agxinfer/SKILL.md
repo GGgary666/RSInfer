@@ -54,7 +54,7 @@ description: Working in the agxinfer repository - where each component, unit, te
 
 | 路径 | 内容 |
 |---|---|
-| `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、出错不冻结（`loop.py`）；变更前排空（`drain.py`，`doc/specs/empty-apply.md`） |
+| `engine/core/sched/` | 调度器 `core.sched`（`proc.loop@1`）：两个决策点、在途步队列（深度 1，开 `sched.overlap` 为 2）、多 rank、调度域（`sched.domains`：各 rank 跑各自的请求、一起走，DS 1017 的 DP 加 EP）、出错不冻结（`loop.py`）；变更前排空（`drain.py`，`doc/specs/empty-apply.md`） |
 | `engine/policies/` | 决策点的策略单元：`fcfs`（`policy.order@1`）、`prefill_first`（`policy.compose@1`），接口在 `core/contracts/policy.py` |
 | `engine/core/state/alloc/` | 联合账本 `core.state.alloc`（`ledger@1`，接口在 `core/contracts/ledger.py`）：默认是 `radix.py` 的前缀缓存（照 SGLang 的 radix cache 加 mamba `extra_buffer`，`doc/specs/prefix-cache.md`），`alloc.radix_cache = false` 时是 `pool.py` 不带缓存的账本 |
 
@@ -76,13 +76,17 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/state/` | 存储单元 `state.kv_paged`（`MHATokenToKVPool`；一层声明什么张量就放什么，Qwen 是 `k`、`v`，DS 是压缩 latent `kv` 和 indexer 的 `ik`，按 DeepInfer 的格式存字节，一页存 `page_size / ratio` 条：一个张量每页的条目数可以少于每页的 token 数）、`state.gdn_slots`（`MambaPool`） |
 | DS 1017（v1，2026-11-14，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md)） | 另一族模型的 worker 单元，和 Qwen 的那些并列，一个 worker 只装其中一族（见下面「两族模型」）： |
 | `engine/models/ds1017/`、`engine/models/ds1017_config.py` | `models.ds1017`（`model@1`）：DeepSeek-V4.1 文本模型，照 checkpoint 自带的参照实现 `inference/model.py`；参数按 checkpoint 的名字和字节声明（FP8、FP4 存成 `u8`），一层的路由专家叠成两个张量（每个专家的 `w1` 在 `w3` 上面，和 `w2`），专家和 FP8 权重的 scale 另按 GEMM kernel 读的排法存一份（`formats.pack_scales`），都由 `load_weights` 填、`refit` 会重写。`ds1017_config.py` 是库：config 字段、每层存什么状态（`states`）、Engram 的哈希布局 |
-| `engine/layers/ds1017/` | `layers.ds1017`（`layers.ds1017@1`）：稀疏 attention（连同压缩器和 indexer）、Engram、MoE、Hyper-Connections，数据流照 DeepInfer：decode 步在设备上按固定形状推出一步的布局（能录进 graph），在状态的缓存字节上做 attention（`ds.cache_attn@1`），indexer 读页（`ds.index_topk_paged@1`）；其他步在主机上排（`Layout`），每层把环里的窗口 KV、这一步的 KV、各行的 latent 装进一个源（load segments）再做一次 sparse attention，indexer 在装载的 key 上按区间打分（`ds.index_topk@1`）。只在 prefill 或只在 decode 用的 definition 分开解析（`PREFILL_ONLY`、`DECODE_ONLY`），graph 只录 decode 的。kernel 后端由 `dsv4.backend` 定 |
+| `engine/layers/ds1017/` | `layers.ds1017`（`layers.ds1017@1`）：稀疏 attention（连同压缩器和 indexer）、Engram、MoE、Hyper-Connections，数据流照 DeepInfer：decode 步在设备上按固定形状推出一步的布局（能录进 graph），在状态的缓存字节上做 attention（`ds.cache_attn@1`），indexer 读页（`ds.index_topk_paged@1`）；其他步按计划里每行的几个数在设备上排（`Layout`，不从设备读回任何值：读回要等设备上排着的活，开重叠时等的是上一步），每层把环里的窗口 KV、这一步的 KV、各行的 latent 装进一个源（load segments）再做一次 sparse attention，indexer 在装载的 key 上按区间打分（`ds.index_topk@1`）。只在 prefill 或只在 decode 用的 definition 分开解析（`PREFILL_ONLY`、`DECODE_ONLY`），graph 只录 decode 的。kernel 后端由 `dsv4.backend` 定 |
 | `engine/state/swa_slots/` | `state.swa_slots`（`state.swa.slots@1`）：每个请求一个槽，放每层的滑动窗口 KV、没凑满的压缩组、n-gram 往回看的几个 token |
 | `engine/kernels/ds1017/`、`engine/kernels/ds1017_formats.py`、`engine/kernels/ds1017_compose.py` | `kernels.ds1017`：DS 的 definition（`ds.*`）和纯 PyTorch 参照。参照是 batch 无关的：求和顺序固定（`total`）、矩阵乘每行单独算（`matmul`），所以一个 token 的结果不随这一步怎么排而变。`ds1017_formats.py` 是库：FP8、FP4 的量化和反量化、RoPE 表；状态里三种记录（窗口 KV 528 B、压缩 latent 288 B、indexer key 68 B，DeepInfer 的缓存格式）的打包和解包也在 `ds1017_formats.py`；`ds1017_compose.py` 是库：缓存上的几个组合 definition（存、取、indexer 的选择、压缩器）写一次，参照和 TileLang 后端各给自己的算术（`Pieces`），所以 TileLang 后端仍是官方的算术 |
+| `engine/state/expert_placement/`、`engine/policies/eplb/` | EPLB（2026-11-15，照 DeepInfer 的 `model_executor/eplb/`）。`state.expert_placement`（`expert.placement@1`）是机制：每层的专家放在哪个 rank 的哪个槽位（`eplb.extra_experts` 个多余槽位放热点专家的副本）、kernel 读的映射和计数、每 `eplb.interval` 步按最近 `eplb.window` 步的 token 数重排并在 rank 之间搬权重。`policies.eplb`（`policy.rebalance@1`）只做决定，是从 DeepInfer 搬来的两遍贪心；换重排算法就是换这个单元。都只在 DS 的 worker 里装。默认关（`eplb.interval = 0`），用 `agxinfer serve --set eplb.interval=1000 --set eplb.window=100 --set eplb.extra_experts=32` 打开。重排不改变算出来的结果 |
+| `engine/kernels/deepinfer/mega.py` | DeepGEMM 的融合 kernel（2026-11-15）：`ds.hc_step@1`（两个子层之间的一步，`mega_mhc`）和 `ds.moe@1`（一层的 MoE，`bf16_mega_gate` 加带共享专家的 `fp8_fp4_mega_moe`）在后端 `deepinfer` 下的 solution，单 rank 和多 rank 都走它。它持有这个进程在各 rank 共享的 MoE 缓冲区（`SymmBuffer`）里的那一份。模型形状不合适时用 `deepinfer.unfused.*`（同一个组合，不融合的 kernel）。专家和共享专家的权重要按融合 kernel 的行顺序排（`formats.expert_layout`、`shared_layout`，模型按后端就地置换，权重存储里的 `experts.layout` 是标记） |
+| `engine/kernels/ds1017_ep.py` | 库（2026-11-15）：专家和 Engram 表分在几个 rank 上时的两个 definition，`ds.ep_experts@1` 和 `ds.engram_fetch@1`，用某个后端自己的专家 kernel 加通信组的两个 collective（`gather`、`reduce`）写成，参照和 `tilelang` 后端共用。每个 rank 把每个 token 的每一项单独送回，token 所在的 rank 按专家的顺序加，所以结果和一个 rank 全算逐位相同 |
 | `engine/kernels/tilelang/` | `kernels.tilelang`：参照实现自带的 TileLang kernel（`kernel.py`，原样）和它调用的 torch 写法，作为后端 `tilelang`。用它时引擎的 logits 和参照实现逐位相同。要 CUDA 和 `tilelang` 包，不能录进 graph |
 | `engine/kernels/deepinfer/` | `kernels.deepinfer`：DeepInfer 用的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）接成 `ds.*` 的 solution，后端 `deepinfer`，调用方式照 DeepInfer 自己的模块。要 SM 10.0 的卡和这四个库装在跑引擎的环境里（SM100 上 DeepInfer 的环境）。都能录进 graph；路由专家录进 graph 的是固定行数的版本。和官方参照实现算术上不同的三处写在 `ops.py` 的开头。`tilelang_ops/` 是从 DeepInfer 搬来的 TileLang 算子（Apache 2.0，`LICENSE.deepinfer`，原样，去掉了测试）：融合的 norm/RoPE/cast/存缓存、装载、压缩、候选块、`convert_kv_index`。TileLang 的 kernel 按宽度编译，层给它们固定的宽度（`batch.max_context_len`），不然每步重编 |
 | `engine/core/state/holder/` | `core.state.holder`（`state.holder@1`）：按 SGLang 的分法定 KV 页数和 GDN 槽数（`mem_fraction_static`、`mamba_full_memory_ratio`、`max_mamba_cache_size`），启动时定，阶段 2 不在线扩容 |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
+| `engine/worker/comm/` | `worker.comm`（`comm.group@1`，2026-11-15）：这个 worker 在通信组里的位置。组里的 rank 每一步一起算（DS 1017 的专家和 Engram 表分在各 rank 上）。底下是 `torch.distributed`，照 DeepInfer 的建法：默认组走 gloo，按 `comm.rendezvous` 碰头；`comm.device_backend = nccl` 时另有一个卡上的组，DeepInfer 的 kernel 库要的就是它。`comm.size = 1`（默认）时什么都不建，所以每族模型的 worker 都装着它。一个进程只加入一次：改组的大小要换进程；一个 rank 死了，整个组要重启 |
 | `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_graph` 上都用它；plan 要求必须有图（`PlanService.required`）时，没有图能装下的 decode 步在状态写入前被拒绝；`spec.py` 是投机解码的一步（草稿、验证、接受、提交、草稿扩展，SGLang 的 `EAGLEWorkerV2` 链式那条路，doc/specs/mtp.md），`spec.*` 配置键也由这个单元声明和检查 |
 | `engine/core/plan/` | `core.plan`（`plan@1`）：eager（bucket 0）和 TP1 的 decode graph（`graph.py`：默认的桶、每个桶的固定输入、录制、依赖记录）。没配 `plan.graph_buckets` 时用 SGLang 的默认档位到 `min(batch.max_rows, 64)`；graph 里的 attention 是固定容量的那个（`kernels.torch_graph`）时仍是 2 的幂到 8。单元加载时录制（启动或暂停期），`plan.cuda_graph` 为 auto / off / required；没有 rebuild action，依赖变了由 `core.deps` 重载本单元。启动时让各 backend 按配置固定 kernel 并打一行 `core.plan: {json}`（含录了哪些桶、没录的原因、留下的显存） |
 | `engine/core/worker/` | worker 循环 `core.worker`（`proc.loop@1`）：读计划、交给 `executor@1`、按计划顺序回 `Sampled` / `Resync` / `StepFailure`，启动时和结果换了读端时报 `Capacity` |
@@ -97,6 +101,19 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `deploy/agxinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `agxinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
 - `core.plan` 和 `executors.pytorch` 不再写死 Qwen 的状态种类和层：backend 和存储从模型拿（`model.backends`、`model.stores`）。
 - DS 的随机 checkpoint：`deploy/agxinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
+
+**多个 worker**（2026-11-15，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md) 阶段 3）：`agxinfer serve --gpus 0,1,2,3` 每张卡起一个 worker，`--ranks N` 在一张卡（或 CPU）上起 N 个（本地试多 rank 用）。
+- 每个 worker 是一个调度域（`sched.domains`），跑自己的请求。
+- 模型在不在各 worker 之间分，由配方定：DS 1017 把每层的路由专家和 Engram 表按 rank 的顺序分开（`comm.size`），每一步所有 rank 一起算；Qwen 不分，每个 worker 是完整的一份。
+- 一个变更里，同一个角色的进程是一起启动的（`core.change`）：通信组的 rank 在加载单元时要互相等。
+- **改 EP 的卡数（worker 个数、`comm.size`）要整引擎重启**（`stop` 再 `serve`），不在线扩缩（2026-11-16 约定）。协调者先等要重启的旧 rank 起来，再起新增的 rank，而通信组要所有 rank 一起加入，两边会互相等到 `comm.timeout_s`。只改 `comm.size` 不加进程时，已加入的进程在 `worker.comm` 重载时直接报错，变更撤回。
+- EPLB 搬过的专家在哪，记在权重存储里（`experts.placed`，2026-11-16）：重载模型或 `state.expert_placement`（改代码、改 `eplb.*` 而槽位数不变）都按它重建映射，只有权重重新装载（或 `refit`）才回到初始布局。关掉 EPLB 而槽位数不变时，kernel 仍按搬过的位置读，只是不再重排。
+- 用参照或 `tilelang` 后端时，分开的专家经 `torch.distributed` 交换，录不进 graph，`plan.cuda_graph = auto` 会退回 eager 并在 `core.plan` 那一行里写明是哪个 kernel。
+- 没有请求的 rank 每一步也要跑（`model.idle`）：别的 rank 的 token 可能选了它的专家。所以一个 rank 出错，其他 rank 会卡在那一层，直到 `comm.timeout_s`。
+- 后端 `deepinfer` 在多 rank 下用 DeepGEMM 的融合 kernel（`kernels/deepinfer/mega.py`），能录进 graph：要显式给 `--cuda-graph auto`（默认 off），桶默认到 8 行，更大的 batch 给 `--graph-buckets 1 2 4 8 16 32 64`。各 rank 同时录、同时回放；融合 MoE kernel 在 kernel 里等别的 rank，等 60 秒是设备断言。所以一个 rank 的一步出错（比如 OOM），其他 rank 的进程 60 秒后退出，之后的 `apply` 是 `change.recovery_required`，只能重启引擎（2026-11-16 碰到过，[doc/rsi/2026-11-16-ds1017-prefill-overhead.md](../../../doc/rsi/2026-11-16-ds1017-prefill-overhead.md)）。
+- `sched.token_budget = 32768`（DeepInfer benchmark 的 prefill 预算）配默认的 `--mem-fraction 0.85`，SM100 上显存贴着上限，跑了一百多分钟以后出过 OOM；`16384` 时每张卡至少空 11 GiB。对照 DeepInfer 的 benchmark 时还要 `deepinfer.force_random_gate = true`（它强制随机路由，文本没有意义，量完改回去）。
+- 模型层的三个钩子（都是可选的方法，没有就不调）：`model.idle()`（executor 收到空计划时）、`model.stepped()`（每个 forward 之后、graph 之外：EPLB 计数）、backend 的 `fetch(input_ids, positions)`（`core.plan` 在 `prepare` 之后、forward 或回放之前调：多 rank 时取 Engram 的行）。
+- 记录：[doc/rsi/2026-11-15-ds1017-several-gpus.md](../../../doc/rsi/2026-11-15-ds1017-several-gpus.md)；没做完的在 specs 的 10.8 节。
 
 ### `tests/`
 
@@ -113,6 +130,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - `tests/units/frontend/`：前端和请求表的测试。`support.py` 提供字节 tokenizer、脚本调度器（真请求表、固定回复，测试夹具）和只回答 Lookup 的假进程管家；`demo.py` 起一个无模型的 HTTP 服务。
 - `tests/units/kernels/`：kernel 目录的选择（含回放步的选择）和重载，参照 kernel 对照 HF `qwen3_5`（要 `--extra cpu`），`kernels.torch_graph` 对照参照 kernel，paged attention 的参照对照原来的参照。
 - `tests/units/worker/`：worker 循环。先对着假 executor 测循环本身，再把 worker 的全部单元加上循环放到线程上（`support.py` 的 `RealWorker`），接在 `tests/units/scheduler/support.py` 的真调度器下面，贪心生成和 HF 逐 token 相同。
+- `tests/units/state/test_expert_placement.py`：EPLB 的机制和策略，一个进程里用线程当几个 rank（`Ranks`，collective 是一道栅栏），每个槽位的行里写着它该是哪个专家，搬错了能看出来。
 - `tests/units/models/`、`state/`、`executors/`：模型和权重存储、存储单元和持久 batch、整个 worker 栈对照 HF（逐 token）和几组对比。`tests/units/support/worker.py` 提供：worker 全部单元装进一个 `UnitRuntime`（`Worker`）、小尺寸 HF 参照模型，以及按调度器的方式写每步记录的测试夹具 `Driver`。 `executors/test_paged_attention.py` 在 CPU 上把 attention 切到 paged 一族的参照 operator，对照原来那一族。
 - DS 1017 的测试：`tests/units/kernels/test_ds1017.py`（数值格式和参照 kernel）、`tests/units/models/test_ds1017.py`（小配置过整个 worker 栈：分块、多行、graph 桶都和一次性算逐位相同）；`tests/units/support/ds1017.py` 提供小配置、随机 checkpoint 和 DS 的 worker（`DSWorker`），`tests/units/support/graphs.py` 是 CPU 上的 graph 替身。
 - `tests/units/support/tokenizer.py`：测试用的真 HF tokenizer（词级、带 Qwen 的 chat 标记和模板）。
@@ -125,6 +143,8 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
   - `test_ds1017_deepinfer.py`：`kernels.deepinfer` 的每个 kernel 对参照（真实形状）、一个 token 的结果不随同一步的其他行变、录进 graph 换输入回放；缓存上的组合 definition 的用例在 `support_ds1017_cases.py`（`test_ds1017.py` 拿它们在小形状上对 TileLang 后端）。只能在 SM100 上 DeepInfer 的环境里跑。
   - `check_ds1017_real.py`：SM100 上手动跑的引擎级检查（真实形状的随机权重，或真 checkpoint 的前几层）。`--backends` 每个后端跑一遍（`+graph` 录 graph，`~direct` 把 MoE 换成 DeepInfer 的舍入方式）；`--shadow tilelang` 在每次 kernel 调用旁边用官方 kernel 在相同输入上再算一遍，逐个 definition 报相差多少。
   - `sm100_ds1017.sh`、`sm100_deepinfer_env.sh`：SM100 的任务入口（各步检查、建 DeepInfer 的环境）。
+  - `check_ds1017_ranks.py`（2026-11-15）：同一个 checkpoint 在一个 rank 和几个 rank 上各起一次引擎，经 HTTP 问同样的提示词（一个一个问，再一起问），文本要逐字相同；`--no-single` 只起多 rank 的（整个模型一张卡放不下）。本地用 `--random <目录> --ranks 2`（两个 worker 共用一张卡，要把 `--mem-fraction` 调小），SM100 上的入口是 `sm100_ds1017_ranks.sh`。
+  - `sm100_deepinfer_baseline.sh`（2026-11-15）：在节点上跑 DeepInfer 自己（EP4/DP4 的离线例子和 benchmark），拿它的文本和吞吐当对照。
   - `sm100_follow.sh`、`sm100_session.sh`：SM100 上的两个长任务，跟着一个分支，推一个提交就跑一次，不用每次排任务和冷启动。前者在 DeepInfer 的环境里跑该提交的 `sm100_follow_check.sh`（做 kernel 的对照用）；后者先起一个引擎，每个提交 `apply` 上去再跑 `sm100_session_check.sh`（热切换后端、量吞吐）。
   - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。

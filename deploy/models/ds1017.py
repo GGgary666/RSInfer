@@ -13,6 +13,7 @@ import argparse
 import json
 import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,11 @@ PAGE_SIZE = 128
 ARCHITECTURES = frozenset({"DeepseekV41ForCausalLM"})
 MODEL_TYPES = frozenset({"deepseek_v41", "deepseek_v41_text"})
 WORKER_ONLY = frozenset({"models.ds1017", "layers.ds1017", "state.swa_slots", "kernels.ds1017", "kernels.tilelang",
-                         "kernels.deepinfer"})
+                         "kernels.deepinfer", "state.expert_placement", "policies.eplb"})
 """Worker units of this family alone: a worker serving another family does not load them."""
+WORKER_ENV = {"CUDA_SCALE_LAUNCH_QUEUES": "4x"}
+"""The workers' environment, as DeepInfer sets it before CUDA starts (deepinfer/__init__.py): room for
+the many kernel launches of a step that is queued while the one before runs."""
 
 
 def matches(cfg: dict[str, Any]) -> bool:
@@ -58,8 +62,23 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
     places = [d.resolve() for d in (model, args.weights) if d is not None]
     found = (tok if tok is not None and any((tok / name).is_file() for name in ("engram_token_map.json", "tokenizer.json"))
              else next((d for name in ("engram_token_map.json", "tokenizer.json") for d in places if (d / name).is_file()), None))
+    # Several workers hold the model between them (its routed experts and Engram tables, split in
+    # rank order): one communication group. Its ranks meet through a file of this run's, a new one each
+    # time the engine is planned; tensors travel over NCCL where every rank has a card of its own.
+    ranks = len(args.rank_gpus)
+    comm: dict[str, Any] = {}
+    if ranks > 1:
+        meet = args.run.resolve() / "comm"
+        meet.mkdir(parents=True, exist_ok=True)
+        own_cards = args.device == "cuda" and len(set(args.rank_gpus)) == ranks
+        comm = {"comm.size": ranks, "comm.rendezvous": f"file://{meet / uuid.uuid4().hex}",
+                "comm.device_backend": "nccl" if own_cards else "gloo"}
+    # A plain prompt starts with BOS, as DeepInfer makes it (its tokenizer repair sets add_bos_token):
+    # the checkpoint's tokenizer_config says not to add one, and its chat template writes its own.
+    settings = (args.tokenizer or model).resolve() / "tokenizer_config.json"
+    bos = settings.is_file() and bool(json.loads(settings.read_text()).get("bos_token"))
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
-            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend,
+            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend, "frontend.add_bos": bos, **comm,
             **({"dsv4.token_map_path": str(found)} if found else {}),
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 
