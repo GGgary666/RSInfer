@@ -72,9 +72,13 @@ class Alone:
 class Mega:
     """This rank's part of the ranks' shared MoE and Engram buffers, and the fused solutions over them."""
 
-    def __init__(self, max_tokens: int) -> None:
+    def __init__(self, max_tokens: int, force_random: bool = False) -> None:
         self.max_tokens = max_tokens
         """Tokens a rank brings to one step at most (a prefill's budget and the decoding rows)."""
+        self.force_random = force_random
+        """Benchmarks only (``deepinfer.force_random_gate``): the fused gate picks every token's experts at
+        random, as DeepInfer's ``examples/benchmark.py`` does (``DEEPINFER_FORCE_LOAD_BALANCE``)."""
+        self.random_mask: torch.Tensor | None = None
         self.buffer: Any = None
         self.made_for: tuple[int, ...] = ()
         self.staged = -1
@@ -341,7 +345,8 @@ class Mega:
             deep_gemm.bf16_mega_gate(
                 x, gate_bf16, num_topk=topk, use_shared_as_routed=False, num_shared_experts=0,
                 routed_scaling_factor=route_scale, ep_rank=group.rank, mask=None, bias=gate_bias, image_bias=None,
-                image_token_mask=None, force_random=None, to_physical_map=to_physical, logical_count=copies,
+                image_token_mask=None, force_random=self._random(tokens, x.device), to_physical_map=to_physical,
+                logical_count=copies,
                 scoring_func="sqrtsoftplus", out=(symm.topk_idx[:tokens], symm.topk_weights[:tokens]))
         self.staged = -1
         out = torch.empty(tokens, hidden, dtype=BF16, device=x.device)
@@ -351,6 +356,13 @@ class Mega:
             shared_l2_weights=(sw2.view(E4M3), packed_words(sp2, hidden)), cumulative_local_expert_recv_stats=taken,
             activation="swiglu", activation_clamp=limit if limit > 0 else None, fast_math=True)
         return out
+
+    def _random(self, tokens: int, device: torch.device) -> torch.Tensor | None:
+        if not self.force_random:
+            return None
+        if self.random_mask is None or self.random_mask.shape[0] < tokens:
+            self.random_mask = torch.ones(max(tokens, self.max_tokens), dtype=torch.bool, device=device)
+        return self.random_mask[:tokens]
 
     # ---------------------------------------------------------------- fused Engram
 

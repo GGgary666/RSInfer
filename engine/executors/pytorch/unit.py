@@ -138,6 +138,8 @@ def check_plan(plan: BatchPlan) -> None:
         raise ValueError("a from_previous row runs exactly one token")
     if sum(n for f, n in zip(prev, num_tokens, strict=True) if not f) != len(plan.tokens):
         raise ValueError("tokens holds the input of every row without from_previous")
+    if plan.tokens.dtype != "i64":
+        raise ValueError("tokens is an i64 column")
 
 
 class PyTorchExecutor:
@@ -231,7 +233,8 @@ class PyTorchExecutor:
                 store.clear(fresh)
         self._copies(state, "before")
 
-        given = on_device(torch.tensor(list(plan.tokens.values()), dtype=torch.int64), device)
+        given = on_device(torch.frombuffer(bytearray(plan.tokens.data), dtype=torch.int64) if len(plan.tokens)
+                          else torch.empty(0, dtype=torch.int64), device)
         parts: list[torch.Tensor] = []
         offset = 0
         for r, n, prev in zip(rows, num_tokens, plan.from_previous.values(), strict=True):

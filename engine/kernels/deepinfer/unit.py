@@ -84,7 +84,7 @@ class Unit:
         # the fused ones in the catalog's order, so a model the fused kernels fit runs those).
         from kernels.deepinfer.mega import Mega
 
-        mega = Mega(config["sched.token_budget"] + config["batch.max_rows"])
+        mega = Mega(config["sched.token_budget"] + config["batch.max_rows"], config["deepinfer.force_random_gate"])
         ctx.effect(lambda: mega.close, label="fused MoE and Engram buffers")
         fused: dict[str, list[int]] = {"mega": [1]}
         fused_attn: dict[str, list[int]] = {"heads": [64, 128], "head_dim": [512], "mega": [1], "mega_attn": [1]}

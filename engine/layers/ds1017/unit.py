@@ -398,15 +398,24 @@ class Layers:
 
     def lay_out(self, rows: Sequence[int], counts: Sequence[int], starts: Sequence[int], decoding: Sequence[bool],
                 device: torch.device) -> Layout:
+        """The step's index tensors. Per row the plan's few numbers go to the device, and every per-token
+        tensor is computed there: on the host the ``[tokens, window]`` arithmetic of a 32K-token step
+        took over a second (2026-11-16, SM100), longer than the step's forward. Nothing is read back from
+        the device, sizes included (``torch.nonzero``): that would wait for the work queued there, with
+        ``sched.overlap`` for the step still running."""
         cfg, w = self.cfg, self.cfg.sliding_window
-        n = torch.tensor(counts)
-        p0 = torch.tensor(starts)
-        base = torch.cumsum(n, 0) - n
-        tok_row, tok_p0, tok_base = (torch.repeat_interleave(torch.tensor(v) if isinstance(v, list) else v, n)
-                                     for v in (list(rows), p0, base))
-        tok_n = torch.repeat_interleave(n, n)
-        pos = torch.cat([torch.arange(p, p + c) for p, c in zip(starts, counts, strict=True)])
-        end = tok_p0 + tok_n - 1  # the row's last position of this step
+        total = sum(counts)
+
+        def put(values: Sequence[Any] | torch.Tensor, dtype: torch.dtype = torch.int64) -> torch.Tensor:
+            return on_device(values if isinstance(values, torch.Tensor) else torch.tensor(list(values), dtype=dtype),
+                             device)
+
+        n_host, p0_host = torch.tensor(list(counts)), torch.tensor(list(starts))
+        base_host = torch.cumsum(n_host, 0) - n_host
+        n, p0, base = put(n_host), put(p0_host), put(base_host)
+        tok_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), n, output_size=total)
+        tok_row, tok_p0, tok_base = put(rows)[tok_seq], p0[tok_seq], base[tok_seq]
+        pos = tok_p0 + torch.arange(total, device=device) - tok_base
 
         # The window, ``w`` columns. A prefilling row lists a token's keys as a prefill of the reference
         # does: ascending from max(0, p - w + 1), those that exist first. A decoding row lists them
@@ -416,25 +425,28 @@ class Layers:
         # prompt would, wherever the chunk starts and ends. (For a prompt shorter than the window
         # the reference lists only as many columns as the prompt has tokens, so its compressed
         # keys follow in earlier columns than here: the same keys, another last bit.)
-        ahead = ~torch.repeat_interleave(torch.tensor(list(decoding), dtype=torch.bool), n)
-        col = torch.arange(w)
+        ahead = ~put(decoding, torch.bool)[tok_seq]
+        col = torch.arange(w, device=device)
         keys = torch.where(ahead[:, None], (pos - w + 1).clamp_min(0)[:, None] + col, pos[:, None] - w + 1 + col)
         valid = (keys >= 0) & (keys <= pos[:, None])
         in_chunk = keys >= tok_p0[:, None]
-        chunk = (tok_base[:, None] + keys - tok_p0[:, None]).clamp(0, int(n.sum()) - 1)
-        keep = torch.nonzero(pos > end - w).flatten()
+        chunk = (tok_base[:, None] + keys - tok_p0[:, None]).clamp(0, total - 1)
+        kept_host = n_host.clamp_max(w)  # a row keeps the last tokens of its chunk, a window of them at most
+        kept, kept_total = put(kept_host), int(kept_host.sum())
+        kept_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), kept, output_size=kept_total)
+        keep = ((base + n - kept - put(torch.cumsum(kept_host, 0) - kept_host))[kept_seq]
+                + torch.arange(kept_total, device=device))
         # The rings of the rows with earlier tokens are loaded whole, one after the other.
         earlier = [i for i, p in enumerate(starts) if p > 0]
-        ring_base = torch.zeros(len(rows), dtype=torch.int64)
-        ring_base[earlier] = torch.arange(len(earlier)) * w
+        ring_base_host = torch.zeros(len(rows), dtype=torch.int64)
+        ring_base_host[earlier] = torch.arange(len(earlier)) * w
         ring_total = len(earlier) * w
-        tok_seq = torch.repeat_interleave(torch.arange(len(rows)), n)
-        window_index = torch.where(valid, torch.where(in_chunk, ring_total + chunk, ring_base[tok_seq][:, None] + keys % w),
-                                   -1)
+        window_index = torch.where(valid, torch.where(in_chunk, ring_total + chunk, put(ring_base_host)[tok_seq][:, None]
+                                                      + keys % w), -1)
         slot_table = self.batch_tables[f"slots.{SLOT_KIND}"]
-        ring_rows = on_device(torch.tensor([rows[i] for i in earlier], dtype=torch.int64), device)
+        ring_rows = put([rows[i] for i in earlier])
         ring_segments = torch.stack([slot_table[ring_rows].long(), torch.zeros_like(ring_rows),
-                                     torch.full_like(ring_rows, w), on_device(ring_base[earlier], device)], dim=1).int()
+                                     torch.full_like(ring_rows, w), put(ring_base_host[earlier])], dim=1).int()
 
         latents: dict[int, Latents] = {}
         table = self.batch_tables["req_to_token"]
@@ -444,62 +456,53 @@ class Layers:
             seg_row: list[int] = []
             seg_col: list[int] = []
             seg_rest: list[tuple[int, int, int]] = []
-            ks, ke = torch.zeros(len(pos), dtype=torch.int64), torch.zeros(len(pos), dtype=torch.int64)
-            c_seq: list[int] = []
-            first: list[int] = []
-            real: list[bool] = []
-            cu_c = [0]
+            row_k: list[int] = []
+            done: list[int] = []  # per row: the groups this step completes, an entry each (one reserved at least)
             base_k = 0
             width = 0
-            for i, (b, c, p, r) in enumerate(zip(base.tolist(), counts, starts, rows, strict=True)):
+            for c, p, r in zip(counts, starts, rows, strict=True):
                 count = (p + c) // ratio
                 for j in range(-(-count // entries)):
                     seg_row.append(r)
                     seg_col.append(j * page)
                     seg_rest.append((0, min(entries, count - j * entries), base_k + j * entries))
-                ks[b:b + c] = base_k
-                ke[b:b + c] = base_k + (pos[b:b + c] + 1) // ratio
-                groups = list(range(p // ratio, (p + c) // ratio))
-                reserved = max(len(groups), 1)
-                c_seq += [i] * reserved
-                first += [g * ratio for g in groups] + [0] * (reserved - len(groups))
-                real += [True] * len(groups) + [False] * (reserved - len(groups))
-                cu_c.append(cu_c[-1] + reserved)
+                row_k.append(base_k)
+                done.append(count - p // ratio)
                 base_k += count
                 width = max(width, count)
-            seg_rows = on_device(torch.tensor(seg_row, dtype=torch.int64), device)
-            seg_cols = on_device(torch.tensor(seg_col, dtype=torch.int64), device)
-            rest = on_device(torch.tensor(seg_rest, dtype=torch.int64).view(-1, 3), device)
-            segments = torch.cat([(table[seg_rows, seg_cols].long() // page)[:, None], rest], dim=1).int()
-            c_seq_t = torch.tensor(c_seq, dtype=torch.int64)
-
-            def put(values: list[Any] | torch.Tensor, dtype: torch.dtype = torch.int64) -> torch.Tensor:
-                return on_device(values if isinstance(values, torch.Tensor) else torch.tensor(values, dtype=dtype), device)
-
+            rest = put(torch.tensor(seg_rest, dtype=torch.int64).view(-1, 3))
+            segments = torch.cat([(table[put(seg_row), put(seg_col)].long() // page)[:, None], rest], dim=1).int()
+            # The compressor's entries, per row as many as it reserves, on the device (a 32K-token step
+            # has as many entries as tokens at ratio 1: lists of them on the host took tens of ms).
+            reserved_host = [max(d, 1) for d in done]
+            cu_host = [0]
+            for v in reserved_host:
+                cu_host.append(cu_host[-1] + v)
+            done_t, reserved = put(done), put(reserved_host)
+            cu_c = put(cu_host)
+            c_seq = torch.repeat_interleave(torch.arange(len(rows), device=device), reserved, output_size=cu_host[-1])
+            j = torch.arange(cu_host[-1], device=device) - cu_c[:-1][c_seq]
+            real = j < done_t[c_seq]
+            first = torch.where(real, (p0[c_seq] // ratio + j) * ratio, 0)
+            ks = put(row_k)[tok_seq]
             latents[ratio] = Latents(
-                segments=segments, total=base_k, width=width, ks=put(ks), ke=put(ke), seq_token=put(base),
-                cu_q=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(n, 0)])),
-                cu_k=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(p0 + n, 0)])),
-                cu_c=put(cu_c), c_seq=put(c_seq_t), first=put(first), real=put(real, torch.bool),
-                entry_token=put(base[c_seq_t]))
+                segments=segments, total=base_k, width=width, ks=ks, ke=ks + (pos + 1) // ratio, seq_token=base,
+                cu_q=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(n_host, 0)])),
+                cu_k=put(torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(p0_host + n_host, 0)])),
+                cu_c=cu_c, c_seq=c_seq, first=first, real=real, entry_token=base[c_seq])
 
         # Engram: an n-gram ending at p looks back to p - s; the row's tail holds what earlier steps ran.
         ng = max(cfg.engram_max_ngram_size, 1)
-        back = pos[:, None] - torch.arange(ng)
+        back = pos[:, None] - torch.arange(ng, device=device)
         ngram_from = torch.where(back < 0, 2, torch.where(back >= tok_p0[:, None], 0, 1))
         ngram = torch.where(ngram_from == 0, tok_base[:, None] + back - tok_p0[:, None], tok_p0[:, None] - 1 - back)
         row_end = p0 + n - 1
-        after = row_end[:, None] - torch.arange(max(ng - 1, 1))
+        after = row_end[:, None] - torch.arange(max(ng - 1, 1), device=device)
         tail_from = torch.where(after < 0, 2, torch.where(after >= p0[:, None], 0, 1))
         tail = torch.where(tail_from == 0, base[:, None] + after - p0[:, None], p0[:, None] - 1 - after)
-
-        def dev(t: torch.Tensor) -> torch.Tensor:
-            return on_device(t, device)
-
-        return Layout(rows=dev(tok_row), start=dev(tok_p0), ring_segments=ring_segments, ring_total=ring_total,
-                      window_index=dev(window_index), keep=dev(keep), latents=latents, ngram=dev(ngram.clamp_min(0)),
-                      ngram_from=dev(ngram_from), last=dev(base + n - 1), tail=dev(tail.clamp_min(0)),
-                      tail_from=dev(tail_from))
+        return Layout(rows=tok_row, start=tok_p0, ring_segments=ring_segments, ring_total=ring_total,
+                      window_index=window_index, keep=keep, latents=latents, ngram=ngram.clamp_min(0),
+                      ngram_from=ngram_from, last=base + n - 1, tail=tail.clamp_min(0), tail_from=tail_from)
 
     # ------------------------------------------------------------------ constants
 

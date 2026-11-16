@@ -60,6 +60,13 @@ def test_decode_length_is_validated_before_state_changes() -> None:
         check_plan(plan)
 
 
+def test_tokens_in_another_type_than_i64_are_refused_before_their_bytes_are_read() -> None:
+    plan = BatchPlan(Column.of("i32", [0]), Column.of("i32", [2]), Column.of("i32", [0]),
+                     Column.of("i32", [4, 5]), Column.of("u8", [0]), "prefill", 0)
+    with pytest.raises(ValueError, match="i64"):
+        check_plan(plan)
+
+
 def test_the_guard_follows_the_provider_its_generation_and_the_catalog() -> None:
     tensor = torch.zeros(2, 3)
     state = SimpleNamespace(generation=0, buffers=lambda: {"x": tensor})
