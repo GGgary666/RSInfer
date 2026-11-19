@@ -117,8 +117,9 @@ case "$cmd" in
         concs=("$@"); if [[ ${#concs[@]} -eq 0 ]]; then concs=(16 24 48); fi
         dest=$(stage_to_n1 "$tag" | tail -n 1)
         gpus="${N1_GPUS:-0,1,2,3}"
+        mport="${MASTER_PORT:-36897}"
         sess="agentx-di-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} bash tests/gpu/ds1017_bench/run_agentx.sh run-di \"${suite_prefix}\" ${concs[*]} >di.log 2>&1; echo \$? >di.exit'"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} MASTER_PORT=${mport} bash tests/gpu/ds1017_bench/run_agentx.sh run-di \"${suite_prefix}\" ${concs[*]} >di.log 2>&1; echo \$? >di.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/di.log'; cat '${dest}/di.exit' 2>/dev/null || true\""
         exit 0
@@ -132,7 +133,7 @@ case "$cmd" in
     remote-stop)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/agentx-${tag}"
-        "$script_dir/remote_exec.sh" "tmux kill-session -t 'agentx-agx-${tag}' 2>/dev/null || true; tmux kill-session -t 'agentx-di-${tag}' 2>/dev/null || true; if [[ -d '${dest}/agx-run' ]]; then N1_RUN='${dest}/agx-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-agx || true; fi"
+        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'agentx-agx-${tag}' 'agentx-di-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done; if [[ -d '${dest}/agx-run' ]]; then N1_RUN='${dest}/agx-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-agx || true; fi"
         exit 0
         ;;
 esac
@@ -173,7 +174,7 @@ case "$cmd" in
             echo "error: refuse to patch a live git repo directly; run 'stage' first." >&2
             exit 2
         fi
-        "$agpy" "$bench_dir/admit_probe.py" "$src"
+        python3 "$bench_dir/admit_probe.py" "$src"
         echo "Prepared staged AgentX source in ${src}"
         ;;
     prepare)
@@ -248,7 +249,8 @@ case "$cmd" in
             # shellcheck source=/dev/null
             source /workspace/gpu-env/deepinfer-env.sh
         fi
-        export CUDA_VISIBLE_DEVICES="$gpus_csv" DEVICE_OFFSET=0 WORLD_SIZE=1 PROFILE=0
+        device_offset="${DEVICE_OFFSET:-${gpus_csv%%,*}}"
+        export CUDA_VISIBLE_DEVICES="$gpus_csv" DEVICE_OFFSET="$device_offset" WORLD_SIZE=1 PROFILE=0
         export DEEPINFER_NUM_STATE_SLOTS_RATIO=4 DEEPINFER_USE_NEXTN_DECODE=0 DEEPINFER_ENABLE_MTP_VARLEN=0
         export DEEPINFER_USE_MULTIMODAL_POOL=0 DEEPINFER_FORCE_LOAD_BALANCE=0 DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=0
         export DEEPINFER_HF_MODEL_DIR="$model" DEEPINFER_ROOT="$di"

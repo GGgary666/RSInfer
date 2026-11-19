@@ -156,6 +156,7 @@ case "$cmd" in
         if ! patch --force -s -R -p1 --dry-run < "$patchfile" >/dev/null 2>&1; then
             patch -p1 < "$patchfile"
         fi
+        "$py" -v >/dev/null 2>&1 || py=python3
         "$py" "$bench_dir/admit_probe.py" "$src"
         "$py" "$bench_dir/dsbench_step_probe.py" "$src"
         if [[ "$mode" == "decode" ]]; then

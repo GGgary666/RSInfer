@@ -58,8 +58,9 @@ case "$cmd" in
         gpus="${N1_GPUS:-0,1,2,3}"
         di_mode="${DI_MODE:-resident}"
         qps="${ENGRAM_QPS:-}"
+        mport="${MASTER_PORT:-36995}"
         sess="di-prefill-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} DI_MODE=${di_mode} ENGRAM_QPS=${qps} SWEEP_COPY_TAG=di-prefill-${tag} bash run_di_official.sh prefill ${budgets[*]} >bench.log 2>&1; echo \$? >bench.exit'"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} DI_MODE=${di_mode} ENGRAM_QPS=${qps} MASTER_PORT=${mport} SWEEP_COPY_TAG=di-prefill-${tag} bash run_di_official.sh prefill ${budgets[*]} >bench.log 2>&1; echo \$? >bench.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/bench.log'; cat '${dest}/bench.exit' 2>/dev/null || true\""
         exit 0
@@ -70,8 +71,9 @@ case "$cmd" in
         dest=$(stage_di_scripts "$tag" | tail -n 1)
         gpus="${N1_GPUS:-0,1,2,3}"
         qps="${ENGRAM_QPS:-}"
+        mport="${MASTER_PORT:-35927}"
         sess="di-decode-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} ENGRAM_QPS=${qps} SWEEP_COPY_TAG=di-decode-${tag} bash run_di_official.sh decode ${ds[*]} >bench.log 2>&1; echo \$? >bench.exit'"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} ENGRAM_QPS=${qps} MASTER_PORT=${mport} SWEEP_COPY_TAG=di-decode-${tag} bash run_di_official.sh decode ${ds[*]} >bench.log 2>&1; echo \$? >bench.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/bench.log'; cat '${dest}/bench.exit' 2>/dev/null || true\""
         exit 0
@@ -84,7 +86,7 @@ case "$cmd" in
         ;;
     remote-stop)
         tag=${1:-}; require_tag "$tag"
-        "$script_dir/remote_exec.sh" "tmux kill-session -t 'di-prefill-${tag}' 2>/dev/null || true; tmux kill-session -t 'di-decode-${tag}' 2>/dev/null || true"
+        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'di-prefill-${tag}' 'di-decode-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done"
         exit 0
         ;;
 esac
@@ -102,8 +104,9 @@ di="${DI_ROOT:-/workspace/agxinfer-env/DeepInfer}"
 py="${DI_PY:-/workspace/agxinfer-env/venv-deepinfer/bin/python}"
 model="${AGX_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
 gpus_csv="${N1_GPUS:-0,1,2,3}"
+device_offset="${DEVICE_OFFSET:-${gpus_csv%%,*}}"
 
-export CUDA_VISIBLE_DEVICES="$gpus_csv" DEVICE_OFFSET=0 WORLD_SIZE=1 PROFILE=0
+export CUDA_VISIBLE_DEVICES="$gpus_csv" DEVICE_OFFSET="$device_offset" WORLD_SIZE=1 PROFILE=0
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}" PYTHONUNBUFFERED=1
 export DEEPINFER_HF_MODEL_DIR="$model"
 export DEEPINFER_USE_NEXTN_DECODE=0 DEEPINFER_ENABLE_MTP_VARLEN=0
