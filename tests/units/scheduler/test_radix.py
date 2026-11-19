@@ -3,10 +3,12 @@ cache with the mamba ``extra_buffer`` strategy, on ids alone."""
 
 from __future__ import annotations
 
+from array import array
+
 import pytest
 
 from core.contracts.state import StateDecl
-from core.state.alloc.radix import GDN, KV, RadixLedger, RadixTree
+from core.state.alloc.radix import GDN, KV, SWA, RadixLedger, RadixTree
 
 PAGE = 16
 DECLS = [StateDecl(KV, 0, {"k": ((PAGE, 1, 8), "bf16")}, "request", tokens_per_item=PAGE),
@@ -262,3 +264,107 @@ def test_a_speculative_step_keeps_its_state_only_where_its_accepted_tokens_cross
     led.release(1, 99, tokens)
     led.retire(99)
     assert led.match(2, [*tokens, 1]) == 64 and led.check() == []
+
+def test_window_slot_publishes_whole_and_mid_chunk_checkpoints_and_restores_privately() -> None:
+    led = RadixLedger([DECLS[0], StateDecl(SWA, 1, {"ring": ((8, 8), "u8")}, "slot")])
+    led.set_capacity({KV: 20, SWA: 20})
+    prompt = list(range(37))
+    assert led.prefill_end(0, len(prompt), len(prompt)) == len(prompt)
+    parent = led.admit(1, prompt, 48, 1)
+    assert parent is not None
+    # A chunk ending on a page takes a post-step snapshot; one continuing past the page tracks mid-chunk.
+    r_page = led.reserve(1, 16, 1)
+    assert r_page is not None and len(r_page.snapshot) == 1 and not r_page.track
+    assert r_page.snapshot[0][:2] == (SWA, parent.items[SWA][0])
+    led.retire(1)
+    r = led.reserve(1, len(prompt), 2)
+    assert r is not None and not r.snapshot and r.track[SWA][1] == 32
+    snapshot = r.track[SWA][0]
+    assert led.match(2, prompt) == 0
+    led.retire(2)
+    led.commit(1, prompt)
+    for rid in (2, 3):
+        child = led.admit(rid, prompt[:32] + [rid, 91], 42, rid)
+        assert child is not None and child.prefix == 32
+        assert child.items[KV][:2] == parent.items[KV][:2]
+        reservation = led.reserve(rid, 34, rid)
+        assert reservation is not None and reservation.restore[SWA] == (snapshot, child.items[SWA][0])
+        assert not reservation.snapshot
+        led.retire(rid)
+    assert led.check() == []
+
+
+def test_packed_radix_segments_own_their_keys_and_branch_at_whole_tokens() -> None:
+    tree = RadixTree(4)
+    source = array("q", [-3, 1 << 42, 3, 4] * 256)
+    tree.insert(memoryview(source), list(range(256)), 10)
+    original = list(source)
+    source[511] += 1 << 33
+    assert tree.match(original).prefix == 1024
+    assert tree.match(source).kv == 508
+    tree.insert(source, list(range(256, 512)), 11)
+    assert tree.match(original).node.state == 10
+    assert tree.match(source).node.state == 11
+    # An integer view with non-unit stride takes the sequence conversion path.
+    interleaved = array("q", [v for token in original for v in (token, 0)])
+    assert tree.match(memoryview(interleaved)[::2]).prefix == 1024
+
+
+def test_bounded_replay_cache_leaves_its_retained_suffix_to_compute() -> None:
+    led = RadixLedger([DECLS[0], StateDecl(SWA, 1, {"ring": ((8, 8), "u8")}, "slot")],
+                      replay_tokens=33)
+    led.set_capacity({KV: 64, SWA: 20})
+    prompt = list(range(128))
+    assert led.prefill_end(0, 128, 128) == 128
+    parent = led.admit(1, prompt, 140, 1)
+    assert parent is not None
+    r = led.reserve(1, 128, 1)
+    assert r is not None and not r.snapshot and r.track[SWA][1] == 80
+    led.retire(1)
+    led.commit(1, prompt)
+    assert led.match(2, prompt) == 80
+    assert led.match(3, prompt[:20]) == 0
+    assert led.check() == []
+
+
+def test_incremental_waiting_matches_track_splits_extensions_and_evictions() -> None:
+    led = RadixLedger([DECLS[0], StateDecl(SWA, 1, {"ring": ((8, 8), "u8")}, "slot")],
+                      replay_tokens=4)
+    led.set_capacity({KV: 64, SWA: 9})
+    base = list(range(1000, 1064))
+    suffix_a = list(range(2000, 2036))
+    suffix_b = list(range(3000, 3036))
+
+    # Cache the shared 64-token prefix.
+    p0 = [*base, 99, 99, 99, 99]
+    assert led.admit(1, p0, len(p0), 1) is not None
+    assert led.reserve(1, len(p0), 1) is not None
+    led.retire(1)
+    led.commit(1, p0)
+    led.release(1, 1, p0)
+
+    waiting_a = [*base, *suffix_a]
+    waiting_b = [*base, *suffix_b]
+    branch_mid = [*base[:32], *range(4000, 4052)]
+    assert led.match(10, waiting_a) == 64
+    assert led.match(11, waiting_b) == 64
+
+    # Splitting an ancestor edge (at 32) and adding a deeper extension on waiting_a's path:
+    # waiting_a advances incrementally from 64 -> 96, while waiting_b stays at 64 without rescanning 0..64.
+    for rid, prompt, step in ((2, branch_mid, 2), (3, waiting_a, 3)):
+        assert led.admit(rid, prompt, len(prompt), step) is not None
+        assert led.reserve(rid, len(prompt), step) is not None
+        led.retire(step)
+        led.commit(rid, prompt)
+        led.release(rid, step, prompt)
+
+    assert led.match(10, waiting_a) == 96
+    assert led.match(11, waiting_b) == 64
+
+    # Evicting states down to free capacity invalidates only evicted checkpoints and stays exact.
+    other = list(range(5000, 5084))
+    assert led.admit(4, other, len(other), 4) is not None
+    for rid, prompt in ((10, waiting_a), (11, waiting_b)):
+        assert led.match(rid, prompt) == led.tree.match(led._limit(prompt)).prefix
+    led.cancel(4, 4)
+    assert led.check() == []

@@ -262,6 +262,18 @@ def real() -> dict[str, tuple[Any, ...]]:
     return _real()
 
 
+@pytest.mark.covers(edges=("data",), kinds=("logic",))
+def test_paged_index_layers_share_only_the_schedule(real: dict[str, tuple[Any, ...]]) -> None:
+    """Sharing a layer's sparse schedule must not share its scores or selected indices."""
+    args = real["ds.index_topk_paged@1 user"]
+    step_cache: dict[Any, Any] = {}
+    for weights in (args[2], -args[2]):
+        layer = (*args[:2], weights, *args[3:])
+        expected, _ = ops.index_topk_paged(*layer, step_cache={})
+        actual, _ = ops.index_topk_paged(*layer, step_cache=step_cache)
+        assert torch.equal(actual, expected)
+
+
 @pytest.mark.timeout(1800)
 @pytest.mark.parametrize("case", [  # the case names of support_ds1017_cases (known without a GPU)
     "ds.rope@1", "ds.rope@1 inverse", "ds.transform@1", "ds.store_cache@1 fp8", "ds.store_cache@1 fp8 values",
@@ -548,6 +560,24 @@ def _engram_ep_worker(rank: int, port: int) -> None:
     group = join(2, rank, f"tcp://127.0.0.1:{port}", "nccl", 60.0)
     mega = Mega(64)
     try:
+        # A checkpoint refit writes the mapped storage directly. Both ranks must see the new bytes.
+        import torch.distributed._symmetric_memory as symm_mem
+        from kernels.ds1017_triton import NvlinkEngram
+
+        device = torch.device("cuda", rank)
+        shard = symm_mem.empty((16, 256), dtype=torch.uint8, device=device)
+        scales = symm_mem.empty((16, 8), dtype=torch.uint8, device=device)
+        scales.zero_()
+        mapped = NvlinkEngram(group, 4, 1, [shard], [scales])
+        lookup = torch.tensor([0, 16], dtype=torch.int64, device=device).reshape(2, 1, 1)
+        for generation in (1, 4):
+            shard.fill_(rank + generation)
+            dist.barrier(group=group.device_group)
+            read, _ = mapped.fetch(lookup)[0]()
+            torch.testing.assert_close(read.view(torch.uint8)[:, 0],
+                                       torch.tensor([generation, generation + 1], dtype=torch.uint8, device=device))
+            dist.barrier(group=group.device_group)
+        mapped.close()
         g = torch.Generator().manual_seed(500)
         rows, cols, eh = 256, 8, 256
         full_w, full_s = formats.quantize_rows_fp8(torch.randn(rows, eh, generator=g).cuda() * 0.2)
@@ -647,5 +677,91 @@ def test_the_fused_engram_computes_what_the_unfused_kernels_compute() -> None:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         spawn(_engram_ep_worker, args=(port,), nprocs=2, join=True)
+
+
+@pytest.mark.timeout(1800)
+def test_sm100_fast_triton_and_identity_hc_seams() -> None:
+    """Verify ``fast_triton.hc_epilogue_norm``, ``fast_triton.decode_begin_meta``, and
+    ``Mega.hc_step(None, ...)`` identity ``mega_mhc`` seam against the unfused reference kernels,
+    including CUDA graph capture and replay."""
+    from kernels import ds1017_triton as fast_triton
+    from kernels.deepinfer.mega import Mega
+
+    g = torch.Generator().manual_seed(909)
+    # 1. Identity mega_mhc seam (x is None, dim=1024 multiple)
+    dim_m = 1024
+    res = rand(g, 16, HC, dim_m)
+    pre0 = torch.zeros(16, HC, dtype=torch.float32, device="cuda")
+    pre0[:, 0] = 1.0
+    fn = rand(g, HC * (HC + 2), HC * dim_m, scale=1 / 64, dtype=torch.float32)
+    scale = torch.full((3,), 0.01, dtype=torch.float32, device="cuda")
+    base = torch.randn(HC * (HC + 2), generator=g).cuda() * 0.1
+    nw = 1.0 + rand(g, dim_m, scale=0.1)
+    mega = Mega(64)
+    try:
+        got_hc = mega.hc_step(None, res, pre0, None, None, fn, scale, base, nw, 1e-6, 4, 1e-6, "attn")
+        want_hc = ops.hc_step(None, res, pre0, None, None, fn, scale, base, nw, 1e-6, 4, 1e-6)
+        assert torch.equal(got_hc[1], res)
+        for a, b in zip(got_hc, want_hc, strict=True):
+            apart = float((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-12))
+            assert apart < 0.01, apart
+    finally:
+        mega.close()
+
+    # 2. Fused hc_epilogue_norm (decode full + prefill last_index gather + CUDA graph replay)
+    x = rand(g, 16, dim_m)
+    h = rand(g, 16, HC, dim_m)
+    post = torch.randn(16, HC, generator=g).cuda()
+    comb = torch.softmax(torch.randn(16, HC, HC, generator=g).cuda(), dim=1)
+    pre = torch.sigmoid(torch.randn(16, HC, generator=g).cuda())
+    want_ep = ops.rms_norm(ops.hc_pre(ops.hc_post(x, h, post, comb), pre), nw, 1e-6)
+    got_ep = fast_triton.hc_epilogue_norm(x, h, post, comb, pre, nw, 1e-6, None)
+    apart_ep = float((got_ep.float() - want_ep.float()).abs().max())
+    assert apart_ep <= 2e-2, apart_ep
+    last_idx = torch.tensor([0, 5, 11, 15], dtype=torch.int64, device="cuda")
+    got_sub = fast_triton.hc_epilogue_norm(x, h, post, comb, pre, nw, 1e-6, last_idx)
+    assert torch.equal(got_sub, got_ep[last_idx])
+
+    # 3. Fused decode_begin_meta + CUDA graph replay
+    n_b, win, page, num_pages = 8, 128, 128, 16
+    rows = torch.tensor([1, 3, 4, 7, 8, 0, 0, 0], dtype=torch.int64, device="cuda")
+    pos = torch.tensor([0, 2, 127, 300, 511, 0, 0, 0], dtype=torch.int64, device="cuda")
+    inp = torch.randint(0, 500, (n_b,), generator=g).cuda()
+    slot_table = torch.arange(16, dtype=torch.int32, device="cuda") * 2
+    slot_table[0] = 0
+    r2t = torch.randint(0, 4096, (16, num_pages * page), generator=g, dtype=torch.int32).cuda()
+    tmap = torch.randint(0, 300, (512,), generator=g, dtype=torch.int64).cuda()
+    tail_ref = torch.randint(0, 300, (32, 3), generator=g, dtype=torch.int64).cuda()
+    tail_got = tail_ref.clone()
+    pad_c = int(tmap[0].item())
+
+    bufs = fast_triton.alloc_decode_meta_buffers(n_b, win, num_pages, True, torch.device("cuda"))
+    fast_triton.decode_begin_meta(rows, pos, inp, slot_table, r2t, page, win, bufs, tmap, tail_got, pad_c)
+
+    slot_ref = slot_table[rows].long()
+    pos32_ref = pos.to(torch.int32)
+    slot32_ref = slot_ref.to(torch.int32)
+    assert torch.equal(bufs["slot"], slot_ref)
+    assert torch.equal(bufs["pos32"], pos32_ref)
+    assert torch.equal(bufs["pos1_32"], pos32_ref + 1)
+    assert torch.equal(bufs["tok_slot32"], r2t[rows, pos])
+    assert torch.equal(bufs["ring_slot32"], slot32_ref * win + pos32_ref % win)
+    assert torch.equal(bufs["window_cnt"], (pos32_ref + 1).clamp(0, win))
+    at32 = pos32_ref[:, None] - torch.arange(win, dtype=torch.int32, device="cuda")
+    win_ref = torch.where(at32 >= 0, slot32_ref[:, None] * win + at32.clamp_min(0) % win, -1)
+    assert torch.equal(bufs["window"], win_ref)
+    pcols = torch.arange(0, num_pages * page, page, dtype=torch.int64, device="cuda")
+    assert torch.equal(bufs["pages32"], torch.div(r2t[rows[:, None], pcols], page, rounding_mode="floor").to(torch.int32))
+    fc_ref = (pos - 1).clamp_min(0)
+    dc_ref = torch.where((pos + 1) % 2 == 0, r2t[rows, fc_ref].long() // 2, -1).to(torch.int32)
+    assert torch.equal(bufs["comp_fc32"], fc_ref.to(torch.int32))
+    assert torch.equal(bufs["comp_dc32"], dc_ref)
+    comp = tmap[inp]
+    tok_ref = torch.cat([comp[:, None], tail_ref[slot_ref]], dim=1)
+    tok_ref = torch.where(pos[:, None] < torch.arange(4, device="cuda"), pad_c, tok_ref)
+    valid_m = rows > 0
+    tail_ref[slot_ref[valid_m]] = tok_ref[valid_m, :3]
+    assert torch.equal(bufs["engram_tok32"], tok_ref.to(torch.int32))
+    assert torch.equal(tail_got, tail_ref)
 
 

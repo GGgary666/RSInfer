@@ -11,7 +11,7 @@ layers need not declare the same tensors.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +49,7 @@ class SlotPool:
     """Usable slots; 0: as many as the holder gives ``swa.slots`` (``state.holder@1``), taken again at
     every declaration."""
     holder: Any = None
+    cuda_copy: bool = False
     decls: list[StateDecl] = field(default_factory=list[StateDecl])
     tensors: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict[int, dict[str, torch.Tensor]])
     allocated: list[Any] = field(default_factory=list[Any])
@@ -99,19 +100,39 @@ class SlotPool:
         device = next(iter(first.values())).device if first else torch.device("cpu")
         return on_device(torch.tensor(list(items), dtype=torch.int64) + 1, device)
 
+    def _buffers(self) -> Iterator[torch.Tensor]:
+        return (buf for layer in self.tensors.values() for buf in layer.values())
+
+    def _cuda_copy(self) -> bool:
+        buf = next(self._buffers(), None)
+        return self.cuda_copy and buf is not None and buf.is_cuda
+
     def copy(self, src: Sequence[int], dst: Sequence[int]) -> None:
-        src_indices, dst_indices = self.indices(src), self.indices(dst)
-        for tensors in self.tensors.values():
-            for buffer in tensors.values():
-                buffer[dst_indices] = buffer[src_indices]
+        """Copy complete slots on the current stream. Ping-pong restores and snapshots are disjoint."""
+        pairs = [(s + 1, d + 1) for s, d in zip(src, dst, strict=True) if s != d]
+        if not pairs:
+            return
+        if set(src).intersection(dst):
+            # Preserve simultaneous reads if someone copies a permutation, e.g. A -> B, B -> A.
+            source, target = self.indices(src), self.indices(dst)
+            for buf in self._buffers():
+                buf[target] = buf[source]
+        elif self._cuda_copy():
+            from .slot_copy import operator
+            operator().clone_and_zero(list(self._buffers()), pairs, [])
+        else:
+            for buf in self._buffers():
+                for s, d in pairs:
+                    buf[d].copy_(buf[s], non_blocking=True)
 
     def clear(self, items: Sequence[int]) -> None:
-        """Zero the slots: a request that starts from position 0 reads nothing it did not write, but a
-        cleared slot keeps what it holds defined."""
-        index = self.indices(items)
-        for tensors in self.tensors.values():
-            for buffer in tensors.values():
-                buffer.index_fill_(0, index, 0)
+        if self._cuda_copy():
+            from .slot_copy import operator
+            operator().clone_and_zero(list(self._buffers()), [], [i + 1 for i in items])
+        else:
+            index = self.indices(items)
+            for buf in self._buffers():
+                buf.index_fill_(0, index, 0)
 
     def invalidate(self) -> None:
         """Nothing to do here: a slot is cleared or restored before a request reads it."""
@@ -125,6 +146,7 @@ class SlotPool:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        self.pool = SlotPool(ctx.platform, config["state.swa.slots"], holder=ctx.use("state.holder@1"))
+        self.pool = SlotPool(ctx.platform, config["state.swa.slots"], holder=ctx.use("state.holder@1"),
+                             cuda_copy=config["dsv4.backend"] == "deepinfer")
         ctx.effect(lambda: self.pool.free, label="swa states")
         ctx.provide("state.swa.slots@1", self.pool)

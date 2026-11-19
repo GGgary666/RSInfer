@@ -12,6 +12,18 @@ def result(tokens: list[int]) -> Sampled:
     return Sampled(Column.of("i32", [0]), Column.of("i32", [len(tokens)]), Column.of("i64", tokens))
 
 
+@pytest.mark.covers(edges=("data", "state"), kinds=("logic",))
+def test_long_prompt_keeps_an_immutable_view_of_its_wire_storage() -> None:
+    prompt = Column.of("i64", range(32768))
+    entry = RequestTable().add(NewRequest(7, prompt)).unwrap()
+    assert len(entry.prompt_tokens) == 32768
+    assert list(entry.prompt_tokens[127:131]) == [127, 128, 129, 130]
+    assert isinstance(entry.prompt_tokens, memoryview)
+    assert entry.prompt_tokens.readonly and entry.prompt_tokens.obj is prompt.data
+    with pytest.raises(TypeError):
+        entry.prompt_tokens[0] = 99  # type: ignore[index]
+
+
 def test_cancel_drops_late_tokens_but_waits_for_every_submitted_step() -> None:
     table = RequestTable()
     entry = table.add(NewRequest(7, Column.of("i64", [10]))).unwrap()

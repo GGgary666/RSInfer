@@ -25,6 +25,8 @@ from .radix import RadixLedger
 
 
 class JointLedger:
+    caches = False
+
     def __init__(self, declarations: Sequence[StateDecl]) -> None:
         grouped: dict[str, list[StateDecl]] = {}
         for declaration in declarations:
@@ -33,6 +35,10 @@ class JointLedger:
             raise ValueError("the ledger needs at least one state declaration (alloc.states)")
         self.pools = {kind: Pool(decls) for kind, decls in grouped.items()}
         self.ready = False
+        self._empty_reserved = Reserved({}, {}, {})
+
+    def prefill_end(self, start: int, end: int, prompt_len: int) -> int:
+        return end
 
     @property
     def align(self) -> int:
@@ -68,16 +74,22 @@ class JointLedger:
     def reserve(self, request: int, upto: int, step: int, speculative: bool = False) -> Reserved | None:
         """Without a cache, speculation changes nothing here: the pages up to ``upto`` are what a
         speculative step may write, and a position counts pages only."""
-        given: dict[str, list[int]] = {}
+        given: dict[str, list[int]] | None = None
         for kind, pool in self.pools.items():
             holding = pool.holdings[request]
-            items = pool.take(request, pool.need(request, upto - holding.position))
+            n_need = pool.need(request, upto - holding.position)
+            if n_need == 0:
+                pool.snapshot(request, upto, step)
+                continue
+            items = pool.take(request, n_need)
             if items is None:
                 self.cancel(request, step)
                 return None
             pool.snapshot(request, upto, step)
+            if given is None:
+                given = {}
             given[kind] = items
-        return Reserved(given, {}, {})
+        return self._empty_reserved if given is None else Reserved(given, {}, {})
 
     def items(self, request: int) -> dict[str, list[int]]:
         return {kind: list(pool.holdings[request].items) for kind, pool in self.pools.items()}
@@ -132,7 +144,8 @@ class Unit:
         def ledger() -> JointLedger | RadixLedger:
             if config["alloc.radix_cache"]:
                 return RadixLedger(declarations, track_interval=config["alloc.mamba_track_interval"],
-                                   max_states_per_path=config["alloc.mamba_max_states_per_path"])
+                                   max_states_per_path=config["alloc.mamba_max_states_per_path"],
+                                   replay_tokens=config["alloc.prefix_replay_tokens"])
             return JointLedger(declarations)
 
         # One ledger per scheduling domain: a domain's ranks hold its requests' items, and what one

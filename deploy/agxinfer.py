@@ -290,7 +290,8 @@ def serve_command(args: argparse.Namespace, topo: Path, config: Path, tunables: 
     return [sys.executable, "-m", "core.control", "serve", "--source", str(args.source.resolve()), "--topology", str(topo),
             "--state-dir", str(args.run.resolve() / "control"), "--host", HOST, "--bind", args.control_host,
             "--config", str(config), "--spawn-agents", "--platform",
-            json.dumps({"name": "cuda_graph" if graphs else "torch_eager"}), "--tunables", json.dumps(tunables)]
+            json.dumps({"name": "cuda_graph" if graphs else "torch_eager"}), "--tunables", json.dumps(tunables),
+            "--proc-tunables", json.dumps(args.proc_tunables)]
 
 
 def reachable(host: str) -> str:
@@ -653,6 +654,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
                    "(default: this repo); change it and apply it with control apply --source, without a restart")
     e.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="any other config key (a JSON value, or a string); may repeat")
+    e.add_argument("--proc-tunables", type=json.loads, default={}, metavar="JSON",
+                   help="process host.*, ipc.* and change.* tunables, e.g. {\"ipc.shm_capacity\":16777216}")
     e.add_argument("--timeout", type=int, default=3600, help="seconds for start-up and for a response; "
                    "above 3600, also for a change's execution (a wake reads the weights again)")
     e.add_argument("--detach", action="store_true", help="run in the background: return once the engine is up")

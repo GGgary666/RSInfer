@@ -50,9 +50,12 @@ TOP_K_ALL = 1 << 30
 SAMPLING_EPS = 1e-6
 
 
-def _on_device(values: Sequence[float] | Sequence[int], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _on_device(values: Sequence[float] | Sequence[int] | torch.Tensor,
+               dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """Per-request sampling values on ``device`` without waiting for the queued work: from pinned
     memory, ``non_blocking``, as SGLang's ``SamplingBatchInfo`` copies them."""
+    if isinstance(values, torch.Tensor):
+        return values.to(device=device, dtype=dtype)
     if device.type != "cuda":
         return torch.tensor(list(values), dtype=dtype, device=device)
     return torch.tensor(list(values), dtype=dtype, pin_memory=True).to(device, non_blocking=True)
@@ -710,16 +713,22 @@ def _top_k_top_p_sampling_from_probs_torch(probs: torch.Tensor, top_ks: torch.Te
     return torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
 
 
+def sample_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unordered top-k logits and matching token indices, before sampling transforms."""
+    values, indices = torch.topk(logits, k, dim=-1, sorted=False)
+    return values, indices
+
+
 def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence[float], top_ks: Sequence[int],
-           seeds: Sequence[int], positions: Sequence[int]) -> torch.Tensor:
+           seeds: Sequence[int], positions: Sequence[int] | torch.Tensor) -> torch.Tensor:
     """``sample.seeded@1``: ``Sampler.forward``'s native path, always seeded (deterministic
     inference). Requests are normalized as ``SamplingParams`` does: temperature 0 is top-k 1,
     top-k -1 the whole vocabulary. ``positions``: of each row's last input token (the model
     runner passes ``positions`` for decode, ``seq_lens - 1`` for extend). ``int32`` tokens."""
+    if all(0 <= t < SAMPLING_EPS or k == 1 for t, k in zip(temperatures, top_ks)):  # sampling_info.is_all_greedy
+        return torch.argmax(logits, dim=-1).to(torch.int32)
     temps = [1.0 if 0 <= t < SAMPLING_EPS else float(t) for t in temperatures]
     ks = [1 if 0 <= t < SAMPLING_EPS else (TOP_K_ALL if k == -1 else int(k)) for t, k in zip(temperatures, top_ks)]
-    if all(k == 1 for k in ks):  # sampling_info.is_all_greedy
-        return torch.argmax(logits, dim=-1).to(torch.int32)
     device = logits.device
     logits = logits.float().div_(_on_device(temps, torch.float32, device).view(-1, 1))
     probs = torch.softmax(logits, dim=-1)

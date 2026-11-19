@@ -136,6 +136,23 @@ def test_a_silent_scheduler_times_out_the_http_request_and_sends_cancel() -> Non
         scheduler.close()
 
 
+@pytest.mark.covers(edges=("data", "call"), kinds=("logic",))
+def test_response_timeout_is_refreshed_while_tokens_keep_arriving() -> None:
+    scheduler = ScriptScheduler()
+    scheduler.text = "x" * 64
+    front = Frontend(scheduler, response_timeout_s=0.1)
+    try:
+        started = time.monotonic()
+        with httpx.Client(base_url=front.url, timeout=10) as client:
+            response = client.post("/v1/completions", json={"model": "toy", "prompt": "hello", "max_tokens": 128})
+        assert time.monotonic() - started > 0.1
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["text"] == scheduler.text
+    finally:
+        front.close()
+        scheduler.close()
+
+
 def test_without_a_scheduler_a_request_fails_fast_and_the_frontend_stays_up() -> None:
     """Not a permanent failure: the frontend answers 503 for this request and keeps serving."""
     scheduler = ScriptScheduler()

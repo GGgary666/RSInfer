@@ -13,3 +13,4 @@ config = ["sched.token_budget", "batch.max_rows"]
 
 [config]
 "deepinfer.force_random_gate" = { type = "bool", default = false, binding = "startup", doc = "Benchmarks only: the fused MoE gate picks every token's experts at random, so the ranks carry even loads, as DeepInfer's examples/benchmark.py measures (DEEPINFER_FORCE_LOAD_BALANCE). The text is then meaningless" }
+"deepinfer.nvlink_engram" = { type = "bool", default = true, binding = "startup", doc = "Place distributed Engram shards in NVLink symmetric memory with Triton direct gather when all ranks share an NVLink domain, falling back to deep_ep.EngramBuffer otherwise" }

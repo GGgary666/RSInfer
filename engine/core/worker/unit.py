@@ -19,6 +19,7 @@ the executor's (``core.contracts.execution``).
 
 from __future__ import annotations
 
+import gc
 import sys
 import time
 from collections import deque
@@ -87,6 +88,7 @@ class WorkerLoop:
         self.announcing = False
         """A ``Capacity`` is queued."""
         self.failures = 0
+        self._idle_gc_armed = False
         # Not at once: built inside a change's Execute, its stores are a candidate the change may
         # still undo (Codex, #42). It sends Capacity at its first step, after the process resumed,
         # under the identity it serves then; the scheduler waits for that after a commit.
@@ -98,7 +100,11 @@ class WorkerLoop:
         self._finish_ready()
         self._flush()
         if len(self.taken) < DEPTH:
-            raw = self.plans.read(timeout=0 if self.taken or self.outbox else self.idle_wait_s)
+            idle = not self.taken and not self.outbox
+            if idle and self._idle_gc_armed:
+                self._idle_gc_armed = False
+                gc.collect(0)
+            raw = self.plans.read(timeout=self.idle_wait_s if idle else 0)
             if raw is not None:
                 self._take(raw)
                 self._finish_ready()
@@ -125,6 +131,7 @@ class WorkerLoop:
     # ------------------------------------------------------------------ plans
 
     def _take(self, raw: bytes) -> None:
+        self._idle_gc_armed = True
         try:
             record = decode_record(raw)
         except Exception as e:  # noqa: BLE001 - nothing to answer to: the epoch is unknown
@@ -235,6 +242,9 @@ class WorkerLoop:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
+        # Raise Gen-0/1/2 thresholds so large token_map / TileLang / SymPy heaps never trigger an
+        # ~800 ms Gen-2 full-heap scan on a single worker rank mid-step; Gen-0 runs when idle.
+        gc.set_threshold(100_000, 50, 50)
         scheduler = msgspec.convert(config["worker.scheduler"], ProcId)
         streams = ctx.use("proc.streams@1")
         control = ctx.use("proc.control@1")

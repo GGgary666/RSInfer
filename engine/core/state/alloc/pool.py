@@ -72,7 +72,7 @@ class Pool:
         self.capacity = 0
         self.free = Free()
         self.holdings: dict[int, Holding] = {}
-        self.reservations: dict[tuple[int, int], Reservation] = {}
+        self._by_step: dict[int, dict[int, Reservation]] = {}
         self.releases: dict[int, int] = {}
         self.retired = -1
 
@@ -97,7 +97,7 @@ class Pool:
         """The workers' usable items (``Capacity``). It may shrink only while nothing is held: a
         change applies to an empty engine (doc/specs/empty-apply.md), and rebuilding a store there
         can change its size (a new dtype, another holder budget)."""
-        if not (self.holdings or self.reservations or self.releases):
+        if not (self.holdings or self._by_step or self.releases):
             # Every item is free, so none needs listing. A free item carries nothing while prefix
             # caching is off (``reusable``); a cache kept in free items would not survive this.
             self.free = Free(items)
@@ -123,7 +123,7 @@ class Pool:
         if items is None:
             return None
         self.holdings[request] = Holding(items)
-        self.reservations[step, request] = Reservation(0, list(items), True)
+        self._by_step.setdefault(step, {})[request] = Reservation(0, list(items), True)
         return Admitted(list(items))
 
     def need(self, request: int, new_tokens: int) -> int:
@@ -140,9 +140,16 @@ class Pool:
 
     def snapshot(self, request: int, upto: int, step: int) -> list[tuple[int, int]]:
         holding = self.holdings[request]
-        reservation = self.reservations.setdefault((step, request), Reservation(holding.position, []))
-        reservation.added.extend(holding.tentative)
-        holding.tentative.clear()
+        step_map = self._by_step.get(step)
+        if step_map is None:
+            step_map = self._by_step[step] = {}
+        reservation = step_map.get(request)
+        if reservation is None:
+            step_map[request] = Reservation(holding.position, list(holding.tentative) if holding.tentative else [])
+        elif holding.tentative:
+            reservation.added.extend(holding.tentative)
+        if holding.tentative:
+            holding.tentative.clear()
         holding.position = upto
         return []  # declarations require snapshot_every=0
 
@@ -155,7 +162,10 @@ class Pool:
         holding = self.holdings.get(request)
         if holding is None:
             return
-        reservation = self.reservations.pop((step, request), None)
+        step_map = self._by_step.get(step)
+        reservation = step_map.pop(request, None) if step_map is not None else None
+        if step_map is not None and not step_map:
+            del self._by_step[step]
         added = [*(reservation.added if reservation else []), *holding.tentative]
         holding.tentative.clear()
         remove = set(added)
@@ -179,16 +189,14 @@ class Pool:
                 del self.releases[request]
 
     def retire(self, step: int, ran: bool = True) -> None:
-        for key, reservation in list(self.reservations.items()):
-            epoch, request = key
-            if epoch != step:
-                continue
-            if not ran:
+        step_map = self._by_step.pop(step, None)
+        if step_map is not None and not ran:
+            for request, reservation in step_map.items():
                 holding = self.holdings[request]
                 holding.position = min(holding.position, reservation.previous)
-            del self.reservations[key]
         self.retired = max(self.retired, step)
-        self._free_ready()
+        if self.releases:
+            self._free_ready()
 
     def check(self) -> list[str]:
         ids = [*self.free.returned, *(item for holding in self.holdings.values() for item in holding.items)]

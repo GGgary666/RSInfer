@@ -54,6 +54,7 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
      "convolved [q|k|v]", ops.fused_recurrent_gated_delta_rule_packed_decode, LOOSE, False),
     ("gdn.track_states@1", "for the prefix cache: every layer's conv and temporal state copied from each "
      "masked lane's slot to its tracking slot (track_mamba_states_all_layers)", ops.track_states, Tolerance(), True),
+    ("sample.topk@1", "Unordered top-k logits and their token indices", ops.sample_topk, Tolerance(), False),
     ("sample.seeded@1", "Sampler: greedy, or top-k/top-p drawn from (seed, position)", ops.sample, Tolerance(),
      False),
     # Speculative decoding (doc/specs/mtp.md)

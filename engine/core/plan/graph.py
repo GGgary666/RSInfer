@@ -127,8 +127,9 @@ class GraphPlan:
             backend.prepare(batch, plan, PlanKey("decode", self.size))
         self.inputs[:n].copy_(input_ids)
         self.positions[:n].copy_(positions)
-        self.inputs[n:].zero_()
-        self.positions[n:].zero_()
+        if n < self.size:
+            self.inputs[n:].zero_()
+            self.positions[n:].zero_()
         fetch(self.backends, self.inputs, self.positions)
         self.graph.replay()
         assert self.output is not None
@@ -201,8 +202,9 @@ class VerifyGraphPlan:
         tokens = n * self.steps
         self.inputs[:tokens].copy_(input_ids)
         self.positions[:tokens].copy_(positions)
-        self.inputs[tokens:].zero_()
-        self.positions[tokens:].zero_()
+        if tokens < len(self.inputs):
+            self.inputs[tokens:].zero_()
+            self.positions[tokens:].zero_()
         self.graph.replay()
         assert self.output is not None
         logits, hidden = self.output
@@ -284,9 +286,10 @@ class DraftGraphPlan:
         self.inputs[:n].copy_(input_ids)
         self.positions[:n].copy_(positions)
         self.hidden[:n].copy_(hidden)
-        self.inputs[n:].zero_()
-        self.positions[n:].zero_()
-        self.hidden[n:].zero_()
+        if n < self.size:
+            self.inputs[n:].zero_()
+            self.positions[n:].zero_()
+            self.hidden[n:].zero_()
         self.graph.replay()
         assert self.output is not None
         logits, out = self.output

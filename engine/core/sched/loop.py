@@ -63,8 +63,10 @@ What is ours (stage2-contract.md §4):
 
 from __future__ import annotations
 
+import gc
 import sys
 import time
+from array import array
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -225,6 +227,9 @@ class Flight:
     refused_by: set[int] = field(default_factory=set[int])
     """Ranks whose new worker refuses this step: it reached them after a replacement, before the
     full delta. A ``Resync`` from them while other ranks ran it is expected."""
+    unhomed: list[list[int]] = field(default_factory=list[list[int]])
+    """Per domain, request ids in this step that do not yet have ``home`` recorded on every rank of
+    their domain."""
 
 
 class Outbox:
@@ -265,6 +270,11 @@ class Scheduler:
                  tokens_to: Callable[[StreamAddress], Writer], discard: Callable[[StreamAddress], None],
                  identity: Callable[[], str], ledger: Ledger | None = None, ledgers: Sequence[Ledger] | None = None,
                  depth: Callable[[], int] = lambda: 1,
+                 overlap_lead_s: Callable[[], float] = lambda: 0.0,
+                 prefill_coalesce_s: Callable[[], float] = lambda: 0.0,
+                 prefill_interval: Callable[[], int] = lambda: 0,
+                 prefill_occupancy_target: Callable[[], int] = lambda: 0,
+                 balance_prefill: Callable[[], bool] = lambda: False,
                  settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
         if not plans or len(plans) != len(results):
             raise ValueError("one plan writer and one result reader per rank")
@@ -292,6 +302,17 @@ class Scheduler:
         self.plans = [Outbox(w) for w in plans]
         self.tokens_to, self.discard, self.identity = tokens_to, discard, identity
         self.depth, self.settings, self.clock = depth, settings, clock
+        self.overlap_lead_s = overlap_lead_s
+        self.prefill_coalesce_s = prefill_coalesce_s
+        self.prefill_interval = prefill_interval
+        self.prefill_occupancy_target = prefill_occupancy_target
+        self.balance_prefill = balance_prefill
+        self._last_retire_at: float = 0.0
+        self._decode_step_s: float = 0.012
+        self._prefill_tok_s: float = 56000.0
+        self._decode_streak: int = 0
+        self._coalesce_since: float | None = None
+        self._defer_until: float | None = None
         self.flights: deque[Flight] = deque()
         self.full = True
         """The next plan resets the workers' persistent batch: it cannot know what an earlier
@@ -325,6 +346,7 @@ class Scheduler:
         whether it can retire."""
         self.turned_away: dict[int, int] = {}
         """Waiting request -> the domain whose ledger last had no room for it: it tries another next."""
+        self._idle_gc_armed = False
 
     # ------------------------------------------------------------------ the loop
 
@@ -417,13 +439,19 @@ class Scheduler:
             print(f"core.sched: {text}", file=sys.stderr, flush=True)
 
     def _wait(self) -> None:
+        wait_s = self.settings.idle_wait_s
+        if self._defer_until is not None:
+            wait_s = min(wait_s, max(0.0005, self._defer_until - self.clock()))
         if self.flights and self.fault is None:
-            self._wait_result(self.settings.idle_wait_s)
+            self._wait_result(wait_s)
             return
+        if self._idle_gc_armed and self._defer_until is None:
+            self._idle_gc_armed = False
+            gc.collect(0)
         if self.held:
-            time.sleep(self.settings.idle_wait_s)
+            time.sleep(wait_s)
             return
-        raw = self.requests.read(timeout=self.settings.idle_wait_s)
+        raw = self.requests.read(timeout=wait_s)
         if raw is not None:
             self._take_requests(raw)
 
@@ -633,7 +661,7 @@ class Scheduler:
             return
         # A domain's ranks ran one plan: they sampled the same, or all refused it (it did not run
         # there), or the new workers of replaced ranks refused it while the others ran it.
-        ran: dict[int, tuple[list[int], list[int], list[int]]] = {}
+        ran: dict[int, tuple[Sequence[int], Sequence[int], Sequence[int]]] = {}
         refused_by: set[int] = set()
         split: set[int] = set()
         for domain, ranks in enumerate(self.domains):
@@ -669,9 +697,16 @@ class Scheduler:
                                                    f"{sorted(row for row in flight.rows if self._domain(row) == domain)}")
                 return
             ran[domain] = kept
-        merged = Sampled(Column.of("i32", [row for rows, _, _ in ran.values() for row in rows]),
-                         Column.of("i32", [n for _, counts, _ in ran.values() for n in counts]),
-                         Column.of("i64", [t for _, _, tokens in ran.values() for t in tokens]))
+        m_rows = array("i")
+        m_counts = array("i")
+        m_tokens = array("q")
+        for r_seq, c_seq, t_seq in ran.values():
+            m_rows.extend(r_seq)
+            m_counts.extend(c_seq)
+            m_tokens.extend(t_seq)
+        merged = Sampled(Column("i32", m_rows.tobytes()),
+                         Column("i32", m_counts.tobytes()),
+                         Column("i64", m_tokens.tobytes()))
         advanced = self._advanced(flight, merged, ran)
         if advanced is None:
             self.flights.appendleft(flight)
@@ -679,16 +714,34 @@ class Scheduler:
                                         "draft tokens in a row, or none")
             return
         stayed = everywhere - set(ran)
+        now = self.clock()
+        started = max(flight.since, self._last_retire_at) if self._last_retire_at > 0 else flight.since
+        gpu_s = max(now - started, 1e-4)
+        self._last_retire_at = now
+        if ran:
+            if flight.prefills:
+                per_dom = [0] * len(self.domains)
+                for row in flight.prefills:
+                    dom = self._domain(row)
+                    if dom in ran:
+                        per_dom[dom] += flight.counts.get(row, 0)
+                peak_tok = max(per_dom, default=0)
+                if peak_tok >= 512 and gpu_s > 1e-3:
+                    rate = min(max(peak_tok / gpu_s, 5000.0), 250000.0)
+                    self._prefill_tok_s = 0.7 * self._prefill_tok_s + 0.3 * rate
+            else:
+                self._decode_step_s = 0.8 * self._decode_step_s + 0.2 * min(gpu_s, 0.2)
         events = self.table.sample(flight.epoch, self.identity(), merged) if ran else None
         for domain, ledger in enumerate(self.ledgers):
             if domain in ran:
-                ledger.retire(flight.epoch, advanced={flight.rows[row]: n for row, n in advanced.items()
-                                                      if self._domain(row) == domain})
+                ledger.retire(flight.epoch, advanced=({flight.rows[row]: n for row, n in advanced.items()
+                                                       if self._domain(row) == domain} if advanced else None))
             else:
                 ledger.retire(flight.epoch, ran=False)
         # A row of a domain that did not run the step computed nothing.
-        ready = self.table.retire(flight.epoch, advanced={
-            **advanced, **{row: 0 for row in flight.rows if self._domain(row) in stayed}})
+        ret_adv = ({**advanced, **{row: 0 for row in flight.rows if self._domain(row) in stayed}}
+                   if (advanced or stayed) else None)
+        ready = self.table.retire(flight.epoch, advanced=ret_adv)
         if stayed:
             self._stayed(flight, stayed, split, refused_by)
         for row in flight.prefills:  # checkpoint_kv_cache
@@ -722,6 +775,8 @@ class Scheduler:
     def _advanced(self, flight: Flight, kept: Sampled, ran: Iterable[int]) -> dict[int, int] | None:
         """Row -> tokens each speculative decode row of the domains ``ran`` accepted: its count, 1 to
         ``draft_tokens``. ``None``: a count out of that range."""
+        if not flight.speculative:
+            return {}
         counts = dict(zip((int(x) for x in kept.rows.values()), (int(x) for x in kept.counts.values()), strict=True))
         domains = set(ran)
         out = {row: counts.get(row, 0) for row in flight.speculative if self._domain(row) in domains}
@@ -729,14 +784,36 @@ class Scheduler:
             return None
         return out
 
-    def _kept(self, flight: Flight, domain: int, sampled: Sampled) -> tuple[list[int], list[int], list[int]] | None:
+    def _kept(self, flight: Flight, domain: int, sampled: Sampled
+              ) -> tuple[Sequence[int], Sequence[int], Sequence[int]] | None:
         """What a domain sampled, as rows, counts and tokens, the rows as the scheduler numbers them:
         the tokens of the rows that sample. Every row of the plan answers, and a row whose chunk did
         not end its prompt has its token dropped (``Sampled``). ``None``: the rows are not the plan's."""
         base = domain * self.settings.max_batch
-        rows = [int(x) + base for x in sampled.rows.values()]
-        counts = [int(x) for x in sampled.counts.values()]
-        tokens = [int(x) for x in sampled.tokens.values()]
+        max_b = self.settings.max_batch
+        s_rows = cast(Sequence[int], sampled.rows.values())
+        s_counts = cast(Sequence[int], sampled.counts.values())
+        s_tokens = cast(Sequence[int], sampled.tokens.values())
+        n_r = len(s_rows)
+        if n_r != len(s_counts):
+            return None
+        if len(flight.samples) == len(flight.rows) and len(s_tokens) == n_r and all(c == 1 for c in s_counts):
+            f_rows = flight.rows
+            exp_n = sum(1 for row in f_rows if base <= row < base + max_b)
+            if n_r != exp_n:
+                return None
+            out_r = array("i")
+            seen_r: set[int] = set()
+            for x in s_rows:
+                row = x + base
+                if row in seen_r or row not in f_rows or not (base <= row < base + max_b):
+                    return None
+                seen_r.add(row)
+                out_r.append(row)
+            return out_r, s_counts, s_tokens
+        rows = [int(x) + base for x in s_rows]
+        counts = [int(x) for x in s_counts]
+        tokens = [int(x) for x in s_tokens]
         planned = sorted(row for row in flight.rows if self._domain(row) == domain)
         if sorted(rows) != planned or len(counts) != len(rows) or sum(counts) != len(tokens):
             return None
@@ -816,7 +893,7 @@ class Scheduler:
         if self.held:  # what comes now waits in the stream: it runs on what the change makes
             return False
         got = False
-        for _ in range(32):
+        for _ in range(256):
             raw = self.requests.read(timeout=0)
             if raw is None:
                 break
@@ -890,9 +967,22 @@ class Scheduler:
             self._reap(rid)
 
     def _emit(self, events: TokenEvents, epoch: int) -> None:
-        ids = [int(x) for x in events.requests.values()]
-        if not ids:
+        req_arr = cast(Sequence[int], events.requests.values())
+        if not req_arr:
             return
+        first_req = self.table.get(req_arr[0])
+        single_route = first_req.route if first_req is not None else None
+        if single_route is not None:
+            all_same = True
+            for rid in req_arr:
+                r_obj = self.table.get(rid)
+                if r_obj is None or r_obj.route != single_route:
+                    all_same = False
+                    break
+            if all_same:
+                self._send(single_route, events, epoch)
+                return
+        ids = [int(x) for x in req_arr]
         offsets = [int(x) for x in events.offsets.values()]
         tokens = [int(x) for x in events.tokens.values()]
         grouped: dict[StreamAddress, dict[int, list[int]]] = {}
@@ -944,9 +1034,19 @@ class Scheduler:
         request = self.table.get(rid)
         if request is None or not request.reclaimable:
             return
-        computed = [*request.prompt_tokens, *request.output_ids][:request.computed]
         # A request without a row holds nothing; every ledger forgets what it matched of it.
-        for ledger in (self.ledgers if request.row is None else [self._ledger(request)]):
+        targets = self.ledgers if request.row is None else [self._ledger(request)]
+        if any(getattr(l, "caches", True) for l in targets):
+            prompt_len = len(request.prompt_tokens)
+            if request.computed <= prompt_len or not request.output_ids:
+                computed: Sequence[int] = request.prompt_tokens[:request.computed]
+            else:
+                extra = request.output_ids[:request.computed - prompt_len]
+                packed = request.input.prompt.data + Column.of("i64", extra).data
+                computed = memoryview(packed).cast("q")
+        else:
+            computed = ()
+        for ledger in targets:
             ledger.release(rid, self.table.last_retired, computed)
         if request.row is not None:
             self.removed.append(request.row)
@@ -970,14 +1070,20 @@ class Scheduler:
                 self.plan_gens[rank] = gen
                 if moved:  # before the plans just written are counted: they went to the new reader
                     self._plans_moved(rank, gen)
-            flights = {f.epoch: f for f in self.flights}
-            for epoch in written:
-                flight = flights.get(epoch)
-                if flight is not None:
-                    flight.written[rank] = gen
-                    for row, rid in flight.rows.items():
-                        if self._domain(row) == self._of(rank):
-                            self.home.setdefault(rid, {}).setdefault(rank, gen)
+            if written:
+                flights = {f.epoch: f for f in self.flights}
+                dom = self._of(rank)
+                for epoch in written:
+                    flight = flights.get(epoch)
+                    if flight is not None:
+                        flight.written[rank] = gen
+                        if dom < len(flight.unhomed):
+                            for rid in flight.unhomed[dom]:
+                                self.home.setdefault(rid, {}).setdefault(rank, gen)
+                        else:
+                            for row, rid in flight.rows.items():
+                                if self._domain(row) == dom:
+                                    self.home.setdefault(rid, {}).setdefault(rank, gen)
         self._flush_routes()
 
     def _plan(self) -> bool:
@@ -1016,9 +1122,15 @@ class Scheduler:
         """What can run, and each domain's view of it."""
         kinds: dict[int, tuple[Kind, Request, int]] = {}
         views = [_View() for _ in self.domains]
+        queued = [0] * len(self.domains)
         for request in self.table.entries():
             if request.row is not None:
-                views[self._domain(request.row)].free_rows -= 1
+                dom = self._domain(request.row)
+                views[dom].free_rows -= 1
+                if not request.finished():
+                    rem = len(request.prompt_tokens) - (request.computed + tokens.get(request.input.request, 0))
+                    if rem > 0:
+                        queued[dom] += rem
         for view in views:
             view.free_rows += self.settings.max_batch
         room = [view.free_rows for view in views]  # where a waiting request can be admitted: where it starts
@@ -1031,7 +1143,7 @@ class Scheduler:
                 view = views[self._domain(request.row)]
                 planned = request.computed + tokens.get(rid, 0)
             else:
-                domain, planned = self._route(request, views, room)
+                domain, planned = self._route(request, views, room, queued)
                 view = views[domain]
             output = len(request.output_ids) + samples.get(rid, 0)
             c = Candidate(rid, arrival, prompt, min(planned, prompt), output, request.input.max_tokens)
@@ -1051,7 +1163,8 @@ class Scheduler:
             view.free_rows = max(0, view.free_rows)
         return kinds, views
 
-    def _route(self, request: Request, views: Sequence[_View], room: list[int]) -> tuple[int, int]:
+    def _route(self, request: Request, views: Sequence[_View], room: list[int],
+               queued: list[int]) -> tuple[int, int]:
         """The domain a waiting request would be admitted to, and how much of its prompt that
         domain's prefix cache holds. Of the domains with a free row whose ledger can hold it at all:
         not the one that just had no room for it, if there is another; then the one whose cache
@@ -1059,15 +1172,20 @@ class Scheduler:
         before it. Without such a domain it waits where fewest wait, and starts at 0."""
         rid, prompt = request.input.request, request.prompt_tokens
         extent = self._extent(len(prompt), request.input.max_tokens)
+        balance = self.balance_prefill()
         open_ = [d for d, view in enumerate(views) if view.free_rows > 0 and
                  (len(views) == 1 or self.ledgers[d].fits(extent))]
         if not open_:
-            domain = max(range(len(room)), key=lambda d: (room[d], -d))
+            domain = (max(range(len(room)), key=lambda d: (-queued[d], room[d], -d))
+                      if balance else max(range(len(room)), key=lambda d: (room[d], -d)))
             room[domain] -= 1
+            queued[domain] += len(prompt)
             return domain, 0
         matches = {d: self.ledgers[d].match(rid, prompt) for d in open_}
-        domain = max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], room[d], -d))
+        domain = (max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], -queued[d], room[d], -d))
+                  if balance else max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], room[d], -d)))
         room[domain] -= 1
+        queued[domain] += max(0, len(prompt) - matches[domain])
         return domain, matches[domain]
 
     def _decide(self, waiting: list[Candidate], prefilling: list[Candidate], decoding: list[Candidate],
@@ -1102,30 +1220,141 @@ class Scheduler:
                               f"{self.settings.token_budget} tokens and {free_rows} rows")
         return takes
 
+    def _flight_eta(self, flight: Flight) -> float:
+        started = max(flight.since, self._last_retire_at) if self._last_retire_at > flight.since else flight.since
+        if not flight.prefills:
+            return started + self._decode_step_s
+        per_dom = [0] * len(self.domains)
+        for row in flight.prefills:
+            per_dom[self._domain(row)] += flight.counts.get(row, 0)
+        peak_tok = max(per_dom, default=0)
+        return started + max(self._decode_step_s, peak_tok / max(self._prefill_tok_s, 1.0))
+
     def _plan_step(self) -> bool:
+        self._defer_until = None
         tokens, samples = self._in_flight()
         kinds, views = self._view(tokens, samples)
         if not kinds:
+            self._coalesce_since = None
+            self._decode_streak = 0
             return False
-        epoch = max(self.table.last_submitted, 0) + 1
-        used = {r.row for r in self.table.entries() if r.row is not None}
-        batch = self.settings.max_batch
-        steps = [_Step(epoch, domain * batch) for domain in range(len(self.domains))]
-        try:
-            for step, view in zip(steps, views, strict=True):
-                if not (view.waiting or view.prefilling or view.decoding):
-                    continue
-                free = [row for row in range(step.base, step.base + batch) if row not in used]
-                takes = self._decide(view.waiting, view.prefilling, view.decoding, view.free_rows)
-                if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
-                    # No mixed step with speculation (SGLang disables mixed chunks): the prompts go first.
-                    takes = [t for t in takes if kinds[t.request][0] != "decoding"]
-                refused = self._carry_out(step, takes, kinds, tokens, free)
-                if not step.rows and refused:
-                    takes = self._decide([], view.prefilling, view.decoding, view.free_rows)
-                    self._carry_out(step, takes, kinds, tokens, free)
-            if not any(step.rows for step in steps):
+        now = self.clock()
+        any_decoding = any(v.decoding for v in views)
+        any_waiting = any(v.waiting for v in views)
+        any_prefilling = any(v.prefilling for v in views)
+        budget = self.settings.token_budget
+
+        # 1. Idle multi-domain prefill coalescing: wait briefly when idle so concurrent HTTP arrivals
+        #    spread across domains before sealing step 1 on a single GPU.
+        coalesce_s = self.prefill_coalesce_s()
+        if (not self.flights and coalesce_s > 0 and len(views) > 1 and not any_decoding
+                and any_waiting and not all(v.waiting or v.prefilling for v in views)):
+            if self._coalesce_since is None:
+                self._coalesce_since = now
+            if now < self._coalesce_since + coalesce_s:
+                self._defer_until = self._coalesce_since + coalesce_s
                 return False
+        else:
+            self._coalesce_since = None
+
+        # 2. Coordinated prefill cadence while decoding: batch prefill chunks (both new admissions and
+        #    remaining multi-step chunks) across DP+EP domains so all ranks run eager prefill together
+        #    instead of stalling decoding ranks on isolated single-domain chunks.
+        interval = self.prefill_interval()
+        target = self.prefill_occupancy_target() * len(views)
+        if interval > 0 and target > 0 and any_decoding:
+            active = min(target, sum(len(view.decoding) for view in views))
+            interval = max(1, (interval * active + target - 1) // target)
+        hold_prefill = False
+        if not any_decoding:
+            self._decode_streak = 0
+        elif interval > 0 and (any_waiting or any_prefilling):
+            prefill_toks = [
+                sum(c.prompt - c.planned for c in (*v.prefilling, *v.waiting))
+                for v in views
+            ]
+            min_prefill_toks = min(prefill_toks, default=0)
+            all_have_prefill = min_prefill_toks > 0
+            all_saturated = min_prefill_toks >= max(1, (budget * 3) // 4)
+            all_point = max(12, interval // 4)
+            if self._decode_streak == 0:
+                if not all_have_prefill:
+                    hold_prefill = True
+            elif self._decode_streak < interval:
+                if not (
+                    (all_have_prefill and self._decode_streak >= all_point)
+                    or (all_saturated and self._decode_streak >= max(8, all_point // 2))
+                ):
+                    hold_prefill = True
+
+        # 3. Overlap lead-time pacing: while a prefill step is running on GPU (len(flights) == 1),
+        #    avoid sealing step N + 1 hundreds of ms early with idle domains unless all domains are
+        #    already at least half-full of prefill tokens.
+        lead_s = self.overlap_lead_s()
+        if (len(self.flights) == 1 and lead_s > 0 and self.flights[0].prefills
+                and not hold_prefill and (any_waiting or any_prefilling)):
+            all_saturated = all(
+                sum(c.prompt - c.planned for c in (*v.prefilling, *v.waiting)) >= max(1, budget // 2)
+                for v in views
+            )
+            if not all_saturated:
+                eta = self._flight_eta(self.flights[0])
+                if now < eta - lead_s:
+                    self._defer_until = eta - lead_s
+                    return False
+
+        epoch = max(self.table.last_submitted, 0) + 1
+        used: set[int] | None = None
+        batch = self.settings.max_batch
+
+        def try_build(defer_prefill: bool) -> list[_Step]:
+            nonlocal used
+            built = [_Step(epoch, domain * batch) for domain in range(len(self.domains))]
+            try:
+                for step, view in zip(built, views, strict=True):
+                    waiting_cs = [] if defer_prefill else view.waiting
+                    prefilling_cs = [] if defer_prefill else view.prefilling
+                    if not (waiting_cs or prefilling_cs or view.decoding):
+                        continue
+                    if waiting_cs:
+                        if used is None:
+                            used = {r.row for r in self.table.entries() if r.row is not None}
+                        free = [row for row in range(step.base, step.base + batch) if row not in used]
+                    else:
+                        free = []
+                    takes = self._decide(waiting_cs, prefilling_cs, view.decoding, view.free_rows)
+                    if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
+                        # No mixed step with speculation (SGLang disables mixed chunks): the prompts go first.
+                        takes = [t for t in takes if kinds[t.request][0] != "decoding"]
+                    refused = self._carry_out(step, takes, kinds, tokens, free)
+                    if not step.rows and refused:
+                        takes = self._decide([], prefilling_cs, view.decoding, view.free_rows)
+                        self._carry_out(step, takes, kinds, tokens, free)
+                if not any(step.rows for step in built):
+                    for step in built:
+                        ledger = self.ledgers[step.base // batch]
+                        for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
+                            ledger.cancel(rid, epoch)
+                        for request in step.admitted:
+                            request.row = None
+                            request.computed = 0
+                return built
+            except BaseException:
+                for step in built:
+                    ledger = self.ledgers[step.base // batch]
+                    for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
+                        ledger.cancel(rid, epoch)
+                    for request in step.admitted:
+                        request.row = None
+                        request.computed = 0
+                raise
+
+        steps = try_build(hold_prefill)
+        if not any(step.rows for step in steps) and hold_prefill:
+            steps = try_build(False)
+        if not any(step.rows for step in steps):
+            return False
+        try:
             self._send_plan(steps)
         except BaseException:  # nothing of this step went out: give back what it took
             for step in steps:
@@ -1136,6 +1365,12 @@ class Scheduler:
                     request.row = None
                     request.computed = 0
             raise
+        self._coalesce_since = None
+        self._idle_gc_armed = True
+        if any(step.prefills for step in steps):
+            self._decode_streak = 0
+        else:
+            self._decode_streak += 1
         return True
 
     def _carry_out(self, step: _Step, takes: list[Take], kinds: Mapping[int, tuple[Kind, Request, int]],
@@ -1189,10 +1424,13 @@ class Scheduler:
                 continue
             step.assign_all(row, extra.items)
             for state_kind, (src, dst) in extra.restore.items():
-                step.copies.setdefault(state_kind, []).append((row, src, dst))
+                step.copies.setdefault((state_kind, "before"), []).append((src, dst))
+            for state_kind, src, dst in extra.snapshot:
+                step.copies.setdefault((state_kind, "after"), []).append((src, dst))
             for state_kind, (dst, upto) in extra.track.items():
                 step.track.setdefault(state_kind, []).append((row, dst, upto))
             step.rows[row], step.counts[row] = rid, n
+            step.prompt_lengths.append(len(request.prompt_tokens))
             # A speculative decode row starts where the retired steps left it at least; the worker
             # knows where the steps in flight took it (BatchPlan.positions).
             step.positions.append(request.computed if speculative else planned)
@@ -1227,7 +1465,7 @@ class Scheduler:
         if n < left:
             align = self.ledgers[0].align
             n = (planned + n) // align * align - planned
-        return n
+        return self.ledgers[0].prefill_end(planned, planned + n, len(request.prompt_tokens)) - planned
 
     def _send_plan(self, steps: Sequence[_Step]) -> None:
         """One step: each domain's part to its ranks, an empty one to a domain with nothing to run."""
@@ -1249,9 +1487,14 @@ class Scheduler:
             for rank in ranks:
                 self.plans[rank].put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)),
                                      now, epoch)
+        per_dom = len(self.domains[0])
+        unhomed = [[rid for rid in step.rows.values()
+                    if rid not in self.home or len(self.home[rid]) < per_dom]
+                   for step in steps]
         self.flights.append(Flight(epoch, rows, counts, frozenset(row for step in steps for row in step.samples), now,
                                    frozenset(row for step in steps for row in step.prefill_rows),
-                                   frozenset(row for step in steps for row in step.speculative)))
+                                   frozenset(row for step in steps for row in step.speculative),
+                                   unhomed=unhomed))
         self.full = False
         self.removed.clear()
 
@@ -1262,13 +1505,15 @@ class Scheduler:
             "decode" if not step.prefills else "prefill" if not step.decodes else "mixed")
         counts = [1 if row in step.speculative else n for row, n in step.counts.items()]
         batch = BatchPlan(Column.of("i32", [row - base for row in step.rows]), Column.of("i32", counts),
-                          Column.of("i32", step.positions), Column.of("i64", step.tokens),
+                          Column.of("i32", step.positions), Column("i64", step.tokens.tobytes()),
                           Column.of("u8", step.from_previous), phase, 0, self.settings.draft_tokens,
-                          Column.of("i64", step.next_tokens if self.settings.draft_tokens else []))
+                          Column.of("i64", step.next_tokens if self.settings.draft_tokens or
+                                    (step.prefills and any(t >= 0 for t in step.next_tokens)) else []),
+                          Column.of("i32", step.prompt_lengths if phase != "decode" else []))
         state = StateOps([StateAssign(kind, Column.of("i32", [row - base for row in per_row]),
                                       *ragged("i32", per_row.values())) for kind, per_row in step.assign.items()],
-                         [StateCopy(kind, "before", Column.of("i32", [c[1] for c in cs]),
-                                    Column.of("i32", [c[2] for c in cs])) for kind, cs in step.copies.items()],
+                         [StateCopy(kind, when, Column.of("i32", [src for src, _ in cs]),
+                                    Column.of("i32", [dst for _, dst in cs])) for (kind, when), cs in step.copies.items()],
                          [StateTrack(kind, Column.of("i32", [t[0] - base for t in ts]), Column.of("i32", [t[1] for t in ts]),
                                      Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()])
         removed = [] if self.full else [row - base for row in self.removed
@@ -1298,16 +1543,17 @@ class _Step:
     rows: dict[int, int] = field(default_factory=dict[int, int])
     counts: dict[int, int] = field(default_factory=dict[int, int])
     positions: list[int] = field(default_factory=list[int])
-    tokens: list[int] = field(default_factory=list[int])
+    tokens: array[int] = field(default_factory=lambda: array("q"))
     from_previous: list[int] = field(default_factory=list[int])
     samples: set[int] = field(default_factory=set[int])
     added: list[AddedRow] = field(default_factory=list[AddedRow])
     assign: dict[str, dict[int, list[int]]] = field(default_factory=dict[str, dict[int, list[int]]])
     admitted: list[Request] = field(default_factory=list[Request])
-    copies: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict[str, list[tuple[int, int, int]]])
-    """kind -> (row, src, dst): cached states restored before the step."""
+    copies: dict[tuple[str, Literal["before", "after"]], list[tuple[int, int]]] = field(
+        default_factory=dict[tuple[str, Literal["before", "after"]], list[tuple[int, int]]])
     track: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict[str, list[tuple[int, int, int]]])
     """kind -> (row, dst, upto): states the step keeps for the prefix cache."""
+    prompt_lengths: list[int] = field(default_factory=list[int])
     prefill_rows: set[int] = field(default_factory=set[int])
     speculative: set[int] = field(default_factory=set[int])
     next_tokens: list[int] = field(default_factory=list[int])

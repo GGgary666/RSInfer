@@ -164,7 +164,7 @@ class Placement:
         if not self.mapped:
             return None, None, None
         assert self.to_physical is not None and self.copies is not None and self.counts is not None
-        return self.to_physical[layer], self.copies[layer], self.counts[layer] if self.active else None
+        return self.to_physical[layer], self.copies[layer], self.counts[layer] if self.interval > 0 else None
 
     def count(self, layer: int) -> torch.Tensor:
         """``[local]`` int32: the routed-experts kernel adds the tokens each slot of this rank took."""

@@ -262,7 +262,8 @@ class Driver:
         prefilling = all(reqs[row].computed + chunks[row] <= len(reqs[row].known) for row in rows)
         plan = BatchPlan(Column.of("i32", rows), Column.of("i32", list(chunks.values())),
                          Column.of("i32", [reqs[row].computed for row in rows]), Column.of("i64", tokens),
-                         Column.of("u8", prev), "decode" if decoding else "prefill" if prefilling else "mixed", 0)
+                         Column.of("u8", prev), "decode" if decoding else "prefill" if prefilling else "mixed", 0,
+                         prompt_lengths=Column.of("i32", [reqs[row].prompt_len for row in rows]))
         return delta, plan, state
 
     def step(self, chunks: dict[int, int], copies: list[StateCopy] | None = None,

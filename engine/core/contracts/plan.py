@@ -60,6 +60,10 @@ class PlanService(Protocol):
         eagerly."""
         ...
 
+    def replay_idle(self) -> bool:
+        """Participate in this step's expert collectives on a rank with no requests, if a valid idle graph exists."""
+        ...
+
     def buckets(self, phase: Phase) -> list[int]:
         """The graph buckets that are ready and whose dependencies hold, from the bucketing policy
         (powers of 2 by default). The eager plan, bucket 0, is always there and not listed. This is

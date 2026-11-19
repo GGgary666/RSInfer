@@ -13,9 +13,10 @@ An aborted request can therefore finish for its client while GPU work still hold
 from __future__ import annotations
 
 import secrets
-from collections.abc import Iterable, Mapping
+from array import array
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import msgspec
 
@@ -38,10 +39,11 @@ class Request:
     computed: int = 0
     row: int | None = None
     route: StreamAddress | None = None
-    prompt_tokens: list[int] = field(default_factory=list[int])
+    prompt_tokens: Sequence[int] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        self.prompt_tokens = [int(x) for x in self.input.prompt.values()]
+        # Keep the immutable wire buffer instead of boxing every long-context token.
+        self.prompt_tokens = memoryview(self.input.prompt.data).cast("q")
 
     def finished(self) -> bool:
         return self.finished_reason is not None
@@ -116,12 +118,18 @@ class RequestTable:
         """Snapshot the submitted row mapping; a later row reuse cannot misroute an old result."""
         if epoch <= self.last_submitted:
             raise ValueError("step epochs must increase")
-        if len(set(rows.values())) != len(rows):
-            raise ValueError("a request occurs twice in the step")
-        entries = [self.requests[rid] for rid in rows.values()]
-        if any(r.status == "finished" for r in entries):
-            raise ValueError("a finished request cannot start another step")
-        self.steps[epoch] = Step(dict(rows), dict(counts or {}))
+        seen: set[int] = set()
+        entries: list[Request] = []
+        reqs = self.requests
+        for rid in rows.values():
+            if rid in seen:
+                raise ValueError("a request occurs twice in the step")
+            seen.add(rid)
+            entry = reqs[rid]
+            if entry.status == "finished":
+                raise ValueError("a finished request cannot start another step")
+            entries.append(entry)
+        self.steps[epoch] = Step(dict(rows), dict(counts) if counts else {})
         self.last_submitted = epoch
         for request in entries:
             request.pending.add(epoch)
@@ -136,17 +144,68 @@ class RequestTable:
         step = self.steps[epoch]
         if step.sampled:
             return token_events(identity, {})
-        rows = [int(x) for x in sampled.rows.values()]
-        counts = [int(x) for x in sampled.counts.values()]
-        tokens = [int(x) for x in sampled.tokens.values()]
-        if len(rows) != len(counts) or len(set(rows)) != len(rows) or any(n < 0 for n in counts) \
-                or sum(counts) != len(tokens) or any(row not in step.rows for row in rows):
+        rows = cast(Sequence[int], sampled.rows.values())
+        counts = cast(Sequence[int], sampled.counts.values())
+        tokens = cast(Sequence[int], sampled.tokens.values())
+        n_rows = len(rows)
+        step_rows = step.rows
+        if n_rows != len(counts):
+            raise ValueError("malformed sampling result")
+        if n_rows and len(tokens) == n_rows and all(c == 1 for c in counts):
+            seen_rows: set[int] = set()
+            for row in rows:
+                if row in seen_rows or row not in step_rows:
+                    raise ValueError("malformed sampling result")
+                seen_rows.add(row)
+            reqs = self.requests
+            out_reqs = array("q")
+            out_offs = array("i", [0])
+            out_toks = array("q")
+            finished: dict[int, FinishReason] = {}
+            for row, tok in zip(rows, tokens):
+                rid = step_rows[row]
+                request = reqs[rid]
+                if request.status == "finished":
+                    continue
+                if identity not in request.identities:
+                    request.identities.append(identity)
+                out_ids = request.output_ids
+                inp = request.input
+                if not inp.stop_token_ids and request.finished_len is None:
+                    out_ids.append(tok)
+                    if len(out_ids) >= inp.max_tokens:
+                        request.finished_reason = "length"
+                        request.finished_len = inp.max_tokens
+                        request.status = "finished"
+                        finished[rid] = "length"
+                    out_reqs.append(rid)
+                    out_toks.append(tok)
+                    out_offs.append(len(out_toks))
+                else:
+                    start = len(out_ids)
+                    out_ids.append(tok)
+                    request.update_finish_state(1)
+                    end = request.finished_len or len(out_ids)
+                    emitted = out_ids[start:end]
+                    del out_ids[end:]
+                    if request.finished_reason is not None:
+                        finished[rid] = request.finished_reason
+                    if emitted or rid in finished:
+                        out_reqs.append(rid)
+                        out_toks.extend(emitted)
+                        out_offs.append(len(out_toks))
+            step.sampled = True
+            return TokenEvents(identity, Column("i64", out_reqs.tobytes()),
+                               Column("i32", out_offs.tobytes()),
+                               Column("i64", out_toks.tobytes()), finished)
+        if len(set(rows)) != n_rows or any(n < 0 for n in counts) \
+                or sum(counts) != len(tokens) or any(row not in step_rows for row in rows):
             raise ValueError("malformed sampling result")
         outputs: dict[int, list[int]] = {}
-        finished: dict[int, FinishReason] = {}
+        finished = {}
         offset = 0
         for row, count in zip(rows, counts, strict=True):
-            rid = step.rows[row]
+            rid = step_rows[row]
             request = self.requests[rid]
             incoming = tokens[offset:offset + count]
             offset += count

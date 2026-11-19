@@ -9,6 +9,7 @@ ranks, in that order, into scheduling domains of equal size, each with its ledge
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -25,6 +26,9 @@ from .loop import Scheduler, Settings, Table
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
+        # Raise Gen-0/1/2 thresholds so large multi-hundred-request decode batches never trigger a
+        # ~180 ms Gen-2 heap scan mid-window; Gen-0 is collected explicitly when the loop goes idle.
+        gc.set_threshold(100_000, 50, 50)
         workers = msgspec.convert(config["sched.workers"], list[ProcId])
         if not workers:
             raise ValueError("sched.workers lists no worker")
@@ -47,8 +51,16 @@ class Unit:
             results=[channels.reader(f"results.{rank}", w.host) for rank, w in enumerate(workers)],
             plans=[channels.writer(w, "plans") for w in workers],
             tokens_to=channels.writer_to, discard=channels.discard, identity=lambda: str(control.identity),
-            depth=lambda: 2 if config["sched.overlap"] else 1, settings=settings)
-        ctx.on_config("sched.overlap", lambda value: None)  # read when planning: no reload needed
+            depth=lambda: 2 if config["sched.overlap"] else 1,
+            overlap_lead_s=lambda: float(config["sched.overlap_lead_s"]),
+            prefill_coalesce_s=lambda: float(config["sched.prefill_coalesce_s"]),
+            prefill_interval=lambda: int(config["sched.prefill_interval"]),
+            prefill_occupancy_target=lambda: int(config["sched.prefill_occupancy_target"]),
+            balance_prefill=lambda: bool(config["sched.balance_prefill"]),
+            settings=settings)
+        for key in ("sched.overlap", "sched.overlap_lead_s", "sched.prefill_coalesce_s",
+                    "sched.prefill_interval", "sched.prefill_occupancy_target", "sched.balance_prefill"):
+            ctx.on_config(key, lambda value: None)  # read when planning: no reload needed
         ctx.on_action("drain", Drain(self.loop))  # a change applies to an empty engine
         ctx.provide("proc.loop@1", self.loop)
         ctx.provide("sched.status@1", self.loop)

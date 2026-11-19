@@ -37,9 +37,15 @@ class Reserved(NamedTuple):
     track: dict[str, tuple[int, int]]
     """Per kind, ``(dst, upto)``: the step writes the request's state at position ``upto`` into item
     ``dst`` (``StateTrack``), for the prefix cache."""
+    snapshot: tuple[tuple[str, int, int], ...] = ()
+    """(kind, src, dst) copies of a whole live state after this step (``StateCopy(after)``)."""
 
 
 class Ledger(Protocol):
+    def prefill_end(self, start: int, end: int, prompt_len: int) -> int:
+        """Stop at an earlier checkpoint if the ledger needs the state there."""
+        ...
+
     @property
     def ready(self) -> bool:
         """Whether the usable capacity of every state kind is known."""

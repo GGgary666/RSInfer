@@ -224,8 +224,9 @@ def rope(x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary
 
 
 def transform(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
-              positions: torch.Tensor | None, rotary: int, fmt: str) -> torch.Tensor:
-    return compose.transform(PIECES, x, norm, eps, cos_sin, positions, rotary, fmt)
+              positions: torch.Tensor | None, rotary: int, fmt: str,
+              out: torch.Tensor | None = None) -> torch.Tensor:
+    return compose.transform(PIECES, x, norm, eps, cos_sin, positions, rotary, fmt, out)
 
 
 def store_cache(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
@@ -234,8 +235,9 @@ def store_cache(x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin:
     return compose.store_cache(PIECES, x, norm, eps, cos_sin, positions, rotary, cache, rows, fmt, entries, normed)
 
 
-def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str) -> torch.Tensor:
-    return compose.load_values(cache, entries, segments, total, fmt)
+def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str,
+                out: torch.Tensor | None = None) -> torch.Tensor:
+    return compose.load_values(cache, entries, segments, total, fmt, out)
 
 
 def load_keys(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, dim: int
@@ -250,14 +252,16 @@ def quant_index_q(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tenso
 
 def index_topk(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, k_data: torch.Tensor,
                k_scales: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor, longest: int, topk: int, mode: str,
-               candidates: torch.Tensor | None, topk_blocks: int, block: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+               candidates: torch.Tensor | None, topk_blocks: int, block: int,
+               cache: dict[Any, Any] | None = None) -> tuple[torch.Tensor, torch.Tensor | None]:
     return compose.index_topk(PIECES, q_data, q_scales, weights, k_data, k_scales, ks, ke, longest, topk, mode,
                               candidates, topk_blocks, block)
 
 
 def index_topk_paged(q_data: torch.Tensor, q_scales: torch.Tensor, weights: torch.Tensor, cache: torch.Tensor,
                      entries: int, block_table: torch.Tensor, lens: torch.Tensor, width: int, topk: int, mode: str,
-                     candidates: torch.Tensor | None, topk_blocks: int, block: int
+                     candidates: torch.Tensor | None, topk_blocks: int, block: int,
+                     step_cache: dict[Any, Any] | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor | None]:
     return compose.index_topk_paged(PIECES, q_data, q_scales, weights, cache, entries, block_table, lens, width, topk,
                                     mode, candidates, topk_blocks, block)
@@ -296,7 +300,7 @@ def moe(group: Any, x: torch.Tensor, gate_weight: torch.Tensor, gate_bias: torch
         w13: torch.Tensor, p13: torch.Tensor, w2: torch.Tensor, p2: torch.Tensor, sw13: torch.Tensor, ss13: torch.Tensor,
         sp13: torch.Tensor, sw2: torch.Tensor, ss2: torch.Tensor, sp2: torch.Tensor, topk: int, route_scale: float,
         limit: float, to_physical: torch.Tensor | None = None, copies: torch.Tensor | None = None,
-        taken: torch.Tensor | None = None) -> torch.Tensor:
+        taken: torch.Tensor | None = None, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
     """A layer's MoE on its normed input (``compose.moe``); ``gate_bf16`` is the gate's weight as a
     fused gate kernel takes it, not read here."""
     return compose.moe(moe_gate, moe_experts, ep_experts, shared_expert, group, x, gate_weight, gate_bias,
@@ -316,7 +320,8 @@ def attn_qkv(x: torch.Tensor, wq_a: torch.Tensor, sq_a: torch.Tensor, pq_a: torc
 def cache_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
                    window: torch.Tensor, window_idx: torch.Tensor, latents: torch.Tensor | None,
                    latent_idx: torch.Tensor | None, sink: torch.Tensor, scale: float, groups: int,
-                   wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor) -> torch.Tensor:
+                   wo_a: torch.Tensor, wo_b: torch.Tensor, so_b: torch.Tensor, po_b: torch.Tensor,
+                   window_cnt: torch.Tensor | None = None, latent_cnt: torch.Tensor | None = None) -> torch.Tensor:
     return compose.cache_attn_out(PIECES, cache_attn, grouped_linear, q, cos_sin, positions, rotary, window,
                                   window_idx, latents, latent_idx, sink, scale, groups, wo_a, wo_b, so_b, po_b)
 
@@ -331,7 +336,8 @@ def sparse_attn_out(q: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Ten
 def engram(index: int, x: torch.Tensor, held: torch.Tensor | None, scales: torch.Tensor | None,
            ids: torch.Tensor | None, embed_weight: torch.Tensor, embed_scale: torch.Tensor,
            wkv_w: torch.Tensor, wkv_s: torch.Tensor, wkv_p: torch.Tensor,
-           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float) -> torch.Tensor:
+           q_weight: torch.Tensor, k_weight: torch.Tensor, eps: float,
+           inplace: bool = False) -> torch.Tensor:
     return compose.engram(PIECES, engram_gate, index, x, held, scales, ids, embed_weight, embed_scale,
                           wkv_w, wkv_s, wkv_p, q_weight, k_weight, eps)
 

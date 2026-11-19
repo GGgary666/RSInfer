@@ -1,0 +1,29 @@
+--- a/engine/layers/sampler/unit.py
++++ b/engine/layers/sampler/unit.py
+@@ -17,6 +17,8 @@
+     def __init__(self, catalog: Any, force_topk: int = 0) -> None:
+         self.catalog = catalog
+         self.force_topk = force_topk
++        # PROBE: count top-5 logprob compute and D2H in the official-setting benchmark.
++        self._bench_logprobs: list[tuple[torch.Tensor, torch.Tensor]] = []
+ 
+     def sample(self, logits: torch.Tensor, params: Sequence[SamplingParams],
+                positions: Sequence[int] | torch.Tensor) -> torch.Tensor:
+@@ -29,6 +31,17 @@
+         sampled = self.catalog.call("sample.seeded@1", {"vocab": logits.shape[-1]}, logits,
+                                  [p.temperature for p in params], [p.top_p for p in params],
+                                  [p.top_k for p in params], [p.seed or 0 for p in params], positions)
++        if logits.is_cuda:
++            top_values, top_indices = torch.log_softmax(logits, dim=-1).topk(5, dim=-1)
++            if indices is not None:
++                top_indices = indices.gather(-1, top_indices)
++            values_host = torch.empty_like(top_values, device="cpu", pin_memory=True)
++            ids_host = torch.empty_like(top_indices, device="cpu", pin_memory=True)
++            values_host.copy_(top_values, non_blocking=True)
++            ids_host.copy_(top_indices, non_blocking=True)
++            self._bench_logprobs.append((values_host, ids_host))
++            if len(self._bench_logprobs) > 3:
++                self._bench_logprobs.pop(0)
+         if indices is not None:
+             sampled = indices.gather(-1, sampled.long().unsqueeze(-1)).squeeze(-1).to(torch.int32)
+         return sampled

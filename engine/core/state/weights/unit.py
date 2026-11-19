@@ -129,7 +129,9 @@ class WeightStore:
         """Which contents: ``"<n>:<path>"`` after the ``n``-th load, ``"<n>:dummy:<seed>"`` for dummy ones."""
         return f"{self.loads}:{self.loaded_from}" if self.loads else ""
 
-    def declare(self, decls: Sequence[WeightDecl]) -> None:
+    def declare(self, decls: Sequence[WeightDecl], *,
+                allocate: Callable[[WeightDecl], torch.Tensor | None] | None = None) -> None:
+        """A model may supply storage for weights shared over a device group; refit writes it in place."""
         moved = False
         existing = bool(self.decls)
         decls = [d for d in decls if self.decls.get(d.name) != d]
@@ -151,6 +153,8 @@ class WeightStore:
             moved |= existing
             if self.asleep:
                 self.tensors[d.name] = torch.empty(d.shape, dtype=META_DTYPES[d.format], device="meta")
+            elif allocate is not None and (tensor := allocate(d)) is not None:
+                self.tensors[d.name] = tensor
             else:
                 buf = self.platform.alloc(0, 0, shape=d.shape, dtype=d.format)
                 self.buffers_[d.name], self.tensors[d.name] = buf, self.platform.tensor(buf)
