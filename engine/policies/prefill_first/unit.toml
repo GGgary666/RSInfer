@@ -6,3 +6,9 @@ entry = "policies.prefill_first.unit:Unit"
 
 [provides]
 services = ["policy.compose@1"]
+
+[capabilities]
+accept_config = true
+
+[config]
+"policy.min_chunk_tokens" = { type = "int", default = 0, binding = "live", doc = "When a prefill step already has work, do not start chunking another waiting request unless at least this many budget tokens remain (0: chunk any positive remainder)." }

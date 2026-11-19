@@ -5,8 +5,9 @@ among other rows."""
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
+import pytest
 import torch
 from transformers.models.qwen3_5 import modeling_qwen3_5 as hf
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
@@ -14,7 +15,9 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from kernels.reference import ops
 from kernels.reference.paged import PagedDecode, PagedExtend
 from kernels.reference.unit import DEFINITIONS
+from core.contracts.sampling import SamplingParams
 from layers.rope.unit import rope_cos_sin_cache
+from layers.sampler.unit import Sampler
 
 torch.manual_seed(0)
 
@@ -219,6 +222,25 @@ def test_the_batch_invariant_references_give_a_row_the_same_bits_alone_and_batch
                 one = torch.zeros_like(cache[0]), torch.zeros_like(cache[1])
                 ops.kv_store(*one, loc[s:e], kv[0][s:e], kv[1][s:e])
                 assert torch.equal(one[0][loc[s:e]], cache[0][loc[s:e]])
+
+
+@pytest.mark.covers(edges=("call",), kinds=("logic",))
+def test_force_topk_caps_before_temperature_and_maps_token_ids_back() -> None:
+    class Catalog:
+        def call(self, definition: str, shape: dict[str, int], logits: torch.Tensor,
+                 *args: Any) -> Any:
+            if definition == "sample.topk@1":
+                assert shape == {"vocab": 5, "k": 2}
+                return ops.sample_topk(logits, args[0])
+            assert definition == "sample.seeded@1" and shape == {"vocab": 2}
+            return ops.sample(logits, *args)
+
+    logits = torch.tensor([[0.0, 1.0, 0.0, 1.2, -1.0], [1.1, -2.0, 1.0, -1.0, 0.0]])
+    params = [SamplingParams(temperature=0.3, top_p=0.95, seed=7)] * 2
+    values, indices = logits.topk(2, dim=-1)
+    selected = ops.sample(values.clone(), [0.3] * 2, [0.95] * 2, [-1] * 2, [7] * 2, [8, 9])
+    expected = indices.gather(-1, selected.long().unsqueeze(-1)).squeeze(-1).to(torch.int32)
+    assert torch.equal(Sampler(Catalog(), force_topk=2).sample(logits.clone(), params, [8, 9]), expected)
 
 
 def test_sampling_is_greedy_at_zero_and_drawn_from_seed_and_position() -> None:

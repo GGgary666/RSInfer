@@ -13,6 +13,7 @@ takes no new requests (503 with ``Retry-After``), and ``Gate`` tells the change 
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import secrets
 import time
@@ -84,6 +85,7 @@ class RequestState:
     abort_sent: bool = False
     incarnation: int | None = None
     """The scheduler instance it was sent to; ``None`` until it was."""
+    last_active: float = field(default_factory=time.monotonic)
 
 
 class FrontendManager:
@@ -91,6 +93,7 @@ class FrontendManager:
                  identity: Callable[[], str], *, max_tokens: int = 4096, max_requests: int = 1024,
                  response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False) -> None:
         self.model, self.tokenizer, self.detokenizer, self.channel = model, tokenizer, detokenizer, channel
+        self._model_json = json.dumps(model, ensure_ascii=False)
         self.identity, self.max_tokens, self.max_requests = identity, max_tokens, max_requests
         self.response_timeout_s = response_timeout_s
         self.uid_counter = secrets.randbits(30) << 32
@@ -98,6 +101,8 @@ class FrontendManager:
         self.event_map: dict[int, asyncio.Event] = {}
         self.states: dict[int, RequestState] = {}
         self.listener: asyncio.Task[None] | None = None
+        self.watchdog: asyncio.Task[None] | None = None
+        self._now_sec: int = int(time.time())
         self.failure: str | None = None
         """The token stream broke for good (two schedulers writing at once); a reload fixes it."""
         self.incarnation = 0
@@ -120,18 +125,35 @@ class FrontendManager:
         return self.gate is not None or self.built_paused
 
     async def start(self) -> None:
+        gc.set_threshold(100_000, 50, 50)
+        self._now_sec = int(time.time())
         await self.channel.start()
         self.listener = asyncio.create_task(self.listen())
+        self.watchdog = asyncio.create_task(self._watchdog())
 
     async def shutdown(self) -> None:
         for uid in list(self.states):
             with suppress(Exception):
                 await self.abort_user(uid, "frontend unloaded")
-        if self.listener is not None:
-            self.listener.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.listener
+        for task in (self.watchdog, self.listener):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         await self.channel.close()
+
+    async def _watchdog(self) -> None:
+        while True:
+            limit = self.response_timeout_s
+            await asyncio.sleep(min(0.25, max(0.02, limit * 0.25)))
+            now = time.monotonic()
+            self._now_sec = int(time.time())
+            for uid, state in list(self.states.items()):
+                if not state.finished and now - state.last_active >= limit:
+                    state.finished = True
+                    with suppress(Exception):
+                        await self._send_abort(uid, state, "scheduler response timed out")
+                    self._ack(UserReply(uid, "", True, error="scheduler response timed out"))
 
     def _ack(self, reply: UserReply) -> None:
         if reply.uid in self.ack_map:
@@ -158,6 +180,7 @@ class FrontendManager:
                 epoch, events = await self.channel.receive()
                 self._end_replaced()
                 await self.deliver(epoch, events)
+                await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -174,6 +197,8 @@ class FrontendManager:
         if len(offsets) != len(ids) + 1 or offsets[0] != 0 or offsets[-1] != len(tokens) \
                 or any(a > b for a, b in zip(offsets, offsets[1:])):
             raise ValueError("malformed TokenEvents offsets")
+        now_mono = time.monotonic()
+        self._now_sec = int(time.time())
         pieces = {uid: tokens[offsets[i]:offsets[i + 1]] for i, uid in enumerate(ids)}
         for uid in events.finished:
             pieces.setdefault(uid, [])
@@ -183,6 +208,7 @@ class FrontendManager:
             state = self.states.get(uid)
             if state is None or state.finished:
                 continue
+            state.last_active = now_mono
             if uid in events.errors:
                 state.finished = True
                 # A change forcing the engine empty ended it: the server's doing, retry later (Devin, #42).
@@ -264,14 +290,13 @@ class FrontendManager:
 
     async def wait_for_ack(self, uid: int) -> AsyncGenerator[UserReply]:
         event = self.event_map[uid]
+        ack_list = self.ack_map[uid]
         while True:
-            try:
-                await asyncio.wait_for(event.wait(), timeout=self.response_timeout_s)
-            except TimeoutError:
-                yield UserReply(uid, "", True, error="scheduler response timed out")
-                return
+            if not ack_list:
+                await event.wait()
             event.clear()
-            pending, self.ack_map[uid] = self.ack_map[uid], []
+            pending = ack_list[:]
+            ack_list.clear()
             for ack in pending:
                 yield ack
                 if ack.finished:
@@ -298,6 +323,8 @@ class FrontendManager:
         self.states.pop(uid, None)
         self.ack_map.pop(uid, None)
         self.event_map.pop(uid, None)
+        if not self.states:
+            gc.collect(0)
 
     def usage(self, uid: int) -> dict[str, int]:
         state = self.states[uid]
@@ -306,12 +333,26 @@ class FrontendManager:
 
     async def stream_completions(self, uid: int, chat: bool) -> AsyncGenerator[bytes]:
         first_chunk = True
+        cmpl_prefix = f'data: {{"id": "cmpl-{uid}", "object": "text_completion", "created": '
+        chat_prefix = f'data: {{"id": "chatcmpl-{uid}", "object": "chat.completion.chunk", "created": '
+        model_mid = f', "model": {self._model_json}, "choices": [{{"index": 0, "finish_reason": null, '
         try:
             async for ack in self.wait_for_ack(uid):
                 if ack.error:
                     kind = "invalid_request_error" if ack.error_status < 500 else "server_error"
                     yield self.sse({"error": {"message": ack.error, "type": kind, "code": ack.error_status}})
                     break
+                if not ack.finished and not (first_chunk and chat):
+                    first_chunk = False
+                    now = self._now_sec
+                    if not chat:
+                        txt = json.dumps(ack.incremental_output, ensure_ascii=False)
+                        yield f'{cmpl_prefix}{now}{model_mid}"text": {txt}}}]}}\n\n'.encode()
+                    else:
+                        dlt = (f'{{"content": {json.dumps(ack.incremental_output, ensure_ascii=False)}}}'
+                               if ack.incremental_output else "{}")
+                        yield f'{chat_prefix}{now}{model_mid}"delta": {dlt}}}]}}\n\n'.encode()
+                    continue
                 delta: dict[str, str] = {}
                 if first_chunk and chat:
                     delta["role"] = "assistant"
@@ -324,7 +365,7 @@ class FrontendManager:
                 chunk: dict[str, Any] = {
                     "id": f"{'chatcmpl' if chat else 'cmpl'}-{uid}",
                     "object": "chat.completion.chunk" if chat else "text_completion",
-                    "created": int(time.time()), "model": self.model, "choices": [choice],
+                    "created": self._now_sec, "model": self.model, "choices": [choice],
                 }
                 if ack.finished:
                     chunk.update(usage=self.usage(uid), engine_finish_reason=ack.reason,

@@ -213,7 +213,7 @@ class StepChannel:
                     except queue.Empty:
                         break
                 self._flush(pending)
-                wait = 0.002 if pending else 0.01
+                wait = 0.0005 if pending else 0.001
                 if not reading:
                     time.sleep(wait)
                     continue

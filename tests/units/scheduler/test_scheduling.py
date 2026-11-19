@@ -518,3 +518,37 @@ def test_a_waiting_request_whose_chunk_reaches_no_page_is_not_admitted_and_evict
         b.run_until(b.finished(30, 31))
         assert len(ledger.tree.held()[1]) == 3
         check(b, both)
+
+
+def test_multi_domain_prefill_interval_coordinates_chunked_prefills_while_decoding() -> None:
+    """With ``sched.prefill_interval > 0`` across DP domains, an isolated multi-chunk prompt pauses
+    between chunks once other domains are decoding without prefill work, and resumes in lockstep
+    when the other domain also receives prefill work."""
+    with bed(ranks=2, token_budget=8,
+             config={"sched.domains": 2, "sched.prefill_interval": 16, "sched.balance_prefill": True}) as b:
+        r1 = request(1, [10, 11, 12, 13], 35)
+        r2 = request(2, [20, 21, 22, 23], 35)
+        b.client.send([r1, r2])
+        b.run_until(lambda: len(b.client.outputs[1].tokens) >= 2 and len(b.client.outputs[2].tokens) >= 2)
+
+        r3 = request(3, list(range(100, 120)), 3)  # 20 tokens -> 3 chunks at budget 8
+        b.client.send([r3])
+        # Wait until r3 runs its first 8-token chunk on one domain, then verify decode resumes instead
+        # of running r3's second chunk alone while the other domain only decodes.
+        b.run_until(lambda: any(
+            plan.phase == "prefill" and sum(int(n) for n in plan.num_tokens.values()) == 8
+            for w in b.workers for _, plan, _ in w.fixture.plans_seen
+        ))
+        toks_before = len(b.client.outputs[1].tokens) + len(b.client.outputs[2].tokens)
+        b.run_until(lambda: len(b.client.outputs[1].tokens) + len(b.client.outputs[2].tokens) >= toks_before + 4)
+
+        r4 = request(4, list(range(200, 216)), 3)
+        b.client.send([r4])
+        b.run_until(b.finished(1, 2, 3, 4))
+        joint_epochs = {
+            e0 for e0, p0, _ in b.workers[0].fixture.plans_seen if p0.phase == "prefill"
+        } & {
+            e1 for e1, p1, _ in b.workers[1].fixture.plans_seen if p1.phase == "prefill"
+        }
+        assert len(joint_epochs) >= 2  # initial (r1, r2) plus coordinated (r3 remaining chunk, r4)
+        check(b, [r1, r2, r3, r4])

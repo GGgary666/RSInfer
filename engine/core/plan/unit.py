@@ -87,6 +87,7 @@ class Plans:
         that commit a verify step's GDN states."""
         self.resolved: Mapping[str, Any] = {}
         """The start-up record (``resolution``, and what became of the graphs)."""
+        self.idle_graph: Any = None
         self.graphs: dict[int, GraphPlan] = {}
         self.verify_graphs: dict[int, VerifyGraphPlan] = {}
         """With speculation, the verify steps' graphs instead of the decode steps' (doc/specs/mtp.md), each
@@ -97,6 +98,14 @@ class Plans:
         """The verify graph the step in progress replayed: its draft extend replays on its metadata."""
         self.deps: Dependencies | None = None
         """What every bucket was recorded over."""
+
+    def replay_idle(self) -> bool:
+        if self.idle_graph is None or self.deps is None or not self.deps.valid():
+            return False
+        self.eager.model.prepare_idle()
+        self.idle_graph.replay()
+        self.eager.model.stepped()
+        return True
 
     def buckets(self, phase: Phase) -> list[int]:
         """A step's one dependency check: the executor asks here before it changes any state."""
@@ -167,9 +176,12 @@ class Plans:
         """After the step stream and the consumers of the last logits are done. The graphs' pool
         goes back to the device: PyTorch would keep its blocks cached where the next graphs,
         recorded into a pool of their own, cannot use them."""
-        if not self.graphs and not self.verify_graphs:
+        if not self.graphs and not self.verify_graphs and self.idle_graph is None:
             return
         torch.cuda.synchronize()
+        if self.idle_graph is not None:
+            self.idle_graph.close()
+            self.idle_graph = None
         for graph in [*self.graphs.values(), *self.verify_graphs.values(), *self.draft_graphs.values()]:
             graph.close()
         self.graphs, self.verify_graphs, self.draft_graphs, self.deps, self.replayed = {}, {}, {}, None, None
@@ -286,6 +298,9 @@ class Unit:
                 if size in drafts:
                     drafts[size].capture(self.batch, self.model, stores, recorder)
                 seconds[str(size)] = round(time.perf_counter() - started, 3)
+            capture_idle = getattr(self.model, "capture_idle", None)
+            if not steps and capture_idle is not None:
+                self.plans.idle_graph = capture_idle(recorder)
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
             kept = torch.cuda.memory_reserved(device) - before
@@ -294,6 +309,9 @@ class Unit:
                                   f"plan.graph_memory_bytes = {budget}")
         except BaseException:
             torch.cuda.synchronize(device)
+            if self.plans.idle_graph is not None:
+                self.plans.idle_graph.close()
+                self.plans.idle_graph = None
             for graph in [*graphs.values(), *drafts.values()]:
                 graph.close()
             for backend in self.backends:
@@ -312,7 +330,7 @@ class Unit:
             self.plans.draft_graphs = dict(sorted(drafts.items()))
         else:
             self.plans.graphs = dict(sorted(graphs.items()))
-        return "", {"seconds": seconds, "kept_bytes": kept}
+        return "", {"seconds": seconds, "kept_bytes": kept, "idle_experts": self.plans.idle_graph is not None}
 
 
 if TYPE_CHECKING:

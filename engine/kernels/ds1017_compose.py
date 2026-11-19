@@ -68,7 +68,8 @@ class Pieces:
 def rope(p: Pieces, x: torch.Tensor, cos_sin: torch.Tensor, positions: torch.Tensor, rotary: int,
          inverse: bool = False) -> torch.Tensor:
     half = rotary // 2
-    freqs = torch.complex(cos_sin[positions, :half], cos_sin[positions, half:])
+    pos = positions.long()
+    freqs = torch.complex(cos_sin[pos, :half], cos_sin[pos, half:])
     return p.rotate(x, freqs, rotary, inverse)
 
 
@@ -84,18 +85,20 @@ def quantize(p: Pieces, values: torch.Tensor, fmt: str) -> torch.Tensor:
 
 
 def transform(p: Pieces, x: torch.Tensor, norm: torch.Tensor | None, eps: float, cos_sin: torch.Tensor | None,
-              positions: torch.Tensor | None, rotary: int, fmt: str) -> torch.Tensor:
+              positions: torch.Tensor | None, rotary: int, fmt: str,
+              out: torch.Tensor | None = None) -> torch.Tensor:
     """Norm (with ``norm``), rotation (with ``cos_sin``) and the record's quantization, as values."""
     v = x if norm is None else p.rms_norm(x, norm, eps)
     if cos_sin is not None and positions is not None:
         v = rope(p, v, cos_sin, positions, rotary)
-    return quantize(p, v, fmt)
+    res = quantize(p, v, fmt)
+    return out.copy_(res) if out is not None else res
 
 
 def write(cache: torch.Tensor, rows: torch.Tensor, values: torch.Tensor, fmt: str, entries: int) -> None:
     """``values`` (as the format holds them) into their rows. A row of ``-1`` goes to row 0, the
     scratch entry of the padding page, which nothing reads: no shape depends on the values."""
-    safe = rows.clamp_min(0)
+    safe = rows.long().clamp_min(0)
     if fmt == "fp8":
         cache[safe] = formats.pack_kv(values)
     elif fmt == "latent":
@@ -129,12 +132,16 @@ def expand(segments: torch.Tensor, entries: int, total: int) -> tuple[torch.Tens
     return seg[which, 0] * entries + seg[which, 1] + within, seg[which, 3] + within
 
 
-def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str) -> torch.Tensor:
+def load_values(cache: torch.Tensor, entries: int, segments: torch.Tensor, total: int, fmt: str,
+                out: torch.Tensor | None = None) -> torch.Tensor:
     """``load_paged_kv_cache`` of window KV or latent records: their values ``[total, D]`` bf16."""
     src, dst = expand(segments, entries, total)
     unpack = formats.unpack_kv if fmt == "fp8" else formats.unpack_latent
-    out = torch.zeros(total, cache.shape[-1] * (32 if fmt == "fp8" else 16) // (33 if fmt == "fp8" else 9),
-                      dtype=torch.bfloat16, device=cache.device)
+    if out is None:
+        out = torch.zeros(total, cache.shape[-1] * (32 if fmt == "fp8" else 16) // (33 if fmt == "fp8" else 9),
+                          dtype=torch.bfloat16, device=cache.device)
+    else:
+        out.zero_()
     out[dst] = unpack(cache[src]).to(torch.bfloat16)
     return out
 

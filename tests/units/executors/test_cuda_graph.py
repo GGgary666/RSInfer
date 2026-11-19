@@ -301,3 +301,16 @@ def test_graphs_whose_dependencies_moved_are_not_listed_and_required_refuses_the
         graph.service("executor@1").submit(100, delta, plan, ops)
     assert all(torch.equal(x, y) for x, y in zip(before, state(graph), strict=True))
     plans.required = False
+
+
+def test_idle_ep_replay_obeys_graph_dependencies_and_advances_placement_once() -> None:
+    calls: list[str] = []
+    model = SimpleNamespace(prepare_idle=lambda: calls.append("fetch"), stepped=lambda: calls.append("placement"))
+    catalog = SimpleNamespace(version=1)
+    plans = Plans(model, [])
+    plans.idle_graph = SimpleNamespace(replay=lambda: calls.append("experts"))
+    assert not plans.replay_idle()
+    plans.deps = Dependencies([], [], catalog)
+    assert plans.replay_idle() and calls == ["fetch", "experts", "placement"]
+    catalog.version += 1
+    assert not plans.replay_idle() and calls == ["fetch", "experts", "placement"]

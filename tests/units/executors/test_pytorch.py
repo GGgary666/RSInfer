@@ -6,10 +6,11 @@ snapshot (stage2-contract.md §1.3; the comparisons are not bitwise, §6)."""
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
+import msgspec
 import torch
 
 from core.contracts.columns import Column
@@ -75,6 +76,55 @@ def test_a_chunked_prefill_gives_what_one_prefill_gives(worker: Worker) -> None:
         tokens, logits = run(worker, [1], chunk)
         assert tokens == whole_tokens
         same(logits, whole)
+
+
+@pytest.mark.covers(edges=("call", "data"), kinds=("logic",))
+def test_known_prompt_continuations_skip_sampling_and_keep_kv(worker: Worker) -> None:
+    want, _ = run(worker, [0, 1])
+    d = Driver(worker)
+    for row, prompt in PROMPTS.items():
+        d.add(row, prompt)
+    sampler = worker.service("layers.sampler@1")
+    real = sampler.sample
+    calls: list[tuple[int, list[int]]] = []
+
+    def observed(logits: torch.Tensor, params: Sequence[object],
+                 positions: Sequence[int] | torch.Tensor) -> torch.Tensor:
+        calls.append((logits.shape[0], [int(p) for p in positions]))
+        return real(logits, params, positions)
+
+    sampler.sample = observed
+    try:
+        delta, plan, state = d.records({0: 3, 1: 3})
+        plan = msgspec.structs.replace(plan, next_tokens=Column.of("i64", [PROMPTS[0][3], PROMPTS[1][3]]))
+        first = worker.service("executor@1").submit(1, delta, plan, state)
+        sampled = first.finish()
+        assert list(sampled.rows.values()) == [0, 1]
+        assert list(sampled.counts.values()) == [0, 0] and not len(sampled.tokens)
+        assert first.logits.shape[0] == 0 and calls == []
+        d.full, d.epoch = False, 1
+        for request in d.requests.values():
+            request.in_batch, request.computed = True, 3
+
+        delta, plan, state = d.records({0: 4, 1: 3})
+        plan = msgspec.structs.replace(plan, next_tokens=Column.of("i64", [-1, PROMPTS[1][6]]))
+        second = worker.service("executor@1").submit(2, delta, plan, state)
+        sampled = second.finish()
+        assert list(sampled.rows.values()) == [0, 1]
+        assert list(sampled.counts.values()) == [1, 0]
+        assert list(sampled.tokens.values()) == [want[0][0]]
+        assert calls == [(1, [6])]
+        d.requests[0].computed, d.requests[1].computed = 7, 6
+        d.requests[0].known.append(want[0][0])
+        d.requests[0].previous, d.epoch = True, 2
+
+        # An older sender with no continuation column still samples every row.
+        d.step({0: 1, 1: 5})
+        assert d.requests[0].outputs == want[0][:2]
+        assert d.requests[1].outputs == want[1][:1]
+        assert calls[-1] == (2, [7, 10])
+    finally:
+        sampler.sample = real
 
 
 def test_a_rebuilt_batch_answers_resync_until_a_full_delta_then_continues(worker: Worker) -> None:

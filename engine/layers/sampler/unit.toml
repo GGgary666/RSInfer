@@ -9,3 +9,6 @@ services = ["layers.sampler@1"]
 
 [requires]
 services = ["kernels.catalog@1"]
+
+[config]
+"sampler.force_topk" = { type = "int", default = 0, binding = "startup", doc = "Cap the vocabulary before temperature and top-p, as DeepInfer's sampler force-top-k; 0 disables this approximation. Non-speculative decoding only." }

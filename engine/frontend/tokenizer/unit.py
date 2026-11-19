@@ -49,6 +49,7 @@ class HFTokenizer:
         self.tokenizer: Any = module.AutoTokenizer.from_pretrained(path, local_files_only=True, use_fast=True)
         if not self.tokenizer.is_fast:
             raise ValueError("the frontend requires a fast tokenizer for incremental decoding")
+        self._backend: Any = self.tokenizer.backend_tokenizer
         template = Path(path, "chat_template.jinja")
         if not getattr(self.tokenizer, "chat_template", None) and template.is_file():
             self.tokenizer.chat_template = template.read_text()
@@ -66,7 +67,7 @@ class HFTokenizer:
         return self._stop
 
     def encode(self, text: str) -> list[int]:
-        ids = list(self.tokenizer.encode(text, add_special_tokens=True))
+        ids = list(self._backend.encode(text, add_special_tokens=True).ids)
         if self.bos is not None and ids[:1] != [self.bos]:
             ids.insert(0, self.bos)
         return ids
@@ -78,8 +79,10 @@ class HFTokenizer:
         return self.encode(str(prompt))
 
     def decode(self, tokens: Sequence[int]) -> str:
-        return str(self.tokenizer.decode(list(tokens), skip_special_tokens=True,
-                                         clean_up_tokenization_spaces=False))
+        if not tokens:
+            return ""
+        ids = tokens if isinstance(tokens, list) else list(tokens)
+        return str(self._backend.decode(ids, skip_special_tokens=True))
 
 
 class Unit:

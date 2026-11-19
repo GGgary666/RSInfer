@@ -136,10 +136,13 @@ def as_bytes(t: torch.Tensor) -> torch.Tensor:
 class DeepseekV41ForCausalLM:
     """``model@1``."""
 
-    def __init__(self, cfg: DSConfig, dtype: str, page_size: int, services: Mapping[str, Any]) -> None:
+    def __init__(self, cfg: DSConfig, dtype: str, page_size: int, services: Mapping[str, Any],
+                 *, symmetric_engram: bool = False, graph_idle: bool = False) -> None:
         if dtype != "bf16":
             raise ValueError(f"model.dtype = {dtype!r}: DS 1017's activations are bf16 (its kernels quantize from it)")
         self.cfg, self._dtype = cfg, dtype
+        self.symmetric_engram = symmetric_engram
+        self.graph_idle = graph_idle
         s = services
         self.ranks, self.rank = s["comm.group@1"].size, s["comm.group@1"].rank
         """The ranks that hold the model between them, and which of them this is."""
@@ -183,6 +186,19 @@ class DeepseekV41ForCausalLM:
     def dtype(self) -> str:
         return self._dtype
 
+    def _allocate_engram(self, decl: WeightDecl) -> torch.Tensor | None:
+        if ENGRAM.fullmatch(decl.name) is None:
+            return None
+        # Checkpoint loading and refit write the same tensors the peers will map.
+        try:
+            import torch.distributed._symmetric_memory as symm_mem
+            with torch.inference_mode(False):
+                return symm_mem.empty(decl.shape, dtype=torch.uint8, device=torch.device("cuda", torch.cuda.current_device())).zero_()
+        except torch.OutOfMemoryError:
+            raise
+        except (ImportError, NotImplementedError, RuntimeError):
+            return None  # Ordinary weight storage remains usable by the DeepEP path.
+
     def start(self) -> None:
         a = self._assembly
         weights_bytes = sum(math.prod(d.shape) * _DECL_BYTES[d.format] for d in a.weights)
@@ -195,9 +211,9 @@ class DeepseekV41ForCausalLM:
             self.holder.size(a.states, weights_bytes)
             self.kv.declare(kv_decls)
             self.slots.declare(slot_decls)
-            self.weights.declare(a.weights)
+            self.weights.declare(a.weights, allocate=self._allocate_engram if self.symmetric_engram else None)
         else:
-            self.weights.declare(a.weights)
+            self.weights.declare(a.weights, allocate=self._allocate_engram if self.symmetric_engram else None)
             self.holder.size(a.states, weights_bytes)
             self.kv.declare(kv_decls)
             self.slots.declare(slot_decls)
@@ -378,6 +394,26 @@ class DeepseekV41ForCausalLM:
         self.layers.idle(self._layer_weights())
         self.placement.step()
 
+    def prepare_idle(self) -> None:
+        self.layers.idle_fetch(self._layer_weights())
+
+    def capture_idle(self, recorder: Any) -> Any:
+        if not self.graph_idle or self.ranks == 1 or not self.layers.mega_experts():
+            return None
+        weights = self._layer_weights()
+        with recorder.warmup(), torch.inference_mode():
+            self.layers.idle_fetch(weights)
+            self.layers.idle_experts(weights)
+        with torch.inference_mode(), recorder.capture() as graph:
+            self.layers.idle_experts(weights)
+        try:
+            with recorder.warmup():
+                graph.replay()
+        except BaseException:
+            graph.close()
+            raise
+        return graph
+
     def stepped(self) -> None:
         """A forward of this rank's rows was run (or replayed from a graph): the executor calls it
         after each, outside any graph. The experts' placement counts the step, and places them again
@@ -390,29 +426,50 @@ class DeepseekV41ForCausalLM:
         weights = self._layer_weights()
         top = weights[cfg.num_hidden_layers]
         layers.begin(input_ids, positions)
-        h = self.embedding.embed(input_ids, top["embed.weight"]).unsqueeze(1).repeat(1, cfg.hc_mult, 1)
+        h = self.embedding.embed(input_ids, top["embed.weight"]).unsqueeze(1).expand(-1, cfg.hc_mult, -1).contiguous()
         # Each sublayer's mixes give the next sublayer its input: the first takes the stream's first copy.
-        pre = torch.zeros(h.shape[0], cfg.hc_mult, dtype=torch.float32, device=h.device)
-        pre[:, 0] = 1.0
+        pre = layers.hc_pre0(h.shape[0], h.device)
         # A sublayer's output ``x`` waits to be written back to the stream ``h`` with the ``post`` and
         # ``comb`` computed before it ran: the step before the next sublayer does it (DeepInfer's
         # order, one kernel there), or it is done here where the stream itself is needed.
         x: torch.Tensor | None = None
         post = comb = None
+        selected_tail = False
         for i in range(cfg.num_hidden_layers):
             w = weights[i]
             if i in cfg.engram_layer_ids:
                 if x is not None:
                     h, x = layers.hc_post(x, h, post, comb), None
                 h = layers.engram(i, h, w)
-            y, h, attn_pre, post, comb = layers.hc_step(x, h, pre, post, comb, w, "attn")
-            x = layers.attention(i, y, w)
+            at_yoco = i == cfg.n_prefill_layer and layers.layout is not None
+            stage_attn = not (at_yoco and layers.compacts_yoco_boundary(h.shape[0]))
+            y, h, attn_pre, post, comb = layers.hc_step(x, h, pre, post, comb, w, "attn", stage_attn=stage_attn)
+            if at_yoco:
+                y, h, attn_pre, post, comb, last_index = layers.consumer_inputs(y, h, attn_pre, post, comb,
+                                                                              last_index, w)
+            if i == cfg.num_hidden_layers - 1 and last_index.numel() < input_ids.numel():
+                # The last layer still writes all KV. Compute attention outputs for
+                # requested positions, retaining one unused lane for the EP collective.
+                selected = last_index if last_index.numel() else slice(0, 1)
+                x = layers.attention(i, y, w, selected)
+                h, attn_pre = h[selected], attn_pre[selected]
+                post, comb = post[selected], comb[selected]
+                selected_tail = True
+            else:
+                x = layers.attention(i, y, w)
             y, h, pre, post, comb = layers.hc_step(x, h, attn_pre, post, comb, w, "ffn")
             x = layers.moe(i, y, w)
-        if x is not None:
-            h = layers.hc_post(x, h, post, comb)
-        out = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
-        return layers.linear(out[last_index], top["head.weight"])
+        layers.end()
+        if selected_tail and not last_index.numel():
+            return torch.empty(0, cfg.vocab_size, dtype=torch.float32, device=h.device)
+        idx = last_index if not selected_tail and (last_index.numel() < h.shape[0] or layers.layout is not None) else None
+        if x is not None and post is not None and comb is not None:
+            out = layers.hc_epilogue_norm(x, h, post, comb, pre, top["norm.weight"], idx)
+        else:
+            if idx is not None:
+                h, pre = h[idx], pre[idx]
+            out = layers.norm(layers.hc_pre(h, pre), top["norm.weight"])
+        return layers.linear(out, top["head.weight"])
 
 
 def hf_config(path: str, inline: dict[str, Any]) -> dict[str, Any]:
@@ -435,8 +492,11 @@ class Unit:
                              "(agxinfer checkpoint writes random weights in the checkpoint's formats)")
         cfg = DSConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))
         cfg.check()
+        symmetric = (ctx.use("comm.group@1").device_group is not None and config["dsv4.backend"] in ("auto", "deepinfer")
+                     and config["deepinfer.nvlink_engram"])
         self.model = DeepseekV41ForCausalLM(cfg, config["model.dtype"], config["state.kv.page_size"],
-                                            {name: ctx.use(name) for name in self.SERVICES})
+                                            {name: ctx.use(name) for name in self.SERVICES}, symmetric_engram=symmetric,
+                                            graph_idle=config["dsv4.graph_idle_experts"])
         ctx.effect(lambda: self.model.close, label="model caches and layer hooks")
         ctx.register("state.weights@1", self.model.load_weights, label="load_weights")
         self.model.start()

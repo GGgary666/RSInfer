@@ -7,6 +7,9 @@ entry = "state.swa_slots.unit:Unit"
 [provides]
 services = ["state.swa.slots@1"]
 
+[reads]
+config = ["dsv4.backend"]
+
 [config]
 "state.swa.slots" = { type = "int", default = 0, binding = "startup", doc = "Usable request slots, slot 0 being padding; 0: as many as core.state.holder gives" }
 

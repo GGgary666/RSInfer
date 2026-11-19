@@ -30,7 +30,7 @@ class Server:
         self.manager = manager
         self.app = create_app(manager)
         self.server = uvicorn.Server(uvicorn.Config(
-            self.app, host=host, port=port, loop="asyncio", log_level="warning",
+            self.app, host=host, port=port, loop="auto", http="auto", log_level="warning",
             timeout_graceful_shutdown=max(1, int(shutdown_timeout / 2))))
         self.thread = threading.Thread(target=self.server.run, name="frontend-http", daemon=True)
         self.start_timeout, self.shutdown_timeout = start_timeout, shutdown_timeout

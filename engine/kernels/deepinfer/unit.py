@@ -68,11 +68,14 @@ class Unit:
 
         ops.align_experts()
         for definition, source, shapes in SOLUTIONS:
+            if definition == "ds.linear@1":
+                continue
             solution = f"{BACKEND}.{definition}"
             name = definition.split(".", 1)[1].split("@")[0]
+            implementation = getattr(ops, name)
             ctx.register("kernels.catalog@1", Implementation(
                 Solution(solution, definition, f"{ops.__name__}:{name}", library=library(source), shapes=shapes,
-                         capturable=definition not in HOST_DEPENDENT, requires=["cuda", "sm_100"]), getattr(ops, name)),
+                         capturable=definition not in HOST_DEPENDENT, requires=["cuda", "sm_100"]), implementation),
                 label=f"solution {solution}")
         fn = ops.moe_experts_fixed
         ctx.register("kernels.catalog@1", Implementation(
@@ -84,12 +87,17 @@ class Unit:
         # the fused ones in the catalog's order, so a model the fused kernels fit runs those).
         from kernels.deepinfer.mega import Mega
 
-        mega = Mega(config["sched.token_budget"] + config["batch.max_rows"], config["deepinfer.force_random_gate"])
+        mega = Mega(
+            config["sched.token_budget"] + config["batch.max_rows"],
+            config["deepinfer.force_random_gate"],
+            nvlink_engram=bool(config["deepinfer.nvlink_engram"]),
+        )
         ctx.effect(lambda: mega.close, label="fused MoE and Engram buffers")
         fused: dict[str, list[int]] = {"mega": [1]}
         fused_attn: dict[str, list[int]] = {"heads": [64, 128], "head_dim": [512], "mega": [1], "mega_attn": [1]}
         fused_engram: dict[str, list[int]] = {"mega": [1], "mega_engram": [1]}
         has_deep_ep = importlib.util.find_spec("deep_ep") is not None
+        has_triton = importlib.util.find_spec("triton") is not None
         entries: list[tuple[str, str, Any, bool, list[str], dict[str, list[int]], str]] = [
             (f"{BACKEND}.ds.hc_step@1", "ds.hc_step@1", mega.hc_step, True, [], fused, "deep_gemm"),
             (f"{BACKEND}.ds.moe@1", "ds.moe@1", mega.moe, True, [], fused, "deep_gemm"),
@@ -110,9 +118,10 @@ class Unit:
             (f"{BACKEND}.unfused.ds.engram@1", "ds.engram@1", ops.engram, True, [], {}, "tile_kernels"),
             (f"{BACKEND}.ds.ep_experts@1", "ds.ep_experts@1", ops.ep_experts, False, [], {}, "deep_gemm"),
         ]
-        if has_deep_ep:
+        entries.append((f"{BACKEND}.ds.linear@1", "ds.linear@1", mega.linear, True, [], {}, "deep_gemm"))
+        if has_deep_ep or (has_triton and bool(config["deepinfer.nvlink_engram"])):
             entries.append((f"{BACKEND}.ds.engram_fetch@1", "ds.engram_fetch@1", mega.engram_fetch, True, [],
-                            fused_engram, "deep_ep"))
+                            fused_engram, "deep_ep" if has_deep_ep else "triton"))
         entries.append((f"{BACKEND}.unfused.ds.engram_fetch@1", "ds.engram_fetch@1", ops.engram_fetch, False, [],
                         {}, "deep_gemm"))
         for solution, definition, fn, capturable, requires, shapes, pkg in entries:
@@ -120,3 +129,14 @@ class Unit:
                 Solution(solution, definition, f"{fn.__module__}:{fn.__qualname__}", library=library(pkg),
                          shapes=shapes, capturable=capturable, requires=["cuda", "sm_100", *requires]), fn),
                 label=f"solution {solution}")
+
+        from kernels.deepinfer import sampling
+        ctx.register("kernels.catalog@1", Implementation(
+            Solution("deepinfer.sample.seeded@1", "sample.seeded@1", "kernels.deepinfer.sampling:CachedSampler.sample",
+                     library=library("triton"), shapes={"vocab": [1024]}, capturable=False,
+                     requires=["cuda", "sm_100"]), sampling.CachedSampler().sample), label="fused stateless sampling")
+
+        ctx.register("kernels.catalog@1", Implementation(
+            Solution("deepinfer.sample.topk@1", "sample.topk@1", "kernels.deepinfer.sampling:force_topk",
+                     library=library("deep_select"), capturable=True, requires=["cuda", "sm_100"]),
+            sampling.force_topk), label="sampler vocabulary cap")

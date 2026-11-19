@@ -195,3 +195,18 @@ def test_domains_must_divide_the_ranks() -> None:
     with pytest.raises(Exception, match="sched.domains"):
         with bed(ranks=2, config={"sched.domains": 3}):
             pass
+
+
+def test_balance_prefill_and_coordinated_prefill_interval() -> None:
+    """With balance_prefill, long waiting prompts route to the domain with fewer queued prompt tokens;
+    with prefill_interval, arriving prefills batch behind pure decode steps while a domain decodes."""
+    cfg = {**TWO, "sched.balance_prefill": True, "sched.prefill_interval": 4, "policy.min_chunk_tokens": 8}
+    first = [request(1, list(range(1, 13)), 10), request(2, [5, 6], 10)]
+    later = [request(3, list(range(1, 11)), 4), request(4, list(range(1, 11)), 4)]
+    with bed(delay_s=0.001, overlap=True, token_budget=16, config=cfg) as b:
+        b.client.send(first)
+        b.run_until(lambda: all(len(b.client.outputs[r].tokens) >= 2 for r in (1, 2)))
+        b.client.send(later)
+        b.run_until(b.finished(1, 2, 3, 4))
+        check(b, [*first, *later])
+        assert served(b, 0) & {3, 4} and served(b, 1) & {3, 4}

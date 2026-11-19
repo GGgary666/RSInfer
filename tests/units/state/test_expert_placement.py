@@ -140,6 +140,7 @@ def test_a_chosen_expert_runs_in_one_of_its_slots_and_its_copies_share_the_token
     p = Placement(bus.of(0), Greedy(), 0, 1, 2)  # spare slots, never placed again
     p.start(1, 4, lambda layer: [], torch.device("cpu"))
     assert p.slots(4) == 6 and initial(4, 6) == [0, 1, 2, 3, 0, 1]
+    assert p.maps(0)[2] is None  # static replicas route normally without unused receive counters
     indices = torch.tensor([[0, 2], [0, 3], [1, 0], [0, 1]])
     slots = p.physical(0, indices)
     assert torch.equal(torch.tensor(initial(4, 6))[slots], indices)  # each slot holds the expert chosen

@@ -13,15 +13,20 @@ the prefill batch, else the decode batch):
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from core.contracts.policy import COMPOSE, StepView, Take
 
 
 class PrefillFirst:
+    def __init__(self, min_chunk_tokens: Callable[[], int] = lambda: 0) -> None:
+        self.min_chunk_tokens = min_chunk_tokens
+
     def compose(self, view: StepView) -> list[Take]:
         takes: list[Take] = []
         budget, rows = view.token_budget, view.free_rows
+        min_chunk = self.min_chunk_tokens()
         for c in view.prefilling:
             if budget <= 0:
                 break
@@ -31,7 +36,10 @@ class PrefillFirst:
         for c in view.waiting:
             if budget <= 0 or rows <= 0:
                 break
-            n = min(budget, c.prompt - c.planned)
+            need = c.prompt - c.planned
+            if takes and need > budget and budget < min_chunk:
+                break
+            n = min(budget, need)
             takes.append(Take(c.request, n))
             budget -= n
             rows -= 1
@@ -42,4 +50,5 @@ class PrefillFirst:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        ctx.provide(COMPOSE, PrefillFirst())
+        ctx.on_config("policy.min_chunk_tokens", lambda value: None)
+        ctx.provide(COMPOSE, PrefillFirst(lambda: int(config["policy.min_chunk_tokens"])))

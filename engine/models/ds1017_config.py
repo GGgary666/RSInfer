@@ -109,6 +109,12 @@ class DSConfig(msgspec.Struct, frozen=True):
             engram_pad_token_id=d.get("engram_pad_token_id", 2),
             engram_compressed_vocab_size=d.get("engram_compressed_vocab_size", 0))
 
+    @property
+    def n_prefill_layer(self) -> int:
+        """DeepInfer's first ratio-one layer is the decoder compaction boundary."""
+        return next((i for i in range(self.num_hidden_layers) if self.compress_ratios[i] == 1),
+                    self.num_hidden_layers)
+
     def ratio(self, layer: int) -> int:
         return self.compress_ratios[layer]
 

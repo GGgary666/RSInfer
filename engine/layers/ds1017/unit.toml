@@ -11,11 +11,17 @@ services = ["layers.ds1017@1"]
 services = ["kernels.catalog@1", "state.kv.paged@1", "state.swa.slots@1", "comm.group@1",
             "expert.placement@1"]
 
+[capabilities]
+accept_config = true
+
 [config]
+"dsv4.yoco_mode" = { type = "str", default = "off", binding = "startup", doc = "Decoder SWA bounded replay: off, compact (keep suffix rows), mask (full rows with the same bounded visibility, for verification)." }
+"dsv4.yoco_keep_tokens" = { type = "int", default = 140, binding = "startup", doc = "Prompt suffix kept in decoder layers, at least sliding_window + 1 without speculation." }
+"dsv4.yoco_paged_consumer" = { type = "bool", default = true, binding = "live", doc = "Attend directly over paged FP4 latents and compact FP8 window records in YoCo compact decoder layers." }
 "dsv4.backend" = { type = "str", default = "auto", binding = "startup", doc = "DS 1017's layer kernels: auto, or a backend of the kernel catalog, e.g. reference or tilelang" }
 "dsv4.prefill_backend" = { type = "str", default = "", binding = "startup", doc = "For prefill and mixed steps; empty: dsv4.backend" }
 "dsv4.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps; empty: dsv4.backend" }
 "dsv4.token_map_path" = { type = "str", default = "", binding = "startup", doc = "Directory of Engram's compressed token map (engram_token_map.json) or of the tokenizer.json it is built from; empty: model.path, else weights.path" }
 
 [reads]
-config = ["model.path", "model.hf_config", "weights.path", "batch.max_context_len"]
+config = ["model.path", "model.hf_config", "weights.path", "batch.max_context_len", "alloc.radix_cache", "alloc.prefix_replay_tokens"]

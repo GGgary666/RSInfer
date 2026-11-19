@@ -1,0 +1,15 @@
+--- a/csrc/jit_kernels/heuristics/mega_moe.hpp
++++ b/csrc/jit_kernels/heuristics/mega_moe.hpp
+@@ -112,6 +112,11 @@
+         }
+     }
+-
++
++    // EP4, DS1017 with 32 redundant experts: measured on four SM100 GPUs.
++    if (num_ranks == 4 && num_experts == 416 && num_topk == 6 &&
++        mma_kind == MmaKind::MXFP8FP4 && (num_tokens == 4096 || num_tokens == 8192))
++        block_m = 240;
++
+     // Use smaller, asymmetric store blocks at FP8xFP4 prefill to save shared memory for sufficient TMA pipeline depth
+     const int store_block_m_l1 = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 :
+                                  mma_kind == MmaKind::MXFP8FP4 ? 24 : 40;

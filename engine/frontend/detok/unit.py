@@ -21,16 +21,20 @@ class DecodeStatus:
     read_offset: int = 0
     surr_offset: int = 0
 
-    def decode(self, tokenizer: Tokenizer, tokens: Sequence[int], final: bool) -> str:
-        self.decoded_ids.extend(tokens)
-        read_str = tokenizer.decode(self.decoded_ids[self.surr_offset:])
-        surr_str = tokenizer.decode(self.decoded_ids[self.surr_offset:self.read_offset])
+    def finish_decoded(self, read_str: str, surr_str: str, final: bool) -> str:
         new_text = read_str[len(surr_str):]
         if final or (new_text and not new_text.endswith("\ufffd")):
             self.surr_offset = self.read_offset
             self.read_offset = len(self.decoded_ids)
             return new_text
         return ""
+
+    def decode(self, tokenizer: Tokenizer, tokens: Sequence[int], final: bool) -> str:
+        self.decoded_ids.extend(tokens)
+        read_str = tokenizer.decode(self.decoded_ids[self.surr_offset:])
+        surr_str = ("" if self.surr_offset == self.read_offset
+                    else tokenizer.decode(self.decoded_ids[self.surr_offset:self.read_offset]))
+        return self.finish_decoded(read_str, surr_str, final)
 
 
 class Stream:
@@ -42,28 +46,34 @@ class Stream:
         self.pending = ""
         self.stopped = False
 
+    def _emit(self, piece: str, final: bool) -> TextPiece:
+        self.pending += piece
+        if self.stops:
+            hits = [at for stop in self.stops if (at := self.pending.find(stop)) >= 0]
+            if hits:
+                text = self.pending[:min(hits)]
+                self.pending, self.stopped = "", True
+                return TextPiece(text, True)
+            held = 0
+            if not final:
+                for stop in self.stops:
+                    for n in range(1, min(len(stop), len(self.pending) + 1)):
+                        if self.pending.endswith(stop[:n]):
+                            held = max(held, n)
+            end = len(self.pending) - held
+            text, self.pending = self.pending[:end], self.pending[end:]
+        else:
+            text, self.pending = self.pending, ""
+        if final:
+            self.stopped = True
+        return TextPiece(text)
+
     def push(self, tokens: Sequence[int], *, final: bool = False) -> TextPiece:
         if self.stopped:
             return TextPiece("", True)
         if final and tokens and tokens[-1] in self.tokenizer.stop_token_ids:
             tokens = tokens[:-1]
-        self.pending += self.status.decode(self.tokenizer, tokens, final)
-        hits = [at for stop in self.stops if (at := self.pending.find(stop)) >= 0]
-        if hits:
-            text = self.pending[:min(hits)]
-            self.pending, self.stopped = "", True
-            return TextPiece(text, True)
-        held = 0
-        if not final:
-            for stop in self.stops:
-                for n in range(1, min(len(stop), len(self.pending) + 1)):
-                    if self.pending.endswith(stop[:n]):
-                        held = max(held, n)
-        end = len(self.pending) - held
-        text, self.pending = self.pending[:end], self.pending[end:]
-        if final:
-            self.stopped = True
-        return TextPiece(text)
+        return self._emit(self.status.decode(self.tokenizer, tokens, final), final)
 
 
 class Detokenizer:

@@ -1,0 +1,101 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -365,35 +365,59 @@
+             }
+         };
+ 
+-        // Count experts' tokens
+-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+-           atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+-        });
+-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+-
+-        // Get SM offset (~6.5 us)
+-        #pragma unroll
+-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
+-            shared_storage.expert_token_count[i] = static_cast<uint32_t>(
+-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
++        // Small EP4 batches fit in one CTA's shared-memory histogram. Only
++        // CTA 0 writes source slots, so no inter-CTA prefix reservation is needed.
++        const bool single_cta = kNumRanks == 4 && num_tokens <= 128;
++        if (single_cta) {
++            if (sm_idx == 0) {
++                for (uint32_t base = warp_idx * kNumTokensPerWarp; base < num_tokens;
++                     base += kNumDispatchWarps * kNumTokensPerWarp) {
++                    const uint32_t row = base + lane_idx / kNumTopk;
++                    if (row < num_tokens && lane_idx < kNumActivateLanes) {
++                        const uint32_t item = base * kNumTopk + lane_idx;
++                        const int expert = static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[item]);
++                        if (expert >= 0) {
++                            const auto slot = atomicAdd_block(shared_storage.expert_token_count + expert, 1);
++                            const auto dst = workspace.get_src_token_topk_idx_ptr(
++                                expert % kNumExpertsPerRank, sym_buffer.rank_idx, slot);
++                            *sym_buffer.map(dst, expert / kNumExpertsPerRank) = item;
++                        }
++                    }
++                }
++                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
++            }
++        } else {
++            // Count experts' tokens
++            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
++               atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
++            });
++            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
++
++            // Get SM offset (~6.5 us)
++            #pragma unroll
++            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
++                const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(shared_storage.expert_token_count[i]);
++                shared_storage.expert_token_count[i] = static_cast<uint32_t>(
++                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
++            }
++            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
++
++            // Write source indices (~2 us with 512 tokens)
++            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
++                const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
++                const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
++                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
++                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
++                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
++            });
++
++            // Grid sync
++            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
++                workspace, sm_idx, thread_idx,
++                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
++            );
++
+         }
+-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+-
+-        // Write source indices (~2 us with 512 tokens)
+-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+-            const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+-        });
+-
+-        // Grid sync
+-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+-            workspace, sm_idx, thread_idx,
+-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+-        );
+ 
+         // Write expert count
+         if (sm_idx == 0) {
+@@ -407,7 +431,9 @@
+             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                 const auto dst_rank_idx = i / kNumExpertsPerRank;
+                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
++                const auto expert_status = single_cta
++                    ? (static_cast<uint64_t>(kNumSMs) << 32) | shared_storage.expert_token_count[i]
++                    : *workspace.get_expert_send_count_ptr(i);
+                 *sym_buffer.map(
+                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                     dst_rank_idx) = expert_status & 0xffffffff;

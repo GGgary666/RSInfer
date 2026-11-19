@@ -38,13 +38,17 @@ def matches(cfg: dict[str, Any]) -> bool:
 
 
 def add_arguments(group: argparse._ArgumentGroup) -> None:
+    group.add_argument("--yoco-clip", nargs="?", const=140, default=0, type=int,
+                       help="Keep this prompt suffix in decoder layers (default when set: 140; 0 disables).")
+    group.add_argument("--yoco-mask", action="store_true",
+                       help="Validate bounded replay with full query rows and the same visibility mask.")
     group.add_argument("--ds-backend", default="auto", help="dsv4.backend: the layers' kernels (auto, reference, "
                        "tilelang, deepinfer)")
 
 
 def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[str, Any]:
-    """The keys of this family's units. ``cfg`` is the config served (cut to ``--layers``). No prefix
-    cache yet: its rule for this model's states is not written (doc/specs/v1-ds1017.md §3)."""
+    """The keys of this family's units. ``cfg`` is the config served (cut to ``--layers``). Full models
+    can share compressed KV pages and restore the window slot at a checkpoint."""
     import msgspec
 
     from models.ds1017_config import DSConfig, states
@@ -53,7 +57,12 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
         raise SystemExit("DS 1017 takes no dummy weights (its matrices are stored as FP8 and FP4 bytes): write random "
                          "ones in the checkpoint's formats with `agxinfer checkpoint --config <model dir> [--layers N] "
                          "--out <dir>` and serve that directory")
-    decls = states(DSConfig.from_hf(cfg), args.page_size)
+    model_cfg = DSConfig.from_hf(cfg)
+    decls = states(model_cfg, args.page_size)
+    clip = getattr(args, "yoco_clip", 0)
+    mask = getattr(args, "yoco_mask", False)
+    if clip < 0 or (mask and not clip):
+        raise SystemExit("--yoco-clip must be nonnegative; --yoco-mask needs a positive --yoco-clip")
     # Engram's compressed token map: an explicit --tokenizer overrides the model's directory (as it
     # does for frontend.tokenizer_path); otherwise the model's or the weights' directory, preferring a
     # prebuilt engram_token_map.json to the tokenizer.json it is built from. The worker is not given
@@ -72,13 +81,20 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
         meet.mkdir(parents=True, exist_ok=True)
         own_cards = args.device == "cuda" and len(set(args.rank_gpus)) == ranks
         comm = {"comm.size": ranks, "comm.rendezvous": f"file://{meet / uuid.uuid4().hex}",
-                "comm.device_backend": "nccl" if own_cards else "gloo"}
+                "comm.device_backend": "nccl" if own_cards else "gloo",
+                **({"sched.idle_wait_s": 0.001, "sched.overlap_lead_s": 0.025,
+                    "sched.prefill_coalesce_s": 0.006, "sched.prefill_interval": 108,
+                    "sched.balance_prefill": True, "policy.min_chunk_tokens": 2048} if own_cards else {})}
     # A plain prompt starts with BOS, as DeepInfer makes it (its tokenizer repair sets add_bos_token):
     # the checkpoint's tokenizer_config says not to add one, and its chat template writes its own.
     settings = (args.tokenizer or model).resolve() / "tokenizer_config.json"
     bos = settings.is_file() and bool(json.loads(settings.read_text()).get("bos_token"))
     return {"alloc.states": msgspec.json.decode(msgspec.json.encode(decls)), "model.dtype": "bf16",
-            "alloc.radix_cache": False, "dsv4.backend": args.ds_backend, "frontend.add_bos": bos, **comm,
+            "dsv4.backend": args.ds_backend, "frontend.add_bos": bos, **comm,
+            "dsv4.yoco_mode": ("mask" if mask else "compact") if clip else "off",
+            "dsv4.yoco_keep_tokens": clip or 140, "alloc.prefix_replay_tokens": max(clip, 1),
+            # A truncated, window-only model has no KV pages to share.
+            **({"alloc.radix_cache": False} if not any(d.kind == "kv.paged" for d in decls) else {}),
             **({"dsv4.token_map_path": str(found)} if found else {}),
             **({"model.hf_config": cfg} if args.layers else {"model.path": str(model)})}
 

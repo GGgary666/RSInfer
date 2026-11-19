@@ -1,6 +1,6 @@
 # Copyright 2023-2026 SGLang Team
 # SPDX-License-Identifier: Apache-2.0
-"""The prefix cache of a hybrid (KV + GDN) model: SGLang's radix cache with the mamba
+"""Hybrid KV + slot prefix caching. For GDN, SGLang's radix cache with the mamba
 ``extra_buffer`` strategy (e838360, LICENSE.sglang; doc/specs/prefix-cache.md).
 
 From SGLang, the device part only (no HiCache, SWA, sessions, PD, DCP, PP, int8 or host-only
@@ -21,6 +21,9 @@ checkpoints, lazy buffers):
   ``prepare_for_caching_req``) and at the end (``_select_finished_checkpoint``); a hit restores the
   cached state into the running slot before the first step (``mamba_cow_src_index``).
 
+For DS 1017, a checkpoint is the whole sliding-window slot at the end of a step, as in
+DeepInfer's fork_seq. Its compressed KV pages stay shared, while a child gets a private slot.
+
 Ours: the ids of ``ledger@1`` instead of tensors; positions move when a step retires, so a step
 that did not run (``Resync``) is undone. Two tracking slots always: ``sched.overlap`` is a live key,
 SGLang decides at start. A request keeps its own pages where the tree already had the tokens, and
@@ -34,6 +37,7 @@ import heapq
 import itertools
 import math
 import sys
+from array import array
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -42,7 +46,8 @@ from core.contracts.state import StateDecl
 
 from .pool import Free
 
-KV, GDN = "kv.paged", "gdn.slots"
+TOKEN_BYTES = 8  # ledger token IDs are wire-format signed int64
+KV, GDN, SWA = "kv.paged", "gdn.slots", "swa.slots"
 FLA_CHUNK = 64
 """The GDN kernels' chunk (``mamba_chunk_size``): a state inside a step's input is there only at its
 multiples (the chunk kernel's ``h``)."""
@@ -55,10 +60,10 @@ TRACKING_SLOTS = 2
 class Node:
     __slots__ = ("key", "pages", "state", "children", "parent", "kv_lock", "state_lock", "access", "depth")
 
-    def __init__(self, key: tuple[int, ...], pages: list[int], parent: Node | None, depth: int) -> None:
+    def __init__(self, key: bytes, pages: list[int], parent: Node | None, depth: int) -> None:
         self.key, self.pages, self.parent, self.depth = key, pages, parent, depth
         self.state: int | None = None
-        self.children: dict[tuple[int, ...], Node] = {}
+        self.children: dict[bytes, Node] = {}
         self.kv_lock = 0
         """Requests anchored here or below (Full's lock on the path)."""
         self.state_lock = 0
@@ -92,40 +97,67 @@ class Inserted:
 class RadixTree:
     def __init__(self, page: int, max_states_per_path: int = -1) -> None:
         self.page, self.max_states_per_path = page, max_states_per_path
-        self.root = Node((), [], None, 0)
+        self.page_bytes = page * TOKEN_BYTES
+        self.root = Node(b"", [], None, 0)
         self.root.kv_lock = 1  # never evicted
         self.clock = itertools.count(1)
         self.version = 0
         """Bumped on every change a match could see."""
+        self.insert_version = 0
+        """Bumped whenever a node or state enters the tree."""
         self.freed_states: list[int] = []
         """States ``mamba_max_states_per_path`` took off a path, for the ledger to free."""
 
     # ---------------------------------------------------------------- reading
 
-    def _child_key(self, tokens: Sequence[int], at: int) -> tuple[int, ...]:
-        return tuple(tokens[at:at + self.page])
+    @staticmethod
+    def _packed(tokens: Sequence[int]) -> memoryview:
+        # Requests already hold the wire column as a contiguous view of signed int64.
+        if isinstance(tokens, memoryview) and tokens.format == "q" and tokens.c_contiguous:
+            return tokens.cast("B")
+        return memoryview(array("q", tokens)).cast("B")
 
-    def _shared(self, key: tuple[int, ...], tokens: Sequence[int], at: int) -> int:
-        """Tokens of ``key`` that ``tokens[at:]`` starts with, in whole pages."""
-        n = min(len(key), len(tokens) - at)
-        i = 0
-        while i < n and key[i] == tokens[at + i]:
-            i += 1
-        return i // self.page * self.page
+    def _child_key(self, packed: memoryview, at: int) -> bytes:
+        start = at * TOKEN_BYTES
+        return bytes(packed[start:start + self.page_bytes])
 
-    def match(self, tokens: Sequence[int]) -> Match:
+    def _shared(self, key: bytes, packed: memoryview, at: int) -> int:
+        """Longest common prefix in whole pages. bytes.startswith compares contiguous buffers in C."""
+        start = at * TOKEN_BYTES
+        pages = min(len(key), len(packed) - start) // self.page_bytes
+        if key.startswith(packed[start:start + pages * self.page_bytes]):
+            return pages * self.page
+        lo, hi = 0, pages - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            offset = lo * self.page_bytes
+            if key.startswith(packed[start + offset:start + mid * self.page_bytes], offset):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo * self.page
+
+    def match(self, tokens: Sequence[int], *, start: Node | None = None) -> Match:
         """The deepest stated node within ``tokens`` (whole pages), and how far the KV goes."""
-        node, at, best = self.root, 0, self.root
-        kv = 0
-        while at + self.page <= len(tokens):
-            child = node.children.get(self._child_key(tokens, at))
+        if start is not None and start is not self.root and start.state is not None and start.depth <= len(tokens):
+            node, base, best = start, start.depth, start
+        else:
+            node, base, best = self.root, 0, self.root
+        rem = len(tokens) - base
+        if rem < self.page or not node.children:
+            return Match(best, best.depth)
+        tail = tokens[base:] if base else tokens
+        packed = self._packed(tail)
+        rel, kv = 0, base
+        while rel + self.page <= rem:
+            child = node.children.get(self._child_key(packed, rel))
             if child is None:
                 break
-            shared = self._shared(child.key, tokens, at)
-            kv = at + shared
-            if shared < len(child.key):
+            shared = self._shared(child.key, packed, rel)
+            kv = base + rel + shared
+            if shared * TOKEN_BYTES < len(child.key):
                 break
-            node, at = child, at + shared
+            node, rel = child, rel + shared
             if node.state is not None:
                 best = node
         return Match(best, max(kv, best.depth))
@@ -167,36 +199,47 @@ class RadixTree:
         """``_split_node``: ``child`` keeps its end (and its state); a new node takes its first ``at``
         tokens."""
         parent = child.parent
-        assert parent is not None and 0 < at < len(child.key) and at % self.page == 0
-        top = Node(child.key[:at], child.pages[:at // self.page], parent, child.depth - len(child.key) + at)
+        cut = at * TOKEN_BYTES
+        assert parent is not None and 0 < cut < len(child.key) and at % self.page == 0
+        depth = child.depth - len(child.pages) * self.page + at
+        top = Node(child.key[:cut], child.pages[:at // self.page], parent, depth)
         top.kv_lock, top.access = child.kv_lock, child.access
-        parent.children[self._child_key(child.key, 0)] = top
-        child.key, child.pages, child.parent = child.key[at:], child.pages[at // self.page:], top
-        top.children[self._child_key(child.key, 0)] = child
+        parent.children[child.key[:self.page_bytes]] = top
+        child.key, child.pages, child.parent = child.key[cut:], child.pages[at // self.page:], top
+        top.children[child.key[:self.page_bytes]] = child
         self.version += 1
         return top
 
-    def insert(self, tokens: Sequence[int], pages: Sequence[int], state: int) -> Inserted:
+    def insert(self, tokens: Sequence[int], pages: Sequence[int], state: int, *, anchor: Node | None = None) -> Inserted:
         """``insert`` of ``tokens`` (whole pages) with the request's ``pages``, and ``state`` at the
         end (``commit_insert_component_data``)."""
         assert len(tokens) % self.page == 0 and len(pages) == len(tokens) // self.page and tokens
-        node, at = self.root, 0
+        node = self.root if anchor is None else anchor
+        base_at = node.depth
+        tail_tokens = tokens[base_at:]
+        tail_pages = pages[base_at // self.page:]
+        packed = self._packed(tail_tokens)
+        rel, rel_len = 0, len(tail_tokens)
         dups: set[int] = set()
         now = next(self.clock)
-        while at < len(tokens):
-            child = node.children.get(self._child_key(tokens, at))
+        for ancestor in self.path(node):
+            ancestor.access = now
+        while rel < rel_len:
+            child = node.children.get(self._child_key(packed, rel))
             if child is None:
-                child = Node(tuple(tokens[at:]), list(pages[at // self.page:]), node, len(tokens))
-                node.children[child.key[:self.page]] = child
-                at = len(tokens)
+                child = Node(bytes(packed[rel * TOKEN_BYTES:]), list(tail_pages[rel // self.page:]), node, len(tokens))
+                node.children[child.key[:self.page_bytes]] = child
+                rel = rel_len
             else:
-                shared = self._shared(child.key, tokens, at)
-                if shared < len(child.key):
+                shared = self._shared(child.key, packed, rel)
+                if shared * TOKEN_BYTES < len(child.key):
                     child = self._split(child, shared)
-                for i, p in enumerate(child.pages):
-                    if p != pages[at // self.page + i]:
-                        dups.add(at // self.page + i)
-                at += shared
+                offset = rel // self.page
+                incoming = tail_pages[offset:offset + len(child.pages)]
+                if child.pages != incoming:
+                    dups.update((base_at + rel) // self.page + i
+                                for i, (p, q) in enumerate(zip(child.pages, incoming, strict=True)) if p != q)
+                rel += shared
             child.access = now
             node = child
         existed = node.state is not None
@@ -204,6 +247,7 @@ class RadixTree:
             node.state = state
             self._cap_states(node)
         self.version += 1
+        self.insert_version += 1
         return Inserted(node, dups, existed)
 
     def _cap_states(self, tail: Node) -> None:
@@ -221,6 +265,7 @@ class RadixTree:
                 continue
             self.freed_states.append(n.state)  # type: ignore[arg-type]
             n.state = None
+            self.version += 1
             excess -= 1
 
     # ---------------------------------------------------------------- eviction
@@ -232,8 +277,9 @@ class RadixTree:
         pages.extend(n.pages)
         if n.state is not None:
             states.append(n.state)
+            n.state = None
         assert n.parent is not None
-        del n.parent.children[n.key[:self.page]]
+        del n.parent.children[n.key[:self.page_bytes]]
         self.version += 1
 
     def evict_pages(self, want: int) -> tuple[list[int], list[int]]:
@@ -321,13 +367,17 @@ class Reservation:
 
 
 class RadixLedger:
-    """``ledger@1`` with the prefix cache, for a model with KV pages and GDN slots."""
+    """Share read-only KV pages with a private mutable state slot per admitted request."""
 
     def __init__(self, declarations: Sequence[StateDecl], *, track_interval: int = 256,
-                 max_states_per_path: int = -1) -> None:
+                 max_states_per_path: int = -1, replay_tokens: int = 1) -> None:
+        if replay_tokens < 1:
+            raise ValueError("alloc.prefix_replay_tokens must be positive")
+        self.replay_tokens = replay_tokens
         kinds = {(d.kind, d.lifetime) for d in declarations}
-        if kinds != {(KV, "request"), (GDN, "slot")} or any(d.snapshot_every for d in declarations):
-            raise ValueError(f"the prefix cache (alloc.radix_cache) takes {KV} pages and {GDN} slots; the model "
+        self.slot_kind = SWA if (SWA, "slot") in kinds else GDN
+        if kinds != {(KV, "request"), (self.slot_kind, "slot")} or any(d.snapshot_every for d in declarations):
+            raise ValueError(f"the prefix cache (alloc.radix_cache) takes {KV} pages and {GDN} or {SWA} slots; the model "
                              f"declares {sorted(kinds)}: set alloc.radix_cache = false")
         pages = {d.tokens_per_item for d in declarations if d.kind == KV}
         if len(pages) != 1 or min(pages) <= 0:
@@ -336,29 +386,28 @@ class RadixLedger:
             raise ValueError("alloc.mamba_track_interval must be positive, alloc.mamba_max_states_per_path -1 "
                              "(no limit) or positive")
         self.page = pages.pop()
-        if max(FLA_CHUNK, self.page) % min(FLA_CHUNK, self.page):  # SGLang's mamba_cache_chunk_size_of
+        if self.slot_kind == GDN and max(FLA_CHUNK, self.page) % min(FLA_CHUNK, self.page):
             # Else a state would be kept where the GDN kernels have none (Antigravity, #59).
             raise ValueError(f"state.kv.page_size = {self.page}: with the prefix cache, it or the GDN kernels' "
                              f"chunk ({FLA_CHUNK}) must divide the other (as SGLang's), or alloc.radix_cache = false")
-        if track_interval % self.page:  # SGLang's mamba_hook
+        if self.slot_kind == GDN and track_interval % self.page:  # SGLang's mamba_hook
             raise ValueError(f"alloc.mamba_track_interval = {track_interval} must be a multiple of "
                              f"state.kv.page_size = {self.page} (as SGLang's)")
-        self.chunk = max(FLA_CHUNK, self.page)
+        self.chunk = max(FLA_CHUNK, self.page) if self.slot_kind == GDN else self.page
         """``mamba_cache_chunk_size``."""
         self.grid = math.lcm(self.chunk, self.page)
         """``mamba_checkpoint_grid``: where a state may enter the tree."""
         self.decode_grid = math.lcm(self.grid, track_interval)
         """``mamba_track_grid``: where decoding tracks its state."""
         self.max_states_per_path = max_states_per_path
-        self.matches: dict[int, int] = {}
-        """``match`` of the requests still waiting, on the tree of ``matches_version``."""
-        self.matches_version = -1
+        self.matches: dict[int, tuple[int, int, Match]] = {}
+        """``(tree.version, tree.insert_version, Match)`` of the requests still waiting."""
         self.tree = self._new_tree()
-        self.capacity = {KV: 0, GDN: 0}
-        self.free = {KV: Free(), GDN: Free()}
+        self.capacity = {KV: 0, self.slot_kind: 0}
+        self.free = {KV: Free(), self.slot_kind: Free()}
         self.holdings: dict[int, Holding] = {}
         self.reservations: dict[tuple[int, int], Reservation] = {}
-        self.releases: dict[int, tuple[int, list[int]]] = {}
+        self.releases: dict[int, tuple[int, Sequence[int]]] = {}
         self.retired = -1
         self.ready = False
         self.stale = False
@@ -366,16 +415,18 @@ class RadixLedger:
 
     def _new_tree(self) -> RadixTree:
         self.matches.clear()  # a new tree counts its versions from 0 again
-        self.matches_version = -1
         return RadixTree(self.page, self.max_states_per_path)
 
     @property
     def align(self) -> int:
         return self.page
 
+    def prefill_end(self, start: int, end: int, prompt_len: int) -> int:
+        return end
+
     @property
     def max_requests(self) -> int | None:
-        return self.capacity[GDN] // (STATES_PER_REQUEST + TRACKING_SLOTS)  # _calculate_mamba_ratio
+        return self.capacity[self.slot_kind] // (STATES_PER_REQUEST + TRACKING_SLOTS)  # _calculate_mamba_ratio
 
     def _count(self, tokens: int) -> int:
         return (tokens + self.page - 1) // self.page
@@ -383,8 +434,8 @@ class RadixLedger:
     # ---------------------------------------------------------------- capacity
 
     def set_capacity(self, items: Mapping[str, int]) -> None:
-        if set(items) != {KV, GDN}:
-            raise ValueError(f"capacities for {sorted(items)}, but the declared kinds are {sorted([KV, GDN])}")
+        if set(items) != {KV, self.slot_kind}:
+            raise ValueError(f"capacities for {sorted(items)}, but the declared kinds are {sorted([KV, self.slot_kind])}")
         if self.ready and dict(items) == self.capacity:
             return  # an idle worker says it again
         if not (self.holdings or self.reservations or self.releases):
@@ -399,7 +450,7 @@ class RadixLedger:
         self.capacity = dict(items)
         self.ready = True
         cap = self.max_requests
-        print(f"core.state.alloc: prefix cache on, {items[GDN]} {GDN} for at most {cap} requests at once "
+        print(f"core.state.alloc: prefix cache on, {items[self.slot_kind]} {self.slot_kind} for at most {cap} requests at once "
               f"({STATES_PER_REQUEST + TRACKING_SLOTS} per request, as SGLang's)", file=sys.stderr, flush=True)
 
     def flush(self) -> None:
@@ -415,7 +466,7 @@ class RadixLedger:
 
     def fits(self, tokens: int) -> bool:
         return (self.ready and self._count(tokens) <= self.capacity[KV]
-                and 1 + TRACKING_SLOTS <= self.capacity[GDN] and bool(self.max_requests))
+                and 1 + TRACKING_SLOTS <= self.capacity[self.slot_kind] and bool(self.max_requests))
 
     # ---------------------------------------------------------------- items
 
@@ -428,28 +479,43 @@ class RadixLedger:
             else:
                 pages, states = self.tree.evict_states(n - len(free))
             self.free[KV].extend(pages)
-            self.free[GDN].extend(states)
+            self.free[self.slot_kind].extend(states)
         if len(free) < n:
             return None
         return [free.pop() for _ in range(n)]
 
     def _flush_capped(self) -> None:
         if self.tree.freed_states:
-            self.free[GDN].extend(self.tree.freed_states)
+            self.free[self.slot_kind].extend(self.tree.freed_states)
             self.tree.freed_states.clear()
 
     def _limit(self, prompt: Sequence[int]) -> Sequence[int]:
-        """``_compute_max_prefix_len``: one token at least is left to compute."""
-        return prompt[:(len(prompt) - 1) // self.page * self.page]
+        """``_compute_max_prefix_len``: at least replay_tokens remain to compute."""
+        return prompt[:max(0, len(prompt) - self.replay_tokens) // self.page * self.page]
+
+    def _resolve_match(self, request: int, prompt: Sequence[int]) -> Match:
+        if self.stale:
+            m = Match(self.tree.root, 0)
+            self.matches[request] = (self.tree.version, self.tree.insert_version, m)
+            return m
+        cached = self.matches.get(request)
+        start: Node | None = None
+        if cached is not None:
+            v_tree, v_ins, prev = cached
+            if v_tree == self.tree.version:
+                return prev
+            node_valid = prev.node is self.tree.root or prev.node.state is not None
+            if node_valid and v_ins == self.tree.insert_version and prev.kv == prev.node.depth:
+                self.matches[request] = (self.tree.version, self.tree.insert_version, prev)
+                return prev
+            if prev.node is not self.tree.root and prev.node.state is not None:
+                start = prev.node
+        m = self.tree.match(self._limit(prompt), start=start)
+        self.matches[request] = (self.tree.version, self.tree.insert_version, m)
+        return m
 
     def match(self, request: int, prompt: Sequence[int]) -> int:
-        if self.matches_version != self.tree.version:
-            self.matches.clear()
-            self.matches_version = self.tree.version
-        prefix = self.matches.get(request)
-        if prefix is None:
-            prefix = self.matches[request] = 0 if self.stale else self.tree.match(self._limit(prompt)).prefix
-        return prefix
+        return self._resolve_match(request, prompt).prefix
 
     def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int) -> Admitted | None:
         if request in self.holdings:
@@ -457,12 +523,12 @@ class RadixLedger:
         cap = self.max_requests
         if cap is not None and len(self.holdings) >= cap:
             return None
-        m = self.tree.match(self._limit(prompt) if not self.stale else [])
+        m = self._resolve_match(request, prompt)
         anchor = m.node
         self.tree.lock(anchor)  # before anything is taken: eviction must not take the prefix
         prefix_pages = self.tree.pages_to(anchor)
         pages = self._take(KV, max(0, self._count(tokens) - len(prefix_pages)))
-        slots = self._take(GDN, 1 + TRACKING_SLOTS) if pages is not None else None
+        slots = self._take(self.slot_kind, 1 + TRACKING_SLOTS) if pages is not None else None
         if pages is None or slots is None:
             self.free[KV].extend(pages or [])
             self.tree.unlock(anchor)
@@ -478,12 +544,16 @@ class RadixLedger:
             anchor if hit else None, m.prefix, aligned if aligned > m.prefix else None, restored=not hit,
             committed=m.prefix)
         self.reservations[step, request] = Reservation(m.prefix, admission=True)
-        return Admitted(m.prefix, {KV: [*prefix_pages, *pages], GDN: [slots[0]]})
+        return Admitted(m.prefix, {KV: [*prefix_pages, *pages], self.slot_kind: [slots[0]]})
 
     def _track(self, h: Holding, start: int, upto: int) -> tuple[int, bool] | None:
         """Where this step's state enters the tree, if it does, and whether it decodes."""
         if start >= h.prompt:  # prepare_for_decode
             return (upto, True) if upto % self.decode_grid == 0 else None
+        if self.slot_kind == SWA:
+            bound = min(upto, max(0, h.prompt - self.replay_tokens))
+            at = bound // self.page * self.page
+            return (at, False) if at > start else None
         n = upto - start  # _mamba_radix_cache_v2_req_prepare_for_extend, without DCP
         if n < self.grid:
             return None
@@ -508,30 +578,34 @@ class RadixLedger:
         restore: dict[str, tuple[int, int]] = {}
         if not h.restored and h.restore_step is None:
             assert h.restore_from is not None and h.restore_from.state is not None
-            restore[GDN] = (h.restore_from.state, h.run)
+            restore[self.slot_kind] = (h.restore_from.state, h.run)
             h.restore_step, r.restore = step, True
         track: dict[str, tuple[int, int]] = {}
+        snapshot: tuple[tuple[str, int, int], ...] = ()
         if speculative:
             # Every speculative decode step carries the next tracking slot (SGLang's
             # mamba_track_indices); whether it crosses a boundary is known once it retired. Two in
             # flight share the slot: one step crosses at most one boundary (mamba_track_interval
             # >= num_draft_tokens), and two in a row do not (a boundary every decode_grid tokens).
-            track[GDN] = (h.track[h.next_idx], -self.decode_grid)
+            track[self.slot_kind] = (h.track[h.next_idx], -self.decode_grid)
             r.track, r.decode = (h.next_idx, -self.decode_grid), True
             where = None
         else:
             where = self._track(h, start, upto)
         if where is not None:
             idx = h.next_idx
-            track[GDN] = (h.track[idx], where[0])
+            if self.slot_kind == SWA and where[0] == upto:
+                snapshot = ((SWA, h.run, h.track[idx]),)
+            else:
+                track[self.slot_kind] = (h.track[idx], where[0])
             r.track, r.decode = (idx, where[0]), where[1]
             h.next_idx = 1 - idx
         h.position = upto
-        return Reserved({KV: added} if added else {}, restore, track)
+        return Reserved({KV: added} if added else {}, restore, track, snapshot)
 
     def items(self, request: int) -> dict[str, list[int]]:
         h = self.holdings[request]
-        return {KV: list(h.pages), GDN: [h.run]}
+        return {KV: list(h.pages), self.slot_kind: [h.run]}
 
     def cancel(self, request: int, step: int) -> None:
         h = self.holdings.get(request)
@@ -553,7 +627,7 @@ class RadixLedger:
     def _drop(self, request: int, h: Holding) -> None:
         """Everything the request holds goes back; nothing enters the tree."""
         self.free[KV].extend(h.own)
-        self.free[GDN].extend([h.run, *h.track])
+        self.free[self.slot_kind].extend([h.run, *h.track])
         self.tree.unlock(h.anchor)
         if h.restore_from is not None:
             self.tree.unlock(h.restore_from)
@@ -614,12 +688,15 @@ class RadixLedger:
     def _insert(self, h: Holding, tokens: Sequence[int], length: int, state: int) -> bool:
         """``checkpoint_into_tree`` of ``tokens[:length]`` with ``state`` at its end. Returns whether
         the tree took ``state``."""
-        got = self.tree.insert(tokens[:length], h.pages[:length // self.page], state)
+        anchor = h.anchor if h.anchor.depth <= length else self.tree.root
+        pages = h.pages[:length // self.page]
+        got = self.tree.insert(tokens[:length], pages, state, anchor=anchor)
         self._flush_capped()
-        tree_pages = self.tree.pages_to(got.node)
-        for i, p in enumerate(h.pages[:length // self.page]):
-            if i not in got.dups and tree_pages[i] == p:
-                h.own.discard(p)
+        first_page = anchor.depth // self.page
+        if got.dups:
+            h.own.difference_update(pages[i] for i in range(first_page, len(pages)) if i not in got.dups)
+        else:
+            h.own.difference_update(pages[first_page:])
         self.tree.lock(got.node)
         self.tree.unlock(h.anchor)
         h.anchor = got.node
@@ -633,12 +710,12 @@ class RadixLedger:
         if length is None or length > h.position or not h.restored or self.stale:
             return
         assert length % self.page == 0, f"a tracked state at {length}, not on a page"
-        new = self._take(GDN, 1)  # donate_tracking_slot
+        new = self._take(self.slot_kind, 1)  # donate_tracking_slot
         if new is None:
             return
         donated, h.track[h.last_idx] = h.track[h.last_idx], new[0]
         if not self._insert(h, prompt, length, donated):
-            self.free[GDN].extend([donated])
+            self.free[self.slot_kind].extend([donated])
 
     def restart(self, request: int) -> bool:
         """The cache's pages where the request has its own, the root its anchor, nothing to restore:
@@ -667,7 +744,12 @@ class RadixLedger:
         self.matches.pop(request, None)  # it may end while still waiting
         if request not in self.holdings:
             return
-        self.releases[request] = (last_step, list(tokens))
+        if last_step <= self.retired and not any(k[1] == request for k in self.reservations):
+            self._finish(request, tokens)
+            return
+        held: Sequence[int] = (tokens if isinstance(tokens, tuple) or (isinstance(tokens, memoryview) and tokens.readonly)
+                               else memoryview(array("q", tokens)))
+        self.releases[request] = (last_step, held)
         self._finish_ready()
 
     def _finish_ready(self) -> None:
@@ -677,7 +759,7 @@ class RadixLedger:
             del self.releases[request]
             self._finish(request, tokens)
 
-    def _finish(self, request: int, tokens: list[int]) -> None:
+    def _finish(self, request: int, tokens: Sequence[int]) -> None:
         """``release_kv_cache`` with ``checkpoint``: the request's last tracked state, and the KV up to
         it, enter the tree; everything else goes back."""
         h = self.holdings[request]
@@ -688,7 +770,7 @@ class RadixLedger:
             if self._insert(h, tokens, length, h.track[idx]):
                 keep = idx
         self.free[KV].extend(h.own)
-        self.free[GDN].extend([h.run, *(s for i, s in enumerate(h.track) if i != keep)])
+        self.free[self.slot_kind].extend([h.run, *(s for i, s in enumerate(h.track) if i != keep)])
         self.tree.unlock(h.anchor)
         self._restored(h)
         del self.holdings[request]
@@ -708,9 +790,9 @@ class RadixLedger:
     def check(self) -> list[str]:
         tree_pages, tree_states = self.tree.held()
         held = {KV: [*tree_pages, *(p for h in self.holdings.values() for p in h.own)],
-                GDN: [*tree_states, *(s for h in self.holdings.values() for s in (h.run, *h.track))]}
+                self.slot_kind: [*tree_states, *(s for h in self.holdings.values() for s in (h.run, *h.track))]}
         errors = []
-        for kind in (KV, GDN):
+        for kind in (KV, self.slot_kind):
             ids = sorted([*self.free[kind].returned, *held[kind]])
             if ids != list(range(self.free[kind].fresh, self.capacity[kind])):
                 errors.append(f"{kind}: free, held and cached items disagree")

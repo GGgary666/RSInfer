@@ -16,8 +16,10 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
+from core.contracts.columns import Column
 from core.contracts.kernels import Implementation, Solution
 from core.contracts.plan import GRAPH
+from core.contracts.records import StateCopy
 from deploy.models.hf import cut
 from kernels import ds1017_formats as formats
 from layers.ds1017.unit import Layers
@@ -331,7 +333,8 @@ def test_a_captured_step_runs_the_named_backend_s_kernels_or_is_not_recorded(wor
     graph = layers.resolve(declared)[GRAPH]
     assert graph.pop("backend") == "reference" and graph["ds.moe@1"] == "reference.fixed.ds.moe@1"
     assert all(solution.startswith("reference.") for solution in graph.values()), graph
-    config = {"dsv4.backend": "eager", "dsv4.prefill_backend": "", "dsv4.decode_backend": ""}
+    config = {"dsv4.backend": "eager", "dsv4.prefill_backend": "", "dsv4.decode_backend": "",
+              "dsv4.yoco_mode": "off", "dsv4.yoco_keep_tokens": 140}
     eager = Layers(catalog, config, layers.cfg, layers.kv, layers.slots, [0], 64, layers.group,
                    layers.placement).resolve(declared)
     assert all(solution == f"eager.{name}" for phase in ("prefill", "decode")
@@ -363,3 +366,24 @@ def test_a_decode_step_reads_no_page_past_a_row_s_own(model: tuple[dict[str, Any
 def test_speculation_is_refused_at_start_for_a_model_that_drafts_nothing(model: tuple[dict[str, Any], Path]) -> None:
     with pytest.raises(Exception, match="spec.algorithm = 'eagle': the model drafts no tokens"):
         fresh(model, **{"spec.algorithm": "eagle"})
+
+def test_siblings_restored_from_the_same_window_generate_their_cold_logits(worker: DSWorker) -> None:
+    prefix = PROMPTS[0][:12]  # three pages, after the first sliding-window wrap
+    prompts = {1: prefix + PROMPTS[1], 2: prefix + PROMPTS[2]}
+    cold_ids, cold_logits = generate(worker, [1, 2], prompts=prompts)
+
+    d = driver(worker)
+    parent = d.add(0, prefix + [55, 54, 53, 52])
+    snapshot = d.next_slot
+    d.next_slot += 1
+    d.step({0: len(prefix)}, [StateCopy("swa.slots", "after", Column.of("i32", [parent.slot]),
+                                        Column.of("i32", [snapshot]))])
+    d.step({0: 4})  # overwrite the parent's ring and Engram tail after taking the snapshot
+    for row, prompt in prompts.items():
+        child = d.add(row, prompt)
+        child.pages, child.computed = parent.pages[:len(prefix) // d.page_size], len(prefix)
+        restore = StateCopy("swa.slots", "before", Column.of("i32", [snapshot]), Column.of("i32", [child.slot]))
+        first = d.step({row: len(prompt) - len(prefix)}, [restore]).logits[0].clone()
+        logits = [first, *d.generate([row], STEPS)[row]]
+        assert child.outputs == cold_ids[row]
+        same({row: logits}, cold_logits, [row])

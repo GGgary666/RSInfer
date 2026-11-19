@@ -81,9 +81,15 @@ class BatchPlan(msgspec.Struct, frozen=True):
     accepted (``Sampled.counts``), 1 to D; a prefill row runs the draft model's extend after the
     target's. Such a step is not mixed."""
     next_tokens: Column = Column("i64")
-    """With ``draft_tokens``, ``i64`` per row: the prompt token after the row's chunk, which the draft
-    model's extend takes as the chunk's last input (SGLang's ``chunked_req_next_prompt_token``); -1
-    for a row whose chunk ends its prompt (it takes the token sampled now) or that decodes."""
+    """Optional ``i64`` per row: the known prompt token after the row's chunk, or -1 when the row
+    needs a sampled token. A non-speculative worker can skip logits and sampling for a known
+    continuation. Empty preserves the older behavior of sampling every row. With ``draft_tokens``,
+    the draft model's extend takes it as the chunk's last input (SGLang's
+    ``chunked_req_next_prompt_token``)."""
+
+    prompt_lengths: Column = Column("i32")
+    """Optional original prompt lengths, one per row. Bounded decoder replay uses the entire
+    prompt suffix across chunk boundaries. Empty: older producers use full decoder replay."""
 
 
 class StateAssign(msgspec.Struct, frozen=True):

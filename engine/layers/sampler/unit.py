@@ -14,20 +14,32 @@ from core.contracts.sampling import SamplingParams
 class Sampler:
     """``layers.sampler@1``."""
 
-    def __init__(self, catalog: Any) -> None:
+    def __init__(self, catalog: Any, force_topk: int = 0) -> None:
         self.catalog = catalog
+        self.force_topk = force_topk
 
-    def sample(self, logits: torch.Tensor, params: Sequence[SamplingParams], positions: Sequence[int]) -> torch.Tensor:
+    def sample(self, logits: torch.Tensor, params: Sequence[SamplingParams],
+               positions: Sequence[int] | torch.Tensor) -> torch.Tensor:
         """One token per row of ``logits``; ``positions``: of each row's last input token."""
-        return self.catalog.call("sample.seeded@1", {"vocab": logits.shape[-1]}, logits,
+        indices = None
+        if 0 < self.force_topk < logits.shape[-1]:
+            # DeepInfer's force-top-k mode caps the vocabulary before temperature and top-p.
+            logits, indices = self.catalog.call("sample.topk@1",
+                {"vocab": logits.shape[-1], "k": self.force_topk}, logits, self.force_topk)
+        sampled = self.catalog.call("sample.seeded@1", {"vocab": logits.shape[-1]}, logits,
                                  [p.temperature for p in params], [p.top_p for p in params],
                                  [p.top_k for p in params], [p.seed or 0 for p in params], positions)
+        if indices is not None:
+            sampled = indices.gather(-1, sampled.long().unsqueeze(-1)).squeeze(-1).to(torch.int32)
+        return sampled
 
     def accept(self, logits: torch.Tensor, drafts: torch.Tensor, params: Sequence[SamplingParams],
                starts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """A verify step's tokens ``[rows, D]`` and accepted lengths ``[rows]`` (``spec.accept@1``,
         doc/specs/mtp.md): ``logits`` ``[rows, D, vocab]``, ``drafts`` ``[rows, D - 1]``, ``starts`` each
         row's length before the step."""
+        if self.force_topk:
+            raise ValueError("sampler.force_topk requires non-speculative decoding")
         return self.catalog.call("spec.accept@1", {"vocab": logits.shape[-1]}, logits, drafts,
                                  [p.temperature for p in params], [p.top_p for p in params],
                                  [p.top_k for p in params], [p.seed or 0 for p in params], starts)
@@ -35,4 +47,4 @@ class Sampler:
 
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
-        ctx.provide("layers.sampler@1", Sampler(ctx.use("kernels.catalog@1")))
+        ctx.provide("layers.sampler@1", Sampler(ctx.use("kernels.catalog@1"), config["sampler.force_topk"]))
