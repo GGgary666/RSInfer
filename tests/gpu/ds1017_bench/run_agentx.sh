@@ -85,7 +85,10 @@ case "$cmd" in
             exit 2
         fi
         dest=$(stage_to_n1 "$tag" | tail -n 1)
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; bash tests/gpu/ds1017_bench/run_agentx.sh prepare '${traces}' '${out_dir}'"
+        sess="agentx-prep-${tag}"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'bash tests/gpu/ds1017_bench/run_agentx.sh prepare \"${traces}\" \"${out_dir}\" >prepare.log 2>&1; echo \$? >prepare.exit'"
+        echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
+        echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/prepare.log'; cat '${dest}/prepare.exit' 2>/dev/null || true\""
         exit 0
         ;;
     remote-agx)
@@ -127,13 +130,13 @@ case "$cmd" in
     remote-status)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/agentx-${tag}"
-        "$script_dir/remote_exec.sh" "cd '${dest}'; for f in agx.log di.log; do if [[ -f \"\$f\" ]]; then echo \"=== \$f ===\"; tail -n 20 \"\$f\"; fi; done; tmux ls 2>/dev/null || true"
+        "$script_dir/remote_exec.sh" "cd '${dest}'; for f in prepare.log agx.log di.log; do if [[ -f \"\$f\" ]]; then echo \"=== \$f ===\"; tail -n 20 \"\$f\"; fi; done; tmux ls 2>/dev/null || true"
         exit 0
         ;;
     remote-stop)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/agentx-${tag}"
-        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'agentx-agx-${tag}' 'agentx-di-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done; if [[ -d '${dest}/agx-run' ]]; then N1_RUN='${dest}/agx-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-agx || true; fi"
+        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'agentx-prep-${tag}' 'agentx-agx-${tag}' 'agentx-di-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done; if [[ -d '${dest}/agx-run' ]]; then N1_RUN='${dest}/agx-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-agx || true; fi"
         exit 0
         ;;
 esac
