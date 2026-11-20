@@ -1,99 +1,207 @@
-# RSI-native 推理引擎
+<div align="center">
 
-一个为“AI 自我改进”而设计的大模型推理引擎。
+# RSInfer
 
-**算子优化开发工具**　RSInfer 使用 Atrex Kernel Agent（AKA）委托算子优化。在 [third_party](third_party) 中点击 `aka` 可查看当前版本使用的确切提交，后续开发在上游 [aka-for-rsi 分支](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi) 进行。安装、提交任务和接回候选见 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)。
+### An RSI-Native LLM Serving Engine for Live, Compositional, and Safe Self-Improvement
 
-## 动机
+**Rethinking Inference Infrastructure When AI Agents Become the System Engineers**
 
-越来越多的工作在让 AI agent 去改进 AI 基础设施本身：写更快的 kernel、调调度策略、改整个推理引擎的代码。但现在的推理引擎（vLLM、SGLang 等）不是为这件事设计的：
+[English](README.md) | [简体中文](README_zh.md)
 
-- **改一点就要重启。** 换一个调度策略、一个 kernel，往往要重启整个引擎，几十秒到几分钟，agent 的每一轮尝试都被拖慢。
-- **改了什么、影响了什么，没人说得清。** 换了 kernel 却没重新录 CUDA graph、换了权重却没重算缩放系数，这类错误会悄悄产生错误结果。
-- **结果不可信。** 在反复修改过的进程里测出来的数字，依赖修改的历史；agent 还可能有意无意地“绕过”评测（比如去掉结束符、只算一部分词表）。
-- **改进不能叠加。** 一次改进很难成为下一次改进的可靠起点。
+[![Technical Report](https://img.shields.io/badge/Technical%20Report-PDF-b31b1b.svg)](doc/RSInfer_Technical_Report.pdf)
+[![Quick Start](https://img.shields.io/badge/Quick%20Start-Guide-0f766e.svg)](doc/quickstart.md)
+[![TLA+ Verified](https://img.shields.io/badge/Protocol-TLA%2B%20Verified-1d4ed8.svg)](tests/framework/formal/README.md)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
-## 使命
+</div>
 
-做一个**架构上就支持“安全地改任何东西”的推理引擎**：
-- 任何改动都能安全地应用和回滚，并且如实报告实际做了什么；
-- 任何结果都能追溯到确切的系统版本；
-- 评测在被改的系统之外、在全新启动的实例上进行；
-- 被接受的改进可以成为新的起点，可以分支、合并、继续叠加。
+---
 
-它首先是一个像 vLLM 一样可以部署的推理引擎；支持自我改进的部分是可以拆掉的插件。
+**RSInfer** is a production-grade LLM serving engine architected from first principles for **Recursive Self-Improvement (RSI)** — where AI agents (and human systems engineers) continuously profile, rewrite, and optimize kernels, schedulers, and serving stacks directly on live GPU engines without paying cold-start taxes or risking silent corruption.
 
-## 核心思路
+![RSInfer at a Glance](doc/figures/fig1_headline.png)
 
-- **每个模块都是一个“单元”**，单元是管理和重载的最小单位，进程只是装单元的容器。改了一个调度策略，只重载这一个单元，不重启任何进程。
-- **框架本身几乎不带领域概念**：没有内建的“调度器”“KV cache”“TP”，这些全是单元。框架只负责把单元拼起来、换下来，像一组微服务拼成一个引擎。
-- **持有显存的“状态单元”比逻辑单元活得长**，所以改代码不会丢掉权重和 KV。
-- **改动的代价由框架推导**：从“改了什么”算出“哪些单元要重载、哪些 CUDA graph 要重录、要不要排空请求”，只动真正受影响的部分。
+### Key Highlights
 
-![单元全景图](doc/figures/modules-map.png)
+- **32×–98× Faster Live Mutations:** In-place code and configuration updates finish in **1.0–2.2 s** on 1×SM100 (`Qwen3.8-27B`) vs. 64–104 s restarts in SGLang/vLLM. On 4×SM100 serving `DeepSeek-V4.1-Flash-1017` (552B MoE + 196B Engram, 475.2 GiB checkpoint), an autonomous agent ran **95 live updates with zero restarts** in 6 hours at **5.18 s** median code-reload latency (**63×–216×** faster than cold boots), saving **8–31 hours** in a single session.
+- **Zero Framework-Core Edits During Autonomous RSI:** All autonomous optimization trajectories — 11 rounds (~75 live `apply`s) on `Qwen3.8-27B` and all three `DeepSeek-V4.1-Flash-1017` benchmark campaigns (including 95 live `apply`s on 4×SM100) — landed entirely inside reloadable **Units** with **zero edits** to the domain-agnostic microkernel (`engine/framework.toml`).
+- **Frontier SM100 Serving Performance:** On 1×SM100 `Qwen3.8-27B`, agent-evolved RSInfer reaches **104.5%** of native SGLang decode throughput, **up to 2.95×** lower prefix-cached TTFT, and **+6.4%–10.8%** higher EAGLE/MTP throughput. On 4×SM100 `DeepSeek-V4.1-Flash-1017`, RSInfer outperforms DeepInfer and DeepInfer (Local Engram) at every point of the official 131K sweep (up to **+13.0% / +9.9%** prefill and **+11.5%** decode), and on real multi-turn **AgentX** traces delivers **+25.6%–26.5%** output throughput on the 131K validation split and **+19.0%–31.8%** on the 256K blind holdout while cutting median and P99 TTFT by up to **4.1×** and **2.7×**.
+- **Formally Verified & Audit-Proof:** Distributed commit, rollback, and incarnation protocols are checked by **4 TLA+ specifications** (43 TLC configurations, 17 bug mutants, 14 witnesses) paired with **59 Python trace-replay tests**, runtime `O(1)` CUDA Graph guards, and clean cold-start evaluation gates.
 
-上图是引擎的单元全景图：彩色大框是进程，小框是单元；白色是逻辑单元，青色是状态单元，灰色粗框是框架本体。可交互的版本（点单元看职责、看场景演示）见 [doc/modules.html](doc/modules.html)。
+> **Asynchronous Kernel Research (AKA):** RSInfer delegates isolated operator search to [Atrex Kernel Agent (AKA)](third_party) (upstream development on [aka-for-rsi](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi)). See the [AKA Optimization Guide](.claude/skills/optimize-kernels-with-aka/SKILL.md) for setup, task submission, and candidate integration.
 
-## 目标
+---
 
-| 版本 | 内容 |
+## Motivation
+
+More and more work asks AI agents to improve AI infrastructure itself: write faster kernels, redesign scheduling policies, and evolve entire inference engines. Today's serving engines (vLLM, SGLang, DeepInfer, etc.) were not designed for this:
+
+- **Every tiny edit forces a full restart.** Changing a 10-line scheduling policy or a kernel wrapper tears down processes, re-initializes CUDA and communicators, reloads tens to hundreds of gigabytes of weights (1–20 minutes), and recaptures CUDA graphs — throttling every single agent iteration.
+- **Nobody knows the true blast radius.** Swapping a kernel without recapturing CUDA graphs, or replacing weights without invalidating cached scales or KV states, silently produces wrong outputs with zero runtime exceptions.
+- **In-situ measurements are untrustworthy.** Numbers benchmarked inside a repeatedly mutated process drift with mutation history and allocator fragmentation; unconstrained agents can also subtly game benchmarks (e.g., skipping EOS checks or slicing the vocabulary).
+- **Improvements do not compose.** Without deterministic system identity and atomic transitions, one optimization rarely serves as a reliable, verifiable starting point for the next.
+
+## Mission
+
+Build an inference engine **architected from the ground up to "safely change anything"**:
+
+- Any change can be safely applied and rolled back, and honestly reports what it actually did;
+- Any result traces back to an exact cryptographic system version (`Identity`);
+- Promotion evaluations run outside the mutated system on clean, cold-started instances;
+- Accepted improvements become reliable new baselines that can be branched, merged, and stacked.
+
+**Above all, RSInfer is first and foremost a standalone, OpenAI-compatible serving engine you can deploy just like vLLM or SGLang; everything for outer-loop self-improvement is a detachable plugin.**
+
+---
+
+## Core Ideas & Architecture
+
+- **Every module is a "Unit."** A Unit is the smallest unit of management and hot-reloading; OS processes are merely containers for units. Change a scheduling policy, and only that unit reloads — no process restarts.
+- **A domain-agnostic microkernel core.** The framework core (`engine/framework.toml`, ~10K LoC — 24.6% of `engine/`) has no built-in concept of tokens, schedulers, KV caches, or TP. All serving capabilities live in **44 hot-reloadable Units**, composed cleanly like in-process microservices.
+- **Long-lived State Units outlive stateless Logic Units.** 10 **State Units** hold GPU HBM pools, weights, NCCL communicators, and ledgers across reloads; 34 **Logic Units** (models, layers, kernels, schedulers, frontends) reload in seconds without dropping hundreds of gigabytes of weights or KV cache.
+- **The framework derives the exact cost of every edit.** From *what changed*, `core.deps` automatically computes which units must reload, which CUDA graphs must be recaptured, and whether traffic must drain — touching only what is truly affected.
+
+![RSInfer Process and Unit Architecture](doc/figures/fig2_arch_map.png)
+
+*Interactive architecture map (click any unit to inspect its responsibilities, edges, and change scenarios): [doc/modules.html](doc/modules.html).*
+
+### Live Change Protocol & Action Ladder
+
+RSInfer models inter-unit dependencies with six edge types (`data`, `call`, `state`, `derive`, `ctrl`, `decl`) and three binding modes (**Live**, **By-Address**, **By-Value**). Given any workspace or configuration `ChangeSet`, `core.deps` maps it onto the minimal sound rung of a **7-rung Action Ladder (Rung 0–6)**, compiles native C++/CUDA extensions asynchronously in background subprocesses during `Prepare` while live traffic continues serving HTTP 200, enforces an `O(1)` three-part CUDA Graph guard before every replay, and commits or rolls back atomically across distributed GPU workers via a TLA+-verified two-round commit barrier.
+
+![Binding Modes, Seven-Rung Action Ladder, and Atomic 2PC Change Transaction](doc/figures/fig3_tx_protocol.png)
+
+### Seven Expressiveness Principles (P1–P7)
+
+To let one unchanged unit contract span single-GPU hybrid linear-attention models and multi-GPU sparse MoE architectures, RSInfer enforces seven architectural invariants across all seams:
+
+| Principle | Invariant |
 |---|---|
-| **v0** | 在单台 8×SM100 上跑 Qwen3.8-27B。**不追求性能，追求架构正确、有表达力**：所有变更路径都能端到端走通、能被测试验证 |
-| v0.1 | 支持 DeepSeek-V4.1-Flash（单机 DP8 + EP8，含 EPLB）。由 agent 在 v0 上一步步演进出来，每一步都 apply 到正在运行的引擎上 |
-| v0.2 | 扩到两台机器 16 卡（DP16 + EP16），同样由演进得到 |
+| **P1 — Data-Driven Description** | Parallel meshes, placement topologies, weight formats (`WeightDecl`), and per-layer cache layouts (`StateDecl`: sub-page ratios, byte shapes, lifetimes) are declarative data, not hardcoded types. |
+| **P2 — Open Records** | Per-step cross-process payloads (`StepPlan` / `StepResult`) are extensible columnar binary maps (`dict[str, bytes]`), enabling MTP speculation or YoCo replay with zero transport schema edits. |
+| **P3 — Rank-Indexed Interfaces** | Execution and ledger interfaces are indexed per rank and scheduling domain (`sched.domains`), unifying TP (`comm.size=1` / identical plans) and heterogeneous `DP4 + EP4`. |
+| **P4 — Capability Declarations** | Units statically declare state actions (`drain`, `refit`), graph capturability, native libraries, and out-of-process `[unit] build` hooks in `unit.toml`. |
+| **P5 — Joint Constraint Protocols** | Multi-pool admission and prefix reuse follow a "propose constraints → intersect" protocol across paged KV, Mamba/GDN recurrent slots, and SWA ring buffers. |
+| **P6 — Unified ChangeSet** | Agent code patches, live config toggles, startup, `sleep`/`wake`, and runtime reconfigurations (such as online EPLB) all flow through one transactional pipeline. |
+| **P7 — Strict Location Transparency** | No framework or unit module may hardcode `localhost`, OS PIDs, or host-local paths in endpoint IDs (`ProcId = (HostId, role, index)`), statically enforced in CI. |
 
-v0.1、v0.2 本身就是对 v0 架构的检验：如果演进的某一步不得不改框架本体，就说明设计还不够通用。
+---
 
-## 文档
+## Empirical Highlights
 
-- [doc/quickstart.md](doc/quickstart.md)：**快速上手与热更新实操指南**（一键起停 DS1017、OpenAI API 调用、改配置/改代码热生效闭环、进程日志位置、`sleep`/`wake` 与一键评测）。
-- [doc/modules.html](doc/modules.html)：**设计的真源**。单元全景图、单元清单、单元模型与重载、边与组合规则、两个思想实验、已定的决定和待讨论的问题。
-- [doc/roadmap.md](doc/roadmap.md)：做的顺序和每一步的验收。
-- [doc/specs/](doc/specs/)：框架本体七个组件的规格。
-- [doc/v0-plan.md](doc/v0-plan.md)：v0 计划（依据 modules.html 更新）。
-- [doc/discussion-summary.md](doc/discussion-summary.md)：讨论纪要和调研记录（背景资料）。
-- [doc/archive/](doc/archive/)：旧版本文档。
+### 1. Live Mutation Latency & Autonomous Session Telemetry
 
-三者冲突时，以 modules.html 为准，其次是 v0-plan.md，再次是 discussion-summary.md。
+![Live Mutation Latency and Full-Session Cost](doc/figures/fig4_reload_matrix.png)
 
-## 快速上手与评测
+| Model & Scale | Mutation Scenario | RSInfer Median | Baseline / Cold Boot | Speedup |
+|---|---|---:|---:|---|
+| **Qwen3.8-27B** (1×SM100, 55.6 GB) | Toggle live config (`sched.overlap`) | **1.00 s** | 71.7 s (SGLang) / 98.8 s (vLLM) | **71× / 98×** (Rung 1, 0 drain) |
+| **Qwen3.8-27B** (1×SM100, 55.6 GB) | Edit policy / scheduler / model / kernel | **1.41–1.54 s** | 67.4–72.2 s (SG) / 96.9–103.8 s (vLLM) | **45×–69×** (Rung 2, weights kept) |
+| **Qwen3.8-27B** (1×SM100, 55.6 GB) | Swap 55 GB disk weights (`refit`) | **26.62 s** | 24.8 s (SG) / 26.0 s (vLLM) | **1.0×** (Rung 4, parity w/ RPC) |
+| **DS-V4.1** (4×SM100, 475.2 GiB) | Live config / sched / light worker code | **2.33–3.01 s** | 325.9 s warm (18–20 min cold FS) | **108×–140×** (9–11 ms pause) |
+| **DS-V4.1** (4×SM100, 475.2 GiB) | Worker code + CUDA ext + 16 Graphs | **5.55 s** | 325.9 s warm (18–20 min cold FS) | **59×** (**195×–216×** vs. cold FS) |
+| **DS-V4.1** (6 h autonomous session) | **95 live `apply`s, 0 restarts** | **10.7 min total** | 8.5 h warm / 28–31 h cold restarts | **2.39×–6.20×** total session speedup |
 
-### 1. 启动服务与热改（`deploy/`）
+### 2. Frontier Serving Performance on 4×SM100 (`DeepSeek-V4.1-Flash-1017`, `DP4+EP4`)
+
+RSInfer beats both stock **DeepInfer** and strengthened **DeepInfer (Local Engram)** at every point of the official 131K YoCo prefill and steady-state decode sweeps, and generalizes cleanly to real multi-turn + subagent **AgentX** traces (`~78%` prefix reuse, real routing, `256/256` bit-exact greedy parity):
+
+![DeepSeek-V4.1 Official 4xSM100 Sweeps](doc/figures/fig6_ds1017_sweeps.png)
+
+![AgentX Multi-Turn and Subagent Evaluation](doc/figures/fig7_agentx_pareto.png)
+
+| Benchmark (`DeepSeek-V4.1-Flash-1017`, 4×SM100 `DP4+EP4`) | RSInfer | vs. DeepInfer | vs. DeepInfer (Local Engram) |
+|---|---:|---:|---:|
+| **Official 131K YoCo Prefill** (`4K–64K`, +AKA Kernels) | **70,128 → 88,438 tok/s/GPU** | **+7.2% to +13.0%** | **+2.3% to +9.9%** |
+| **Official 131K YoCo Decode** (`D=4..256`/GPU, up to 1,024 seqs) | **471.5 → 11,621.1 tok/s/GPU** | **+2.9% to +11.5%** | **+3.8% to +11.5%** |
+| **AgentX 131K Validation** (`C=16/24/48`, 328 reqs) | **880 / 979 / 1,058 out tok/s** | **+25.6% to +26.5%** (P50 TTFT **2.32×–2.57×** faster) | — |
+| **AgentX 256K Blind Holdout** (`C=8..32`, 256 reqs) | **560 → 998 out tok/s** (119.4K total) | **+19.0% to +31.8%** (P50 TTFT **1.74×–4.05×** faster) | — |
+
+<details>
+<summary><b>More Results: Qwen3.8-27B on 1×SM100, AgentX Percentile Latencies, DS-V4.1 Evolution Trajectories, and TLA+ Verification</b></summary>
+
+#### `Qwen3.8-27B` Full 64-Layer Evaluation on 1×SM100 vs. SGLang 0.5.23
+
+- **Verified Agent-Evolved Decode (`R9`, self-check ON):** **104.54%** GeoMean decode throughput vs. SGLang (+7.7% at `C=8`, +7.1% at `C=16`), with short-prompt TTFT down to **17.1 ms** (2.90× faster than SGLang's 49.7 ms).
+- **Radix Prefix Caching + GDN Snapshots (3K shared prefix):** Median TTFT drops to **72.5 / 75.1 / 127.8 ms** at `C=1/4/8` (**2.34×–6.77×** over uncached, up to **2.95×** faster than cache-enabled SGLang).
+- **EAGLE/MTP Speculation:** Fused Triton GDN state commit (`9.79 → 0.63 ms`) + 3 CUDA Graph families reach **191 / 655 / 1,230 tok/s** (**+7.1% / +10.8% / +6.4%** over native SGLang MTP).
+
+![Qwen3.8-27B 1xSM100 Evaluation](doc/figures/fig5_qwen38_sm100.png)
+
+#### AgentX 131K Validation TTFT & TPOT Percentiles (`p50 / p90 / p99`)
+
+![AgentX 131K Percentile Latencies](doc/figures/fig8_agentx_latency.png)
+
+#### Autonomous `DeepSeek-V4.1` Evolution Trajectories (0 Framework-Core Edits)
+
+![DS-V4.1 Autonomous Evolution Trajectories](doc/figures/fig9_dsv4_evolution.png)
+
+#### Bounded TLA+ Formal Verification Suite (`tests/framework/formal/`)
+
+- **4 TLA+ specifications** (`Transaction.tla`, `Participant.tla`, `SequentialTx.tla`, `Incarnation.tla`; 450 LoC) checked by SHA-256-pinned TLC 1.7.4 across **43 configurations** (12 normal models covering 4,743 states, **17 bug mutants**, **14 reachability witnesses**) + **59 Python trace-replay & in-memory mutant tests** against real runtime handlers.
+
+</details>
+
+---
+
+## Quick Start
+
+For a full hands-on walkthrough — including a live code hot-reload & rollback demo, process log locations, `sleep`/`wake`, and troubleshooting — see **[doc/quickstart.md](doc/quickstart.md)**.
+
+### 1. One-Command 4×SM100 Serving & Live Hot-Reload (`deploy/`)
+
+`deploy/serve_ds1017.sh` automatically aligns `CUDA_HOME`, `nvcc`, `LD_LIBRARY_PATH`, `TRITON_PTXAS_PATH`, and `nvidia.cu13` `CPATH` to the active Python's `torch.version.cuda`:
 
 ```bash
-# 4×SM100 一键启动 DS1017（自动匹配 CUDA 版本与 CPATH）
-./deploy/serve_ds1017.sh serve --model /path/to/DeepSeek-V4.1-Flash-1017 --gpus 0,1,2,3
-./deploy/serve_ds1017.sh status
-./deploy/serve_ds1017.sh chat "Hello"
+source /path/to/venv/bin/activate
+export RSINFER_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
 
-# 在跑着的引擎上直接热改代码或配置（不重启、不重载权重）
+# Start 4xSM100 DS1017 (DP4/EP4, detached, port 8000, run dir run/rsinfer)
+./deploy/serve_ds1017.sh serve --gpus 0,1,2,3
+./deploy/serve_ds1017.sh status
+
+# Streamed chat / completions or standard OpenAI HTTP API
+./deploy/serve_ds1017.sh chat "Explain live hot-reloading in three sentences." --max-tokens 128
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":32,"temperature":0}'
+
+# Live-apply config or code edits without restarting or reloading weights
+./deploy/serve_ds1017.sh control apply --config '{"sched.overlap": false}' --dry-run
 ./deploy/serve_ds1017.sh control check --source .
 ./deploy/serve_ds1017.sh control apply --source . --dry-run
 ./deploy/serve_ds1017.sh control apply --source . --intent "describe your change"
-./deploy/serve_ds1017.sh control apply --config '{"sched.overlap": true}'
 
-# 让出显存 / 恢复 / 停止
-./deploy/serve_ds1017.sh sleep
+# Inspect per-process logs (<run>/host-a/snapshots/.run/<role>-<index>-<seq>/log)
+ls run/rsinfer/host-a/snapshots/.run/*/log
+
+# Temporarily release / restore GPU memory, or stop the engine
+./deploy/serve_ds1017.sh sleep --wait-empty
 ./deploy/serve_ds1017.sh wake
 ./deploy/serve_ds1017.sh stop
 ```
 
-完整实操步骤（含热改代码 Demo、日志路径与常见问题）见 [doc/quickstart.md](doc/quickstart.md)；通用单机 CLI（支持 Qwen3.8 / DS1017 / CPU 调试）详见 [deploy/README.md](deploy/README.md)，热改开发约定与排障见 [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md)。
+For general single-host usage (`Qwen3.8-27B`, single-GPU, or CPU debugging via `deploy/rsinfer.py`), see [deploy/README.md](deploy/README.md).
 
-### 2. DS1017 物理机一键评测（`tests/gpu/ds1017_bench/`）
+### 2. Local One-Command GPU Benchmarks (`tests/gpu/ds1017_bench/`)
+
+Benchmark scripts automatically stage temporary probes into disposable `.runs/bench-*` directories (cleaned on exit), keeping the git working tree untouched:
 
 ```bash
-# 官方 Prefill / Decode（自动在 .runs/ 隔离副本施加探针，不污染 git 工作树）
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model /path/to/DS1017 --gpus 0,1,2,3 65536
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode  --model /path/to/DS1017 --gpus 0,1,2,3 256
+# Official 131K YoCo Prefill (64K point; omit numbers for full 4K–64K sweep)
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --gpus 0,1,2,3 65536
 
-# AgentX 回放基准
-./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --model /path/to/DS1017 --gpus 0,1,2,3 ./agentx_eval 32
+# Official 131K YoCo Decode (D=256/GPU; omit numbers for full 4–256 sweep)
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode  --gpus 0,1,2,3 256
+
+# AgentX multi-turn replay benchmark
+./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --gpus 0,1,2,3 /path/to/agentx_eval 32
 ```
 
-详见 [tests/gpu/ds1017_bench/README.md](tests/gpu/ds1017_bench/README.md)。
+See [tests/gpu/ds1017_bench/README.md](tests/gpu/ds1017_bench/README.md) for dataset preparation and full options.
 
-### 3. 本地测试与形式化验证
+### 3. Local Type Checking, Unit Tests & TLA+ Formal Verification
 
 ```bash
 uv sync --python 3.12 --extra cpu
@@ -101,3 +209,52 @@ uv run pyright
 OMP_NUM_THREADS=1 uv run pytest -n 8
 uv run python tests/framework/formal/run.py --bootstrap --replay
 ```
+
+---
+
+## Milestones, Branches & Documentation
+
+### Milestones & Roadmap
+
+| Stage | Status | Scope |
+|---|---|---|
+| **v0** | ✅ Done | 1×SM100 `Qwen3.8-27B` (64L hybrid GatedDeltaNet + Paged GQA, Radix GDN prefix cache, EAGLE/MTP speculation, full change-protocol verification, autonomous evolution past SGLang) |
+| **v1** | ✅ Done | 4×SM100 `DeepSeek-V4.1-Flash-1017` (`DP4+EP4`, 4-stream mHC, Sparse MLA + SWA + YoCo, 384+32 NVFP4 MoE + online EPLB, NVLink Engram, AKA kernels, surpassing DeepInfer on 32K/131K sweeps & AgentX 131K/256K) |
+| **v2** | 🚧 Roadmap | Elastic EP rank resizing & intra-group fault containment, multi-node `DP16+EP16` & disaggregated Prefill/Decode, standalone `rsi.evalsvc` / `rsi.lineage` daemon |
+
+### Key Branches
+
+- `master` — Primary baseline with `Qwen3.8-27B` and `DeepSeek-V4.1-Flash-1017`, one-command launcher (`deploy/serve_ds1017.sh`), and local benchmark scripts.
+- `optimized-deepinfer` — Integrates AKA-discovered SM100 prefill kernels (`--aka-profile auto|official|validated|expanded --aka-warmup`).
+- `exp/agentx-opt` — AgentX multi-turn concurrency optimizations (vocab-parallel LM head, multi-stream decode overlap, and occupancy-aware scheduling).
+
+### Documentation Map
+
+- [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf) — Full Technical Report (architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy).
+- [doc/quickstart.md](doc/quickstart.md) — Step-by-step serve, OpenAI API, live hot-reload demo, log inspection, and benchmark guide.
+- [doc/modules.html](doc/modules.html) — Interactive unit architecture map, edge rules, and change scenarios (design source of truth).
+- [doc/specs/](doc/specs/) — Specifications for the 7 framework-core components, change protocol, CUDA graphs, prefix caching, MTP, and DS1017.
+- [deploy/README.md](deploy/README.md) — Complete `deploy/rsinfer.py` CLI reference (`serve`, `control`, `sleep`/`wake`, `checkpoint`).
+- [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md) — Repository directory map and agent workflow for live-engine development & `# PROBE` debugging.
+
+---
+
+## Citation
+
+If you find RSInfer useful in your research or systems work, please cite our technical report:
+
+```bibtex
+@techreport{wu2026rsinfer,
+  title   = {RSInfer: An RSI-Native LLM Serving Engine for Live, Compositional, and Safe Self-Improvement},
+  author  = {Tianyuan Wu and Wei Gao and Ruibo Fan and Chaokun Chang and Hanfeng Lu and Yuechen Tao and Yinghao Yu and Wei Wang},
+  institution = {HKUST and Alibaba Group},
+  year    = {2026},
+  url     = {https://github.com/open-agent-infra/RSInfer}
+}
+```
+
+## License & Acknowledgments
+
+RSInfer is released under the [Apache License 2.0](LICENSE). Third-party adapted components retain their original upstream licenses in their respective directories (`LICENSE.sglang` and `LICENSE.deepinfer` under Apache-2.0; `LICENSE.mini-sglang` and `LICENSE.deepseek` under MIT).
+
+We gratefully acknowledge the open-source projects whose kernels, abstractions, and evaluation ecosystems informed or integrate with RSInfer, including [SGLang](https://github.com/sgl-project/sglang), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [TileLang](https://github.com/tile-ai/tilelang), [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), [FlashMLA](https://github.com/deepseek-ai/FlashMLA), DeepInfer, and [Atrex Kernel Agent (AKA)](https://github.com/alibaba/atrex-kernel-agent).
