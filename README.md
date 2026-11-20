@@ -2,6 +2,8 @@
 
 一个为“AI 自我改进”而设计的大模型推理引擎。
 
+**算子优化开发工具**　agxInfer 使用 Atrex Kernel Agent（AKA）委托算子优化。在 [third_party](third_party) 中点击 `aka` 可查看当前版本使用的确切提交，后续开发在上游 [aka-for-rsi 分支](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi) 进行。安装、提交任务和接回候选见 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)。
+
 ## 动机
 
 越来越多的工作在让 AI agent 去改进 AI 基础设施本身：写更快的 kernel、调调度策略、改整个推理引擎的代码。但现在的推理引擎（vLLM、SGLang 等）不是为这件事设计的：

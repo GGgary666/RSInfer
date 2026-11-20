@@ -1,0 +1,1 @@
+atrex-aka-light @ https://github.com/alibaba/atrex-kernel-agent/archive/e6e2926d5251c7b815597af165d6396c42e4001c.tar.gz

@@ -9,6 +9,8 @@ description: Working in the agxinfer repository - where each component, unit, te
 
 ## 目录地图
 
+需要把真实算子交给 AKA 研究或接回已验收候选时，见[用 AKA 优化服务路径](../optimize-kernels-with-aka/SKILL.md)。
+
 ### 顶层
 
 | 路径 | 内容 |
