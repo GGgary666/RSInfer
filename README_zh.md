@@ -257,4 +257,4 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 
 本项目采用 [Apache License 2.0](LICENSE) 开源协议。仓库中适配或移植自第三方开源项目的组件均在其各自目录保留原有协议声明（`LICENSE.sglang`、`LICENSE.deepinfer` 为 Apache-2.0；`LICENSE.mini-sglang`、`LICENSE.deepseek` 为 MIT，均与 Apache-2.0 兼容）。
 
-衷心感谢 [SGLang](https://github.com/sgl-project/sglang)、[FlashInfer](https://github.com/flashinfer-ai/flashinfer)、[TileLang](https://github.com/tile-ai/tilelang)、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)、[FlashMLA](https://github.com/deepseek-ai/FlashMLA)、DeepInfer 与 [Atrex Kernel Agent (AKA)](https://github.com/alibaba/atrex-kernel-agent) 等优秀开源生态。
+衷心感谢 [SGLang](https://github.com/sgl-project/sglang)、[FlashInfer](https://github.com/flashinfer-ai/flashinfer)、[TileLang](https://github.com/tile-ai/tilelang)、[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)、[FlashMLA](https://github.com/deepseek-ai/FlashMLA)、[DeepInfer](https://github.com/deepseek-ai/DeepInfer) 与 [Atrex Kernel Agent (AKA)](https://github.com/alibaba/atrex-kernel-agent) 等优秀开源生态。
