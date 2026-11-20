@@ -18,11 +18,11 @@ description: Working in the RSInfer repository - where each component, unit, tes
 | `engine/` | 引擎源码树（框架本体 + 将来的单元） |
 | `tests/` | 全部测试 |
 | `doc/` | 设计文档、规格、评估记录 |
-| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。跑在组织自己的 Linux runner 上（`runs-on: ubuntu-latest`，2026-11-12 起；不用 GitHub 的 runner，那边按分钟算配额），`notify.yml` 也是。runner 是常驻的，uv 的缓存留在它的 `~/.cache/uv`。CI 里 `OMP_NUM_THREADS=1`：runner 的机器核多，不限的话每个引擎进程的 torch 都按核数开线程，两次 CI 同时跑会互相拖到单个测试超时；测试用的模型很小，一个线程跑得一样快。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
-| `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
+| `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。CI 里设 `OMP_NUM_THREADS=1`，避免多核机器上每个引擎进程的 torch 都按核数开线程导致并发测试互相拖超时。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
+| `third_party/` | `aka`（Atrex Kernel Agent SDK 子模块，详见 `optimize-kernels-with-aka` skill） |
 | `.claude/skills/rsinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
-| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`rsinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`models/`：每个模型家族一个 recipe（现在只有 `qwen38.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
+| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`rsinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`serve_ds1017.sh`：DS1017 4×SM100 一键启动与热改封装（自动匹配多版本 CUDA 与 `nvidia.cu13` `CPATH`）；`models/`：每个模型家族一个 recipe（`qwen38.py`、`ds1017.py` 及共用工具 `hf.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
 
 ### `engine/`
 
@@ -97,7 +97,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 每个单元目录下有一份 `unit.toml`。将来的单元（调度策略、KV cache、模型等）也放在 `engine/` 下，同样不列进 `framework.toml`。
 
-需要在 SM100 上运行实验时，使用 [sm100-eval skill](../sm100-eval/SKILL.md) 和 `.github/scripts/gpu_job_runner.py` 客户端提交、查看日志并回收结果。
+需要在 SM100 上跑 DS1017 端到端基准（Official Prefill / Decode、AgentX）时，见 [`tests/gpu/ds1017_bench/README.md`](../../../tests/gpu/ds1017_bench/README.md)；直接起停 4×SM100 服务与热改可用 [`deploy/serve_ds1017.sh`](../../../deploy/serve_ds1017.sh)。
 
 **两族模型**（2026-11-14）：`models.qwen38` 和 `models.ds1017` 都提供 `model@1`，一个 worker 只能装一族。
 - `deploy/rsinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `rsinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
@@ -144,10 +144,9 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
   - `test_ds1017.py`：DS 1017 对照 checkpoint 自带的参照实现（`ds1017_reference/`，原样带进来）：用后端 `tilelang` 时 logits 逐位相同（`cuda_graph=auto` 下也因不可捕获而退回 eager `tilelang`，不会录进别的后端）；参照 kernel 逐个在容差内；参照 kernel 下分块、多行、graph 回放逐位相同。要先在 GPU 环境里装 `tilelang==0.1.12`（不带依赖装，别换掉 torch：`uv pip install --no-deps tilelang==0.1.12 apache-tvm-ffi==0.1.11 torch-c-dlpack-ext==0.1.5 z3-solver==4.15.4.0 cloudpickle ml-dtypes psutil`）。小形状（1024 宽、16 头 × 128）在 4090 D 上能跑；真实形状的 attention kernel 要 SM 10.0。
   - `test_ds1017_deepinfer.py`：`kernels.deepinfer` 的每个 kernel 对参照（真实形状）、一个 token 的结果不随同一步的其他行变、录进 graph 换输入回放；缓存上的组合 definition 的用例在 `support_ds1017_cases.py`（`test_ds1017.py` 拿它们在小形状上对 TileLang 后端）。只能在 SM100 上 DeepInfer 的环境里跑。
   - `check_ds1017_real.py`：SM100 上手动跑的引擎级检查（真实形状的随机权重，或真 checkpoint 的前几层）。`--backends` 每个后端跑一遍（`+graph` 录 graph，`~direct` 把 MoE 换成 DeepInfer 的舍入方式）；`--shadow tilelang` 在每次 kernel 调用旁边用官方 kernel 在相同输入上再算一遍，逐个 definition 报相差多少。
-  - `sm100_ds1017.sh`、`sm100_deepinfer_env.sh`：SM100 的任务入口（各步检查、建 DeepInfer 的环境）。
-  - `check_ds1017_ranks.py`（2026-11-15）：同一个 checkpoint 在一个 rank 和几个 rank 上各起一次引擎，经 HTTP 问同样的提示词（一个一个问，再一起问），文本要逐字相同；`--no-single` 只起多 rank 的（整个模型一张卡放不下）。本地用 `--random <目录> --ranks 2`（两个 worker 共用一张卡，要把 `--mem-fraction` 调小），SM100 上的入口是 `sm100_ds1017_ranks.sh`。
-  - `sm100_deepinfer_baseline.sh`（2026-11-15）：在节点上跑 DeepInfer 自己（EP4/DP4 的离线例子和 benchmark），拿它的文本和吞吐当对照。
-  - `sm100_follow.sh`、`sm100_session.sh`：SM100 上的两个长任务，跟着一个分支，推一个提交就跑一次，不用每次排任务和冷启动。前者在 DeepInfer 的环境里跑该提交的 `sm100_follow_check.sh`（做 kernel 的对照用）；后者先起一个引擎，每个提交 `apply` 上去再跑 `sm100_session_check.sh`（热切换后端、量吞吐）。
+  - `check_ds1017_ranks.py`（2026-11-15）：同一个 checkpoint 在一个 rank 和几个 rank 上各起一次引擎，经 HTTP 问同样的提示词（一个一个问，再一起问），文本要逐字相同；`--no-single` 只起多 rank 的（整个模型一张卡放不下）。本地用 `--random <目录> --ranks 2`（两个 worker 共用一张卡，要把 `--mem-fraction` 调小）。
+  - `sm100_follow_check.sh`、`sm100_session_check.sh`：供开发会话调用的 SM100 检查片段（前者跑 DeepInfer 算子对照与随机权重形状检查，后者在跑着的引擎上连续热切后端/graph 配置并校验输出摘要与吞吐）。
+  - `ds1017_bench/`：4×SM100 物理机一键本地评测套件（自动在 `.runs/` 隔离副本上施加探针、自动对齐多版本 CUDA 与 `nvidia.cu13` `CPATH`，不污染 git 工作树）：`run_rsinfer_official.sh`（官方 Prefill 4K–64K / Decode D=4–256）、`run_agentx.sh`（AgentX 数据生成与回放）、`run_di_official.sh`（原版 DeepInfer 对照），详见 `tests/gpu/ds1017_bench/README.md`。
   - `test_prefix_cache.py`：前缀缓存在 worker 里的部分（2026-11-13）：prefill chunk 中间和末尾存下的状态对照单独算到那里的、graph 回放里 decode 存下的对照 eager、恢复后再算两个 token 对照整个提示词，都带对照组；真 kernel，bf16。
   - `bench_cuda_graph.py`：手动 decode 吞吐 benchmark，在几档 `batch.max_context_len` 下对比 eager（`torch_eager`）和 graph，输出每次测量与环境 JSON；不作为 pytest 的性能阈值断言。
   - `bench_serving.py`：手动的 HTTP 压测，对任何 OpenAI 兼容的服务发同样的负载（本引擎或原生 SGLang），输出每档并发的吞吐、首 token 时间和每 token 间隔。
@@ -192,9 +191,18 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 
 按这次要改、要看的东西起，需要什么就起什么。下面只是几个例子，没有推荐的哪一种：
 
-- 用 `deploy/rsinfer.py`（说明在 `deploy/README.md`）在一台机器上起整个引擎：前端、调度宿主、一个 worker。下面 `A="uv run python deploy/rsinfer.py"`：
+- 用 `deploy/rsinfer.py`（说明在 `deploy/README.md`）在一台机器上起整个引擎：前端、调度宿主、一个或多个 worker。下面 `A="uv run python deploy/rsinfer.py"`（GPU 环境不是 uv 管时换成该环境的 `python`）：
   - 真权重，在后台跑：`$A serve <模型目录> --detach`，引擎起来就返回；不加 `--detach` 就在前台跑到 Ctrl-C；
-  - 只要前几层、dummy 权重：再加 `--layers N --dummy`；
+  - 4×SM100 上跑完整 DS1017（DP4/EP4，自动对齐多版本 CUDA 与 `nvidia.cu13` `CPATH`）：
+    ```sh
+    ./deploy/serve_ds1017.sh serve --model /path/to/DeepSeek-V4.1-Flash-1017 --gpus 0,1,2,3
+    ./deploy/serve_ds1017.sh status
+    ./deploy/serve_ds1017.sh chat "Hello"
+    ./deploy/serve_ds1017.sh control apply --source . --dry-run
+    ./deploy/serve_ds1017.sh control apply --source . --intent "hot edit on live DS1017"
+    ./deploy/serve_ds1017.sh stop
+    ```
+  - 只要前几层、dummy 权重（仅 Qwen3.8）：再加 `--layers N --dummy`；
   - 整个引擎跑在 CPU 上：加 `--device cpu`，模型可以用 `$A checkpoint` 生成的小随机模型（`tests/scenarios/test_m2a.py` 就是这样起的）；
   - 没有专门参数的配置键：`--set 键=值`（值按 JSON 解析，解析不了就当字符串）。
 - 直接用控制面，起任意拓扑和单元组合（单机时 `--spawn-agents` 在本机给拓扑里每台主机起节点代理）：

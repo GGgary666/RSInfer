@@ -55,6 +55,48 @@ v0.1、v0.2 本身就是对 v0 架构的检验：如果演进的某一步不得�
 
 三者冲突时，以 modules.html 为准，其次是 v0-plan.md，再次是 discussion-summary.md。
 
-## 现状
+## 快速上手与评测
 
-设计阶段。下一步是阶段 0（纸面规格）和阶段 1（可验证的骨架），见 [doc/roadmap.md](doc/roadmap.md)。
+### 1. 启动服务与热改（`deploy/`）
+
+```bash
+# 4×SM100 一键启动 DS1017（自动匹配 CUDA 版本与 CPATH）
+./deploy/serve_ds1017.sh serve --model /path/to/DeepSeek-V4.1-Flash-1017 --gpus 0,1,2,3
+./deploy/serve_ds1017.sh status
+./deploy/serve_ds1017.sh chat "Hello"
+
+# 在跑着的引擎上直接热改代码或配置（不重启、不重载权重）
+./deploy/serve_ds1017.sh control check --source .
+./deploy/serve_ds1017.sh control apply --source . --dry-run
+./deploy/serve_ds1017.sh control apply --source . --intent "describe your change"
+./deploy/serve_ds1017.sh control apply --config '{"sched.overlap": true}'
+
+# 让出显存 / 恢复 / 停止
+./deploy/serve_ds1017.sh sleep
+./deploy/serve_ds1017.sh wake
+./deploy/serve_ds1017.sh stop
+```
+
+通用单机 CLI（支持 Qwen3.8 / DS1017 / CPU 调试）详见 [deploy/README.md](deploy/README.md)，热改开发约定与排障见 [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md)。
+
+### 2. DS1017 物理机一键评测（`tests/gpu/ds1017_bench/`）
+
+```bash
+# 官方 Prefill / Decode（自动在 .runs/ 隔离副本施加探针，不污染 git 工作树）
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model /path/to/DS1017 --gpus 0,1,2,3 65536
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode  --model /path/to/DS1017 --gpus 0,1,2,3 256
+
+# AgentX 回放基准
+./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --model /path/to/DS1017 --gpus 0,1,2,3 ./agentx_eval 32
+```
+
+详见 [tests/gpu/ds1017_bench/README.md](tests/gpu/ds1017_bench/README.md)。
+
+### 3. 本地测试与形式化验证
+
+```bash
+uv sync --python 3.12 --extra cpu
+uv run pyright
+OMP_NUM_THREADS=1 uv run pytest -n 8
+uv run python tests/framework/formal/run.py --bootstrap --replay
+```

@@ -3,11 +3,12 @@
 `deploy/` 放的是不属于 pytest 的部署工具。用户同意为它新开这个顶层目录。
 
 - `rsinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
+- `serve_ds1017.sh`：DS1017（4×SM100，DP4/EP4）的一键启动与热改封装。会自动按当前 Python 的 `torch.version.cuda` 对齐多版本 CUDA 工具链（`CUDA_HOME`、`nvcc`、`LD_LIBRARY_PATH`、`TRITON_PTXAS_PATH`）并从 `nvidia.cu13` 补齐 `CPATH`，支持 `serve` / `status` / `chat` / `complete` / `control` / `sleep` / `wake` / `stop`。
 - `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
-  - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`，显式点名某个后端时只用它自己的 kernel）；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；前缀缓存对它是关着的；不支持 `--dummy`（它的矩阵按 FP8/FP4 字节和 scale 存，`initialize_dummy_weights` 只填浮点张量；随机权重用 `checkpoint` 生成）。
+  - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`，显式点名某个后端时只用它自己的 kernel）、`--yoco-clip`（默认 0 关闭，给 140 启用 YoCo compact 有界重放）与 `--yoco-mask`；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；完整模型默认开启前缀缓存（仅截层后无 `kv.paged` 时关闭）；不支持 `--dummy`（它的矩阵按 FP8/FP4 字节和 scale 存，`initialize_dummy_weights` 只填浮点张量；随机权重用 `checkpoint` 生成）。
   - 两族模型的单元都提供 `model@1`，一个 worker 只装一族：`serve` 在拓扑里把 worker 的单元列出来，去掉别的 recipe 独有的（`WORKER_ONLY`）；`control apply --source` / `check --source` 按新工作区重算名单并在变化时更新拓扑。
-- 引擎进程只从引擎的快照和 Python 环境里 import（节点代理把每个进程的 `PYTHONPATH` 设成快照目录）。所以 `tilelang` 和 DeepInfer 的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）要装进跑引擎的那个 Python 环境里（SM100 上是 `source /workspace/gpu-env/deepinfer-env.sh`）；用 `pip install --target` 放在一边的，引擎进程看不到，`kernels.tilelang` 就什么都不注册，层用参照 kernel。
+- 引擎进程只从引擎的快照和 Python 环境里 import（节点代理把每个进程的 `PYTHONPATH` 设成快照目录）。所以 `tilelang` 和 DeepInfer 的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）要装进跑引擎的那个 Python 环境里；用 `pip install --target` 放在一边的，引擎进程看不到，`kernels.tilelang` 就什么都不注册，层用参照 kernel。多版本 CUDA 主机上直接用 `deploy/serve_ds1017.sh` 即可自动对齐 `nvcc` 与 `CPATH`。
 
 ## 命令
 
