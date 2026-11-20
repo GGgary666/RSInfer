@@ -10,33 +10,33 @@ supported-markers = [
     "sys_platform == 'darwin'",
 ]
 conflicts = [[
-    { package = "agxinfer", extra = "cpu" },
-    { package = "agxinfer", extra = "gpu" },
+    { package = "rsinfer", extra = "cpu" },
+    { package = "rsinfer", extra = "gpu" },
 ]]
 
 [[package]]
-name = "agxinfer"
+name = "rsinfer"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "msgspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pyzmq", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "msgspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pyzmq", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 
 [package.optional-dependencies]
 cpu = [
     { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 frontend = [
-    { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "jinja2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "transformers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "uvicorn", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "jinja2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "transformers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "uvicorn", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 gpu = [
-    { name = "flashinfer-python", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-8-agxinfer-gpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "flashinfer-python", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-7-rsinfer-gpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
     { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "triton", marker = "sys_platform == 'linux'" },
@@ -44,15 +44,15 @@ gpu = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "httpx", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "hypothesis", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pyright", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pytest-timeout", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pytest-xdist", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "transformers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "uvicorn", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "fastapi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "httpx", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "hypothesis", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pyright", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pytest-timeout", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pytest-xdist", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "transformers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "uvicorn", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 
 [package.metadata]
@@ -64,8 +64,8 @@ requires-dist = [
     { name = "pyzmq", specifier = ">=26" },
     { name = "safetensors", marker = "extra == 'cpu'", specifier = "==0.8.0" },
     { name = "safetensors", marker = "extra == 'gpu'", specifier = "==0.8.0" },
-    { name = "torch", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "agxinfer", extra = "gpu" } },
-    { name = "torch", marker = "extra == 'cpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "agxinfer", extra = "cpu" } },
+    { name = "torch", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130", conflict = { package = "rsinfer", extra = "gpu" } },
+    { name = "torch", marker = "extra == 'cpu'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "rsinfer", extra = "cpu" } },
     { name = "transformers", marker = "extra == 'frontend'", specifier = ">=5,<6" },
     { name = "triton", marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = "==3.6.0" },
     { name = "uvicorn", marker = "extra == 'frontend'", specifier = ">=0.30" },
@@ -108,8 +108,8 @@ name = "anyio"
 version = "4.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "(python_full_version < '3.15' and sys_platform == 'darwin') or (python_full_version < '3.15' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "(python_full_version < '3.15' and sys_platform == 'darwin') or (python_full_version < '3.15' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a1/98/7e457a3b014976887a050561955c0b76e1e7e2d6e27b78ecef2ef80518f2/anyio-4.16.0.tar.gz", hash = "sha256:59bb03251907983d1603d27c3087ddb1e93299ea2163adcdba37899a4fb12ffb", size = 310971, upload-time = "2026-11-01T11:20:07.282Z" }
 wheels = [
@@ -159,7 +159,7 @@ name = "cffi"
 version = "2.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser", marker = "(implementation_name != 'PyPy' and sys_platform == 'darwin') or (implementation_name != 'PyPy' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "pycparser", marker = "(implementation_name != 'PyPy' and sys_platform == 'darwin') or (implementation_name != 'PyPy' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz", hash = "sha256:dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be", size = 530807, upload-time = "2026-08-03T21:21:18.939Z" }
 wheels = [
@@ -490,12 +490,12 @@ name = "fastapi"
 version = "0.162.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "annotated-doc", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "opentelemetry-api", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pydantic", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "starlette", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-inspection", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "annotated-doc", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "opentelemetry-api", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pydantic", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "starlette", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-inspection", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c9/53/f6fed628a0c3d6a284125a93f9145b02ecc2c394735a878b5ad9938c8e17/fastapi-0.162.2.tar.gz", hash = "sha256:9ebd2a69b579141315b2447d8e3f518e6fd909abd6c01cac5cc6b06d5c8841f4", size = 530366, upload-time = "2026-11-07T15:41:39.838Z" }
 wheels = [
@@ -541,7 +541,7 @@ wheels = [
 
 [package.optional-dependencies]
 cu13 = [
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-8-agxinfer-gpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-7-rsinfer-gpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 
 [[package]]
@@ -587,8 +587,8 @@ name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "certifi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "certifi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
 wheels = [
@@ -600,8 +600,8 @@ name = "httpcore2"
 version = "2.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "truststore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "truststore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/61/afa9d6b7452f9eca73f73d45324eb0bb52f098fd5e6049bf6b8263be9b4e/httpcore2-2.16.0.tar.gz", hash = "sha256:c72cd0413563b17e1cd8354677dff887466f8ec2551679759e93126534428643", size = 69886, upload-time = "2026-10-21T07:09:45.31Z" }
 wheels = [
@@ -613,10 +613,10 @@ name = "httpx"
 version = "0.28.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "certifi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "httpcore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "certifi", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "httpcore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
 wheels = [
@@ -628,11 +628,11 @@ name = "httpx2"
 version = "2.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "httpcore2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "truststore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "httpcore2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "idna", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "truststore", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/43/73/5ca2cedf5e4e50423d1c258877865a6b62793633b561c58499f8aeb33b7e/httpx2-2.16.0.tar.gz", hash = "sha256:0d54c98128e8f2ff7fbbde0fca8c359e5f032edeaaaac443cdb7f31f685bcd7f", size = 103116, upload-time = "2026-10-21T07:09:46.348Z" }
 wheels = [
@@ -644,15 +644,15 @@ name = "huggingface-hub"
 version = "2.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "filelock", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "hf-xet", marker = "(platform_machine == 'AMD64' and sys_platform == 'darwin') or (platform_machine == 'ARM64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'darwin') or (platform_machine == 'amd64' and sys_platform == 'darwin') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'ARM64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'amd64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "httpx2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "filelock", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "fsspec", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "hf-xet", marker = "(platform_machine == 'AMD64' and sys_platform == 'darwin') or (platform_machine == 'ARM64' and sys_platform == 'darwin') or (platform_machine == 'aarch64' and sys_platform == 'darwin') or (platform_machine == 'amd64' and sys_platform == 'darwin') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'ARM64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'amd64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "httpx2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/3b/2fcef1eabe52aec90fc8cd253cc154da1d02a446d7bbcdec59b4a51d4be7/huggingface_hub-2.4.0.tar.gz", hash = "sha256:13a6158b9e3393d9d3f248ce99074d50c2a0a1449fb9d8e2f710751e2084c188", size = 1066194, upload-time = "2026-10-29T15:30:12.321Z" }
 wheels = [
@@ -664,7 +664,7 @@ name = "hypothesis"
 version = "6.170.14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "sortedcontainers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "sortedcontainers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d6/0f/10b2076a1314c554eee58c26e1dbe630fd26a32773df2a63bd5dba5d9947/hypothesis-6.170.14.tar.gz", hash = "sha256:8272913eb34c4399a88cf8a9ecdb351c9ef8f621c061f2ac323362d4a66b755d", size = 521490, upload-time = "2026-10-30T06:51:55.943Z" }
 wheels = [
@@ -752,7 +752,7 @@ name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "markupsafe", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "markupsafe", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
 wheels = [
@@ -764,7 +764,7 @@ name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mdurl", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "mdurl", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49", size = 82454, upload-time = "2026-05-07T12:08:28.36Z" }
 wheels = [
@@ -1128,7 +1128,7 @@ version = "1.32.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-8-agxinfer-gpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "(sys_platform == 'linux' and extra == 'extra-7-rsinfer-gpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/58/277a7025e58073aec6d344ccad0b6397abfd32a88b8f48ef6032405bb9e0/nvidia_cudnn_frontend-1.32.3-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e3c045ce8f270e564960685fa3f900b5eed99980708de6ca4030a223e8a850cf", size = 11453898, upload-time = "2026-11-10T17:52:31.537Z" },
@@ -1349,7 +1349,7 @@ name = "opentelemetry-api"
 version = "1.45.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/19/14/cf3a6b6448849656e1e5f4e2101f3988dc6789724050096aba1bc5ccf592/opentelemetry_api-1.45.2.tar.gz", hash = "sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4", size = 73277, upload-time = "2026-10-29T17:29:37.888Z" }
 wheels = [
@@ -1401,10 +1401,10 @@ name = "pydantic"
 version = "2.14.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "annotated-types", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pydantic-core", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-inspection", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "annotated-types", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pydantic-core", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-inspection", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b4/fc/1203d011145c98ddce3cd2f505bb54375ef8d43223053df6bfcf3c746f46/pydantic-2.14.3.tar.gz", hash = "sha256:1054f237f4d4733e5a30e1e2333bd33a2004ab9ab1510bd053a9a31bb48e232d", size = 925636, upload-time = "2026-11-05T09:17:04.686Z" }
 wheels = [
@@ -1416,7 +1416,7 @@ name = "pydantic-core"
 version = "2.50.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/9c/0f/34f9ce4ba701dd0b815033ef94d99b56f66200e578ee6052aa3ac26f064e/pydantic_core-2.50.4.tar.gz", hash = "sha256:aead3b74b68396bf0feab5d57e050b730ded7df55853c1e048a87e00aaf033c6", size = 522249, upload-time = "2026-11-05T09:15:26.774Z" }
 wheels = [
@@ -1516,8 +1516,8 @@ name = "pyright"
 version = "1.1.414"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nodeenv", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "nodeenv", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e1/1b/244c7b710031ada80f27e579ec20d28a2285dfc318fed0339866b1047f12/pyright-1.1.414.tar.gz", hash = "sha256:523c0a97c60da6333234955c277730c9cf4f5bd6d5399e7b7d2b0fc5d3599524", size = 4154638, upload-time = "2026-09-10T12:26:53.181Z" }
 wheels = [
@@ -1529,10 +1529,10 @@ name = "pytest"
 version = "9.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "iniconfig", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pluggy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pygments", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "iniconfig", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pluggy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pygments", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/79/42/bb4641652e58dedeac2ec51abc1f8cae4fee4ec63899a0999016229a0f2a/pytest-9.2.0.tar.gz", hash = "sha256:97c4f3b1f3c7414aa36465e09b8220f1d03627993bd51b1282e193753c80557b", size = 1797555, upload-time = "2026-10-27T21:30:20.728Z" }
 wheels = [
@@ -1544,7 +1544,7 @@ name = "pytest-timeout"
 version = "2.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ac/82/4c9ecabab13363e72d880f2fb504c5f750433b2b6f16e99f4ec21ada284c/pytest_timeout-2.4.0.tar.gz", hash = "sha256:7e68e90b01f9eff71332b25001f85c75495fc4e3a836701876183c4bcfd0540a", size = 17973, upload-time = "2025-05-05T19:44:34.99Z" }
 wheels = [
@@ -1556,8 +1556,8 @@ name = "pytest-xdist"
 version = "3.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "execnet", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "execnet", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pytest", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/78/b4/439b179d1ff526791eb921115fca8e44e596a13efeda518b9d845a619450/pytest_xdist-3.8.0.tar.gz", hash = "sha256:7e578125ec9bc6050861aa93f2d59f1d8d085595d6551c2c90b6f4fad8d3a9f1", size = 88069, upload-time = "2025-07-01T13:30:59.346Z" }
 wheels = [
@@ -1605,7 +1605,7 @@ name = "pyzmq"
 version = "27.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "(implementation_name == 'pypy' and sys_platform == 'darwin') or (implementation_name == 'pypy' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "cffi", marker = "(implementation_name == 'pypy' and sys_platform == 'darwin') or (implementation_name == 'pypy' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e2/e1/ea46ab0d707219c098065a37d2add5b53d3b124241aa19429bcd0863e5b4/pyzmq-27.3.0.tar.gz", hash = "sha256:bbedb3d1d99babc625f1dd9d7438acefd442b36b75073fd6bc1ef7c0a4b96d56", size = 293249, upload-time = "2026-11-04T00:31:33.068Z" }
 wheels = [
@@ -1744,8 +1744,8 @@ name = "rich"
 version = "15.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "markdown-it-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pygments", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "markdown-it-py", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pygments", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
@@ -1805,8 +1805,8 @@ name = "starlette"
 version = "1.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typing-extensions", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "anyio", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typing-extensions", marker = "(python_full_version < '3.13' and sys_platform == 'darwin') or (python_full_version < '3.13' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/48/bb/3d8757f21e9a53d9035c9eb039a777047139a16bfdbedfc7a58241c3d914/starlette-1.10.0.tar.gz", hash = "sha256:b8399098d4c1e3522734f7235dc79b1fc967f96cf139c81e0fa30479e0685f9b", size = 2734356, upload-time = "2026-10-24T15:04:12.342Z" }
 wheels = [
@@ -1818,7 +1818,7 @@ name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mpmath", marker = "(sys_platform == 'darwin' and extra == 'extra-8-agxinfer-cpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-cpu') or (sys_platform == 'linux' and extra == 'extra-8-agxinfer-gpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "mpmath", marker = "(sys_platform == 'darwin' and extra == 'extra-7-rsinfer-cpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-cpu') or (sys_platform == 'linux' and extra == 'extra-7-rsinfer-gpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/83/d3/803453b36afefb7c2bb238361cd4ae6125a569b4db67cd9e79846ba2d68c/sympy-1.14.0.tar.gz", hash = "sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517", size = 7793921, upload-time = "2025-04-27T18:05:01.611Z" }
 wheels = [
@@ -1839,7 +1839,7 @@ name = "tokenizers"
 version = "0.23.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e0/7c/2cabb2174e772636683008f2c5621949b645da7d303c596589e84516a184/tokenizers-0.23.3.tar.gz", hash = "sha256:cded33237c77caeef62944d32aa9a7ef42bdce2b3497e18d137e072a8c4be438", size = 385286, upload-time = "2026-10-09T10:16:55.759Z" }
 wheels = [
@@ -1931,7 +1931,7 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
-    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-8-agxinfer-gpu') or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "cuda-toolkit", extra = ["cublas", "cudart", "cufft", "cufile", "cupti", "curand", "cusolver", "cusparse", "nvjitlink", "nvrtc", "nvtx"], marker = "(sys_platform == 'linux' and extra == 'extra-7-rsinfer-gpu') or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
     { name = "filelock", marker = "sys_platform == 'linux'" },
     { name = "fsspec", marker = "sys_platform == 'linux'" },
     { name = "jinja2", marker = "sys_platform == 'linux'" },
@@ -1972,15 +1972,15 @@ name = "transformers"
 version = "5.22.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "regex", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "tokenizers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "typer", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "huggingface-hub", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "numpy", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "packaging", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "pyyaml", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "regex", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "safetensors", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "tokenizers", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "tqdm", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "typer", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/17/d6/a610b37bbc3450c056ea68c7f5016d06da8e787c1ac32b20ce58d18a1eb0/transformers-5.22.1.tar.gz", hash = "sha256:bed9fd76d6f43b4a1a9fc5d0c565ace7c77edbd029784f8cbcdf772cb5e924d8", size = 10381794, upload-time = "2026-10-30T07:48:03.721Z" }
 wheels = [
@@ -2018,9 +2018,9 @@ name = "typer"
 version = "0.28.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "annotated-doc", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "rich", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "shellingham", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "annotated-doc", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "rich", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "shellingham", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ad/8f/21021859316f44289101638dc74d82e13d722d8533e4b8708a3ab7c8461a/typer-0.28.0.tar.gz", hash = "sha256:69ab84ef79fd601cff071bbd2566d855ecadfd93adbc4b3360b9924359bdd857", size = 205415, upload-time = "2026-11-06T08:37:19.779Z" }
 wheels = [
@@ -2041,7 +2041,7 @@ name = "typing-inspection"
 version = "0.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "typing-extensions", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ff/50/0195198eb1d75bab716bb0a813abea4cc394bfa17a92a189f021a34859af/typing_inspection-0.4.5.tar.gz", hash = "sha256:7f16c411e7930dc79596d42ab44672a3fe5f60eb34b781a1647e7872363120c7", size = 81194, upload-time = "2026-11-04T14:13:23.774Z" }
 wheels = [
@@ -2062,8 +2062,8 @@ name = "uvicorn"
 version = "0.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
-    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-8-agxinfer-cpu' and extra == 'extra-8-agxinfer-gpu')" },
+    { name = "click", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
+    { name = "h11", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-7-rsinfer-cpu' and extra == 'extra-7-rsinfer-gpu')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/da/34/30e9280707135d2cfc589dfff3cb796bd07a3aeb1a3e415ba09dd89d7bb4/uvicorn-0.54.0.tar.gz", hash = "sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620", size = 112283, upload-time = "2026-09-25T06:52:37.601Z" }
 wheels = [

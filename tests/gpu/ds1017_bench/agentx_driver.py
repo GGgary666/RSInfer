@@ -1,4 +1,4 @@
-"""SemiAnalysis AgentX multi-turn + subagent trace replay benchmark for DeepInfer and agxinfer.
+"""SemiAnalysis AgentX multi-turn + subagent trace replay benchmark for DeepInfer and rsinfer.
 
 Replays real Claude Code agentic session structures from ``semianalysisai/cc-traces-weka-062126-256k``
 on ``DP4 + EP4`` with both engines reusing prefixes reconstructed from the published session-local block hashes:
@@ -13,7 +13,7 @@ on ``DP4 + EP4`` with both engines reusing prefixes reconstructed from the publi
 2. ``deepinfer`` drives DeepInfer in-process across all DP/EP ranks using a shared atomic session
    queue in ``/dev/shm`` so ``C`` concurrent session lanes dynamically pull sessions just like a
    real serving load balancer.
-3. ``agx-direct`` drives a running ``agxinfer`` instance over ``StepChannel`` (pre-tokenized shared
+3. ``rsinfer-direct`` drives a running ``rsinfer`` instance over ``StepChannel`` (pre-tokenized shared
    memory IPC, matching DeepInfer's ``_add_request`` + ``step()`` boundary) on the exact same
    session suite and concurrency levels.
 """
@@ -43,7 +43,7 @@ BOS = 0
 
 
 # ---------------------------------------------------------------------------
-# Metrics (shared across DeepInfer and agxinfer)
+# Metrics (shared across DeepInfer and rsinfer)
 # ---------------------------------------------------------------------------
 
 def _pct(ordered: list[float], q: float) -> float:
@@ -506,7 +506,7 @@ def _di_rank_file(out: Path, rank: int) -> Path:
 
 
 def _di_counter_file(out: Path, conc: int) -> Path:
-    return Path(f"/dev/shm/agx_agentx_{out.stem}_c{conc}.cnt")
+    return Path(f"/dev/shm/rsinfer_agentx_{out.stem}_c{conc}.cnt")
 
 
 def _di_worker(dp_size: int, dp_rank: int) -> None:
@@ -716,10 +716,10 @@ def cmd_deepinfer(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. agxinfer StepChannel direct driver
+# 3. rsinfer StepChannel direct driver
 # ---------------------------------------------------------------------------
 
-async def _run_agx_direct(args: argparse.Namespace) -> None:
+async def _run_rsinfer_direct(args: argparse.Namespace) -> None:
     import msgspec
     import zmq
 
@@ -743,7 +743,7 @@ async def _run_agx_direct(args: argparse.Namespace) -> None:
     sched_proc = msgspec.convert(cfg["frontend.scheduler"], ProcId)
     tun = IpcTunables(rpc_timeout_s=300.0, close_timeout_s=10.0)
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
-    shm_name = f"agx-agentx-{os.getpid()}-{secrets.token_hex(4)}"
+    shm_name = f"rsinfer-agentx-{os.getpid()}-{secrets.token_hex(4)}"
     raw_reader, addr = open_reader(
         zctx, local=sched_proc.host, peer=sched_proc.host, bind_host="127.0.0.1",
         shm_name=shm_name, tun=tun, replaceable=True,
@@ -951,14 +951,14 @@ def _build_parser() -> argparse.ArgumentParser:
     di.add_argument("--check", type=int, default=4)
     di.add_argument("--pause", type=float, default=3.0)
 
-    agx = sub.add_parser("agx-direct", help="Run AgentX suite on agxinfer over StepChannel")
-    agx.add_argument("--run", type=Path, required=True)
-    agx.add_argument("--suite", type=Path, required=True)
-    agx.add_argument("--corpus", type=Path, required=True)
-    agx.add_argument("--concurrencies", type=int, nargs="+", default=[8, 24, 48])
-    agx.add_argument("--out", type=Path, required=True)
-    agx.add_argument("--name", default="agxinfer-direct")
-    agx.add_argument("--pause", type=float, default=3.0)
+    rsinfer_p = sub.add_parser("rsinfer-direct", help="Run AgentX suite on rsinfer over StepChannel")
+    rsinfer_p.add_argument("--run", type=Path, required=True)
+    rsinfer_p.add_argument("--suite", type=Path, required=True)
+    rsinfer_p.add_argument("--corpus", type=Path, required=True)
+    rsinfer_p.add_argument("--concurrencies", type=int, nargs="+", default=[8, 24, 48])
+    rsinfer_p.add_argument("--out", type=Path, required=True)
+    rsinfer_p.add_argument("--name", default="rsinfer-direct")
+    rsinfer_p.add_argument("--pause", type=float, default=3.0)
     return p
 
 
@@ -969,7 +969,7 @@ def main() -> None:
     elif args.cmd == "deepinfer":
         cmd_deepinfer(args)
     else:
-        asyncio.run(_run_agx_direct(args))
+        asyncio.run(_run_rsinfer_direct(args))
 
 
 if __name__ == "__main__":

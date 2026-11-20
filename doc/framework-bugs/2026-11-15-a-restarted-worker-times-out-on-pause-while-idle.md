@@ -3,7 +3,7 @@
 - 日期：2026-11-15
 - 报告人：Devin
 - 状态：未修
-- 引擎：`deploy/agxinfer.py serve` 起单机 Qwen3.8（frontend + sched + worker，CPU `torch_eager`），先完成至少一条请求（令调度宿主 `host.epoch = E >= 1`）。
+- 引擎：`deploy/rsinfer.py serve` 起单机 Qwen3.8（frontend + sched + worker，CPU `torch_eager`），先完成至少一条请求（令调度宿主 `host.epoch = E >= 1`）。
 - 变更：
   1. 提交一次带 worker 重启的变更（例如 `control apply --topology <file>` 修改 worker 角色 `env`）——提交成功，`host-a/worker/0` 重启为新进程；
   2. **中间不发任何推理请求**，直接提交一次涉及 worker 的 in-place 变更（例如向工作区新增一个 `process=["worker"]` 的单元并 `control apply --source <workspace>`，或修改已有 worker 单元代码）。

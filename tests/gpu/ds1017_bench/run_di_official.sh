@@ -22,7 +22,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 cmd=${1:-help}
 if [[ $# -gt 0 ]]; then shift; fi
 
-OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/agxinfer/runs}"
+OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/rsinfer/runs}"
 REMOTE_OSS_DIR="${REMOTE_OSS_DIR:-/mnt/artifacts/runs}"
 REMOTE_BASE="${REMOTE_BASE:-/workspace/ds1017-bench}"
 
@@ -100,9 +100,9 @@ elif [[ -f /workspace/gpu-env/cuda-13.2-env.sh ]]; then
     # shellcheck source=/dev/null
     source /workspace/gpu-env/cuda-13.2-env.sh
 fi
-di="${DI_ROOT:-/workspace/agxinfer-env/DeepInfer}"
-py="${DI_PY:-/workspace/agxinfer-env/venv-deepinfer/bin/python}"
-model="${AGX_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
+di="${DI_ROOT:-/workspace/rsinfer-env/DeepInfer}"
+py="${DI_PY:-/workspace/rsinfer-env/venv-deepinfer/bin/python}"
+model="${RSINFER_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
 gpus_csv="${N1_GPUS:-0,1,2,3}"
 device_offset="${DEVICE_OFFSET:-${gpus_csv%%,*}}"
 
@@ -112,7 +112,7 @@ export DEEPINFER_HF_MODEL_DIR="$model"
 export DEEPINFER_USE_NEXTN_DECODE=0 DEEPINFER_ENABLE_MTP_VARLEN=0
 export DEEPINFER_OVERRIDE_NUM_EXTRA_EXPERTS=32 DEEPINFER_USE_MULTIMODAL_POOL=0
 export DEEPINFER_ROOT="$di" PYTHONPATH="$di:$di/examples"
-export CPATH="/workspace/agxinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
+export CPATH="/workspace/rsinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
 unset DEEPINFER_ENGRAM_LOCAL NVSHMEM_IB_QP_DEPTH NVSHMEM_IBGDA_NUM_RC_PER_PE
 
 assert_gpus_free() {

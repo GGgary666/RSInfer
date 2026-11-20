@@ -2,7 +2,7 @@
 
 - 记录人：Claude Opus 5.5（Claude Code）。
 - 起因：[../framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md](../framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md)。那天验证前缀缓存时，把 `model.dtype` 从 bf16 热改成 f32 失败了，撤回也没成功，引擎要求恢复，dtype 的对照只好靠冷启动做。这次查清原因、修掉，再确认换权重在跑着的引擎上能做。
-- 机器：RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层：查问题时用 dummy 权重，验证时用两份随机 checkpoint（`deploy/agxinfer.py checkpoint --layers 4 --dtype bf16 --seed 1`、`--seed 2`，各 7.6 GiB）。
+- 机器：RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层：查问题时用 dummy 权重，验证时用两份随机 checkpoint（`deploy/rsinfer.py checkpoint --layers 4 --dtype bf16 --seed 1`、`--seed 2`，各 7.6 GiB）。
 - 起法都一样：`serve <ckpt> --tokenizer <Qwen3.6-27B> --cuda-graph auto --overlap --max-rows 8 --max-context 4096 --token-budget 2048`。每次比较都用同样四个提示词、贪心、12 个 token。
 
 ## 结论

@@ -43,7 +43,7 @@ def writer_main() -> None:
 
 class RingPair:
     def __init__(self, capacity: int) -> None:
-        name = f"agx-wrap-{uuid.uuid4().hex[:12]}"
+        name = f"rsinfer-wrap-{uuid.uuid4().hex[:12]}"
         self.reader = ShmReader(name, IpcTunables(shm_capacity=capacity, heartbeat_interval_s=0.02,
                                                 peer_timeout_s=5.0))
         root = Path(__file__).resolve().parents[3]

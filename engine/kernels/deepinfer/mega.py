@@ -156,7 +156,7 @@ class Mega:
     def _release_symm(self) -> None:
         if self.buffer is None:
             return
-        pool: dict[tuple[Any, ...], list[Any]] = sys.__dict__.setdefault("_agx_symm_buf_pool", {})
+        pool: dict[tuple[Any, ...], list[Any]] = sys.__dict__.setdefault("_rsinfer_symm_buf_pool", {})
         entry = pool.get(self.made_for)
         if entry is not None and entry[1] is self.buffer:
             entry[0] -= 1
@@ -175,7 +175,7 @@ class Mega:
             if group.size > 1 and pg is None:
                 raise ValueError("the fused MoE kernel shares memory between the ranks' cards: comm.device_backend = nccl")
             if group.size > 1:
-                pool: dict[tuple[Any, ...], list[Any]] = sys.__dict__.setdefault("_agx_symm_buf_pool", {})
+                pool: dict[tuple[Any, ...], list[Any]] = sys.__dict__.setdefault("_rsinfer_symm_buf_pool", {})
                 entry = pool.get(made_for)
                 if entry is not None and entry[1].num_max_tokens_per_rank >= self.max_tokens:
                     entry[0] += 1
@@ -192,7 +192,7 @@ class Mega:
                     num_max_tokens_per_rank=cap_tokens, num_topk=topk, hidden=hidden,
                     intermediate_hidden=inter, num_shared_experts=1, mma_type="fp8xfp4", activation="swiglu")
             if group.size > 1:
-                sys.__dict__.setdefault("_agx_symm_buf_pool", {})[made_for] = [1, buf]
+                sys.__dict__.setdefault("_rsinfer_symm_buf_pool", {})[made_for] = [1, buf]
             self.buffer = buf
             self.made_for = made_for
         return self.buffer

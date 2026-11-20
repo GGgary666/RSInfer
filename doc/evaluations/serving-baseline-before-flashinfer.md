@@ -1,6 +1,6 @@
 # 接入真 kernel 之前的 serving 基线：master 的引擎（2026-11-11，SM90-80GB，4 层）
 
-测的是 `dev/gw/attn-kernel` 分支当时的服务，引擎固定为 `03579e36a81900d8506f43f75041cc328985db56`。这个提交相对 master `ffa7254` 只多了文档和一个微基准脚本，`engine/` 完全相同，所以**这就是 master（接入 FlashInfer 和 Triton GDN 之前）在 SM90-80GB 上的基线**。从 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 `2f3ac834ba3e009d0f394f8a600e075eb2bdde67` 复用 `tests/gpu/bench_serving.py` 的 HTTP 负载和计时逻辑。没有合入或运行该 PR 的 FlashInfer、Triton GDN 实现。
+测的是 `dev/gw/attn-kernel` 分支当时的服务，引擎固定为 `03579e36a81900d8506f43f75041cc328985db56`。这个提交相对 master `ffa7254` 只多了文档和一个微基准脚本，`engine/` 完全相同，所以**这就是 master（接入 FlashInfer 和 Triton GDN 之前）在 SM90-80GB 上的基线**。从 [PR #51](https://github.com/open-agent-infra/rsinfer/pull/51) 的 `2f3ac834ba3e009d0f394f8a600e075eb2bdde67` 复用 `tests/gpu/bench_serving.py` 的 HTTP 负载和计时逻辑。没有合入或运行该 PR 的 FlashInfer、Triton GDN 实现。
 
 这份记录补充 [attention 算子微基准](attn-kernel-benchmark.md)：这里测的是完整 HTTP 服务链路，但模型只有 Qwen3.8-27B 结构的前 4 层，使用 seed 1 的随机 BF16 权重（约 7.57 GiB），不代表完整 27B 或真实权重的回答质量。
 
@@ -25,7 +25,7 @@
 
 BF16 的 greedy token 与 HF 开始分歧的位置为第 0、2、2 步（eager 和 graph 的上述记录相同）。这沿用当前项目的 BF16 验收口径，不能写成“BF16 token 全部与 HF 一致”，也没有证明任意长度 decode 的 logits 都满足同一数值界限。
 
-验证 command：`cmd_20261111T095949Z_serving-baseline-validation_0aad59ea`，已取得 `done / exit 0` 和 `AGXINFER_SERVING_BASELINE_VALIDATION_OK`。
+验证 command：`cmd_20261111T095949Z_serving-baseline-validation_0aad59ea`，已取得 `done / exit 0` 和 `RSINFER_SERVING_BASELINE_VALIDATION_OK`。
 
 ## 性能测量口径
 
@@ -108,7 +108,7 @@ uv run python /tmp/bench_serving-pr51.py --url http://127.0.0.1:8000 --name base
 
 本地（macOS）当时 `uv run pyright` 为 0 错误；全量 `uv run pytest -n 8 -x` 没有跑完（116 passed、5 failed 后首错即停，堆栈里是只读快照和进程组清理的 PermissionError）。这是本机的限制，和上面的远程 GPU 结果无关。
 
-性能任务的最终标记已写出，末次 GPU 采样时间为 2026-11-11 10:19:57 UTC；原 command 的完成状态回写滞后，未把 `running` 当作成功证据。通过独立只读回收任务 `cmd_20261111T101951Z_probe_serving-baseline-fetch_b3745bdd`（`done / exit 0`、`AGXINFER_BASELINE_ARTIFACT_FETCH_OK`）取得完整结果，核对 `complete=true`、64 个唯一测量组合、12 项协议检查、2752 个审计请求、引擎/benchmark/orchestration SHA256 和原任务最终成功标记。原始回收日志为 `.ossrun-artifacts/serving-baseline-fetch.log`，提取结果为 `serving-baseline-result.json`。
+性能任务的最终标记已写出，末次 GPU 采样时间为 2026-11-11 10:19:57 UTC；原 command 的完成状态回写滞后，未把 `running` 当作成功证据。通过独立只读回收任务 `cmd_20261111T101951Z_probe_serving-baseline-fetch_b3745bdd`（`done / exit 0`、`RSINFER_BASELINE_ARTIFACT_FETCH_OK`）取得完整结果，核对 `complete=true`、64 个唯一测量组合、12 项协议检查、2752 个审计请求、引擎/benchmark/orchestration SHA256 和原任务最终成功标记。原始回收日志为 `.ossrun-artifacts/serving-baseline-fetch.log`，提取结果为 `serving-baseline-result.json`。
 
 同一 checkpoint 的权重校验值（回收时计算，计算发生在压测结束后）：
 

@@ -113,7 +113,7 @@ def main() -> int:
     p.add_argument("--max-context", type=int, default=512)
     p.add_argument("--page-size", type=int, default=0)
     p.add_argument("--timeout", type=int, default=1800, help="seconds an engine may take to come up")
-    p.add_argument("--serve", action="append", default=[], help="another argument for agxinfer serve (repeatable)")
+    p.add_argument("--serve", action="append", default=[], help="another argument for rsinfer serve (repeatable)")
     p.add_argument("--balanced", default="", metavar="INTERVAL,WINDOW,EXTRA",
                    help="serve on several ranks once more with expert parallel load balancing (eplb.interval, "
                         "eplb.window, eplb.extra_experts): the experts are placed again while it generates, and the "

@@ -489,7 +489,7 @@ class Unit:
         if not config["weights.path"]:
             raise ValueError("weights.path is empty, and DS 1017 takes no dummy weights: they fill floating-point "
                              "tensors only, and its matrices are stored as FP8 and FP4 bytes with their scales "
-                             "(agxinfer checkpoint writes random weights in the checkpoint's formats)")
+                             "(rsinfer checkpoint writes random weights in the checkpoint's formats)")
         cfg = DSConfig.from_hf(hf_config(config["model.path"], dict(config["model.hf_config"])))
         cfg.check()
         symmetric = (ctx.use("comm.group@1").device_group is not None and config["dsv4.backend"] in ("auto", "deepinfer")

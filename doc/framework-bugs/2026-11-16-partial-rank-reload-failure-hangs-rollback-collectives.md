@@ -4,8 +4,8 @@
 - 报告人：Antigravity（PR #66 多卡热改开发与验证）
 - 状态：未修
 - 引擎：在 SM100 节点 `n1` 的 4 张卡（GPU 4, 5, 6, 7）上以 `ep-live`（身份 `d92b2330547f4921`）启动 4-rank EP 引擎：
-  `python deploy/agxinfer.py serve /models/DeepSeek-V4.1-Flash-1017 --source ep-live --run run-ep --gpus 4,5,6,7 --port 28166 --backend deepinfer --cuda-graph auto --graph-buckets 1 2 4 8 16 32 64 --disable-radix-cache --detach`（`platform = cuda_graph`，`comm.size = 4`，`comm.device_backend = nccl`，`comm.timeout_s = 1800.0`，`change.execute_timeout_s = 3600.0`）
-- 变更：`python deploy/agxinfer.py control apply --run run-ep --source ep-work --intent "attention fusion + EngramBuffer + prefill warmup + symm hot-apply fix"`（变更 ID 10）；修改了 `kernels.ds1017`、`kernels.tilelang`、`kernels.deepinfer` 与 `layers.ds1017`，计划在 `worker/0..3` 上原地重载 `core.plan`、`kernels.deepinfer`、`kernels.ds1017`、`kernels.tilelang`、`layers.ds1017`
+  `python deploy/rsinfer.py serve /models/DeepSeek-V4.1-Flash-1017 --source ep-live --run run-ep --gpus 4,5,6,7 --port 28166 --backend deepinfer --cuda-graph auto --graph-buckets 1 2 4 8 16 32 64 --disable-radix-cache --detach`（`platform = cuda_graph`，`comm.size = 4`，`comm.device_backend = nccl`，`comm.timeout_s = 1800.0`，`change.execute_timeout_s = 3600.0`）
+- 变更：`python deploy/rsinfer.py control apply --run run-ep --source ep-work --intent "attention fusion + EngramBuffer + prefill warmup + symm hot-apply fix"`（变更 ID 10）；修改了 `kernels.ds1017`、`kernels.tilelang`、`kernels.deepinfer` 与 `layers.ds1017`，计划在 `worker/0..3` 上原地重载 `core.plan`、`kernels.deepinfer`、`kernels.ds1017`、`kernels.tilelang`、`layers.ds1017`
 - 现象：
   1. 在新代码加载阶段，`layers.ds1017` 的单卡预热草稿逻辑传给 `deep_select.topk` 的 `cand` 含重复块号，导致 `worker/2` 读到旧缓冲区未初始化的 `NaN` 字节并触发 PTX `trap;`（日志打印 `[topk_select] NaN detected. Calling trap; which will result in "unspecified launch failure"`），CUDA 上下文损坏。
   2. `worker/2` 的 `UnitRuntime._reload` 失败并进入 `UnitRuntime._rollback`，回退中的 `core.plan` 因同一粘性 CUDA 错误立即再次失败，`worker/2` 向 supervisor 返回 `Failed(code="escalate.restart_process")` 并回到 `SyncRpcServer.poll` 空闲等待。
@@ -16,4 +16,4 @@
 - 复现：
   在 `comm.size >= 2` 且 `core.plan` 重载会执行跨 rank `eager_padding_step` 的拓扑上，让仅 `rank == 1` 的单元在 `resolve()`（进入集合通信前）抛出异常并使其 `_rollback()` 也抛出异常；`rank == 0` 会在 `eager_padding_step` 的集合通信处一直阻塞到 `comm.timeout_s` 超时。可作为多进程集成测试放入 `tests/framework/cluster/`。
 - 绕过：
-  修复了单元侧 `layers.ds1017` 预热入参（候选块填 `[0, -1, ...]`，消除 `trap;` 根因），并用 `agxinfer stop --timeout 10` 重启一次 `run-ep` 清理损坏的 CUDA 上下文与失步的进程组；此后继续在同一 4 卡引擎上完成了后续全部热改验证，未再复现。
+  修复了单元侧 `layers.ds1017` 预热入参（候选块填 `[0, -1, ...]`，消除 `trap;` 根因），并用 `rsinfer stop --timeout 10` 重启一次 `run-ep` 清理损坏的 CUDA 上下文与失步的进程组；此后继续在同一 4 卡引擎上完成了后续全部热改验证，未再复现。

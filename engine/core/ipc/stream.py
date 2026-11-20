@@ -113,7 +113,7 @@ class _Heartbeat(threading.Thread):
 
 # --------------------------------------------------------------------- shm
 
-_MAGIC = 0x41475852494E4732  # "AGXRING2"
+_MAGIC = 0x52534952494E4732  # "RSIRING2"
 _HEADER = 128
 _MARK = 0xFFFFFFFF
 # offsets in the header

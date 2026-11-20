@@ -2,8 +2,8 @@
 
 本目录包含可直接通过 `remote-exec` 在 remote GPU 节点（默认 `n1` / `gpu-node-n1`，4×SM100）运行的脚本，覆盖：
 
-1. **DS1017 官方 Prefill / Decode Benchmark**（`agxinfer` 与原版 `DeepInfer` 对照）
-2. **AgentX 数据集生成与回放 Benchmark**（`agxinfer` 与原版 `DeepInfer` 对照）
+1. **DS1017 官方 Prefill / Decode Benchmark**（`rsinfer` 与原版 `DeepInfer` 对照）
+2. **AgentX 数据集生成与回放 Benchmark**（`rsinfer` 与原版 `DeepInfer` 对照）
 
 ---
 
@@ -29,13 +29,13 @@ BENCH=tests/gpu/ds1017_bench
 | `REMOTE_SLEEP` | `6` | 串行 `remote-exec` 调用前等待秒数（防 60 秒滚动限流；设为 `0` 跳过） |
 | `REMOTE_EXEC_WRAPPER` | `0` | 若本机需要走 `<remote-cli>` 鉴权，设为 `1` |
 | `N1_GPUS` | `0,1,2,3` | 使用的 4 张卡编号（DP4/EP4） |
-| `OSS_PREFIX` | `s3://<artifact-bucket>/agxinfer/runs` | 开发机 `artifact-cli` 上传/下载前缀 |
+| `OSS_PREFIX` | `s3://<artifact-bucket>/rsinfer/runs` | 开发机 `artifact-cli` 上传/下载前缀 |
 | `REMOTE_OSS_DIR` | `/mnt/artifacts/runs` | Pod 内对应挂载目录 |
 | `REMOTE_BASE` | `/workspace/ds1017-bench` | Pod 内工作根目录 |
-| `AGX_MODEL` | `/models/DeepSeek-V4.1-Flash-1017` | 共享 Lustre 模型权重目录 |
-| `AGX_PY` | `/workspace/claude-yoco/venv-opt2/bin/python` | `agxinfer` SM100 环境解释器 |
-| `DI_ROOT` | `/workspace/agxinfer-env/DeepInfer` | 原版 DeepInfer 源码目录 |
-| `DI_PY` | `/workspace/agxinfer-env/venv-deepinfer/bin/python` | 原版 DeepInfer 解释器 |
+| `RSINFER_MODEL` | `/models/DeepSeek-V4.1-Flash-1017` | 共享 Lustre 模型权重目录 |
+| `RSINFER_PY` | `/workspace/claude-yoco/venv-opt2/bin/python` | `rsinfer` SM100 环境解释器 |
+| `DI_ROOT` | `/workspace/rsinfer-env/DeepInfer` | 原版 DeepInfer 源码目录 |
+| `DI_PY` | `/workspace/rsinfer-env/venv-deepinfer/bin/python` | 原版 DeepInfer 解释器 |
 
 > 所有临时探针（`admit_probe.py`、`dsbench_step_probe.py`、`decode_counts_probe.py`、`top5-measurement.patch`）只打在远端临时 stage 出的副本里，**不会修改本地仓库**。
 
@@ -45,28 +45,28 @@ BENCH=tests/gpu/ds1017_bench
 
 固定工况：131,072 上下文（126,976 共享前缀 + 4,096 未缓存后缀）、`yoco_clip=140`、`sampler_force_topk=1024`、32 个冗余专家、随机路由、4×SM100（DP4/EP4）。
 
-### 1.1 跑 `agxinfer`（通过 `remote-exec`）
+### 1.1 跑 `rsinfer`（通过 `remote-exec`）
 
 ```bash
 BENCH=tests/gpu/ds1017_bench
 TAG=opt3-$(date -u +%Y%m%d-%H%M%S)
 
 # 1) Prefill 五档（默认 4096 8192 16384 32768 65536；也可只传部分档位如 16384 32768 65536）
-"$BENCH/run_agx_official.sh" remote-prefill "$TAG" 4096 8192 16384 32768 65536
+"$BENCH/run_rsinfer_official.sh" remote-prefill "$TAG" 4096 8192 16384 32768 65536
 
 # 2) Decode 七档（默认 4 8 16 32 64 128 256，对应每卡并发 D）
-"$BENCH/run_agx_official.sh" remote-decode "${TAG}-dec" 4 8 16 32 64 128 256
+"$BENCH/run_rsinfer_official.sh" remote-decode "${TAG}-dec" 4 8 16 32 64 128 256
 
 # 查看进度 / 退出码（exit 0 表示全部跑完）
-"$BENCH/run_agx_official.sh" remote-status "$TAG"
+"$BENCH/run_rsinfer_official.sh" remote-status "$TAG"
 
 # 强停任务与引擎
-"$BENCH/run_agx_official.sh" remote-stop "$TAG"
+"$BENCH/run_rsinfer_official.sh" remote-stop "$TAG"
 ```
 
 取回结果：日志中每跑完一档会打印 `RESULT s3://<artifact-bucket>/...`，用 `artifact-cli cp` 下载即可：
-- Prefill 结果：`agx-prefill-<TAG>-<BUDGET>.jsonl`（关键字段：`prefill_tokens_per_s_per_gpu`、`prefill_window_steps`、`prefill_window_seconds`）
-- Decode 结果：`agx-decode-<TAG>-d<D>.json`（关键字段：`decode_tokens_per_s_per_gpu`、`decode_avg_sps`、`decode_max_step_ms`）
+- Prefill 结果：`rsinfer-prefill-<TAG>-<BUDGET>.jsonl`（关键字段：`prefill_tokens_per_s_per_gpu`、`prefill_window_steps`、`prefill_window_seconds`）
+- Decode 结果：`rsinfer-decode-<TAG>-d<D>.json`（关键字段：`decode_tokens_per_s_per_gpu`、`decode_avg_sps`、`decode_max_step_ms`）
 
 ### 1.2 跑原版 `DeepInfer`（通过 `remote-exec`）
 
@@ -153,11 +153,11 @@ BENCH=tests/gpu/ds1017_bench
 SUITE=/workspace/agentx-data-131k/agentx_eval
 TAG=ax-$(date -u +%Y%m%d-%H%M%S)
 
-# 1) 跑 agxinfer（默认并发 C = 16 24 48，每档前自动热切清缓存）
-"$BENCH/run_agentx.sh" remote-agx "$TAG" "$SUITE" 16 24 48
+# 1) 跑 RSInfer（默认并发 C = 16 24 48，每档前自动热切清缓存）
+"$BENCH/run_agentx.sh" remote-rsinfer "$TAG" "$SUITE" 16 24 48
 
 # 2) 跑原版 DeepInfer（自动编译 ds_prefix_pages 扩展，启用原生 fork_seq 前缀缓存与 YoCo=140）
-#    注意与 agxinfer 错开使用同一组 4 卡，或用 N1_GPUS=4,5,6,7 分卡跑
+#    注意与 RSInfer 错开使用同一组 4 卡，或用 N1_GPUS=4,5,6,7 分卡跑
 "$BENCH/run_agentx.sh" remote-di "${TAG}-di" "$SUITE" 16 24 48
 
 # 查看进度 / 停止
@@ -165,7 +165,7 @@ TAG=ax-$(date -u +%Y%m%d-%H%M%S)
 "$BENCH/run_agentx.sh" remote-stop "$TAG"
 ```
 
-结果文件自动复制到 `${OSS_PREFIX}/agentx-agx-<TAG>-c<C>.json` 与 `${OSS_PREFIX}/agentx-di-<TAG>.json`（包含吞吐、总耗时、TTFT/TPOT 分位数、缓存命中率等汇总字段）。
+结果文件自动复制到 `${OSS_PREFIX}/agentx-rsinfer-<TAG>-c<C>.json` 与 `${OSS_PREFIX}/agentx-di-<TAG>.json`（包含吞吐、总耗时、TTFT/TPOT 分位数、缓存命中率等汇总字段）。
 
 ---
 
@@ -174,10 +174,10 @@ TAG=ax-$(date -u +%Y%m%d-%H%M%S)
 若已登录到 Pod 内的 stage 目录（如 `/workspace/ds1017-bench/<TAG>`），可直接调用节点内子命令：
 
 ```bash
-# agxinfer 官方 bench（设置 KEEP_ENGINE=1 可在跑完后保留常驻引擎以便热改复测）
-KEEP_ENGINE=1 bash tests/gpu/ds1017_bench/run_agx_official.sh prefill 16384 32768 65536
-bash tests/gpu/ds1017_bench/run_agx_official.sh status
-bash tests/gpu/ds1017_bench/run_agx_official.sh stop
+# RSInfer 官方 bench（设置 KEEP_ENGINE=1 可在跑完后保留常驻引擎以便热改复测）
+KEEP_ENGINE=1 bash tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill 16384 32768 65536
+bash tests/gpu/ds1017_bench/run_rsinfer_official.sh status
+bash tests/gpu/ds1017_bench/run_rsinfer_official.sh stop
 
 # DeepInfer 官方 bench
 bash tests/gpu/ds1017_bench/run_di_official.sh prefill 16384 32768
@@ -185,7 +185,7 @@ bash tests/gpu/ds1017_bench/run_di_official.sh decode 4 8 16 32 64 128 256
 
 # AgentX 数据准备与回放
 bash tests/gpu/ds1017_bench/run_agentx.sh prepare /path/to/weka.jsonl /workspace/agentx-data-131k
-bash tests/gpu/ds1017_bench/run_agentx.sh run-agx /workspace/agentx-data-131k/agentx_eval 16 24 48
+bash tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer /workspace/agentx-data-131k/agentx_eval 16 24 48
 bash tests/gpu/ds1017_bench/run_agentx.sh run-di  /workspace/agentx-data-131k/agentx_eval 16 24 48
 ```
 
@@ -196,14 +196,14 @@ bash tests/gpu/ds1017_bench/run_agentx.sh run-di  /workspace/agentx-data-131k/ag
 | 文件 | 作用 |
 |---|---|
 | `remote_exec.sh` | `remote-exec` 远端命令执行封装（默认 `n1`，带限流间隔保护） |
-| `run_agx_official.sh` | `agxinfer` 官方 Prefill / Decode bench 入口（本地 `remote-exec` + 节点内执行） |
+| `run_rsinfer_official.sh` | `rsinfer` 官方 Prefill / Decode bench 入口（本地 `remote-exec` + 节点内执行） |
 | `run_di_official.sh` | `DeepInfer` 官方 Prefill / Decode bench 入口（本地 `remote-exec` + 节点内执行） |
-| `dsbench_pareto_sweep.py` | `agxinfer` StepChannel Prefill/Decode sweep 驱动 |
-| `dsbench_decode.py` | `agxinfer` 131K 共享前缀 Decode sweep 驱动 |
+| `dsbench_pareto_sweep.py` | `rsinfer` StepChannel Prefill/Decode sweep 驱动 |
+| `dsbench_decode.py` | `rsinfer` 131K 共享前缀 Decode sweep 驱动 |
 | `di_official_sweep.py` | `DeepInfer` 原生 `examples/benchmark.py` 常驻多点扫点封装 |
 | `admit_probe.py` / `dsbench_step_probe.py` / `decode_counts_probe.py` / `top5-measurement.patch` | 仅在远端临时 stage 副本上应用的计时、前缀命中核对与 top-5 logprob 补丁 |
-| `run_agentx.sh` | AgentX 数据生成与 `agxinfer` / `DeepInfer` 回放入口（本地 `remote-exec` + 节点内执行） |
-| `agentx_driver.py` | AgentX `prepare`（生成套件与 `.i32` 共享前缀库）、`deepinfer`、`agx-direct` 驱动 |
+| `run_agentx.sh` | AgentX 数据生成与 `rsinfer` / `DeepInfer` 回放入口（本地 `remote-exec` + 节点内执行） |
+| `agentx_driver.py` | AgentX `prepare`（生成套件与 `.i32` 共享前缀库）、`deepinfer`、`rsinfer-direct` 驱动 |
 | `agentx_prepare_bank.py` | 从独立 `(suite, hashes, corpus)` 物化 `.i32`/`.json` 输入库 |
 | `agentx_corpus.py` | 从 Python 标准库构建真实代码 token 语料 |
 | `di_prefix_directory.py` / `di_prefix_pages.cpp` / `build_di_prefix_ext.py` | `DeepInfer` 离线 API 在线前缀缓存目录及 pybind11 页表扩展 |

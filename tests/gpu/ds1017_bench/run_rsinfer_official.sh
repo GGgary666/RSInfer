@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# Directly runnable DS1017 official Prefill & Decode benchmark for agxinfer (local via remote-exec, or on-node).
+# Directly runnable DS1017 official Prefill & Decode benchmark for rsinfer (local via remote-exec, or on-node).
 #
 # Local commands (run on macOS/dev box; uses artifact-cli + remote_exec.sh / remote-exec):
-#   ./run_agx_official.sh stage <TAG>
-#   ./run_agx_official.sh remote-prefill <TAG> [BUDGET ...]      # default: 4096 8192 16384 32768 65536
-#   ./run_agx_official.sh remote-decode  <TAG> [D ...]           # default: 4 8 16 32 64 128 256
-#   ./run_agx_official.sh remote-status  <TAG>
-#   ./run_agx_official.sh remote-stop    <TAG>
+#   ./run_rsinfer_official.sh stage <TAG>
+#   ./run_rsinfer_official.sh remote-prefill <TAG> [BUDGET ...]      # default: 4096 8192 16384 32768 65536
+#   ./run_rsinfer_official.sh remote-decode  <TAG> [D ...]           # default: 4 8 16 32 64 128 256
+#   ./run_rsinfer_official.sh remote-status  <TAG>
+#   ./run_rsinfer_official.sh remote-stop    <TAG>
 #
 # On-node commands (inside staged directory on n1):
-#   ./run_agx_official.sh prepare [prefill|decode]
-#   ./run_agx_official.sh serve-prefill
-#   ./run_agx_official.sh serve-decode
-#   ./run_agx_official.sh prefill [BUDGET ...]
-#   ./run_agx_official.sh decode  [D ...]
-#   ./run_agx_official.sh status
-#   ./run_agx_official.sh stop
+#   ./run_rsinfer_official.sh prepare [prefill|decode]
+#   ./run_rsinfer_official.sh serve-prefill
+#   ./run_rsinfer_official.sh serve-decode
+#   ./run_rsinfer_official.sh prefill [BUDGET ...]
+#   ./run_rsinfer_official.sh decode  [D ...]
+#   ./run_rsinfer_official.sh status
+#   ./run_rsinfer_official.sh stop
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 cmd=${1:-help}
 if [[ $# -gt 0 ]]; then shift; fi
 
-OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/agxinfer/runs}"
+OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/rsinfer/runs}"
 REMOTE_OSS_DIR="${REMOTE_OSS_DIR:-/mnt/artifacts/runs}"
 REMOTE_BASE="${REMOTE_BASE:-/workspace/ds1017-bench}"
 
@@ -62,10 +62,10 @@ stage_to_n1() {
         --exclude='__pycache__' --exclude='*.pyc' --exclude='._*' --exclude='extension' \
         -C "$repo" engine deploy tests/gpu/ds1017_bench \
         -C "$scratch" source-version.txt
-    object="agx-official-${tag}-source.tgz"
+    object="rsinfer-official-${tag}-source.tgz"
     dest="${REMOTE_BASE}/${tag}"
     artifact-cli cp -f "$scratch/source.tgz" "${OSS_PREFIX}/${object}"
-    "$script_dir/remote_exec.sh" "set -e; mkdir -p '${REMOTE_BASE}'; rm -rf '${dest}' && mkdir -p '${dest}'; tar xzf '${REMOTE_OSS_DIR}/${object}' -C '${dest}'; bash '${dest}/tests/gpu/ds1017_bench/run_agx_official.sh' prepare '${mode}'"
+    "$script_dir/remote_exec.sh" "set -e; mkdir -p '${REMOTE_BASE}'; rm -rf '${dest}' && mkdir -p '${dest}'; tar xzf '${REMOTE_OSS_DIR}/${object}' -C '${dest}'; bash '${dest}/tests/gpu/ds1017_bench/run_rsinfer_official.sh' prepare '${mode}'"
     echo "$dest"
 }
 
@@ -81,8 +81,8 @@ case "$cmd" in
         dest=$(stage_to_n1 "$tag" prefill | tail -n 1)
         gpus="${N1_GPUS:-0,1,2,3}"
         port="${N1_PORT:-24739}"
-        sess="agx-prefill-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/run-prefill bash tests/gpu/ds1017_bench/run_agx_official.sh prefill ${budgets[*]} >bench.log 2>&1; echo \$? >bench.exit'"
+        sess="rsinfer-prefill-${tag}"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/run-prefill bash tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill ${budgets[*]} >bench.log 2>&1; echo \$? >bench.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/bench.log'; cat '${dest}/bench.exit' 2>/dev/null || true\""
         exit 0
@@ -93,8 +93,8 @@ case "$cmd" in
         dest=$(stage_to_n1 "$tag" decode | tail -n 1)
         gpus="${N1_GPUS:-0,1,2,3}"
         port="${N1_PORT:-23619}"
-        sess="agx-decode-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/run-decode bash tests/gpu/ds1017_bench/run_agx_official.sh decode ${ds[*]} >bench.log 2>&1; echo \$? >bench.exit'"
+        sess="rsinfer-decode-${tag}"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/run-decode bash tests/gpu/ds1017_bench/run_rsinfer_official.sh decode ${ds[*]} >bench.log 2>&1; echo \$? >bench.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/bench.log'; cat '${dest}/bench.exit' 2>/dev/null || true\""
         exit 0
@@ -108,7 +108,7 @@ case "$cmd" in
     remote-stop)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/${tag}"
-        "$script_dir/remote_exec.sh" "tmux kill-session -t 'agx-prefill-${tag}' 2>/dev/null || true; tmux kill-session -t 'agx-decode-${tag}' 2>/dev/null || true; for r in '${dest}/run-prefill' '${dest}/run-decode'; do if [[ -d \"\$r\" ]]; then N1_RUN=\"\$r\" bash '${dest}/tests/gpu/ds1017_bench/run_agx_official.sh' stop || true; fi; done"
+        "$script_dir/remote_exec.sh" "tmux kill-session -t 'rsinfer-prefill-${tag}' 2>/dev/null || true; tmux kill-session -t 'rsinfer-decode-${tag}' 2>/dev/null || true; for r in '${dest}/run-prefill' '${dest}/run-decode'; do if [[ -d \"\$r\" ]]; then N1_RUN=\"\$r\" bash '${dest}/tests/gpu/ds1017_bench/run_rsinfer_official.sh' stop || true; fi; done"
         exit 0
         ;;
 esac
@@ -120,15 +120,15 @@ if [[ -f /workspace/gpu-env/cuda-13.2-env.sh ]]; then
     # shellcheck source=/dev/null
     source /workspace/gpu-env/cuda-13.2-env.sh
 fi
-py="${AGX_PY:-/workspace/claude-yoco/venv-opt2/bin/python}"
-model="${AGX_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
-cli="$src/deploy/agxinfer.py"
+py="${RSINFER_PY:-/workspace/claude-yoco/venv-opt2/bin/python}"
+model="${RSINFER_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
+cli="$src/deploy/rsinfer.py"
 bench_dir="$src/tests/gpu/ds1017_bench"
 gpus_csv="${N1_GPUS:-0,1,2,3}"
 run="${N1_RUN:-$src/run}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" PYTHONUNBUFFERED=1
 export PYTHONPATH="$src/engine:$src"
-export CPATH="/workspace/agxinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
+export CPATH="/workspace/rsinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
 
 assert_gpus_free() {
     local vals
@@ -203,7 +203,7 @@ case "$cmd" in
         nvidia-smi --query-gpu=index,uuid,driver_version --format=csv,noheader -i "$gpus_csv" > "$out/hardware.txt"
         for b in "$@"; do
             case "$b" in 4096|8192|16384|32768|65536) ;; *) echo "Invalid prefill budget: $b" >&2; exit 2 ;; esac
-            echo "$(date -Is) AGX prefill budget=${b}"
+            echo "$(date -Is) RSInfer prefill budget=${b}"
             for cache in false true; do
                 cfg="{\"sched.token_budget\":$b,\"alloc.radix_cache\":$cache,\"sched.max_batch\":64,\"batch.max_rows\":64,\"holder.max_slots\":320,\"plan.cuda_graph\":\"auto\",\"plan.graph_buckets\":[1,2,4,8,16,32],\"sched.prefill_interval\":108,\"sched.prefill_occupancy_target\":0,\"eplb.extra_experts\":32,\"deepinfer.force_random_gate\":true,\"sampler.force_topk\":1024,\"dsv4.yoco_mode\":\"compact\"}"
                 apply_config "$cfg" "$out/apply-${b}-${cache}.json"
@@ -211,10 +211,10 @@ case "$cmd" in
             "$py" "$bench_dir/dsbench_pareto_sweep.py" --run "$run" --model "$model" --mode prefill \
                 --context-length 131072 --non-cached-tokens 4096 --yoco-clip 140 --prefill-batch-size "$b" \
                 --seed-base 20000 --prefill-measure-steps 24 --prefill-tail-steps 4 --step-stats \
-                --result-jsonl "$out/agx-prefill-${b}.jsonl"
+                --result-jsonl "$out/rsinfer-prefill-${b}.jsonl"
             if [[ -d "$REMOTE_OSS_DIR" ]]; then
-                obj="agx-prefill-$(basename "$src")-${b}.jsonl"
-                cp "$out/agx-prefill-${b}.jsonl" "${REMOTE_OSS_DIR}/${obj}"
+                obj="rsinfer-prefill-$(basename "$src")-${b}.jsonl"
+                cp "$out/rsinfer-prefill-${b}.jsonl" "${REMOTE_OSS_DIR}/${obj}"
                 echo "RESULT ${OSS_PREFIX}/${obj}"
             fi
         done
@@ -232,15 +232,15 @@ case "$cmd" in
         mkdir -p "$out"
         nvidia-smi --query-gpu=index,uuid,driver_version --format=csv,noheader -i "$gpus_csv" > "$out/hardware.txt"
         for d in "$@"; do
-            echo "$(date -Is) AGX decode D=${d}"
+            echo "$(date -Is) RSInfer decode D=${d}"
             for cache in false true; do
                 apply_config "{\"alloc.radix_cache\":$cache}" "$out/apply-d${d}-${cache}.json"
             done
             "$py" "$bench_dir/dsbench_decode.py" --run "$run" --model "$model" --d "$d" \
-                --out "$out/agx-decode-${d}.json"
+                --out "$out/rsinfer-decode-${d}.json"
             if [[ -d "$REMOTE_OSS_DIR" ]]; then
-                obj="agx-decode-$(basename "$src")-d${d}.json"
-                cp "$out/agx-decode-${d}.json" "${REMOTE_OSS_DIR}/${obj}"
+                obj="rsinfer-decode-$(basename "$src")-d${d}.json"
+                cp "$out/rsinfer-decode-${d}.json" "${REMOTE_OSS_DIR}/${obj}"
                 echo "RESULT ${OSS_PREFIX}/${obj}"
             fi
         done

@@ -1,4 +1,4 @@
-"""The whole engine on one CUDA GPU, started as an operator starts it (``deploy/agxinfer.py serve``):
+"""The whole engine on one CUDA GPU, started as an operator starts it (``deploy/rsinfer.py serve``):
 text over HTTP equals the text of HF's greedy generation, with and without one step of overlap.
 
 Manual (``tests/gpu`` is not collected by default):

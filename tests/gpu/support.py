@@ -38,12 +38,12 @@ TEXT = {  # Qwen3.8-27B's text_config
 
 
 def make_checkpoint(tmp: pytest.TempPathFactory, layers: int, seed: int = 1) -> Path:
-    """Random weights for the first ``layers`` layers, written by ``deploy/agxinfer.py checkpoint``."""
+    """Random weights for the first ``layers`` layers, written by ``deploy/rsinfer.py checkpoint``."""
     src = tmp.mktemp("config")
     (src / "config.json").write_text(json.dumps({"architectures": ["Qwen3_5ForConditionalGeneration"],
                                                  "model_type": "qwen3_5", "text_config": TEXT}))
     out = tmp.mktemp("ckpt")
-    subprocess.run([sys.executable, str(REPO / "deploy" / "agxinfer.py"), "checkpoint", "--config", str(src),
+    subprocess.run([sys.executable, str(REPO / "deploy" / "rsinfer.py"), "checkpoint", "--config", str(src),
                     "--layers", str(layers), "--out", str(out), "--dtype", "bf16", "--seed", str(seed)],
                    env={**os.environ, "PYTHONPATH": str(REPO / "engine")}, check=True, timeout=1800)
     return out

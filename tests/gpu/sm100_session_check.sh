@@ -62,7 +62,7 @@ n=0
 for setting in $SETTINGS; do
   n=$(( n + 1 ))
   started=$(date +%s)
-  "$PY" deploy/agxinfer.py control --run "$SESSION_RUN" apply --config "$setting" > "/tmp/session-apply.$$" 2>&1
+  "$PY" deploy/rsinfer.py control --run "$SESSION_RUN" apply --config "$setting" > "/tmp/session-apply.$$" 2>&1
   echo "== [$n] apply $setting: exit $? in $(( $(date +%s) - started )) s $(grep -E '"status"' "/tmp/session-apply.$$" | head -1 | tr -d ' ,')"
   kernels
   measure

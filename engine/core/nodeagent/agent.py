@@ -300,7 +300,7 @@ class NodeAgent:
 
     def alloc_shm(self, msg: AllocShm) -> Result[msgspec.Struct]:
         rec = self.procs.get(msg.proc)
-        name = f"agx-{self.host}-{next(self._shm)}-{uuid.uuid4().hex[:8]}"
+        name = f"rsinfer-{self.host}-{next(self._shm)}-{uuid.uuid4().hex[:8]}"
         if rec is not None:
             rec.shm.append(name)
         return Ok(ShmAllocated(name))

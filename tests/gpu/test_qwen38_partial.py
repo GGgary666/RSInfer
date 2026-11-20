@@ -6,7 +6,7 @@ Manual (``tests/gpu`` is not collected by default; it needs the ``gpu`` extra):
     uv sync --extra gpu --extra frontend
     uv run pytest tests/gpu/test_qwen38_partial.py -s
 
-The weights are random, from HF's initialization, written by ``deploy/agxinfer.py checkpoint`` in a
+The weights are random, from HF's initialization, written by ``deploy/rsinfer.py checkpoint`` in a
 real checkpoint's layout (``model.language_model.*``), so the loader, the vocabulary of 248k, the
 head counts and the partial rotary of the real model are all in play. HF runs first and is freed,
 then the worker stack, its pools sized by ``core.state.holder``.

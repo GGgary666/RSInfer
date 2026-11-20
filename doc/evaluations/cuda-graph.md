@@ -4,15 +4,15 @@
 
 ## 环境与复现
 
-- 分支 `gw/dev/cuda-graph`，OSS project `agxinfer_cuda_graph`。
+- 分支 `gw/dev/cuda-graph`，OSS project `rsinfer_cuda_graph`。
 - 主机 `sm90-node-0`，NVIDIA SM90-80GB、SM90、约 80 GiB，使用 GPU 1；不是 SM100。
 - Python 3.12.7，锁定 PyTorch 2.11.0+cu130 / CUDA 13.0，transformers 5.22.1。依赖通过local package mirror按 uv.lock 哈希校验安装。
-- runner 及本地使用说明在 `oss_run_agxinfer_cuda_graph/action.md`，属于本机工具，不提交到源码仓库。发布后始终固定 `--release`，避免其他 session 更新 app 链接影响结果。
+- runner 及本地使用说明在 `oss_run_rsinfer_cuda_graph/action.md`，属于本机工具，不提交到源码仓库。发布后始终固定 `--release`，避免其他 session 更新 app 链接影响结果。
 
 ```sh
-bash oss_run_agxinfer_cuda_graph/scripts/ossrun/run.sh --release <RID> \
-  --inline 'bash oss_run_agxinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph.py tests/gpu/test_cuda_graph_apply.py -x' \
-  --name graph-focused --expect '^AGXINFER_GPU_TEST_OK$' \
+bash oss_run_rsinfer_cuda_graph/scripts/ossrun/run.sh --release <RID> \
+  --inline 'bash oss_run_rsinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph.py tests/gpu/test_cuda_graph_apply.py -x' \
+  --name graph-focused --expect '^RSINFER_GPU_TEST_OK$' \
   --max-wait-s 1800 --log-out .ossrun-artifacts/graph-focused.log
 ```
 

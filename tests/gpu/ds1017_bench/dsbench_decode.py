@@ -1,4 +1,4 @@
-"""131K shared-prefix Decode sweep for agxinfer.
+"""131K shared-prefix Decode sweep for rsinfer.
 
 Verifies every request hits the 126,976-token shared prefix via ``AGENTX_ADMIT`` and times 60
 consecutive full-DP pure-decode scheduler retirements after 110 warmup decode steps.

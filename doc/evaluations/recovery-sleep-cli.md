@@ -4,7 +4,7 @@
 
 - worker 出错以后改好代码再 apply 也不恢复（[a-repaired-worker-stays-stopped](../framework-bugs/2026-11-11-a-repaired-worker-stays-stopped.md)）：用户同意的两个方向，一起做了；
 - 让出显存（sleep mode），让同一张卡能边开着引擎边跑 GPU 测试；
-- 新的命令行 `deploy/agxinfer.py`，取代 `deploy/qwen38.py`：起停引擎和改引擎分开，带上 `stop`；
+- 新的命令行 `deploy/rsinfer.py`，取代 `deploy/qwen38.py`：起停引擎和改引擎分开，带上 `stop`；
 - 临时检查放在另一份工作区里，再加一个扫描测试兜底。
 
 另外两件要改框架本体（准备阶段编译、心跳核实），在第二个 PR 里。
@@ -41,7 +41,7 @@
 
 醒来是把它改回 false：这几个单元重载，从 checkpoint 重新读权重，重建状态池，重录 graph。和 vLLM 第 2 级的 sleep 一样不留权重副本，`refit` 换过的权重回到 checkpoint。SGLang 的 `release_memory_occupation` 用 torch_memory_saver 留住虚拟地址，graph 不用重录；我们的 graph 本来就随 `core.plan` 重载重录，用不着。
 
-### 命令行（`deploy/agxinfer.py`、`deploy/models/`）
+### 命令行（`deploy/rsinfer.py`、`deploy/models/`）
 
 - 起停引擎：`serve <模型目录>`（`--detach` 在后台跑，`--dry-run` 只生成拓扑和配置），`status`，`stop`，`sleep`，`wake`。
 - 改引擎：`control check|apply|status|introspect|logs`，就是控制面客户端，地址从运行目录里找。

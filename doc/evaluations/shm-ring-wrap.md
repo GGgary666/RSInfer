@@ -19,7 +19,7 @@ B 保留原有“填充和消息可以一起放入”的路径。空间不足以
 
 ## A/B/C 实验
 
-三个独立 worktree 位于仓库旁的 `agxinfer-worktrees/`，分支共同前缀为 `gw/framework-base/`。
+三个独立 worktree 位于仓库旁的 `rsinfer-worktrees/`，分支共同前缀为 `gw/framework-base/`。
 
 | 角色 | 分支后缀 | 初始提交 | 初始 2 例 | 加强测试提交 | 最终 10 例（实测） |
 | --- | --- | --- | --- | --- | --- |
@@ -77,8 +77,8 @@ git diff a5ef0d8 05b47ff -- engine
 初始实验保留了独立提交，可以在临时 worktree 复现 C 逃过弱测试的过程：
 
 ```sh
-git worktree add --detach /tmp/agxinfer-shm-C-initial 703b6a9
-cd /tmp/agxinfer-shm-C-initial
+git worktree add --detach /tmp/rsinfer-shm-C-initial 703b6a9
+cd /tmp/rsinfer-shm-C-initial
 uv run --frozen --python 3.12 pytest tests/framework/ipc/test_shm_ring_wrap.py -q
 # 2 passed
 ```

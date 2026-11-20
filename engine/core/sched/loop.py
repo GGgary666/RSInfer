@@ -177,7 +177,7 @@ class Settings:
 
 
 ASLEEP = ("the engine is asleep (holder.sleep): it holds no weights or states. Wake it first "
-          "(agxinfer wake, or apply holder.sleep false)")
+          "(rsinfer wake, or apply holder.sleep false)")
 
 
 class Fault(msgspec.Struct, frozen=True):

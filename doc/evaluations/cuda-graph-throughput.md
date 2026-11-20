@@ -79,9 +79,9 @@ CUDA event 记录的步跨度从 **5.23 / 5.47 / 5.56 ms** 降至 **2.84 / 3.17 
 
 ```sh
 RID=20261110T103945Z_acd5dd0-dirty_2f4240d7
-bash oss_run_agxinfer_cuda_graph/scripts/ossrun/run.sh --release "$RID" \
-  --inline 'bash oss_run_agxinfer_cuda_graph/scripts/ossrun/gpu.sh exec python -m tests.gpu.bench_cuda_graph --work-dir /checkpoint/binary/agxinfer_cuda_graph/bench-cuda-graph --output /checkpoint/binary/agxinfer_cuda_graph/bench-cuda-graph/result-steady.json' \
-  --name graph-throughput-steady --expect '^AGXINFER_GRAPH_BENCH_OK$' \
+bash oss_run_rsinfer_cuda_graph/scripts/ossrun/run.sh --release "$RID" \
+  --inline 'bash oss_run_rsinfer_cuda_graph/scripts/ossrun/gpu.sh exec python -m tests.gpu.bench_cuda_graph --work-dir /checkpoint/binary/rsinfer_cuda_graph/bench-cuda-graph --output /checkpoint/binary/rsinfer_cuda_graph/bench-cuda-graph/result-steady.json' \
+  --name graph-throughput-steady --expect '^RSINFER_GRAPH_BENCH_OK$' \
   --max-wait-s 1800 --log-out .ossrun-artifacts/graph-throughput-steady.log
 ```
 

@@ -16,7 +16,7 @@
 
 ## 过程
 
-小随机模型（4 层，fp32，`agxinfer checkpoint --seed 3`），`--device cpu --max-rows 8 --cpu-bytes 16MiB`，`state.gdn.slots = 20`。
+小随机模型（4 层，fp32，`rsinfer checkpoint --seed 3`），`--device cpu --max-rows 8 --cpu-bytes 16MiB`，`state.gdn.slots = 20`。
 
 | 做了什么 | 计划 | 结果 |
 |---|---|---|

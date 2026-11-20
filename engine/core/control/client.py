@@ -205,7 +205,7 @@ async def _main(args: argparse.Namespace) -> int:
     wait_s = getattr(args, "wait_empty", None)
     # The reply comes once the change is over: after waiting for the engine to empty, if asked to,
     # and after its prepare and its execute, which may take their whole limits (change.prepare_timeout_s,
-    # change.execute_timeout_s: 600 s and 3600 s by default, deploy/agxinfer.py sets the first to --timeout).
+    # change.execute_timeout_s: 600 s and 3600 s by default, deploy/rsinfer.py sets the first to --timeout).
     client = ControlClient(zctx, args.control, timeout_s=7200.0 + (wait_s or 0.0))
     try:
         match args.command:

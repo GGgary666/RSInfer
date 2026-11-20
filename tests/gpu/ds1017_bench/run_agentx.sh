@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Directly runnable AgentX dataset generation and replay benchmark for agxinfer & DeepInfer (local via remote-exec, or on-node).
+# Directly runnable AgentX dataset generation and replay benchmark for rsinfer & DeepInfer (local via remote-exec, or on-node).
 #
 # Local commands (run on macOS/dev box; uses artifact-cli + remote_exec.sh / remote-exec):
 #   ./run_agentx.sh stage          <TAG>
 #   ./run_agentx.sh remote-prepare <TAG> <REMOTE_WEKA_TRACES_JSONL> <REMOTE_DATA_DIR>
-#   ./run_agentx.sh remote-agx     <TAG> <REMOTE_SUITE_PREFIX> [CONCURRENCIES ...]  # default: 16 24 48
+#   ./run_agentx.sh remote-rsinfer     <TAG> <REMOTE_SUITE_PREFIX> [CONCURRENCIES ...]  # default: 16 24 48
 #   ./run_agentx.sh remote-di      <TAG> <REMOTE_SUITE_PREFIX> [CONCURRENCIES ...]  # default: 16 24 48
 #   ./run_agentx.sh remote-status  <TAG>
 #   ./run_agentx.sh remote-stop    <TAG>
 #
 # On-node commands (inside staged directory on n1):
 #   ./run_agentx.sh prepare   <WEKA_TRACES_JSONL> <OUT_DATA_DIR>
-#   ./run_agentx.sh serve-agx
-#   ./run_agentx.sh run-agx   <SUITE_PREFIX> [CONCURRENCIES ...]
-#   ./run_agentx.sh stop-agx
+#   ./run_agentx.sh serve-rsinfer
+#   ./run_agentx.sh run-rsinfer   <SUITE_PREFIX> [CONCURRENCIES ...]
+#   ./run_agentx.sh stop-rsinfer
 #   ./run_agentx.sh run-di    <SUITE_PREFIX> [CONCURRENCIES ...]
 #
 # Notes:
@@ -24,7 +24,7 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 cmd=${1:-help}
 if [[ $# -gt 0 ]]; then shift; fi
 
-OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/agxinfer/runs}"
+OSS_PREFIX="${OSS_PREFIX:-s3://<artifact-bucket>/rsinfer/runs}"
 REMOTE_OSS_DIR="${REMOTE_OSS_DIR:-/mnt/artifacts/runs}"
 REMOTE_BASE="${REMOTE_BASE:-/workspace/ds1017-bench}"
 
@@ -91,11 +91,11 @@ case "$cmd" in
         echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/prepare.log'; cat '${dest}/prepare.exit' 2>/dev/null || true\""
         exit 0
         ;;
-    remote-agx)
+    remote-rsinfer)
         tag=${1:-}; suite_prefix=${2:-}
         require_tag "$tag"
         if [[ -z "$suite_prefix" ]]; then
-            echo "usage: $0 remote-agx <TAG> <REMOTE_SUITE_PREFIX> [CONCURRENCIES ...]" >&2
+            echo "usage: $0 remote-rsinfer <TAG> <REMOTE_SUITE_PREFIX> [CONCURRENCIES ...]" >&2
             exit 2
         fi
         shift 2
@@ -103,10 +103,10 @@ case "$cmd" in
         dest=$(stage_to_n1 "$tag" | tail -n 1)
         gpus="${N1_GPUS:-0,1,2,3}"
         port="${N1_PORT:-24919}"
-        sess="agentx-agx-${tag}"
-        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/agx-run bash tests/gpu/ds1017_bench/run_agentx.sh run-agx \"${suite_prefix}\" ${concs[*]} >agx.log 2>&1; echo \$? >agx.exit'"
+        sess="agentx-rsinfer-${tag}"
+        "$script_dir/remote_exec.sh" "set -e; cd '${dest}'; tmux new-session -d -s '${sess}' 'N1_GPUS=${gpus} N1_PORT=${port} N1_RUN=${dest}/rsinfer-run bash tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer \"${suite_prefix}\" ${concs[*]} >rsinfer.log 2>&1; echo \$? >rsinfer.exit'"
         echo "Started tmux session '${sess}' on ${TARGET_POD:-gpu-node-n1} in ${dest}"
-        echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/agx.log'; cat '${dest}/agx.exit' 2>/dev/null || true\""
+        echo "Check progress: $script_dir/remote_exec.sh \"tail -n 25 '${dest}/rsinfer.log'; cat '${dest}/rsinfer.exit' 2>/dev/null || true\""
         exit 0
         ;;
     remote-di)
@@ -130,13 +130,13 @@ case "$cmd" in
     remote-status)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/agentx-${tag}"
-        "$script_dir/remote_exec.sh" "cd '${dest}'; for f in prepare.log agx.log di.log; do if [[ -f \"\$f\" ]]; then echo \"=== \$f ===\"; tail -n 20 \"\$f\"; fi; done; tmux ls 2>/dev/null || true"
+        "$script_dir/remote_exec.sh" "cd '${dest}'; for f in prepare.log rsinfer.log di.log; do if [[ -f \"\$f\" ]]; then echo \"=== \$f ===\"; tail -n 20 \"\$f\"; fi; done; tmux ls 2>/dev/null || true"
         exit 0
         ;;
     remote-stop)
         tag=${1:-}; require_tag "$tag"
         dest="${REMOTE_BASE}/agentx-${tag}"
-        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'agentx-prep-${tag}' 'agentx-agx-${tag}' 'agentx-di-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done; if [[ -d '${dest}/agx-run' ]]; then N1_RUN='${dest}/agx-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-agx || true; fi"
+        "$script_dir/remote_exec.sh" "kill_tree() { local p=\$1; for c in \$(pgrep -P \"\$p\" 2>/dev/null || true); do kill_tree \"\$c\"; done; kill -9 \"\$p\" 2>/dev/null || true; }; for s in 'agentx-prep-${tag}' 'agentx-rsinfer-${tag}' 'agentx-di-${tag}'; do for p in \$(tmux list-panes -t \"\$s\" -F '#{pane_pid}' 2>/dev/null || true); do kill_tree \"\$p\"; done; tmux kill-session -t \"\$s\" 2>/dev/null || true; done; if [[ -d '${dest}/rsinfer-run' ]]; then N1_RUN='${dest}/rsinfer-run' bash '${dest}/tests/gpu/ds1017_bench/run_agentx.sh' stop-rsinfer || true; fi"
         exit 0
         ;;
 esac
@@ -148,19 +148,19 @@ if [[ -f /workspace/gpu-env/cuda-13.2-env.sh ]]; then
     # shellcheck source=/dev/null
     source /workspace/gpu-env/cuda-13.2-env.sh
 fi
-agpy="${AGX_PY:-/workspace/claude-yoco/venv-opt2/bin/python}"
-di="${DI_ROOT:-/workspace/agxinfer-env/DeepInfer}"
-dipy="${DI_PY:-/workspace/agxinfer-env/venv-deepinfer/bin/python}"
-model="${AGX_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
-cli="$src/deploy/agxinfer.py"
+agpy="${RSINFER_PY:-/workspace/claude-yoco/venv-opt2/bin/python}"
+di="${DI_ROOT:-/workspace/rsinfer-env/DeepInfer}"
+dipy="${DI_PY:-/workspace/rsinfer-env/venv-deepinfer/bin/python}"
+model="${RSINFER_MODEL:-/models/DeepSeek-V4.1-Flash-1017}"
+cli="$src/deploy/rsinfer.py"
 bench_dir="$src/tests/gpu/ds1017_bench"
 gpus_csv="${N1_GPUS:-0,1,2,3}"
-run="${N1_RUN:-$src/agx-run}"
+run="${N1_RUN:-$src/rsinfer-run}"
 yoco_clip="${YOCO_CLIP:-140}"
 max_ctx="${MAX_CONTEXT:-131072}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}" PYTHONUNBUFFERED=1
-export CPATH="/workspace/agxinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
+export CPATH="/workspace/rsinfer-env/venv-deepinfer/lib/python3.12/site-packages/nvidia/cu13/include${CPATH:+:$CPATH}"
 
 assert_gpus_free() {
     local vals
@@ -190,7 +190,7 @@ case "$cmd" in
             --traces-jsonl "$traces" --tokenizer "$model" --out-dir "$out_dir" \
             --max-context "$max_ctx" --dev-sessions "${DEV_SESSIONS:-16}" --eval-sessions "${EVAL_SESSIONS:-48}"
         ;;
-    serve-agx)
+    serve-rsinfer)
         assert_gpus_free
         export PYTHONPATH="$src/engine:$src"
         exec "$agpy" "$cli" serve "$model" --source "$src" --run "$run" --detach --port "${N1_PORT:-24919}" \
@@ -202,39 +202,39 @@ case "$cmd" in
             --set sampler.force_topk=0 --set deepinfer.force_random_gate=false \
             --set eplb.extra_experts=0 --set dsv4.graph_idle_experts=true --set sched.prefill_occupancy_target=0
         ;;
-    stop-agx)
+    stop-rsinfer)
         export PYTHONPATH="$src/engine:$src"
         exec "$agpy" "$cli" stop --run "$run" --timeout 90
         ;;
-    run-agx)
+    run-rsinfer)
         suite_prefix=${1:-}
         if [[ -z "$suite_prefix" ]]; then
-            echo "usage: $0 run-agx <SUITE_PREFIX> [CONCURRENCIES ...]" >&2
+            echo "usage: $0 run-rsinfer <SUITE_PREFIX> [CONCURRENCIES ...]" >&2
             exit 2
         fi
         shift
         if [[ $# -eq 0 ]]; then set -- 16 24 48; fi
         export PYTHONPATH="$src/engine:$src"
         if [[ ! -f "$run/engine.json" ]]; then
-            bash "$0" serve-agx
+            bash "$0" serve-rsinfer
             trap 'if [[ "${KEEP_ENGINE:-0}" != "1" ]]; then "$agpy" "$cli" stop --run "$run" --timeout 90 || true; fi' EXIT
         fi
-        out_dir="$src/results/agentx-agx-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        out_dir="$src/results/agentx-rsinfer-$(date -u +%Y%m%dT%H%M%SZ)-$$"
         mkdir -p "$out_dir"
         for c in "$@"; do
-            echo "$(date -Is) AGX AgentX suite=${suite_prefix} C=${c}"
+            echo "$(date -Is) RSInfer AgentX suite=${suite_prefix} C=${c}"
             for enabled in false true; do
                 f="$out_dir/apply-c${c}-${enabled}.json"
                 "$agpy" "$cli" control --run "$run" apply --source "$src" \
                     --config "{\"alloc.radix_cache\":$enabled}" --wait-empty 120 --json > "$f"
                 "$agpy" -c 'import json,sys; d=json.load(open(sys.argv[1]))["result"]; assert d["status"]=="committed", d' "$f"
             done
-            "$agpy" "$bench_dir/agentx_driver.py" agx-direct --run "$run" \
+            "$agpy" "$bench_dir/agentx_driver.py" rsinfer-direct --run "$run" \
                 --suite "${suite_prefix}.json" --corpus "${suite_prefix}.i32" \
-                --concurrencies "$c" --out "$out_dir/agx-c${c}.json"
+                --concurrencies "$c" --out "$out_dir/rsinfer-c${c}.json"
             if [[ -d "$REMOTE_OSS_DIR" ]]; then
-                obj="agentx-agx-$(basename "$src")-c${c}.json"
-                cp "$out_dir/agx-c${c}.json" "${REMOTE_OSS_DIR}/${obj}"
+                obj="agentx-rsinfer-$(basename "$src")-c${c}.json"
+                cp "$out_dir/rsinfer-c${c}.json" "${REMOTE_OSS_DIR}/${obj}"
                 echo "RESULT ${OSS_PREFIX}/${obj}"
             fi
         done

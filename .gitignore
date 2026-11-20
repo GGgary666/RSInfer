@@ -4,6 +4,6 @@
 __pycache__/
 .pytest_cache/
 .hypothesis/
-/oss_run_agxinfer_cuda_graph/
+/oss_run_rsinfer_cuda_graph/
 /tests/test_ossrun.py
 /.ossrun-artifacts/

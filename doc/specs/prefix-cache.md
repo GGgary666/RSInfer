@@ -197,7 +197,7 @@ GDN 槽照 SGLang 的比例算（§2.4），用户也同意了（2026-11-13）�
     - 参照实现不和 host 来回，能录进 graph：每个 lane 都写，没被选中的 lane 写到 padding 槽 0。
     - Triton 版是 SGLang 的 `track_mamba_states_all_layers`，原样搬过来。
   - `gdn.chunk_delta_rule@1` 的参照实现也给出 `h`，和 fla 一样。
-- **部署**：`deploy/agxinfer.py serve --disable-radix-cache`。
+- **部署**：`deploy/rsinfer.py serve --disable-radix-cache`。
 
 ### 7.2 和 SGLang 不一样的地方
 

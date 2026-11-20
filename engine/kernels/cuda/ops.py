@@ -28,7 +28,7 @@ from kernels.cuda.kv_store_cu import CUDA_SOURCE
 
 def build() -> Any:
     """The compiled module; ``None`` without a CUDA device (a build step runs on every worker)."""
-    return build_cuda_extension("agx_kernels_cuda", "kv_store.cu", CUDA_SOURCE)
+    return build_cuda_extension("rsinfer_kernels_cuda", "kv_store.cu", CUDA_SOURCE)
 
 
 def kv_store(module: Any, k_cache: torch.Tensor, v_cache: torch.Tensor, loc: torch.Tensor, cache_k: torch.Tensor,

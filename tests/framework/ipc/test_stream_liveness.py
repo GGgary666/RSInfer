@@ -25,7 +25,7 @@ HOLD_S = 4 * TUN.peer_timeout_s
 
 
 def shm_name() -> str:
-    return f"agx-test-{uuid.uuid4().hex[:12]}"
+    return f"rsinfer-test-{uuid.uuid4().hex[:12]}"
 
 
 def test_a_writer_waits_for_a_reader_that_holds_the_gil() -> None:

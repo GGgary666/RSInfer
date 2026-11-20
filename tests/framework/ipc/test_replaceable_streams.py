@@ -35,7 +35,7 @@ def reader_for(zctx: zmq.Context[zmq.Socket[bytes]], hosts: tuple[str, str], *, 
                tun: IpcTunables = PATIENT) -> tuple[ShmReader | TcpReader, StreamAddress]:
     rhost, whost = hosts
     return open_reader(zctx, local=HostId(rhost), peer=HostId(whost), bind_host=BIND,
-                       shm_name=f"agx-test-{uuid.uuid4().hex[:12]}", tun=tun,
+                       shm_name=f"rsinfer-test-{uuid.uuid4().hex[:12]}", tun=tun,
                        replaceable=replaceable)
 
 

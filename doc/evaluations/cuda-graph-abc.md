@@ -62,7 +62,7 @@ A 通过相同的就绪 graph 断言拒绝，不把旧版本不存在的新模�
 | C eager | `d3b137d` | 2 passed / 1 failed，5.07 秒 | decode 实际 replay 次数为 0 |
 | C catalog | `70cc0eb` | 2 passed / 1 failed，8.44 秒 | catalog 变化后没有抛出 StaleGraph |
 
-A/C 均为正常 pytest 断言失败、退出码 1；B 的最终 GPU 与全量组合命令退出码 0，包含 `AGXINFER_GPU_TEST_OK` 和 `ABC_B_FINAL_OK`。两个 C 各由一个加强用例检出，不声称每一项测试都能拒绝它们。
+A/C 均为正常 pytest 断言失败、退出码 1；B 的最终 GPU 与全量组合命令退出码 0，包含 `RSINFER_GPU_TEST_OK` 和 `ABC_B_FINAL_OK`。两个 C 各由一个加强用例检出，不声称每一项测试都能拒绝它们。
 
 A 的 engine 与 `07442d6` 逐字相同。相对 B，C eager 只多保存一个 forward 方法并将 replay 改为 eager forward（+2/-1）；C catalog 只删除版本检查两行。加强前后 C 的生产改动没有变化，只增强了测试。
 
@@ -112,11 +112,11 @@ uv run --no-sync pytest tests/gpu/test_cuda_graph_adversarial.py
 通过 OSS 复现最终版本时，使用表中 RID：
 
 ```sh
-bash oss_run_agxinfer_cuda_graph/scripts/ossrun/run.sh --release <RID> \
-  --inline 'bash oss_run_agxinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph_adversarial.py' \
+bash oss_run_rsinfer_cuda_graph/scripts/ossrun/run.sh --release <RID> \
+  --inline 'bash oss_run_rsinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph_adversarial.py' \
   --name graph-abc-reproduce
 ```
 
-A/C 的预期退出码为 1，必须核对具体 pytest 断言；`agent exception`、导入失败或环境失败不算成功检出。B 预期退出码为 0，并包含 `AGXINFER_GPU_TEST_OK`。
+A/C 的预期退出码为 1，必须核对具体 pytest 断言；`agent exception`、导入失败或环境失败不算成功检出。B 预期退出码为 0，并包含 `RSINFER_GPU_TEST_OK`。
 
 初始逃逸可在 `1ebebc9`、`26b2080` 的临时 worktree 复现，共同文件当时只有 1 个用例；加上 `tests/gpu/test_cuda_graph.py` 就是上述 C 各 7 passed 的集合。最终 A/C 分支保留测试加强提交，B 的生产实现不含任何 C 改动。

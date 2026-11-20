@@ -4,7 +4,7 @@
 
 The metadata follows csrc/engine/input_metadata/prepare_tensor_input_v4.cpp; the CUDA
 gather comes from model_executor/layers/tilelang_ops/gather.py. CP is one in DS1017's
-AGX DP/EP topology. License in deepinfer/tilelang_ops/LICENSE.deepinfer.
+RSInfer DP/EP topology. License in deepinfer/tilelang_ops/LICENSE.deepinfer.
 """
 
 from collections.abc import Sequence

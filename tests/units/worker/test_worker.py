@@ -209,7 +209,7 @@ def test_an_idle_worker_finds_a_scheduler_restarted_while_nothing_ran() -> None:
     tun = msgspec.structs.replace(IpcTunables(), lookup_retry_s=0.02, peer_timeout_s=0.5)
 
     def reader() -> tuple[Any, Any]:
-        return open_reader(zctx, local=host, peer=host, bind_host="127.0.0.1", shm_name=f"agx-w-{uuid.uuid4().hex[:8]}",
+        return open_reader(zctx, local=host, peer=host, bind_host="127.0.0.1", shm_name=f"rsinfer-w-{uuid.uuid4().hex[:8]}",
                            tun=tun)
 
     def capacity_within(r: Any, seconds: float) -> bool:

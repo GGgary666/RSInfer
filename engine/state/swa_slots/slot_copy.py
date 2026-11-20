@@ -120,4 +120,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
 
 @cache
 def operator() -> Any:
-    return build_cuda_extension("agx_swa_slots", "slot_copy.cu", SOURCE)
+    return build_cuda_extension("rsinfer_swa_slots", "slot_copy.cu", SOURCE)

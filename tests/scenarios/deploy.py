@@ -1,4 +1,4 @@
-"""The engine as an operator starts it, ``deploy/agxinfer.py serve``, for the end-to-end tests
+"""The engine as an operator starts it, ``deploy/rsinfer.py serve``, for the end-to-end tests
 (``test_m2a.py`` on the CPU, ``tests/gpu/test_qwen38_serve.py`` on a GPU)."""
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parents[2]
-CLI = REPO / "deploy" / "agxinfer.py"
+CLI = REPO / "deploy" / "rsinfer.py"
 ENV = {**os.environ, "PYTHONPATH": str(REPO / "engine")}
 
 
@@ -59,7 +59,7 @@ def served(run: Path, *args: str, ready_s: float = 90) -> Generator[str]:
             assert time.monotonic() < deadline, "the engine did not come up"
             time.sleep(0.3)
         with urllib.request.urlopen(url + "/v1/models", timeout=10) as r:  # and it is this engine on that port
-            assert json.loads(r.read())["data"][0]["owned_by"] == "agxinfer", f"another server on port {port}"
+            assert json.loads(r.read())["data"][0]["owned_by"] == "rsinfer", f"another server on port {port}"
         yield url
     finally:
         os.killpg(proc.pid, signal.SIGTERM)

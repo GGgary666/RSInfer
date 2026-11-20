@@ -36,7 +36,7 @@ def test_a_builder_killed_mid_way_leaves_no_lock_the_next_one_waits_on(tmp_path:
                                text=True)
     try:
         assert builder.stdout is not None and builder.stdout.readline() == "building\n"
-        with open(tmp_path / ".agx-build.lock", "a") as other, pytest.raises(BlockingIOError):
+        with open(tmp_path / ".rsinfer-build.lock", "a") as other, pytest.raises(BlockingIOError):
             fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another builder waits meanwhile
     finally:
         builder.send_signal(signal.SIGKILL)

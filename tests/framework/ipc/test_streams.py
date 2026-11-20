@@ -33,7 +33,7 @@ def zctx() -> zmq.Context[zmq.Socket[bytes]]:
 
 
 def shm_name() -> str:
-    return f"agx-test-{uuid.uuid4().hex[:12]}"
+    return f"rsinfer-test-{uuid.uuid4().hex[:12]}"
 
 
 def test_backend_is_chosen_by_host_id_not_address() -> None:

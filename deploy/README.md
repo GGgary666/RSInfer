@@ -1,8 +1,8 @@
-# 部署：在一台机器上跑引擎（2026-11-11 起是 `agxinfer.py`）
+# 部署：在一台机器上跑引擎（2026-11-11 起是 `rsinfer.py`）
 
 `deploy/` 放的是不属于 pytest 的部署工具。用户同意为它新开这个顶层目录。
 
-- `agxinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
+- `rsinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
 - `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
   - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数只有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`，显式点名某个后端时只用它自己的 kernel）；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；前缀缓存对它是关着的；不支持 `--dummy`（它的矩阵按 FP8/FP4 字节和 scale 存，`initialize_dummy_weights` 只填浮点张量；随机权重用 `checkpoint` 生成）。
@@ -11,7 +11,7 @@
 
 ## 命令
 
-`A="uv run python deploy/agxinfer.py"`（GPU 环境不是 uv 管的时候，用那个环境的 `python`）。
+`A="uv run python deploy/rsinfer.py"`（GPU 环境不是 uv 管的时候，用那个环境的 `python`）。
 
 | 命令 | 做什么 |
 |---|---|
@@ -23,7 +23,7 @@
 | `$A chat "..."` / `$A complete "..."` | 发一个请求（chat 或 completions），流式打到标准输出 |
 | `$A checkpoint --config <目录> --out <目录>` | 按一份配置生成随机权重，布局和这个模型家族的真 checkpoint 一样（Qwen3.8：多模态命名 `model.language_model.*`，外加加载器会跳过的 `visual`、`mtp` 张量）；可以只保留前 N 层 |
 
-**运行目录**（`--run`，默认 `run/agxinfer`）就是一个引擎：拓扑和配置（`topology.json`、`config.json`）、控制面的状态（`control/`）、快照和各进程的日志（`host-a/snapshots/`）、`engine.json`（控制面进程、URL、控制面地址），`--detach` 时还有 `engine.log`。每个命令都靠 `--run` 找到它的引擎；一个运行目录里同时只能有一个引擎，上一个引擎还有进程留着（比如控制面崩了，worker 还在）时 `serve` 也拒绝，先 `stop`。
+**运行目录**（`--run`，默认 `run/rsinfer`）就是一个引擎：拓扑和配置（`topology.json`、`config.json`）、控制面的状态（`control/`）、快照和各进程的日志（`host-a/snapshots/`）、`engine.json`（控制面进程、URL、控制面地址），`--detach` 时还有 `engine.log`。每个命令都靠 `--run` 找到它的引擎；一个运行目录里同时只能有一个引擎，上一个引擎还有进程留着（比如控制面崩了，worker 还在）时 `serve` 也拒绝，先 `stop`。
 
 ```sh
 uv sync --python 3.12 --extra gpu --extra frontend      # 没有 GPU 的机器用 --extra cpu

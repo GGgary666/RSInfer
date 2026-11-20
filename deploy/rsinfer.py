@@ -1,10 +1,10 @@
-"""``agxinfer``: run this engine on one machine, and change it while it runs.
+"""``rsinfer``: run this engine on one machine, and change it while it runs.
 
-    python deploy/agxinfer.py serve <model dir> [--layers 8] [--dummy] [--detach]
-    python deploy/agxinfer.py status | stop | sleep | wake           [--run DIR]
-    python deploy/agxinfer.py control apply --source <workspace>     [--run DIR]
-    python deploy/agxinfer.py chat "Hello" | complete "The capital of France is"
-    python deploy/agxinfer.py checkpoint --config <HF dir> --layers 4 --out <dir>
+    python deploy/rsinfer.py serve <model dir> [--layers 8] [--dummy] [--detach]
+    python deploy/rsinfer.py status | stop | sleep | wake           [--run DIR]
+    python deploy/rsinfer.py control apply --source <workspace>     [--run DIR]
+    python deploy/rsinfer.py chat "Hello" | complete "The capital of France is"
+    python deploy/rsinfer.py checkpoint --config <HF dir> --layers 4 --out <dir>
 
 Two kinds of command:
 
@@ -15,7 +15,7 @@ Two kinds of command:
 - Changes to a running engine. ``control check|apply|status|introspect|logs`` is the control client
   (``python -m core.control.client``), with the engine's control address found for you.
 
-A run directory (``--run``, default ``run/agxinfer``) is one engine: its topology and config, its
+A run directory (``--run``, default ``run/rsinfer``) is one engine: its topology and config, its
 control plane's state, its snapshots and logs, and ``engine.json`` (its process and addresses).
 Every command finds its engine through it.
 
@@ -55,7 +55,7 @@ SCHED = {"host": HOST, "role": "sched", "index": 0}
 SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
 """SGLang's --speculative-algorithm values the engine takes: the MTP layer drafts (SGLang runs NEXTN as EAGLE)."""
 WORKER = {"host": HOST, "role": "worker", "index": 0}
-DEFAULT_RUN = Path("run/agxinfer")
+DEFAULT_RUN = Path("run/rsinfer")
 ENGINE_FILE = "engine.json"
 
 
@@ -316,14 +316,14 @@ def _stop_with_parent() -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     args.model = args.model or args.model_option
     if not args.model:
-        raise SystemExit("serve: give the model directory (agxinfer serve <model dir>)")
+        raise SystemExit("serve: give the model directory (rsinfer serve <model dir>)")
     run = args.run.resolve()
     running, procs = engine_processes(run)
     if running is not None:
-        raise SystemExit(f"an engine already runs in {run} (process {running}): agxinfer stop --run {args.run}")
+        raise SystemExit(f"an engine already runs in {run} (process {running}): rsinfer stop --run {args.run}")
     if procs:  # its control plane is gone, not what it started: a worker left behind keeps its GPU memory
         raise SystemExit(f"processes {procs} of an earlier engine in {run} are still running: stop them first with "
-                         f"agxinfer stop --run {args.run}")
+                         f"rsinfer stop --run {args.run}")
     topo, config, tunables, recipe = plan(args)
     command = serve_command(args, topo, config, tunables)
     if args.dry_run:
@@ -362,7 +362,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def prog() -> str:
-    return "python deploy/agxinfer.py"
+    return "python deploy/rsinfer.py"
 
 
 # ------------------------------------------------------------------ stop, status
@@ -669,7 +669,7 @@ def _engine_target(p: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="agxinfer", description="Run this engine on one machine, and change it while "
+    ap = argparse.ArgumentParser(prog="rsinfer", description="Run this engine on one machine, and change it while "
                                  "it runs. Every command finds its engine through a run directory (--run).")
     sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
     _serve_options(sub.add_parser("serve", help="start an engine for a model"))

@@ -48,9 +48,9 @@ w23 w94 w54 w90 w109 w216 w127 w30 w265 w244 w230 w46
 
 ## 记录
 
-- 脚本：`dev-server:/tmp/agxinfer-pr66-codex/repro_eplb_reload.py`
+- 脚本：`dev-server:/tmp/rsinfer-pr66-codex/repro_eplb_reload.py`
 - 日志：同目录 `eplb-reload.log`，退出码 0。
-- 运行目录与临时源码：`/tmp/agxinfer-pr66-eplb-reload/`。
+- 运行目录与临时源码：`/tmp/rsinfer-pr66-eplb-reload/`。
 - 未修改仓库实现；复现引擎已停止。本轮没有重复运行已通过的 CI 套件或完整 SM100 模型。
 
 ## 修复（2026-11-16，Antigravity）
@@ -68,7 +68,7 @@ w23 w94 w54 w90 w109 w216 w127 w30 w265 w244 w230 w46
 - 测试：
   - `tests/units/state/test_expert_placement.py::test_a_placement_started_again_reads_where_the_experts_were_moved_from_the_record`：两个 rank 重排以后，新的 `Placement`（还在重排的和已关掉的各一组）按记录建映射，每个专家的映射指向装着它的行；初始布局的记录不需要映射。
   - `tests/scenarios/test_ds1017.py::test_a_reload_after_the_experts_were_placed_again_finds_them_where_they_were_moved`：报告里的复现写成了测试。CPU、reference 后端、`--ranks 2`、EPLB 重排以后，热重载 `models.ds1017`（加一行注释），再关掉 EPLB（槽位数不变），三次的文本都和一个 rank 算的逐字相同。拿掉修复，这条在第一次热重载后失败。
-- 在线增加 EP 卡数（报告附带的代码走查结论）：不修，约定整引擎重启，写在 `.claude/skills/agxinfer/SKILL.md` 和 `doc/specs/v1-ds1017.md` 10.9。
+- 在线增加 EP 卡数（报告附带的代码走查结论）：不修，约定整引擎重启，写在 `.claude/skills/rsinfer/SKILL.md` 和 `doc/specs/v1-ds1017.md` 10.9。
 
 ### SM100 上的验证（2026-11-16）
 

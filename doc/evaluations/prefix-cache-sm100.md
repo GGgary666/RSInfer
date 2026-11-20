@@ -8,8 +8,8 @@
 
 - n1：`gpu-node-n1`，GPU 6。PyTorch 确认 SM100、148 SM、约 180 GiB 显存；设备名称显示 NVIDIA SM100-180GB。
 - 模型：`/models/Qwen3.8-27B`，真实完整权重，64 层（48 GDN、16 full attention），TP=1；BF16 权重、激活和 conv，FP32 recurrent state。
-- agxinfer：PR 原代码，未跳过 graph 或数值自检。PyTorch `2.11.0+cu130`。SGLang：n1 已安装的 `0.5.23`，使用已有的同权重 language-model-only checkpoint。
-- HTTP 对比配置：context=4096、page=16、chunk/token budget=2048、最大并发请求=32、memory fraction=0.80、GDN/KV memory ratio=0.9；FlashInfer attention、Triton GDN、decode graph 开启、prefill graph 关闭。默认开启 overlap，另测 agxinfer 关闭 overlap。
+- RSInfer：PR 原代码，未跳过 graph 或数值自检。PyTorch `2.11.0+cu130`。SGLang：n1 已安装的 `0.5.23`，使用已有的同权重 language-model-only checkpoint。
+- HTTP 对比配置：context=4096、page=16、chunk/token budget=2048、最大并发请求=32、memory fraction=0.80、GDN/KV memory ratio=0.9；FlashInfer attention、Triton GDN、decode graph 开启、prefill graph 关闭。默认开启 overlap，另测 RSInfer 关闭 overlap。
 - 性能负载：合成英文提示词，共享 3072 token 前缀，加各请求独立的 16 token 后缀；**in=3088/out=64**。并发 1/4/8，每客户端 4 请求。每档先用另一前缀预热，再种下待测前缀；正式计时不含种缓存请求。报告单轮中位数。
 - 边界输出检查：输入长度 63/64/65/127/128/129/2047/2048/2049/3088，每个提示词连续请求两次，各生成 8 token，temperature=0。
 - 所有 GPU 任务在远端独立 tmux 中运行。性能用干净代码；打印命中长度的临时探针在性能结束后才热改进去。实验结束已停止自己的服务和会话，GPU 6 显存回到 0 MiB。
@@ -20,7 +20,7 @@
 
 两项需要随这份性能结果一起保留：
 
-1. **BF16 的冷跑和缓存命中文本存在差异。** 10 组边界长度中，agxinfer 有 **4 组**贪心文本变化，SGLang 有 **2 组**；同输入逐步比较的 logits 最低余弦相似度为 **0.9998**，发生 top-1 变化时原来的领先分差只有 **0–0.0625**。
+1. **BF16 的冷跑和缓存命中文本存在差异。** 10 组边界长度中，RSInfer 有 **4 组**贪心文本变化，SGLang 有 **2 组**；同输入逐步比较的 logits 最低余弦相似度为 **0.9998**，发生 top-1 变化时原来的领先分差只有 **0–0.0625**。
 2. **原有 GPU 测试仍是 2 passed / 1 failed，负例断言需要修正。** 正确检查点的 temporal 误差为 **0.30%**，满足原测试的 5% 要求；故意错一个 token 的负例误差为 **14%**，已经比正例大约 47 倍，但没有达到测试写死的 **50%** 下限，因此测试失败。应调整这个负例条件，保留正确状态的误差要求。补充的完整模型检查覆盖了该测试因提前失败而未执行的末尾检查点分支。
 
 ## 真实引擎里的命中
@@ -41,7 +41,7 @@ SGLang 的服务日志也记录了同负载 `#new-token: 16, #cached-token: 3072
 
 首 token 延迟中位数，单位 ms：
 
-| 并发 | agxinfer 关缓存 | agxinfer 开缓存 | 加速倍数 | SGLang 关缓存 | SGLang 开缓存 |
+| 并发 | RSInfer 关缓存 | RSInfer 开缓存 | 加速倍数 | SGLang 关缓存 | SGLang 开缓存 |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 169.7 | **72.5** | **2.34×** | 192.1 | 113.8 |
 | 4 | 508.3 | **75.1** | **6.77×** | 542.9 | 221.9 |
@@ -49,13 +49,13 @@ SGLang 的服务日志也记录了同负载 `#new-token: 16, #cached-token: 3072
 
 整组请求的输出吞吐，单位 token/s：
 
-| 并发 | agxinfer 关缓存 | agxinfer 开缓存 | SGLang 关缓存 | SGLang 开缓存 |
+| 并发 | RSInfer 关缓存 | RSInfer 开缓存 | SGLang 关缓存 | SGLang 开缓存 |
 |---:|---:|---:|---:|---:|
 | 1 | 76.3 | **86.2** | 77.4 | 85.3 |
 | 4 | 189.3 | **313.1** | 186.6 | 283.1 |
 | 8 | 260.0 | **595.3** | 254.4 | 564.3 |
 
-关闭 overlap、保留缓存时，agxinfer 的 TTFT 为 71.0/75.4/132.4 ms，输出吞吐为 77.5/294.3/525.7 token/s。两种调度方式都能复用前缀；开启 overlap 后输出吞吐更高。
+关闭 overlap、保留缓存时，RSInfer 的 TTFT 为 71.0/75.4/132.4 ms，输出吞吐为 77.5/294.3/525.7 token/s。两种调度方式都能复用前缀；开启 overlap 后输出吞吐更高。
 
 ## 状态、Graph 与 A/B/C
 
@@ -99,8 +99,8 @@ assert max(kept) < 5e-2 and min(off) > 0.5
 
 | 配置 | 相同 / 总数 | 有变化的输入长度 |
 |---|---:|---|
-| agxinfer 关缓存 | 10/10 | — |
-| agxinfer 开缓存，overlap 开或关 | 6/10 | 65、127、129、3088 |
+| RSInfer 关缓存 | 10/10 | — |
+| RSInfer 开缓存，overlap 开或关 | 6/10 | 65、127、129、3088 |
 | SGLang 关缓存 | 10/10 | — |
 | SGLang 开缓存 | 8/10 | 127、3088 |
 
@@ -119,9 +119,9 @@ assert max(kept) < 5e-2 and min(off) > 0.5
 
 - n1 工作目录：`/workspace/pr59_codex_d1635fc/`；源码为 `repo/`，原始输出为 `out/`。
 - `test-prefix.sh`：原有三个 GPU 测试，真实 64 层 checkpoint。
-- `tools/run-serving.sh`、`bench_prefix.py`：双方开关缓存、agxinfer 开关 overlap、共享前缀 HTTP 测量。
+- `tools/run-serving.sh`、`bench_prefix.py`：双方开关缓存、RSInfer 开关 overlap、共享前缀 HTTP 测量。
 - `tools/abc_prefix.py`：A/B/C；所有故障仅在测试进程中生效。
 - `tools/observe_live.py`：真实引擎热改探针，观察三种缓存命中。
 - `tools/check_logits.py`：同输入的逐步 logits 对比。
-- 原始数据和脚本包：`/workspace/pr59_codex_d1635fc/results.tar.gz`；OSS `s3://<artifact-bucket>/agxinfer/agxinfer-pr59-codex/results.tar.gz`；本地 `/tmp/agxinfer-pr59-sm100-results/`。
+- 原始数据和脚本包：`/workspace/pr59_codex_d1635fc/results.tar.gz`；OSS `s3://<artifact-bucket>/rsinfer/rsinfer-pr59-codex/results.tar.gz`；本地 `/tmp/rsinfer-pr59-sm100-results/`。
 - 所有任务均已结束。未改动原有服务，未修改或提交 PR 代码。

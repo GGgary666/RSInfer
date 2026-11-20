@@ -49,7 +49,7 @@ B/C 的完整测试去掉 `-k`；复现 C 的初始逃逸使用 `-k 'lost_commit
 
 ## 分支与实验结果
 
-每个分支有自己的 worktree，位于仓库旁的 `agxinfer-worktrees/`。A 保留原始生产代码；B 是候选修复；C 是故意违反修复目标的实验代码，不应合并到生产分支。
+每个分支有自己的 worktree，位于仓库旁的 `rsinfer-worktrees/`。A 保留原始生产代码；B 是候选修复；C 是故意违反修复目标的实验代码，不应合并到生产分支。
 
 | 角色 | 分支（共同前缀 `gw/framework-base/`） | 初始测试提交 | 初始 3 例 | 加强测试提交 | 最终 12 例 |
 | --- | --- | --- | --- | --- | --- |
@@ -129,8 +129,8 @@ uv run --frozen --python 3.12 pyright
 初始实验也已保留提交，可以用独立临时 worktree 复现，例如 C 在加强测试前的逃逸：
 
 ```sh
-git worktree add --detach /tmp/agxinfer-commit-C-initial a2fd1c8
-cd /tmp/agxinfer-commit-C-initial
+git worktree add --detach /tmp/rsinfer-commit-C-initial a2fd1c8
+cd /tmp/rsinfer-commit-C-initial
 uv run --frozen --python 3.12 pytest tests/framework/change/test_commit_consistency.py -q
 # 3 passed
 ```

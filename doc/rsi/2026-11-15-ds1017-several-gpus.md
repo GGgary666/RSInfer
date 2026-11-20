@@ -26,7 +26,7 @@
 | EPLB | `policies.eplb`（决定，照 DeepInfer 的贪心）加 `state.expert_placement`（映射、计数、搬权重） |
 | 融合 kernel | 组合 definition `ds.hc_step@1`、`ds.moe@1`；模型循环按 DeepInfer 的顺序重排；`kernels/deepinfer/mega.py` |
 | 前后的钩子 | `Backend.fetch`（forward 之前、graph 之外：多 rank 时取 Engram 的行）、`model.stepped`（forward 之后：EPLB 计数） |
-| 部署、前端 | `agxinfer serve --gpus 0,1,2,3` / `--ranks N`；`chat_template.jinja`、模板参数、BOS |
+| 部署、前端 | `rsinfer serve --gpus 0,1,2,3` / `--ranks N`；`chat_template.jinja`、模板参数、BOS |
 
 ## 怎么做的，和 AGENTS.md 的出入
 
@@ -54,7 +54,7 @@ AGENTS.md 要求默认在跑着的引擎上热改。这次**大部分不是这�
 - **torch 的对称内存**默认把设备号相同的 rank 当成在同一张卡上而拒绝（`detected allocations from overlapping devices`）。每个 rank 只看得见自己的卡时都是 0 号，要设 `TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES=1`。DeepInfer 在 `deepinfer/__init__.py` 里设了。
 - **`mega_mhc`、`bf16_mega_gate` 按 stream 各有一小块缓冲**，第一次在某个 stream 上调用时建，在录制中建会断言失败。引擎的录制器先在录制 stream 上预热，没问题；自己写测试录 graph 时要先在那个 stream 上跑一遍。
 - **`SymmBuffer` 的布局取决于有没有共享专家**：建的时候带了共享专家，调用时就必须带共享专家的权重，否则 kernel 按另一种布局读缓冲区。所以空闲的 rank 调的也是带共享专家的那个。
-- **`agxinfer serve --cuda-graph` 默认是 off**，默认的桶到 8 行为止。量吞吐要给 `--cuda-graph auto --graph-buckets 1 2 4 8 16 32 64`。
+- **`rsinfer serve --cuda-graph` 默认是 off**，默认的桶到 8 行为止。量吞吐要给 `--cuda-graph auto --graph-buckets 1 2 4 8 16 32 64`。
 - **两个 worker 共用一张 24 GB 的卡**时，`--mem-fraction` 要调到 0.4 左右：部署工具已经把份额按卡上的 worker 数平分，但参照 kernel 的中间结果还要地方。
 - **真权重前 8 层放一张卡**要 `--mem-fraction 0.9`：0.85 放不下状态，0.95 不给 prefill 留够它一次要的 12 GiB（`tilelang` 的 prefill 里有一个 12 GiB 的中间量，没查是哪个 kernel）。
 - **`core.manifest` 不许单元模块里有可变的全局量**：`dict` 要写成 `MappingProxyType`，进程级的对象放在单元实例上。

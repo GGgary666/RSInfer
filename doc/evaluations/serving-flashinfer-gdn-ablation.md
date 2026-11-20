@@ -1,6 +1,6 @@
 # FlashInfer 与 Triton GDN 的 serving 消融比较（2026-11-11，SM90-80GB）
 
-上一轮 [serving 基线](serving-baseline-before-flashinfer.md) 测的是接入之前的引擎（master 的代码）。本轮实际运行 [PR #51](https://github.com/open-agent-infra/agxinfer/pull/51) 的 FlashInfer attention 和 Triton GDN 实现，拆开比较各自及组合后的 HTTP 服务性能。
+上一轮 [serving 基线](serving-baseline-before-flashinfer.md) 测的是接入之前的引擎（master 的代码）。本轮实际运行 [PR #51](https://github.com/open-agent-infra/rsinfer/pull/51) 的 FlashInfer attention 和 Triton GDN 实现，拆开比较各自及组合后的 HTTP 服务性能。
 
 > **读之前先看这两点**（2026-11-11 审查后补的）
 >
@@ -178,10 +178,10 @@ uv run python tests/gpu/bench_serving.py --url http://127.0.0.1:8000 --name "$NA
 
 - 原始 kernel 验证 release：`20261111T095016Z_2f3ac83_f64c4097`，发布时 clean。
 - 配对模型与 serving release：`20261111T110144Z_2f3ac83-dirty_912b719d`，以 PR #51 提交为底，仅增加上述 padding 修复；源码包 SHA256：`06fef5b2e71816ca096180e6320d8d7d07e4e799ef7222572201b146b325032b`。
-- 依赖准备：`cmd_20261111T104859Z_serving-ablation-env_cfb32d47`，done / exit 0，`AGXINFER_ABLATION_ENV_OK`。
-- kernel 验证：`cmd_20261111T105148Z_serving-ablation-kernel-validation_0d7d3cc2`，done / exit 0，`AGXINFER_ABLATION_KERNEL_TESTS_OK`。
+- 依赖准备：`cmd_20261111T104859Z_serving-ablation-env_cfb32d47`，done / exit 0，`RSINFER_ABLATION_ENV_OK`。
+- kernel 验证：`cmd_20261111T105148Z_serving-ablation-kernel-validation_0d7d3cc2`，done / exit 0，`RSINFER_ABLATION_KERNEL_TESTS_OK`。
 - 首次模型检查：`cmd_20261111T105347Z_serving-ablation-model-validation_bf35a287`，失败记录保留。
-- 修复后模型验证：`cmd_20261111T110254Z_serving-ablation-model-fixed_3f076cfb`，done / exit 0，`AGXINFER_ABLATION_MODEL_OK`。
+- 修复后模型验证：`cmd_20261111T110254Z_serving-ablation-model-fixed_3f076cfb`，done / exit 0，`RSINFER_ABLATION_MODEL_OK`。
 - serving：`cmd_20261111T110308Z_serving-ablation-benchmark-fixed_7f9df458`；首次未修复的 command `cmd_20261111T105641Z_serving-ablation-benchmark_feb21891` 在正确性前置检查失败，没有开始计时。
 - 原始日志、完整 command payload、模型结果和性能 JSON 保存在本地 `.ossrun-artifacts/` 与 ossrun command 记录；生成物不提交。
 - 原性能 command 的 OSS 状态回写滞后，回收后仍显示 running，不能据此宣称原 command 已取得 exit 0。计算结束后的 GPU 采样为 2026-11-11 11:21:03 UTC。独立只读回收 command `cmd_20261111T112127Z_probe_serving-ablation-final-fetch_4250d75b` 为 done / exit 0；已取得 `complete=true`、原任务最终成功标记，核对 128 个唯一配置组合、36 项协议检查、5504 个请求以及引擎/benchmark/harness 哈希。回收日志为 `serving-ablation-final-fetch.log`，提取结果为 `serving-ablation-result.json` 与 `serving-ablation-model-result.json`。

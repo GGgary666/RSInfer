@@ -61,13 +61,13 @@ StaleGraph: no ready verify graph holds 1 rows, and graphs are required
 
 单位：输出 token/s。
 
-| 并发 | agxinfer 普通 decode | 原 PR 冷启动 MTP（退回 eager） | 原 PR 热切换后 MTP（图有效） | Codex 两处修复后 MTP | SGLang MTP |
+| 并发 | RSInfer 普通 decode | 原 PR 冷启动 MTP（退回 eager） | 原 PR 热切换后 MTP（图有效） | Codex 两处修复后 MTP | SGLang MTP |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 93.2 | 65.3 | 151.3 | **157.3** | **177.2** |
 | 4 | 361.0 | 238.0 | 479.0 | **492.4** | **543.2** |
 | 8 | 685.7 | 422.7 | 732.9 | **746.0** | **1055.2** |
 
-SGLang 不开投机时为 93.5/360.5/692.5 token/s，与 agxinfer 的普通 decode 基线接近。
+SGLang 不开投机时为 93.5/360.5/692.5 token/s，与 RSInfer 的普通 decode 基线接近。
 
 修复版相对自己的普通 decode 提升 **1.69× / 1.36× / 1.09×**，达到 SGLang MTP 的 **88.8% / 90.6% / 70.7%**。并发 8 的剩余差距最明显。额外请求探针中，每行 verify 平均接受约 **2.86 token（含 bonus）**，真实草稿正常工作。
 
@@ -84,15 +84,15 @@ batch=8 时，commit 占整步约 **36%**。相邻步之间的空档中位数约
 
 CPU/CUDA 时间线进一步确认：
 
-- agxinfer 的 batch=8、30 个 verify 窗口中，通用 `index_elementwise` 和 `where` kernel 合计约 **294.9 ms**，折合 **9.83 ms/步**。分段标记 `mtp.commit` 的 GPU 区间约 10.0 ms/步，与 event 计时一致。
+- RSInfer 的 batch=8、30 个 verify 窗口中，通用 `index_elementwise` 和 `where` kernel 合计约 **294.9 ms**，折合 **9.83 ms/步**。分段标记 `mtp.commit` 的 GPU 区间约 10.0 ms/步，与 event 计时一致。
 - SGLang 同样 30 步中的状态 scatter kernel 合计约 **16.59 ms**，折合 **0.55 ms/步**。使用的是 `_fused_mamba_state_scatter_with_mask_kernel` 和 `_fused_conv_window_scatter_multi_kernel`。
-- batch=1 时，SGLang 相关 scatter 合计约 **0.070 ms/步**；agxinfer 的 commit event 计时约 **1.60 ms/步**。
+- batch=1 时，SGLang 相关 scatter 合计约 **0.070 ms/步**；RSInfer 的 commit event 计时约 **1.60 ms/步**。
 
 原因直接对应原 PR 的 `commit_states`：它对每个池先做一次 `inter[:, lane, step]` gather，再写回；随后无论是否跨跟踪边界，都求值 `inter[:, lane, track.clamp_min(0)]` 和 `pool[:, dst]`，经过 `torch.where` 后再写回。没有跨边界的普通步也会搬这些大张量。64 层模型的一行 GDN 状态约 147 MiB，8 行的一份状态就是约 1.15 GiB，多次临时 gather 和写回的代价很大。
 
 **下一步优先搬 SGLang 的融合状态 scatter/commit kernel。** 直接从选中的中间 step 拷到运行槽；`track_steps < 0` 的行跳过跟踪拷贝，避免构造整份临时状态和重复读取 padding 槽。对应上游文件为 `python/sglang/kernels/ops/mamba/mamba_state_scatter_triton.py`。这是 Claude 原 PR 当前使用参照实现留下的性能瓶颈，与 Codex 的图初始化、事件发布两处修复分开。
 
-其后再优化草稿侧 CPU 发射：profile 中 batch=8 的 draft CPU 区间中位数，agxinfer 约 3.08 ms、SGLang 约 1.27 ms；draft extend 分别约 1.93/1.22 ms。PR 已说明这两段暂时 eager，后续可按 SGLang 补 graph。当前应先处理状态提交这个更大的、随 batch 增长的损耗。
+其后再优化草稿侧 CPU 发射：profile 中 batch=8 的 draft CPU 区间中位数，RSInfer 约 3.08 ms、SGLang 约 1.27 ms；draft extend 分别约 1.93/1.22 ms。PR 已说明这两段暂时 eager，后续可按 SGLang 补 graph。当前应先处理状态提交这个更大的、随 batch 增长的损耗。
 
 ## 验证与记录位置
 
@@ -100,6 +100,6 @@ CPU/CUDA 时间线进一步确认：
 - 用户随后要求以现场验证修复为主，因此没有新增测试或再次跑完整套件。上面的冷启动 required、请求检查、正式吞吐和 profile 都在 SM100 真模型上完成。
 - n1：`/workspace/pr61_codex_ec83231/`。`repo/` 是原 PR，`fixed/` 是两处修复，`profile/` 是额外计时探针；后者不进仓库。
 - `out/` 保存正式 benchmark JSON、请求输出、日志和 profiler trace；`tools/` 保存启动、请求和采集脚本。
-- 时间线：`out/agx-trace-bs{1,8}.json.gz`；`out/sg-traces/sg-bs{1,8}-mtp-bs{1,8}-TP-0.trace.json.gz`，可在 Perfetto 打开。
-- 数据和脚本包：n1 的 `results.tar.gz`；`s3://<artifact-bucket>/agxinfer/agxinfer-pr61-codex/results.tar.gz`；本地 `/tmp/agxinfer-pr61-sm100-results/`。
+- 时间线：`out/rsinfer-trace-bs{1,8}.json.gz`；`out/sg-traces/sg-bs{1,8}-mtp-bs{1,8}-TP-0.trace.json.gz`，可在 Perfetto 打开。
+- 数据和脚本包：n1 的 `results.tar.gz`；`s3://<artifact-bucket>/rsinfer/rsinfer-pr61-codex/results.tar.gz`；本地 `/tmp/rsinfer-pr61-sm100-results/`。
 - 所有本轮服务和 tmux 已结束，GPU 6 已释放。没有改动其他任务。

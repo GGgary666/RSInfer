@@ -16,11 +16,11 @@
    - `core.plan` 和 `executors.pytorch` 原来写死了 Qwen 的层和状态种类，现在从模型拿（`model.backends`、`model.stores`）。
    - `state.kv_paged` 原来只放 `k`、`v`，现在一层声明什么张量就放什么。
    - 部署工具在拓扑里把 worker 的单元列出来，一个 worker 只装一族模型的单元。
-4. **有一条和机制有关的经验**：两个模型单元都提供 `model@1`，同一个 worker 里只能有一个。拓扑的角色不列单元时，会把所有 `process = ["worker"]` 的单元都装进去，第二个模型单元加载时报服务冲突。所以现在起引擎必须在拓扑里列出 worker 的单元（`deploy/agxinfer.py` 已经这样做）。
+4. **有一条和机制有关的经验**：两个模型单元都提供 `model@1`，同一个 worker 里只能有一个。拓扑的角色不列单元时，会把所有 `process = ["worker"]` 的单元都装进去，第二个模型单元加载时报服务冲突。所以现在起引擎必须在拓扑里列出 worker 的单元（`deploy/rsinfer.py` 已经这样做）。
 
 ## 在引擎上做的验证
 
-起法：`deploy/agxinfer.py serve <随机 checkpoint，带真 tokenizer> --max-context 1024 --max-rows 4 --cuda-graph auto`。每次比较用同样三个提示词（英文、单词、中文），贪心，各 24 个 token，比三段文本合起来的摘要。
+起法：`deploy/rsinfer.py serve <随机 checkpoint，带真 tokenizer> --max-context 1024 --max-rows 4 --cuda-graph auto`。每次比较用同样三个提示词（英文、单词、中文），贪心，各 24 个 token，比三段文本合起来的摘要。
 
 | 做了什么 | 计划 | 结果 |
 |---|---|---|

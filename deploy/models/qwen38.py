@@ -2,7 +2,7 @@
 need to serve it (``models.qwen38``, ``state.gdn_slots``), and random-weight checkpoints in its
 layout for tests.
 
-A recipe is what ``agxinfer`` knows about one model family: ``matches`` a ``config.json``,
+A recipe is what ``rsinfer`` knows about one model family: ``matches`` a ``config.json``,
 ``add_arguments`` for the flags only it has, ``config`` for the config keys only its units read,
 ``WORKER_ONLY`` for the worker units only it runs, and ``checkpoint``.
 """

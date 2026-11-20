@@ -127,12 +127,12 @@ FlashInfer graph 相对 torch graph 为 **6.37×**。本次只在 capture 前设
 脚本要先从提交 `03579e3` 取出来（见文首）。远程命令使用独立依赖目录（FlashInfer 0.6.14 单独装，不是仓库 `gpu` extra 里的 0.7.2），完整执行脚本保存在本地 `.ossrun-artifacts/attn-matrix-command.sh`：
 
 ```sh
-export ATTN_DEPS=/checkpoint/binary/agxinfer_cuda_graph/attn-bench-deps/flashinfer-0.6.14
+export ATTN_DEPS=/checkpoint/binary/rsinfer_cuda_graph/attn-bench-deps/flashinfer-0.6.14
 export PATH="$ATTN_DEPS/bin:$PATH"
-export FLASHINFER_WORKSPACE_BASE=/checkpoint/binary/agxinfer_cuda_graph/attn-bench-cache
+export FLASHINFER_WORKSPACE_BASE=/checkpoint/binary/rsinfer_cuda_graph/attn-bench-cache
 export MAX_JOBS=4
 bench() {
-  bash oss_run_agxinfer_cuda_graph/scripts/ossrun/gpu.sh exec \
+  bash oss_run_rsinfer_cuda_graph/scripts/ossrun/gpu.sh exec \
     env PYTHONPATH="$ATTN_DEPS:$PWD/engine:$PWD" python -m tests.gpu.bench_attn "$@"
 }
 bench --batches 1 8 32 --lengths 32 256 4096 --max-context 4096 --iterations 20 --repeats 7 --warmup 5
@@ -144,7 +144,7 @@ bench --batches 8 --lengths 4096 --varlen --max-context 4096 --iterations 20 --r
 
 ## 日志回收与本地验证
 
-测量进程在 2026-11-11 04:03:14 UTC 写出最终 `AGXINFER_ATTN_MATRIX_OK`。ossrun 的原命令完成状态回写滞后；未把其 `running` 状态当作成功证据。通过只读 probe `cmd_20261111T041319Z_probe_attn-fetch-probe_81ae330f` 取回三个完整 JSON，probe 为 `done / exit 0` 且匹配 `ATTN_FETCH_OK`；另行核对 36+8+4 条记录全部正确、release 和脚本 SHA256 一致。远程诊断确认没有 benchmark 进程、GPU 空闲。诊断期间另一个 GPU smoke 在 04:08:49 UTC 才开始，晚于矩阵完成，没有与测量重叠。
+测量进程在 2026-11-11 04:03:14 UTC 写出最终 `RSINFER_ATTN_MATRIX_OK`。ossrun 的原命令完成状态回写滞后；未把其 `running` 状态当作成功证据。通过只读 probe `cmd_20261111T041319Z_probe_attn-fetch-probe_81ae330f` 取回三个完整 JSON，probe 为 `done / exit 0` 且匹配 `ATTN_FETCH_OK`；另行核对 36+8+4 条记录全部正确、release 和脚本 SHA256 一致。远程诊断确认没有 benchmark 进程、GPU 空闲。诊断期间另一个 GPU smoke 在 04:08:49 UTC 才开始，晚于矩阵完成，没有与测量重叠。
 
 本地原始证据保存在 worktree 的 `.ossrun-artifacts/`（忽略，不提交生成物）：
 

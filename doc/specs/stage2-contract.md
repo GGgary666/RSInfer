@@ -391,7 +391,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 配置项只对应 SGLang 已有的参数，默认值和 `auto` 的含义也照 SGLang。都是 startup 键：
 
-| agxinfer 的键 | SGLang | 默认值 |
+| RSInfer 的键 | SGLang | 默认值 |
 |---|---|---|
 | `state.kv.page_size` | `--page-size` | 16 |
 | `state.kv.dtype` | `--kv-cache-dtype` | `auto`：等于模型的 dtype |
@@ -445,7 +445,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 #### 5.5.7 SGLang 配置空间与兼容约束清单（2026-11-09）
 
-以下是 [SGLang](https://github.com/sgl-project/sglang) 的源码静态分析记录。本节的远程源码入口固定到 [`ff762d6`](https://github.com/sgl-project/sglang/tree/ff762d62f8d236e95903620ff0b7e82ac89890db)，便于定位与后续复核。原始分析所用源码副本未记录上游提交，部分文件与该链接版本不同，因此不声称下表与链接版本逐项一致；实际接入时须按选定版本复核能力约束。下表区分可配置选项、原始检查到的代码约束和 agxinfer 的设计决定；没有运行 GPU 性能或全组合正确性实验。SGLang 可通过注册扩展选项，枚举的是原始检查中的内置项。
+以下是 [SGLang](https://github.com/sgl-project/sglang) 的源码静态分析记录。本节的远程源码入口固定到 [`ff762d6`](https://github.com/sgl-project/sglang/tree/ff762d62f8d236e95903620ff0b7e82ac89890db)，便于定位与后续复核。原始分析所用源码副本未记录上游提交，部分文件与该链接版本不同，因此不声称下表与链接版本逐项一致；实际接入时须按选定版本复核能力约束。下表区分可配置选项、原始检查到的代码约束和 RSInfer 的设计决定；没有运行 GPU 性能或全组合正确性实验。SGLang 可通过注册扩展选项，枚举的是原始检查中的内置项。
 
 **attention/backend 维度。** prefill 与 decode 可分别选择；draft 模型和 linear-attention verify 还有自己的 backend。名字出现在 choices 中不代表适用于每种模型、dtype 或设备。
 
@@ -481,7 +481,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 **已检查到的具体约束。** 这些是原始检查中具体实现路径的约束，不是 HND、SWA 或某个算法的普遍限制。
 
-| 实现路径 | 代码证据 | 对 agxinfer 的处理 |
+| 实现路径 | 代码证据 | 对 RSInfer 的处理 |
 |---|---|---|
 | 普通 FlashInfer wrapper | [layers/attention/flashinfer_backend.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/flashinfer_backend.py) 多处以 `NHD` 初始化；部分直连路径要求 direct NHD | NHD 作为该路线基线；HND 不能仅靠改配置宣称支持 |
 | TRT-LLM MHA | [trtllm_mha_backend.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/trtllm_mha_backend.py) 的 `_reshape_paged_kv_cache` 经 `paged_kv_view`/`permute` 交出 HND 形状，可能仍是 NHD 物理 stride | 区分 kernel 形状和物理排列；适配能力按具体调用验证，不默认整个池必须复制，也不默认任意 stride 都可用 |
@@ -489,7 +489,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 | MXFP8 pool | [memory_pool.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/memory_pool.py) 中的 `MHATokenToKVPoolMXFP8` 拒绝 `SGLANG_USE_HND_KVCACHE` | 量化是独立布局能力，不能继承普通 HND 的支持结论 |
 | page-major / unified pool | [arg_groups/kv_cache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/kv_cache_hook.py) 按完整、线性、prefill/decode backend 校验；部分 prefill 需要 gather/scatter 连续状态 | 默认保持逐层池；跨层组织作为独立扩展，公开适配成本 |
 | CP sharded padded | [mem_cache/registry.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/registry.py) 拒绝 radix cache 或 streaming session；[page_interleave_pool.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/mem_cache/page_interleave_pool.py) 的相应 KV sharding 路径只接受 NHD | 明确标为不支持的组合，不把 prefix cache 开关当成万能兼容项 |
-| HiCache IO | [arg_groups/hicache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/hicache_hook.py) 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；agxinfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
+| HiCache IO | [arg_groups/hicache_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/hicache_hook.py) 将 `page_first + direct` 解析为 `page_first_direct` | GPU/host 布局分别解析；RSInfer 对显式配置冲突报错，只有 auto 可以选择兼容替代 |
 | SM100 FlashInfer GDN | [arg_groups/attention_hook.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/arg_groups/attention_hook.py) 的该 decode/verify 路径要求 BF16 recurrent state；[gdn_triton.py](https://github.com/sgl-project/sglang/blob/ff762d62f8d236e95903620ff0b7e82ac89890db/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) 声明 K-last 池 | 保留 FP32 参照路线；请求该 FlashInfer 路径时显式选择并验收 BF16，不静默降精度 |
 
 #### 5.5.8 阶段 2 的布局：严格照 SGLang（2026-11-09 改）
@@ -560,7 +560,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 ## 8. attention 和 GDN 的 backend（@gaow0007 审）
 
-代码：`core/contracts/plan.py` 的 `Backend`。以下补充记录 2026-11-09 的评审结论；是待实现的契约，不表示当前接口和 GPU 路径已经全部落实。模型/backend 的计算边界、分阶段执行及状态处理参考 [SGLang](https://github.com/sgl-project/sglang)（源码入口及版本范围见 §5.5.7），资源管理和配置变更接入 agxinfer 的 state store、worker 与 plan。
+代码：`core/contracts/plan.py` 的 `Backend`。以下补充记录 2026-11-09 的评审结论；是待实现的契约，不表示当前接口和 GPU 路径已经全部落实。模型/backend 的计算边界、分阶段执行及状态处理参考 [SGLang](https://github.com/sgl-project/sglang)（源码入口及版本范围见 §5.5.7），资源管理和配置变更接入 RSInfer 的 state store、worker 与 plan。
 
 **职责总则：backend 准备元数据、组织计算及状态更新；worker 保证执行顺序和配置切换边界；plan 管理 graph 的捕获、选择和失效。** backend 不在每步调用中自行切换配置或重录 graph。
 
@@ -568,7 +568,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 2026-11-09 补充：阶段 2 每种状态只有 SGLang 的那一种布局（§5.5），下面说的显式配置就是 §5.5.3 那张表里的键，解析和日志按 §5.5.3 做。
 
-- **显式 layout 是硬约束。** 用户指定 layout、其余选项为 `auto` 时，参考 SGLang 在对应设备、模型和精度下的默认搭配，从 agxinfer 已注册且已验收的组合中选择。遵守 §5.5.8 的布局和精度约束；不能为了套用默认 backend 而更换显式 layout、降低精度或关闭功能。SGLang 的默认搭配是选择依据，不代表 agxinfer 已支持该组合。
+- **显式 layout 是硬约束。** 用户指定 layout、其余选项为 `auto` 时，参考 SGLang 在对应设备、模型和精度下的默认搭配，从 RSInfer 已注册且已验收的组合中选择。遵守 §5.5.8 的布局和精度约束；不能为了套用默认 backend 而更换显式 layout、降低精度或关闭功能。SGLang 的默认搭配是选择依据，不代表 RSInfer 已支持该组合。
 - **启动或配置变更时统一解析、校验完整组合。** 一次解析启用阶段的 prefill/decode/verify backend 与具体 kernel/solution，并校验模型语义、设备、物理 layout/stride、dtype、page size，以及启用的 prefix、speculation 和 graph 能力。未启用的 verify 标为 disabled；以后启用时重新校验。不能让各阶段独立选择后，等执行时才发现状态不兼容。
 - **跨阶段状态兼容性属于组合校验。** 不同 kernel 可以共享满足其约定的状态；需要适配时，适配路径必须已实现并验收，且明确转换发生的位置。GDN 同时检查 conv/recurrent 状态、快照恢复和投机部分接受所需的中间状态。形状相同不足以证明语义或物理布局兼容。
 - **不兼容的显式配置直接 fail-fast。** 没有合法 auto 组合也失败。在候选池分配、capture 和新配置生效前完成能力校验，报出冲突阶段、用户请求及所需能力。配置变更被拒绝时保留当前有效组合；不静默切换显式 backend/layout。§6 的 kernel 参照回退不能绕过这里的显式约束。
@@ -701,7 +701,7 @@ worker 在测试和调试模式下按这几条检查每份计划。检查的代�
 
 ### 9.3 replay 前检查
 
-**绑定版本检查（2026-11-09 讨论确认）：** 为支持 agxinfer 的资源变更和单元热更新，graph 记录并检查提供者身份及 binding generation。现有 `Binding.generation` 已声明该方向，本节补充其语义；这不是直接沿用 SGLang 的通用 replay 版本检查。在本次检查的 SGLang full/decode graph 路径中，主要由 runner 管理固定资源、判断执行规格并选择 graph；请求行复用所用的 `req_generation` 与这里的绑定版本不同。
+**绑定版本检查（2026-11-09 讨论确认）：** 为支持 RSInfer 的资源变更和单元热更新，graph 记录并检查提供者身份及 binding generation。现有 `Binding.generation` 已声明该方向，本节补充其语义；这不是直接沿用 SGLang 的通用 replay 版本检查。在本次检查的 SGLang full/decode graph 路径中，主要由 runner 管理固定资源、判断执行规格并选择 graph；请求行复用所用的 `req_generation` 与这里的绑定版本不同。
 
 **Generation 是绑定版本，不是内容版本。** 首版每个提供者（状态单元、backend、持久 batch、权重存储）使用一个粗粒度绑定计数器；它交出的任一相关 buffer 的绑定改变，就使该提供者旧绑定上的 graph 失效。先接受可能多重录一些 graph 的代价，不引入逐 tensor 的生产版本系统。
 

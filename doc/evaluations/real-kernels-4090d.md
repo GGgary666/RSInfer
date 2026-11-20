@@ -22,7 +22,7 @@ M2b（[../specs/stage2-contract.md](../specs/stage2-contract.md) §1.3）在这�
    benchmark 里开重叠的 graph 每步 6.0–6.4 ms，已经等于这个设备时间。换 kernel 之前，Triton GDN 让 graph 每步快了 0.3–1.0 ms，FlashInfer 再快 0–0.8 ms（见下表）。只有 4 层时 LM head 占了约四成；完整 64 层时它被摊薄，但每层的 GEMM（0.83 ms）仍是非 GEMM 部分（0.12 ms）的 7 倍。带宽高得多的 SM100 上占比会不同，要在那里重新 profile。
 3. **FlashInfer 的意义在于 graph 步的代价不再跟 `batch.max_context_len` 走。** 之前 graph 里的 attention 按表宽算，`max_context` 从 256 调到 4096，8 行的每步时间从 7.39 涨到 8.15 ms；现在两档都是 6.40 ms。
 4. **热更新没发现问题。** 在跑着的引擎上改 `kernels.triton`、`kernels.flashinfer` 的代码和 backend 配置，计划、生效、撤回、显存都符合预期（见下）。没有需要写进 `doc/framework-bugs/` 的。
-5. **和原生 SGLang 对比（同一天补测，见"和原生 SGLang 对比"一节）：经 HTTP 的吞吐，decode 是它的 95.5–98.9%，prefill 是 94%。** 同一个 checkpoint、同一个 tokenizer、同样的请求，SGLang 是 `e838360` 的默认配置。每个 token 的间隔，agxinfer 比它多 0.2–0.3 ms（1 并发 6.00 对 5.80 ms，32 并发 7.55 对 7.35 ms）。**差距主要来自 RMSNorm 还在用参照实现**（见"差距在哪"）：实验里只把它换成 FlashInfer 的融合 kernel，decode 就到了 SGLang 的 97–101%，prefill 到了 93–99%。
+5. **和原生 SGLang 对比（同一天补测，见"和原生 SGLang 对比"一节）：经 HTTP 的吞吐，decode 是它的 95.5–98.9%，prefill 是 94%。** 同一个 checkpoint、同一个 tokenizer、同样的请求，SGLang 是 `e838360` 的默认配置。每个 token 的间隔，RSInfer 比它多 0.2–0.3 ms（1 并发 6.00 对 5.80 ms，32 并发 7.55 对 7.35 ms）。**差距主要来自 RMSNorm 还在用参照实现**（见"差距在哪"）：实验里只把它换成 FlashInfer 的融合 kernel，decode 就到了 SGLang 的 97–101%，prefill 到了 93–99%。
 
 ## 环境
 
@@ -139,7 +139,7 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 - **让 SGLang 加载这个 checkpoint 要两处调整**：
   - `Qwen3_5ForConditionalGeneration` 是多模态结构，SGLang 会去找图像处理器的文件。在 config.json 里加 `"language_model_only": true`（SGLang 认 checkpoint 自己的这个声明）；`--language-model-only` 这个命令行开关在 `e838360` 不支持这个结构。
   - tokenizer 用 HF 缓存里 `Qwen/Qwen3.6-27B` 的（本机已有，词表 248044）。测试里的词级 tokenizer 不行：用它时 SGLang 的启动预热请求失败（取最后一个 token 的隐状态时张量是空的），日志里它对这个 tokenizer 做了组件"修正"；具体原因没有再查。
-- **agxinfer**：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --graph-buckets 1 2 4 8 16 32`，graph 录到 32 行是为了和 SGLang 对齐。prefill 那一组再加 `--token-budget 4096`：SGLang 一步 prefill 的上限是 `chunked_prefill_size`，这张卡上是 4096（见"prefill 每步多少 token"）。decode 那一组是带着 `--token-budget 16384 --mem-fraction 0.75` 测的，prompt 只有 32 个 token，这两项不影响结果（`--mem-fraction` 用默认的 0.85 时是 164.9 / 627.3 / 1230.8 / 2334.5 / 4021.9 token/s）。
+- **RSInfer**：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --graph-buckets 1 2 4 8 16 32`，graph 录到 32 行是为了和 SGLang 对齐。prefill 那一组再加 `--token-budget 4096`：SGLang 一步 prefill 的上限是 `chunked_prefill_size`，这张卡上是 4096（见"prefill 每步多少 token"）。decode 那一组是带着 `--token-budget 16384 --mem-fraction 0.75` 测的，prompt 只有 32 个 token，这两项不影响结果（`--mem-fraction` 用默认的 0.85 时是 164.9 / 627.3 / 1230.8 / 2334.5 / 4021.9 token/s）。
 - **负载**：`tests/gpu/bench_serving.py`（新）。每档并发有那么多个客户端，各自一个接一个地发 `/v1/completions`（流式、贪心、`ignore_eos`）。每个请求的 prompt 全程唯一。
   - decode：prompt 32 个 token，生成 256 个；每个客户端 4 个请求。
   - prefill：prompt 2000 个 token，生成 8 个；每个客户端 8 个请求。
@@ -149,7 +149,7 @@ FlashInfer 把一步拆成两半：在 graph 外按这一步的长度做 plan（
 
 decode（输出 token/s；每 token 间隔是每个请求第一个 token 之后的平均间隔，取中位数）：
 
-| 并发 | SGLang token/s | agxinfer token/s | 比例 | SGLang 每 token | agxinfer 每 token |
+| 并发 | SGLang token/s | RSInfer token/s | 比例 | SGLang 每 token | RSInfer 每 token |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 171.0 | 164.8 | 96.4% | 5.80 ms | 6.00 ms |
 | 4 | 656.7 | 627.1 | 95.5% | 6.01 ms | 6.31 ms |
@@ -159,15 +159,15 @@ decode（输出 token/s；每 token 间隔是每个请求第一个 token 之后�
 
 prefill（输入 token/s；首 token 时间取中位数）：
 
-| 并发 | SGLang token/s | agxinfer token/s | 比例 | SGLang 首 token | agxinfer 首 token |
+| 并发 | SGLang token/s | RSInfer token/s | 比例 | SGLang 首 token | RSInfer 首 token |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 19166 | 17926 | 93.5% | 63 ms | 65 ms |
 | 4 | 30801 | 29120 | 94.5% | 162 ms | 181 ms |
 | 8 | 35506 | 33325 | 93.9% | 258 ms | 289 ms |
 
 - SGLang 重复跑一次是 19992 / 31685 / 36098 token/s，首 token 59 / 159 / 251 ms：两次的吞吐相差 2–4%。
-- decode 的首 token 时间：SGLang 17–81 ms，agxinfer 24–93 ms。
-- **agxinfer 的默认配置**（graph 桶到 8 行，`--token-budget 2048`，`--mem-fraction 0.85`）下 decode 是 164.8 / 624.0 / 1225.8 / 2199.2 / 3947.7 token/s：16 并发是 SGLang 的 93%，32 并发是 95%。超过 8 行的步走 eager，开重叠时差得不多。
+- decode 的首 token 时间：SGLang 17–81 ms，RSInfer 24–93 ms。
+- **RSInfer 的默认配置**（graph 桶到 8 行，`--token-budget 2048`，`--mem-fraction 0.85`）下 decode 是 164.8 / 624.0 / 1225.8 / 2199.2 / 3947.7 token/s：16 并发是 SGLang 的 93%，32 并发是 95%。超过 8 行的步走 eager，开重叠时差得不多。
 
 ### prefill 每步多少 token
 
@@ -176,11 +176,11 @@ prefill（输入 token/s；首 token 时间取中位数）：
 | | 每步 prefill 的上限 | 这张卡上的值 |
 |---|---|---|
 | SGLang | `chunked_prefill_size`，没指定时按显存大小定 | 4096 |
-| agxinfer | `sched.token_budget`，固定默认值 | 2048 |
+| RSInfer | `sched.token_budget`，固定默认值 | 2048 |
 
 SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时先碰到的是 4096：它的日志里一步最多 `#new-token: 4096`。
 
-同一个 prefill 负载、8 并发，agxinfer 在三种预算下（吞吐都是 3.3 万 token/s 左右，受 GEMM 限制）：
+同一个 prefill 负载、8 并发，RSInfer 在三种预算下（吞吐都是 3.3 万 token/s 左右，受 GEMM 限制）：
 
 | `--token-budget` | 首 token 中位数 | 说明 |
 |---:|---:|---|
@@ -192,12 +192,12 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 
 ### 测的过程里碰到的
 
-- **第一版脚本不同并发档位之间有重复的 prompt，SGLang 的前缀缓存命中了**（它的日志里 `#cached-token: 3968`），8 并发的 prefill 看起来是我们的 1.7 倍。改成全程唯一以后是上表的 94%。agxinfer 现在没有前缀复用（M2d），真实负载里有重复前缀时这个差距会回来。
+- **第一版脚本不同并发档位之间有重复的 prompt，SGLang 的前缀缓存命中了**（它的日志里 `#cached-token: 3968`），8 并发的 prefill 看起来是我们的 1.7 倍。改成全程唯一以后是上表的 94%。RSInfer 现在没有前缀复用（M2d），真实负载里有重复前缀时这个差距会回来。
 - **`--token-budget 16384` 加默认的 `--mem-fraction 0.85` 会让 worker OOM**，引擎停止服务，只能重启。原因是这两个配置之间没有联系，而不是 prefill 本身费显存：
   - 一步 prefill 的瞬时显存和 token 数成正比，进程内量到每个 token 约 200 KiB（峰值已分配量）：2000 个 token 395 MiB，4000 个 781 MiB，16000 个 3121 MiB。PyTorch 的分配器为这个峰值保留的更多，16000 个 token 那一步之后保留量涨了 5.7 GiB。
   - 默认的 0.85 分给状态池 12.41 GiB，权重 7.6 GiB，graph 和 FlashInfer 的 workspace 约 0.6 GiB，剩下不到 3 GiB。4096 个 token 的步放得下（实测，没有 OOM），16000 个的放不下。
   - SGLang 是从每步上限反推池的大小：留 `512 MB + 1.5 MB × chunked_prefill_size`，再加 graph 的份，剩下的才给权重和池。这张卡上是 0.705，状态池 8.65 GB（KV 4.56，GDN 4.09），建完池、录完 graph 以后还空着 5.3 GB。按同一个公式，每步 2048 个 token 对应的是 0.83 左右，和我们的 0.85 接近，所以我们的两个默认值彼此大致一致；只是把 `sched.token_budget` 调大时，`holder.mem_fraction` 不会跟着降。
-  - **同样大小的步，我们用的显存和 SGLang 是一个量级。** 都是每步最多 4096 个 token、同一个 8 并发 prefill 负载，`nvidia-smi` 的占用：agxinfer 从 21532 涨到 23062 MiB（+1.5 GiB），SGLang 从 18692 涨到 19430 MiB（+0.7 GiB），另外它启动时已经给 prefill graph 留了 0.9 GB。空闲时我们多占 2.8 GiB，主要是状态池更大（12.41 GiB 对它日志里的 8.65 GB：KV 171 万 token 对 119 万，GDN 槽 656 对 455）；SGLang 那边另有 prefill graph 的占用。
+  - **同样大小的步，我们用的显存和 SGLang 是一个量级。** 都是每步最多 4096 个 token、同一个 8 并发 prefill 负载，`nvidia-smi` 的占用：RSInfer 从 21532 涨到 23062 MiB（+1.5 GiB），SGLang 从 18692 涨到 19430 MiB（+0.7 GiB），另外它启动时已经给 prefill graph 留了 0.9 GB。空闲时我们多占 2.8 GiB，主要是状态池更大（12.41 GiB 对它日志里的 8.65 GB：KV 171 万 token 对 119 万，GDN 槽 656 对 455）；SGLang 那边另有 prefill graph 的占用。
 - SGLang 冷缓存的启动约 90 秒，其中录 prefill graph 56–64 秒（50 个长度档位，含 Triton 的编译和 autotune）；缓存热了以后录 prefill graph 4.3 秒。
 
 ## 差距在哪
@@ -206,7 +206,7 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 
 ### decode（8 行，每步；两边都是 graph 回放里的 kernel）
 
-| | SGLang | agxinfer |
+| | SGLang | RSInfer |
 |---|---:|---:|
 | kernel launch 次数 | 82 | 238 |
 | 设备上 kernel 时间合计 | 6.22 ms | 6.37 ms |
@@ -218,13 +218,13 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 | 采样 | 0.011 | 0.011 |
 | GDN conv、gated norm | 0.012 | 0.012 |
 
-- agxinfer 一栏里按 definition 分的数字是在 eager 下给每个 definition 的调用打标签量的（合计 6.40 ms），graph 回放的合计是 6.37 ms。attention 两边都在 0.01–0.02 ms，抓 trace 时两边的上下文长度不同，不比。
+- RSInfer 一栏里按 definition 分的数字是在 eager 下给每个 definition 的调用打标签量的（合计 6.40 ms），graph 回放的合计是 6.37 ms。attention 两边都在 0.01–0.02 ms，抓 trace 时两边的上下文长度不同，不比。
 - 不带 profiler 时每步是 6.40 对 6.15 ms，差 0.25 ms。kernel 时间差 0.15–0.18 ms，其中 RMSNorm 一项 0.16 ms。剩下的 0.07–0.10 ms 我归到每步多出的 156 次 launch 上（每个 kernel 之间的间隙），这一项是推出来的，没有直接量。
 - 参照实现的 RMSNorm 慢，是因为它照 `forward_native` 一步一步算：升到 fp32、平方、求均值、rsqrt、乘两次、降回 bf16，带 residual 时再加一次，每一步是一个 kernel。同样 `[8, 5120]` 带 residual 的一次调用，参照实现 93 µs，FlashInfer 的 `gemma_fused_add_rmsnorm` 9 µs。
 
 ### prefill（一步 2000 个 token）
 
-| | SGLang | agxinfer |
+| | SGLang | RSInfer |
 |---|---:|---:|
 | kernel launch 次数 | 257 | 311 |
 | 设备上 kernel 时间合计 | 47.2 ms | 51.3–51.5 ms（3 次） |
@@ -236,8 +236,8 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 | attention | 0.48（ragged） | 0.49（paged） |
 | Q/K norm + RoPE | 0.084（融合） | 0.124，另有 2 次 norm 调用算在上面 |
 
-- GEMM 那一行的差在 agxinfer 自己几次测量的波动之内，不算差距。
-- SGLang 的 prefill 是从它的 prefill graph 回放的，agxinfer 的是 eager。host 一侧的差别这里看不到。
+- GEMM 那一行的差在 RSInfer 自己几次测量的波动之内，不算差距。
+- SGLang 的 prefill 是从它的 prefill graph 回放的，RSInfer 的是 eager。host 一侧的差别这里看不到。
 
 ### 验证：只换 RMSNorm
 
@@ -252,7 +252,7 @@ SGLang 的 `max_prefill_tokens`（16384）是另一个上限，开着分块时�
 
 - decode 的差距去掉了一半以上：每 token 多出的时间从 0.20–0.30 ms 降到 0.04–0.17 ms。
 - 换之后剩下的 decode 差距，按上表是 RoPE 和 Q/K norm 的融合、SiLU·mul、packed decode，以及仍然多出的 launch。
-- **1 并发的 prefill 没有变（93%）**，首 token 71 对 63 ms。这一档每个请求只有一步 prefill 加 7 步 decode，设备上的 kernel 时间解释不了这 8 ms；我没有再往下查，可能在 host 一侧（agxinfer 的 prefill 是 eager，每步 300 多次 launch 从 Python 发出）。
+- **1 并发的 prefill 没有变（93%）**，首 token 71 对 63 ms。这一档每个请求只有一步 prefill 加 7 步 decode，设备上的 kernel 时间解释不了这 8 ms；我没有再往下查，可能在 host 一侧（RSInfer 的 prefill 是 eager，每步 300 多次 launch 从 Python 发出）。
 
 ## 在跑着的引擎上热改
 

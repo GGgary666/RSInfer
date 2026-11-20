@@ -49,7 +49,7 @@ def checkpoint_at(root: Path) -> Path:
     checkpoint = root / "checkpoint"
     marker = root / "checkpoint-ready.json"
     if not marker.exists():
-        subprocess.run([sys.executable, str(REPO / "deploy/agxinfer.py"), "checkpoint", "--config", str(config),
+        subprocess.run([sys.executable, str(REPO / "deploy/rsinfer.py"), "checkpoint", "--config", str(config),
                         "--layers", "4", "--out", str(checkpoint), "--dtype", "bf16", "--seed", "1"], check=True)
         marker.write_text(json.dumps({"layers": 4, "seed": 1, "dtype": "bf16"}))
     return checkpoint
@@ -187,7 +187,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
     print("BENCH_RESULT " + json.dumps(result, default=str), flush=True)
-    print("AGXINFER_GRAPH_BENCH_OK", flush=True)
+    print("RSINFER_GRAPH_BENCH_OK", flush=True)
 
 
 if __name__ == "__main__":

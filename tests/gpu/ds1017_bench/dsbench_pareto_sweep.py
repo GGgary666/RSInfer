@@ -1,6 +1,6 @@
-"""4-GPU Pareto sweep driver for agxinfer matching DeepInfer's ``examples/sweep/run_sweep.sh``.
+"""4-GPU Pareto sweep driver for rsinfer matching DeepInfer's ``examples/sweep/run_sweep.sh``.
 
-Drives a running ``agxinfer`` engine directly over ``StepChannel`` (pre-tokenized ``NewRequest`` ->
+Drives a running ``rsinfer`` engine directly over ``StepChannel`` (pre-tokenized ``NewRequest`` ->
 ``TokenEvents`` shared-memory IPC, matching ``examples/benchmark.py``'s in-process ``_add_request`` +
 ``step()`` boundary) and appends JSONL records in the exact schema consumed by DeepInfer's
 ``examples/sweep/plot_pareto.py``:
@@ -119,7 +119,7 @@ async def _open_step_channel(
     sched_proc = msgspec.convert(cfg["frontend.scheduler"], ProcId)
     tun = IpcTunables(rpc_timeout_s=300.0, close_timeout_s=10.0)
     zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
-    shm_name = f"agx-pareto-{os.getpid()}-{secrets.token_hex(4)}"
+    shm_name = f"rsinfer-pareto-{os.getpid()}-{secrets.token_hex(4)}"
     raw_reader, addr = open_reader(
         zctx, local=sched_proc.host, peer=sched_proc.host, bind_host="127.0.0.1",
         shm_name=shm_name, tun=tun, replaceable=True,
@@ -355,7 +355,7 @@ async def _run_prefill_point(
         record["prefill_device_tokens_per_s_per_gpu"] = window_tokens / native["seconds"]
     _append_jsonl(result_jsonl, record)
     print(
-        f"PARETO-AGX prefill batch_size={prefill_batch_size}: "
+        f"PARETO-RSINFER prefill batch_size={prefill_batch_size}: "
         f"step={step_ms:.2f} ms ({window_steps} steps, expected {expected_steps}), "
         f"throughput={tps_per_gpu:,.1f} tokens/s/GPU (4-GPU total={tps_per_gpu * dp_size:,.0f} tok/s)",
         flush=True,
@@ -474,7 +474,7 @@ async def _run_decode_point(
     }
     _append_jsonl(result_jsonl, record)
     print(
-        f"PARETO-AGX decode reqs/GPU={decode_num_requests} (4-GPU={total_reqs}): "
+        f"PARETO-RSINFER decode reqs/GPU={decode_num_requests} (4-GPU={total_reqs}): "
         f"avg_SPS={avg_sps:.2f} tok/s/user ({1000.0 / avg_sps:.2f} ms/step, max={max_step_ms:.2f} ms), "
         f"throughput={tps_per_gpu:,.1f} tokens/s/GPU (4-GPU total={tps_per_gpu * dp_size:,.0f} tok/s)",
         flush=True,
@@ -527,7 +527,7 @@ async def _amain(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--run", type=Path, required=True, help="Running agxinfer run directory")
+    p.add_argument("--run", type=Path, required=True, help="Running rsinfer run directory")
     p.add_argument("--model", type=Path, required=True, help="Local HF checkpoint directory (for vocab/config)")
     p.add_argument("--model-name", default="deepseek-ai/DeepSeek-V4.1-Flash-1017")
     p.add_argument("--mode", required=True, choices=["prefill", "decode"])

@@ -27,7 +27,7 @@
 | 做了什么 | 计划 | 结果 |
 |---|---|---|
 | master `80ee578`，4 层 dummy 权重，`--cuda-graph auto --overlap --max-rows 8 --max-context 4096 --token-budget 2048`，冷启动 | | 输出每个 token 都是 `.`，对不了 |
-| 停掉，`agxinfer checkpoint --layers 4 --dtype bf16 --seed 1`（14 秒，7.6 GiB），同样参数冷启动 | | 身份 `200ef73d5d49b01c`。基线：A、B、A2（同 A）、short 四个请求，A 和 A2 文本相同 |
+| 停掉，`rsinfer checkpoint --layers 4 --dtype bf16 --seed 1`（14 秒，7.6 GiB），同样参数冷启动 | | 身份 `200ef73d5d49b01c`。基线：A、B、A2（同 A）、short 四个请求，A 和 A2 文本相同 |
 | 把 #59 的 `engine/` 拷进工作区，`check`、`apply --dry-run`、`apply` | 调度宿主重载 `core.sched`、`core.state.alloc`、`sched.reqs`；worker 重载 `core.plan`、`core.worker`、`executors.pytorch`、`kernels.reference`、`kernels.triton`、`layers.attn`、`layers.gdn`、`state.gdn_slots`、`worker.batch`；前端只排空 | 提交，2.4 秒；调度器日志：`prefix cache on, 656 gdn.slots for at most 131 requests at once`。同样四个请求：A、A2、short 和基线相同，A2 首 token 32 → 22 ms；B 不同（见结论 3） |
 | `apply --config '{"model.dtype": "f32", "state.gdn.conv_dtype": "f32"}'` | 重载 `core.state.weights`、`models.qwen38`、`layers.attn`、`layers.gdn`、`state.gdn_slots` | **失败，要求恢复**：重读权重时 OOM，撤回没得到确认。写了 framework-bugs 报告 |
 | 停掉，`--dtype f32 --conv-dtype f32` 冷启动（#59 的代码） | | 250 个 GDN 槽，最多 50 个请求。四个请求开着缓存跑一遍 |

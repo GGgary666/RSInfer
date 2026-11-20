@@ -1,5 +1,5 @@
 """Stage 2's M2a (stage2-contract.md §1.3): the whole engine on the CPU, started the way an operator
-starts it (``deploy/agxinfer.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
+starts it (``deploy/rsinfer.py serve``), with a small random-weight Qwen3.8 in a real checkpoint's
 layout and a real HF tokenizer. Text through HTTP, out of the frontend, the scheduler host and a
 worker process, equals what HF's model computes, greedy, token by token."""
 
@@ -260,22 +260,22 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
         # synced, and a subsequent hot-add builds on the running topology instead of reverting env
         # and restarting the worker a second time.
         custom = json.loads((run / "topology.json").read_text())
-        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"AGX_TEST_TOPO_ENV": "kept"}
+        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"RSINFER_TEST_TOPO_ENV": "kept"}
         topo_file = tmp_path / "custom-topology.json"
         topo_file.write_text(json.dumps(custom))
         restarted = json.loads(cli("control", "apply", "--topology", str(topo_file), "--run", str(run)))
         assert restarted["status"] == "committed" and restarted["restarted"] == ["host-a/worker/0"], restarted
-        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept"}
+        assert worker_role()["env"] == {"RSINFER_TEST_TOPO_ENV": "kept"}
 
-        # Direct core.control.client --topology (bypassing agxinfer.py) is also picked up from the
+        # Direct core.control.client --topology (bypassing rsinfer.py) is also picked up from the
         # control plane's committed change log rather than overwritten by a stale topology.json.
         control = json.loads((run / "control" / "control.json").read_text())["control"]
-        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"AGX_TEST_TOPO_ENV": "kept-direct"}
+        next(r for r in custom["roles"] if r["name"] == "worker")["env"] = {"RSINFER_TEST_TOPO_ENV": "kept-direct"}
         topo_file.write_text(json.dumps(custom))
         direct = subprocess.run([sys.executable, "-m", "core.control.client", "--control", control, "apply",
                                  "--topology", str(topo_file)], env=ENV, capture_output=True, text=True, timeout=300)
         assert direct.returncode == 0 and json.loads(direct.stdout)["restarted"] == ["host-a/worker/0"], direct.stdout
-        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept"}  # local file not touched by direct client
+        assert worker_role()["env"] == {"RSINFER_TEST_TOPO_ENV": "kept"}  # local file not touched by direct client
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
         added.mkdir()
@@ -284,7 +284,7 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
                                          'entry = "kernels.added.unit:Unit"\n\n[provides]\nservices = ["kernels.added@1"]\n')
         (added / "unit.py").write_text("import os\nfrom typing import Any\n\n\nclass Unit:\n"
                                        "    def __init__(self, ctx: Any, config: Any) -> None:\n"
-                                       '        assert os.environ.get("AGX_TEST_TOPO_ENV") == "kept-direct"\n'
+                                       '        assert os.environ.get("RSINFER_TEST_TOPO_ENV") == "kept-direct"\n'
                                        '        ctx.provide("kernels.added@1", self)\n')
         assert apply("--dry-run")["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
         assert "kernels.added" not in listed()  # a dry run leaves the run directory's topology
@@ -292,7 +292,7 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
         assert applied["status"] == "committed" and "restarted" not in applied, applied
         assert applied["processes"]["host-a/worker/0"] == {"stage": ["kernels.added"]}
         assert "kernels.added" in running() and "kernels.added" in listed()
-        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept-direct"}
+        assert worker_role()["env"] == {"RSINFER_TEST_TOPO_ENV": "kept-direct"}
         assert "models.ds1017" not in running()  # still the units of this model's family alone
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
@@ -301,13 +301,13 @@ def test_a_unit_added_to_the_workspace_loads_at_the_next_apply_and_one_removed_u
         assert applied["status"] == "committed" and "restarted" not in applied, applied
         assert applied["processes"]["host-a/worker/0"]["remove"] == ["kernels.added"]
         assert "kernels.added" not in running() and "kernels.added" not in listed()
-        assert worker_role()["env"] == {"AGX_TEST_TOPO_ENV": "kept-direct"}
+        assert worker_role()["env"] == {"RSINFER_TEST_TOPO_ENV": "kept-direct"}
         assert post(url + "/v1/completions", body)["choices"][0]["text"] == baseline
 
 
 def test_the_cli_runs_an_engine_in_the_background_puts_it_to_sleep_and_stops_it(model: Path, tokenizer: Path,
                                                                               tmp_path: Path) -> None:
-    """``agxinfer serve --detach`` returns once the engine is up. ``status``, ``control`` and the
+    """``rsinfer serve --detach`` returns once the engine is up. ``status``, ``control`` and the
     rest find it through its run directory. ``sleep`` gives its memory back and requests are refused;
     ``wake`` loads the weights again and serves what it served before. ``stop`` leaves no process of it."""
     run, port = tmp_path / "run", free_port()
@@ -356,7 +356,7 @@ def test_stop_leaves_an_engine_run_from_inside_the_run_directory_alone(model: Pa
     also those of an engine run from a directory inside it (Codex's review of #54). And ``--host``
     is the frontend's alone: with ``0.0.0.0`` the control plane still listens on this machine only,
     and the URL a client is given is the loopback one."""
-    from deploy.agxinfer import engine_processes
+    from deploy.rsinfer import engine_processes
 
     outer, inner = tmp_path / "run", tmp_path / "run" / "nested"
     ports = {outer: free_port(), inner: free_port()}
@@ -391,12 +391,12 @@ def test_serve_refuses_a_run_directory_whose_last_engine_left_processes(monkeypa
                                                                          tmp_path: Path) -> None:
     """Its control plane is gone, a worker it started is not: that worker keeps its GPU memory, and
     another engine would start beside it."""
-    import deploy.agxinfer as agx
+    import deploy.rsinfer as rsinfer
 
-    monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [4242]))
-    with pytest.raises(SystemExit, match=r"processes \[4242\] of an earlier engine .* agxinfer stop"):
-        agx.cmd_serve(agx.parser().parse_args(["serve", str(tmp_path), "--run", str(tmp_path / "run")]))
-    assert [agx.reachable(h) for h in ("0.0.0.0", "::", "127.0.0.1", "fe80::1")] == \
+    monkeypatch.setattr(rsinfer, "engine_processes", lambda run: (None, [4242]))
+    with pytest.raises(SystemExit, match=r"processes \[4242\] of an earlier engine .* rsinfer stop"):
+        rsinfer.cmd_serve(rsinfer.parser().parse_args(["serve", str(tmp_path), "--run", str(tmp_path / "run")]))
+    assert [rsinfer.reachable(h) for h in ("0.0.0.0", "::", "127.0.0.1", "fe80::1")] == \
         ["127.0.0.1", "[::1]", "127.0.0.1", "[fe80::1]"]
 
 
@@ -405,13 +405,13 @@ def test_stop_without_a_control_plane_asks_every_process_left_to_stop(monkeypatc
     """The control plane is gone and so is the node agent: nothing stops the process hosts for one
     another. Before, only the first one got SIGTERM; the others stayed until ``--timeout`` passed,
     were killed, and ``stop`` failed (Gemini's review of #54)."""
-    import deploy.agxinfer as agx
+    import deploy.rsinfer as rsinfer
 
     left = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]) for _ in range(3)]
     try:
-        monkeypatch.setattr(agx, "engine_processes", lambda run: (None, [p.pid for p in left if p.poll() is None]))
+        monkeypatch.setattr(rsinfer, "engine_processes", lambda run: (None, [p.pid for p in left if p.poll() is None]))
         t0 = time.monotonic()
-        assert agx.cmd_stop(agx.parser().parse_args(["stop", "--run", str(tmp_path), "--timeout", "20"])) == 0
+        assert rsinfer.cmd_stop(rsinfer.parser().parse_args(["stop", "--run", str(tmp_path), "--timeout", "20"])) == 0
         assert time.monotonic() - t0 < 10
         assert [p.returncode for p in left] == [-15, -15, -15]  # each one by SIGTERM, none killed
     finally:
@@ -425,12 +425,12 @@ def test_a_change_s_execution_gets_as_long_as_start_up_and_not_less_than_the_eng
     """A wake reads the weights again while it executes, as start-up does before the check-in: with
     ``--timeout`` above the engine's limit (3600 s), start-up had longer than the wake after it
     (Gemini's second review of #55)."""
-    import deploy.agxinfer as agx
+    import deploy.rsinfer as rsinfer
 
     def limits(timeout: str) -> tuple[float, float]:
-        args = agx.parser().parse_args(["serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu",
+        args = rsinfer.parser().parse_args(["serve", str(model), "--tokenizer", str(tokenizer), "--device", "cpu",
                                         "--run", str(tmp_path / timeout), "--timeout", timeout])
-        tunables = agx.plan(args)[2]
+        tunables = rsinfer.plan(args)[2]
         return tunables["supervisor.checkin_timeout_s"], tunables["change.execute_timeout_s"]
 
     assert limits("7200") == (7200.0, 7200.0)
@@ -441,7 +441,7 @@ def test_the_worker_gpu_follows_the_callers_cuda_visible_devices(monkeypatch: py
     """The node agent sets an engine process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so
     the topology has to place the worker on the GPU the caller was given: before, every engine of a
     machine landed on GPU 0."""
-    from deploy.agxinfer import worker_gpu
+    from deploy.rsinfer import worker_gpu
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assert worker_gpu(None) == 0

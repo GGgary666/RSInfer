@@ -53,7 +53,7 @@ def only_builder(build_dir: Path) -> Generator[None]:
     on it forever (2026-11-12, Codex's review of #55). This lock (``flock``) goes with its holder
     however it ends, and every build of the directory takes it first: whoever holds it, finding a
     ``lock`` there, finds one a dead builder left."""
-    with open(build_dir / ".agx-build.lock", "a") as f:
+    with open(build_dir / ".rsinfer-build.lock", "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         stale = build_dir / "lock"
         if stale.exists():

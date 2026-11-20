@@ -136,7 +136,7 @@ Codex 复测了上面两条，都过了；它又找到一条，Gemini 也提了�
 
 Gemini 的另外两条：
 
-- **`--timeout` 超过 3600 时，执行时限没跟着放长**：成立，改了。`deploy/agxinfer.py` 现在把 `change.execute_timeout_s` 设成 `--timeout` 和默认值（3600 秒）里大的那个。`wake` 在执行阶段重读权重，启动要多久它就可能要多久。`test_m2a.py` 有测试。
+- **`--timeout` 超过 3600 时，执行时限没跟着放长**：成立，改了。`deploy/rsinfer.py` 现在把 `change.execute_timeout_s` 设成 `--timeout` 和默认值（3600 秒）里大的那个。`wake` 在执行阶段重读权重，启动要多久它就可能要多久。`test_m2a.py` 有测试。
 - **执行失败的那条路没有续租**：不改。执行期间协调者的 `KeepAlive` 排在 socket 里，`Execute` 一返回，同一次轮询接着把它们读出来，每条都续租，然后才查租约。执行短，租约本来就没到期；执行长，排着的 `KeepAlive` 一定有。加一行只是为了对称，没有可观察的差别，框架本体不为这个动。
 
 这一轮没解决的：构建进程自己被 SIGKILL 时（比如 OOM），它起的编译器没人停，编完当前文件自己退出。

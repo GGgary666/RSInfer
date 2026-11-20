@@ -4,8 +4,8 @@
 - 报告人：Claude Opus 5.5（Claude Code），在 4090 D 上验证 #59（前缀缓存）时碰到，见 [../rsi/2026-11-13-prefix-cache-on-a-live-engine.md](../rsi/2026-11-13-prefix-cache-on-a-live-engine.md)
 - 状态：已修（2026-11-13，PR #60，见文末「原因」「修复」）。是三个问题：权重存储申请前不把缓存还回去（撤回因此放不下，单元一侧）；状态存储不跟着 holder 重新定的数量走（f32 因此放不下，单元一侧）；撤回失败时诊断仍说"旧单元在服务"（框架本体，`unit.runtime`）。
 - 引擎：
-  - RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层，随机权重的 checkpoint：`deploy/agxinfer.py checkpoint --layers 4 --dtype bf16 --seed 1`，权重 7.57 GiB。
-  - 起法：`deploy/agxinfer.py serve <ckpt> --tokenizer <Qwen3.6-27B> --cuda-graph auto --overlap --max-rows 8 --max-context 4096 --token-budget 2048`。代码是 master `80ee578`，之后热改上了 #59 的树。
+  - RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层，随机权重的 checkpoint：`deploy/rsinfer.py checkpoint --layers 4 --dtype bf16 --seed 1`，权重 7.57 GiB。
+  - 起法：`deploy/rsinfer.py serve <ckpt> --tokenizer <Qwen3.6-27B> --cuda-graph auto --overlap --max-rows 8 --max-context 4096 --token-budget 2048`。代码是 master `80ee578`，之后热改上了 #59 的树。
   - 变更前身份 `200ef73d5d49b01c`，引擎是空的。holder 给状态分了 12.41 GiB（GDN 656 槽，KV 107,020 页）。
 - 变更：
 
@@ -76,7 +76,7 @@
 - 报告人：Antigravity（在 SM100 4 卡引擎上热改 PR #66 的 `eplb.extra_experts` 时碰到）
 - 状态：已修（PR #66）
 - 引擎：4×SM100（每卡 178.35 GiB），DeepSeek-V4.1-Flash-1017，`--ds-backend deepinfer --cuda-graph auto --graph-buckets 1 2 4 8 16 32 64 --disable-radix-cache`。
-- 变更：`agxinfer.py control apply --config '{"eplb.interval": 16, "eplb.window": 16, "eplb.extra_experts": 32}'`（不改 `core.state.weights` 的配置，所以在**同一个** `WeightStore` 实例上重新声明专家栈形状：每卡每层从 96 个槽位扩到 104 个槽位）。
+- 变更：`rsinfer.py control apply --config '{"eplb.interval": 16, "eplb.window": 16, "eplb.extra_experts": 32}'`（不改 `core.state.weights` 的配置，所以在**同一个** `WeightStore` 实例上重新声明专家栈形状：每卡每层从 96 个槽位扩到 104 个槽位）。
 - 现象：`models.ds1017` 在重新声明最后几层的专家权重时 `OutOfMemoryError`（172.70 GiB 已分配），随后撤回（`_rollback`）再次 `OutOfMemoryError`，控制面落到 `change.recovery_required`。
 - 原因（三处）：
   1. **`core.state.weights`**：2026-11-13 的修复在 `WeightStore.declare` 第一个循环里调了 `self.platform.free(self.buffers_.pop(d.name))` 并接着 `torch.cuda.empty_cache()`，但**没有同时 `self.tensors.pop(d.name, None)` 和 `self.decls.pop(d.name, None)`**。在 `platforms.torch_eager` 上，`free(buf)` 只把 `buf.data = None` 清掉；只要 `self.tensors[d.name]` 还握着旧张量的引用，底层存储的引用计数就不为 0，`empty_cache()` 一字节也没释放，旧专家栈一直占着显存直到逐个被新张量覆盖，同时造成缓存块碎片；一旦中途 OOM，`self.decls` 里还留着未成功替换的旧声明，撤回时继续卡死在 OOM。

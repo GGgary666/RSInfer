@@ -1,9 +1,9 @@
 ---
-name: agxinfer
-description: Working in the agxinfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
+name: rsinfer
+description: Working in the RSInfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
 ---
 
-# agxinfer：目录地图与热改开发
+# RSInfer：目录地图与热改开发
 
 规矩在 [AGENTS.md](../../../AGENTS.md)；这里是东西在哪，以及怎么在跑着的引擎上改东西。本文件的目录地图要和代码保持一致（AGENTS.md「文档是开发笔记」）。
 
@@ -21,8 +21,8 @@ description: Working in the agxinfer repository - where each component, unit, te
 | `.github/workflows/ci.yml`、`.github/scripts/framework_changed.py` | CI：`uv sync --python 3.12 --extra cpu`、`uv run pyright`、`uv run pytest -n 8`。跑在组织自己的 Linux runner 上（`runs-on: ubuntu-latest`，2026-11-12 起；不用 GitHub 的 runner，那边按分钟算配额），`notify.yml` 也是。runner 是常驻的，uv 的缓存留在它的 `~/.cache/uv`。CI 里 `OMP_NUM_THREADS=1`：runner 的机器核多，不限的话每个引擎进程的 torch 都按核数开线程，两次 CI 同时跑会互相拖到单个测试超时；测试用的模型很小，一个线程跑得一样快。PR 每次 push 只跑一遍；push 只在 `master` 上触发。PR 和 push 没碰框架本体（`engine/framework.toml` 列出的模块）、`tests/framework/`、共用的测试设置、依赖和 `.github/` 时，跳过 `tests/framework/` |
 | `.github/workflows/notify.yml`、`.github/scripts/notify.py` | 每个合进 `master` 的 PR 都由 LLM 写一句话摘要发到通知群；密钥 `PR_NOTIFY_WEBHOOK`、`PR_NOTIFY_SECRET`、`LLM_API_KEY`、`LLM_BASE_URL`，可选变量 `LLM_MODEL` |
 | `pyproject.toml`、`uv.lock` | 依赖与 pytest / pyright 配置 |
-| `.claude/skills/agxinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
-| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`agxinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`models/`：每个模型家族一个 recipe（现在只有 `qwen38.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
+| `.claude/skills/rsinfer/SKILL.md` | 本文件：目录地图与热改开发。Claude Code 按 skill 自动加载，其他 agent 照 AGENTS.md 的指引读它。用户同意为它新开 `.claude/` |
+| `deploy/` | 部署工具，不属于 pytest，用户同意为它新开这个顶层目录。`rsinfer.py`：命令行，在一台机器上起引擎、看状态、停、睡和醒（`serve` / `status` / `stop` / `sleep` / `wake`），改跑着的引擎（`control`，即控制面客户端），发请求（`chat` / `complete`），生成测试用的 checkpoint（`checkpoint`）；`models/`：每个模型家族一个 recipe（现在只有 `qwen38.py`），按 `config.json` 选；说明见 `deploy/README.md`；在 pyright 的范围内 |
 
 ### `engine/`
 
@@ -81,7 +81,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/layers/ds1017/` | `layers.ds1017`（`layers.ds1017@1`）：稀疏 attention（连同压缩器和 indexer）、Engram、MoE、Hyper-Connections，数据流照 DeepInfer：decode 步在设备上按固定形状推出一步的布局（能录进 graph），在状态的缓存字节上做 attention（`ds.cache_attn@1`），indexer 读页（`ds.index_topk_paged@1`）；其他步按计划里每行的几个数在设备上排（`Layout`，不从设备读回任何值：读回要等设备上排着的活，开重叠时等的是上一步），每层把环里的窗口 KV、这一步的 KV、各行的 latent 装进一个源（load segments）再做一次 sparse attention，indexer 在装载的 key 上按区间打分（`ds.index_topk@1`）。只在 prefill 或只在 decode 用的 definition 分开解析（`PREFILL_ONLY`、`DECODE_ONLY`），graph 只录 decode 的。kernel 后端由 `dsv4.backend` 定 |
 | `engine/state/swa_slots/` | `state.swa_slots`（`state.swa.slots@1`）：每个请求一个槽，放每层的滑动窗口 KV、没凑满的压缩组、n-gram 往回看的几个 token |
 | `engine/kernels/ds1017/`、`engine/kernels/ds1017_formats.py`、`engine/kernels/ds1017_compose.py` | `kernels.ds1017`：DS 的 definition（`ds.*`）和纯 PyTorch 参照。参照是 batch 无关的：求和顺序固定（`total`）、矩阵乘每行单独算（`matmul`），所以一个 token 的结果不随这一步怎么排而变。`ds1017_formats.py` 是库：FP8、FP4 的量化和反量化、RoPE 表；状态里三种记录（窗口 KV 528 B、压缩 latent 288 B、indexer key 68 B，DeepInfer 的缓存格式）的打包和解包也在 `ds1017_formats.py`；`ds1017_compose.py` 是库：缓存上的几个组合 definition（存、取、indexer 的选择、压缩器）写一次，参照和 TileLang 后端各给自己的算术（`Pieces`），所以 TileLang 后端仍是官方的算术 |
-| `engine/state/expert_placement/`、`engine/policies/eplb/` | EPLB（2026-11-15，照 DeepInfer 的 `model_executor/eplb/`）。`state.expert_placement`（`expert.placement@1`）是机制：每层的专家放在哪个 rank 的哪个槽位（`eplb.extra_experts` 个多余槽位放热点专家的副本）、kernel 读的映射和计数、每 `eplb.interval` 步按最近 `eplb.window` 步的 token 数重排并在 rank 之间搬权重。`policies.eplb`（`policy.rebalance@1`）只做决定，是从 DeepInfer 搬来的两遍贪心；换重排算法就是换这个单元。都只在 DS 的 worker 里装。默认关（`eplb.interval = 0`），用 `agxinfer serve --set eplb.interval=1000 --set eplb.window=100 --set eplb.extra_experts=32` 打开。重排不改变算出来的结果 |
+| `engine/state/expert_placement/`、`engine/policies/eplb/` | EPLB（2026-11-15，照 DeepInfer 的 `model_executor/eplb/`）。`state.expert_placement`（`expert.placement@1`）是机制：每层的专家放在哪个 rank 的哪个槽位（`eplb.extra_experts` 个多余槽位放热点专家的副本）、kernel 读的映射和计数、每 `eplb.interval` 步按最近 `eplb.window` 步的 token 数重排并在 rank 之间搬权重。`policies.eplb`（`policy.rebalance@1`）只做决定，是从 DeepInfer 搬来的两遍贪心；换重排算法就是换这个单元。都只在 DS 的 worker 里装。默认关（`eplb.interval = 0`），用 `rsinfer serve --set eplb.interval=1000 --set eplb.window=100 --set eplb.extra_experts=32` 打开。重排不改变算出来的结果 |
 | `engine/kernels/deepinfer/mega.py` | DeepGEMM 的融合 kernel（2026-11-15）：`ds.hc_step@1`（两个子层之间的一步，`mega_mhc`）和 `ds.moe@1`（一层的 MoE，`bf16_mega_gate` 加带共享专家的 `fp8_fp4_mega_moe`）在后端 `deepinfer` 下的 solution，单 rank 和多 rank 都走它。它持有这个进程在各 rank 共享的 MoE 缓冲区（`SymmBuffer`）里的那一份。模型形状不合适时用 `deepinfer.unfused.*`（同一个组合，不融合的 kernel）。专家和共享专家的权重要按融合 kernel 的行顺序排（`formats.expert_layout`、`shared_layout`，模型按后端就地置换，权重存储里的 `experts.layout` 是标记） |
 | `engine/kernels/ds1017_ep.py` | 库（2026-11-15）：专家和 Engram 表分在几个 rank 上时的两个 definition，`ds.ep_experts@1` 和 `ds.engram_fetch@1`，用某个后端自己的专家 kernel 加通信组的两个 collective（`gather`、`reduce`）写成，参照和 `tilelang` 后端共用。每个 rank 把每个 token 的每一项单独送回，token 所在的 rank 按专家的顺序加，所以结果和一个 rank 全算逐位相同 |
 | `engine/kernels/tilelang/` | `kernels.tilelang`：参照实现自带的 TileLang kernel（`kernel.py`，原样）和它调用的 torch 写法，作为后端 `tilelang`。用它时引擎的 logits 和参照实现逐位相同。要 CUDA 和 `tilelang` 包，不能录进 graph |
@@ -100,11 +100,11 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 需要在 SM100 上运行实验时，使用 [sm100-eval skill](../sm100-eval/SKILL.md) 和 `.github/scripts/gpu_job_runner.py` 客户端提交、查看日志并回收结果。
 
 **两族模型**（2026-11-14）：`models.qwen38` 和 `models.ds1017` 都提供 `model@1`，一个 worker 只能装一族。
-- `deploy/agxinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `agxinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
+- `deploy/rsinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `rsinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
 - `core.plan` 和 `executors.pytorch` 不再写死 Qwen 的状态种类和层：backend 和存储从模型拿（`model.backends`、`model.stores`）。
-- DS 的随机 checkpoint：`deploy/agxinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
+- DS 的随机 checkpoint：`deploy/rsinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
 
-**多个 worker**（2026-11-15，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md) 阶段 3）：`agxinfer serve --gpus 0,1,2,3` 每张卡起一个 worker，`--ranks N` 在一张卡（或 CPU）上起 N 个（本地试多 rank 用）。
+**多个 worker**（2026-11-15，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md) 阶段 3）：`rsinfer serve --gpus 0,1,2,3` 每张卡起一个 worker，`--ranks N` 在一张卡（或 CPU）上起 N 个（本地试多 rank 用）。
 - 每个 worker 是一个调度域（`sched.domains`），跑自己的请求。
 - 模型在不在各 worker 之间分，由配方定：DS 1017 把每层的路由专家和 Engram 表按 rank 的顺序分开（`comm.size`），每一步所有 rank 一起算；Qwen 不分，每个 worker 是完整的一份。
 - 一个变更里，同一个角色的进程是一起启动的（`core.change`）：通信组的 rank 在加载单元时要互相等。
@@ -137,7 +137,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 - DS 1017 的测试：`tests/units/kernels/test_ds1017.py`（数值格式和参照 kernel）、`tests/units/models/test_ds1017.py`（小配置过整个 worker 栈：分块、多行、graph 桶都和一次性算逐位相同）；`tests/units/support/ds1017.py` 提供小配置、随机 checkpoint 和 DS 的 worker（`DSWorker`），`tests/units/support/graphs.py` 是 CPU 上的 graph 替身。
 - `tests/units/support/tokenizer.py`：测试用的真 HF tokenizer（词级、带 Qwen 的 chat 标记和模板）。
 - `tests/ci/`：CI 自己的工具（`.github/scripts/`）的测试，比如判断一个 PR 有没有碰到框架本体。它既不是框架本体，也不是单元或整个引擎，所以单独一个目录。
-- `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/agxinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
+- `tests/gpu/`：要 GPU、手动跑（由 `addopts` 排除）。`test_qwen38_partial.py`：Qwen3.8-27B 真实结构的前 4 层，worker 栈对照 HF；`test_qwen38_serve.py`：用 `deploy/rsinfer.py serve` 起整个引擎，经 HTTP 对照 HF（`QWEN38_MODEL` 指向完整模型就是 SM100 上的端到端验证）；`test_qwen38_overlap.py`：worker 栈重叠一步（下一步在上一步跑完之前提交）和逐步提交采到的 token 相同，步与步之间设备空得更少；`support.py`：生成部分层数的 checkpoint、HF 模型。24 GB 的卡就够。
   - `test_cuda_graph.py`：capture/replay、状态/padding、HF、refit、依赖失效、不可捕获或放不下时 auto 走 eager、状态池容量不变、候选失败清理、overlap、多次重录后显存（allocated、reserved、设备空闲）不变；`test_cuda_graph_apply.py`：真实控制面 kernel apply、失败配置撤回、恢复及冷启动对照，配置变更核对 plan 代数和实际 capture 次数，默认 `mem_fraction` 下连续 10 次 kernel 变更。`test_qwen38_partial.py` 同时覆盖 graph/eager；`tests/units/executors/test_cuda_graph.py` 不需要 GPU：桶、守卫，以及用替身 recorder 在 CPU 上跑回放步的整条路径（固定 buffer、padding、`kernels.torch_graph`）对照 eager。
   - `test_state_rebuild.py`：状态池原地重建（新池比旧池稍大）和撤回时旧权重、旧池重新装回（一次更大的尝试失败以后）都放得下，大小按设备空闲显存定（2026-11-10、2026-11-13 两份 framework-bugs 报告）。
   - `test_speculation.py`：投机解码（doc/specs/mtp.md）：真实结构 4 层、真 kernel、开重叠，fp32 下和不开投机逐 token 相同，bf16 下回放验证 graph 和 eager 相同；草稿来自预言（`tests/units/worker/support.py` 的 `Oracle`），checkpoint 的随机 MTP 权重几乎什么都不接受。
@@ -154,7 +154,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
   - `test_real_kernels.py`：`kernels.triton`、`kernels.flashinfer` 的每个 solution 对照参照实现；`kernels.cuda` 的 KV 写入逐位对照参照实现（含回退路径）；worker 栈（4 层、bf16）上 `auto` 选真 kernel、graph 对 eager（同样行数的桶逐值比，带 padding 行的桶比 token）、graph 显存的计量冷启动和重载一致、被拒绝或只用来自检的 graph 不在 backend 里留东西、KV 和模型 dtype 不同时不选 FlashInfer、kernel 单元带请求重载、按名字点 backend。`conftest.py`：每个测试结束时记下它 import 的第三方模块，下一个测试开始时放回去。`tests/conftest.py` 的隔离会忘掉它们，而 FlashInfer 的原生依赖同一进程里不能 import 两次，CuTe DSL 的子模块重新 import 以后编译不了下一个 kernel。记录见 `doc/evaluations/real-kernels-4090d.md`、`real-kernels-fused.md` 和 `real-kernels-kv-store-indices.md`；SM100 上完整模型的结果在 `real-kernels-sm100.md`。
   - `test_cuda_graph_adversarial.py`：A/B/C 共用的 GPU 验收，检查数值、实际 CUDA replay，以及 catalog 变更后在写状态之前拒绝旧图；实验分支、结果与复现命令见 `doc/evaluations/cuda-graph-abc.md`。
 - `tests/scenarios/`：整个引擎（框架本体 + 单元）的测试：modules.html 的 9 个场景、命令行 `serve`、覆盖检查和拆除检查（roadmap 阶段 1 的验收）。
-  - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/agxinfer.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；命令行在后台起引擎、`status`、`sleep` / `wake`、`stop`；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
+  - `test_m2a.py`：阶段 2 的 M2a，在 CPU 上用 `deploy/rsinfer.py serve` 起整个引擎（前端、调度宿主、worker，小随机模型、真 HF tokenizer），经 HTTP 的文本和 HF 逐字相同；命令行在后台起引擎、`status`、`sleep` / `wake`、`stop`；`deploy.py` 是它和 `tests/gpu/` 共用的起停辅助。
   - `test_no_temporary_checks.py`：`engine/` 里不能留下标着 `# PROBE` 的临时检查（「在引擎里做检查」）。
   - `units/scn/`：场景测试用的单元（测试夹具，写法和真单元一样，但只做场景需要的那一步）；`harness.py` 把它们和本仓库的 `engine/` 一起拷进工作区，但不拷 `engine/` 里控制面以外的单元（前端、请求表、kernel、模型等）。场景拓扑的角色不列单元，那些单元会在每个场景进程里加载；kernel 单元每次启动还要 import torch。
 - 测试辅助模块（不以 `test_` 开头，pytest 不收集）：
@@ -192,7 +192,7 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 
 按这次要改、要看的东西起，需要什么就起什么。下面只是几个例子，没有推荐的哪一种：
 
-- 用 `deploy/agxinfer.py`（说明在 `deploy/README.md`）在一台机器上起整个引擎：前端、调度宿主、一个 worker。下面 `A="uv run python deploy/agxinfer.py"`：
+- 用 `deploy/rsinfer.py`（说明在 `deploy/README.md`）在一台机器上起整个引擎：前端、调度宿主、一个 worker。下面 `A="uv run python deploy/rsinfer.py"`：
   - 真权重，在后台跑：`$A serve <模型目录> --detach`，引擎起来就返回；不加 `--detach` 就在前台跑到 Ctrl-C；
   - 只要前几层、dummy 权重：再加 `--layers N --dummy`；
   - 整个引擎跑在 CPU 上：加 `--device cpu`，模型可以用 `$A checkpoint` 生成的小随机模型（`tests/scenarios/test_m2a.py` 就是这样起的）；
@@ -207,7 +207,7 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 - 测试里的起法也可以参考：`tests/scenarios/harness.py`（进程内控制面加两台假主机）、`tests/units/scheduler/test_processes.py`（真实控制面加夹具 worker 进程）。
 
 起来以后：
-- **一个运行目录就是一个引擎**（`--run`，默认 `run/agxinfer`），后面的命令都靠它找到引擎：
+- **一个运行目录就是一个引擎**（`--run`，默认 `run/rsinfer`），后面的命令都靠它找到引擎：
   - `$A status --run <目录>`：在不在跑、URL、控制面地址、身份、各进程的状态；
   - `$A stop --run <目录>`：停引擎，等它的进程全部退出，到时限（默认 60 秒）还没退的 kill 掉；
   - 同一个运行目录里已经有引擎在跑时，`serve` 会拒绝。
@@ -221,7 +221,7 @@ AGENTS.md 规定默认这样开发：把引擎拉起来，改完用 `apply` 生�
 在工作区里改文件，然后：
 
 ```sh
-A="uv run python deploy/agxinfer.py"   # 加 --run <目录> 指定引擎，默认 run/agxinfer
+A="uv run python deploy/rsinfer.py"   # 加 --run <目录> 指定引擎，默认 run/rsinfer
 $A control check --source <工作区>              # 静态检查：清单、服务、跨单元 import、配置键；不排队、不碰引擎
 $A control apply --source <工作区> --dry-run    # 影响分析：哪些进程重载哪些单元、要不要重启引擎、notes
 $A control apply --source <工作区> --intent "为什么改"
@@ -360,7 +360,7 @@ $A control status                               # 也可以是 introspect（单�
 - 改了原生扩展、拓扑、放置或平台：变更自动重启对应的进程；
 - 改了权重存储 `core.state.weights` 的代码：在暂停期内从 checkpoint 重新读，大模型要几分钟；`refit` 换过的权重回到 checkpoint；
 - 静态检查不过（`check` 或 `apply` 的诊断写明了哪条规则）；
-- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：它的构建步骤（`[unit] build`）在准备阶段另起一个进程编译，4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒；这段时间引擎照常服务，暂停期内的重载从缓存加载（2026-11-11 起，见 `doc/evaluations/build-steps-and-stream-liveness.md`）。准备阶段的时限是 `change.prepare_timeout_s`（默认 600 秒，`deploy/agxinfer.py` 设成 `--timeout`）。编译失败时变更在暂停之前就失败，诊断是 `change.build_failed`，编译器的输出在 worker 的日志里。以前要先在引擎外编译（`PYTHONPATH=engine uv run python -m kernels.cuda.ops`），现在不用了，这样做也还行。
+- 改了 `kernels.cuda` 的 C++ 源码（`kv_store_cu.py`）直接 apply：它的构建步骤（`[unit] build`）在准备阶段另起一个进程编译，4090 D 约 55 秒，SM100 / CUDA 13 约 123 秒；这段时间引擎照常服务，暂停期内的重载从缓存加载（2026-11-11 起，见 `doc/evaluations/build-steps-and-stream-liveness.md`）。准备阶段的时限是 `change.prepare_timeout_s`（默认 600 秒，`deploy/rsinfer.py` 设成 `--timeout`）。编译失败时变更在暂停之前就失败，诊断是 `change.build_failed`，编译器的输出在 worker 的日志里。以前要先在引擎外编译（`PYTHONPATH=engine uv run python -m kernels.cuda.ops`），现在不用了，这样做也还行。
 
 可能是更新机制的 bug，写报告：
 - 提交了，可跑的还是旧代码，或者新旧代码混着跑；

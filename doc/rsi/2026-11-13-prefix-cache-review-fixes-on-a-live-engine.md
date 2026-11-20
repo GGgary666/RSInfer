@@ -12,7 +12,7 @@
 
 ## 过程
 
-引擎的源码在 scratchpad 里单独的工作区，先放 `eeeaccf` 的代码。小随机模型（4 层，fp32，`agxinfer checkpoint --seed 3`），`--device cpu --page-size 4 --max-rows 8 --max-context 256 --token-budget 128`，`state.gdn.slots = 20`、`state.kv.pages = 160`。
+引擎的源码在 scratchpad 里单独的工作区，先放 `eeeaccf` 的代码。小随机模型（4 层，fp32，`rsinfer checkpoint --seed 3`），`--device cpu --page-size 4 --max-rows 8 --max-context 256 --token-budget 128`，`state.gdn.slots = 20`、`state.kv.pages = 160`。
 
 | 做了什么 | 计划 | 结果 |
 |---|---|---|

@@ -2,7 +2,7 @@
 model (``models.ds1017``, ``layers.ds1017``, ``state.swa_slots``; doc/specs/v1-ds1017.md), and
 random-weight checkpoints in its checkpoint's formats for tests.
 
-A recipe is what ``agxinfer`` knows about one model family: ``matches`` a ``config.json``,
+A recipe is what ``rsinfer`` knows about one model family: ``matches`` a ``config.json``,
 ``add_arguments`` for the flags only it has, ``config`` for the config keys only its units read,
 ``WORKER_ONLY`` for the worker units only it runs, and ``checkpoint``.
 """
@@ -55,7 +55,7 @@ def config(args: argparse.Namespace, cfg: dict[str, Any], model: Path) -> dict[s
 
     if args.dummy:  # they fill floating-point tensors only: every quantized matrix and its scales would be zero
         raise SystemExit("DS 1017 takes no dummy weights (its matrices are stored as FP8 and FP4 bytes): write random "
-                         "ones in the checkpoint's formats with `agxinfer checkpoint --config <model dir> [--layers N] "
+                         "ones in the checkpoint's formats with `rsinfer checkpoint --config <model dir> [--layers N] "
                          "--out <dir>` and serve that directory")
     model_cfg = DSConfig.from_hf(cfg)
     decls = states(model_cfg, args.page_size)

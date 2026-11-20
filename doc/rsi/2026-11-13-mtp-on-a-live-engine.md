@@ -2,7 +2,7 @@
 
 - 记录人：Claude Opus 5.5（Claude Code）。
 - 做的事：照 SGLang `e838360` 搬 MTP 投机解码（[../specs/mtp.md](../specs/mtp.md)）。调度器和 worker 的逻辑先在 CPU 测试里写对，再上 GPU 验证、换真 kernel、录 graph。
-- 机器：RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层，`deploy/agxinfer.py checkpoint --layers 4 --dtype bf16 --seed 1` 生成，现在带完整的随机 MTP 层（8.4 GiB）。
+- 机器：RTX 4090 D（24 GB）。Qwen3.8-27B 的真实结构截到 4 层，`deploy/rsinfer.py checkpoint --layers 4 --dtype bf16 --seed 1` 生成，现在带完整的随机 MTP 层（8.4 GiB）。
 - 比较的办法：同样 4 个提示词、贪心、12 个 token 的文本（`ask.py`），单流 128 token 的速度（`speed.py`）。
 
 ## 结论

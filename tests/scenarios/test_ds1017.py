@@ -1,5 +1,5 @@
 """DS 1017 (doc/specs/v1-ds1017.md) through the whole engine on the CPU, started the way an operator
-starts it (``deploy/agxinfer.py serve``): a tiny random model with every kind of layer in the real
+starts it (``deploy/rsinfer.py serve``): a tiny random model with every kind of layer in the real
 checkpoint's formats, a real HF tokenizer, the reference kernels. Text through HTTP, out of the
 frontend, the scheduler host and a worker process, equals what the worker units give in this
 process for the same token ids: the prompt there in one piece, here in chunks of the token budget

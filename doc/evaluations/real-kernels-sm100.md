@@ -2,8 +2,8 @@
 
 **这份记录里的数字都不是我测的。** 它们来自 Gemini 4 Carbon（Antigravity）在 #51 上的两条评论，我（Claude Fable 5.2）按用户的要求原样搬过来，方便和 4090 D 上的两份记录放在一起看：
 
-- 第一轮，`2be83ed`（第一批，[real-kernels-4090d.md](real-kernels-4090d.md)）：[评论](https://github.com/open-agent-infra/agxinfer/pull/51#issuecomment-6793605157)
-- 第二轮，`a471a04`（第二批，[real-kernels-fused.md](real-kernels-fused.md)）：[评论](https://github.com/open-agent-infra/agxinfer/pull/51#issuecomment-6795957652)
+- 第一轮，`2be83ed`（第一批，[real-kernels-4090d.md](real-kernels-4090d.md)）：[评论](https://github.com/open-agent-infra/rsinfer/pull/51#issuecomment-6793605157)
+- 第二轮，`a471a04`（第二批，[real-kernels-fused.md](real-kernels-fused.md)）：[评论](https://github.com/open-agent-infra/rsinfer/pull/51#issuecomment-6795957652)
 
 最后一节"我的备注"是我读这些结果时的两点保留，和 Gemini 的结论分开写。
 
@@ -25,8 +25,8 @@
 
 | | 命令或配置 | 说明 |
 |---|---|---|
-| agxinfer，第一轮 | `deploy/qwen38.py serve --cuda-graph required --overlap --max-rows 64 --max-context 4096 --graph-buckets 1 2 4 8 16 24 32 48 64 --token-budget 8192 --mem-fraction 0.80` | 状态池 92.44 GiB：GDN 槽 305，KV 页 49,879（79.8 万 token）；`kept_bytes` 672 MiB（含 FlashInfer 的 384 MiB workspace） |
-| agxinfer，第二轮 | 同上，但不传 `--graph-buckets` | 默认就录齐 1、2、4、8、12、16、24、32、40、48、56、64；`kept_bytes` 266.0 MiB（278,921,216 B），冷启动和热重载一致 |
+| RSInfer，第一轮 | `deploy/qwen38.py serve --cuda-graph required --overlap --max-rows 64 --max-context 4096 --graph-buckets 1 2 4 8 16 24 32 48 64 --token-budget 8192 --mem-fraction 0.80` | 状态池 92.44 GiB：GDN 槽 305，KV 页 49,879（79.8 万 token）；`kept_bytes` 672 MiB（含 FlashInfer 的 384 MiB workspace） |
+| RSInfer，第二轮 | 同上，但不传 `--graph-buckets` | 默认就录齐 1、2、4、8、12、16、24、32、40、48、56、64；`kept_bytes` 266.0 MiB（278,921,216 B），冷启动和热重载一致 |
 | SGLang，`fi+triton` | `--attention-backend flashinfer --linear-attn-backend triton --max-running-requests 64 --context-length 4096` | 和本 PR 同一族 kernel。decode graph 录同样的 12 档；另外默认录 74 档 prefill graph（约 46 秒，约 4.4 GiB 显存）；`chunked_prefill_size=16384` |
 | SGLang，默认 | 不指定 backend | 在 `sm_100` 加 head dim 256 时 attention 自动选 `triton`；`mem_fraction_static=0.859`，GDN 槽 337，KV 88.3 万 token |
 
@@ -49,7 +49,7 @@
 
 吞吐是输出 token/s，每 token 间隔是中位数。
 
-| 并发 | SGLang 默认 | SGLang `fi+triton` | agxinfer 第一轮 | agxinfer 第二轮 | 第二轮相对 `fi+triton` | 相比第一轮 |
+| 并发 | SGLang 默认 | SGLang `fi+triton` | RSInfer 第一轮 | RSInfer 第二轮 | 第二轮相对 `fi+triton` | 相比第一轮 |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 98.0 / 10.04 ms | 97.0 / 10.14 ms | 64.5（热态 68.6）/ 15.22（14.22）ms | 89.9（热态 91.5）/ 10.87（10.68）ms | 92.7%（热态 94.3%） | +39.4%（热态 +33.4%） |
 | 4 | 373.3 / 10.37 ms | 370.7 / 10.48 ms | 252.5 / 15.50 ms | 351.4 / 11.13 ms | 94.8% | +39.2% |
@@ -63,8 +63,8 @@
 | 并发 | 1 | 4 | 8 | 16 | 32 | 64 |
 |---|---:|---:|---:|---:|---:|---:|
 | SGLang `fi+triton` | 51.5 ms | 97.0 ms | 99.8 ms | 106.1 ms | 157.5 ms | 409.4 ms |
-| agxinfer 第二轮 | 73.9 ms | 72.2 ms | 131.8 ms | 130.7 ms | 171.6 ms | 210.8 ms |
-| agxinfer 第一轮 | 107.2 ms | 102.4 ms | 190.2 ms | 188.2 ms | 203.0 ms | 289.3 ms |
+| RSInfer 第二轮 | 73.9 ms | 72.2 ms | 131.8 ms | 130.7 ms | 171.6 ms | 210.8 ms |
+| RSInfer 第一轮 | 107.2 ms | 102.4 ms | 190.2 ms | 188.2 ms | 203.0 ms | 289.3 ms |
 
 - "热态"：1 并发那一档在刚启动时测到的比稳定以后低一些，两个数都列了。
 - **第一轮里默认桶只到 8 行的后果**：16 / 32 / 64 并发退回 eager 以后，吞吐从 850.9 / 1,565.4 / 2,655.3 跌到 258.0 / 509.9 / 996.1 token/s，慢 2.7–3.3 倍。第二批因此改了默认的桶。
@@ -73,7 +73,7 @@
 
 吞吐是输入 token/s，后面是首 token 时间的中位数。`tb` 是 `--token-budget`。
 
-| 并发 | SGLang 默认 | SGLang `fi+triton` | agxinfer 第一轮（`tb=8192`） | agxinfer 第二轮（`tb=8192`） | agxinfer 第二轮（`tb=16384`） | 第二轮（`tb=16384`）相对 `fi+triton` |
+| 并发 | SGLang 默认 | SGLang `fi+triton` | RSInfer 第一轮（`tb=8192`） | RSInfer 第二轮（`tb=8192`） | RSInfer 第二轮（`tb=16384`） | 第二轮（`tb=16384`）相对 `fi+triton` |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 10,914 / 106.1 ms | 11,220 / 103.1 ms | 8,308 / 138.2 ms | 10,894 / 103.8 ms | 10,962 / 102.7 ms | 97.7%（对默认 100.4%） |
 | 4 | 16,988 / 386.3 ms | 17,289 / 381.0 ms | 12,866 / 504.4 ms | 16,936 / 291.8 ms | 16,934 / 293.4 ms | 97.9%（对默认 99.7%） |

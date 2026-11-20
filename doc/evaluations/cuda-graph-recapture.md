@@ -45,14 +45,14 @@
 
 - NVIDIA SM90-80GB / SM90，GPU 1，Python 3.12.7，PyTorch 2.11.0+cu130；通过 OSS runner 复用已安装环境。
 - release：`20261110T110012Z_e6c6971-dirty_997e6787`。
-- command：`cmd_20261110T110035Z_graph-config-recapture_76d8fc7e`；最终 done / exit 0 / `AGXINFER_GPU_TEST_OK`。
+- command：`cmd_20261110T110035Z_graph-config-recapture_76d8fc7e`；最终 done / exit 0 / `RSINFER_GPU_TEST_OK`。
 - 本地原始日志：`.ossrun-artifacts/graph-config-recapture.log`，逐项记录以 `GRAPH_CONFIG_CASE` 开头。初始 run.sh 等待进程因 OSS 读取异常退出，随后用原 CID 的 status/tail 确认最终结果，没有重复提交。
 
 ```sh
-bash oss_run_agxinfer_cuda_graph/scripts/ossrun/run.sh \
+bash oss_run_rsinfer_cuda_graph/scripts/ossrun/run.sh \
   --release 20261110T110012Z_e6c6971-dirty_997e6787 \
-  --inline 'bash oss_run_agxinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph_apply.py tests/gpu/test_cuda_graph.py -k "config_changes or hf_guard or kernel_apply" -x' \
-  --name graph-config-recapture --expect '^AGXINFER_GPU_TEST_OK$' \
+  --inline 'bash oss_run_rsinfer_cuda_graph/scripts/ossrun/gpu.sh test tests/gpu/test_cuda_graph_apply.py tests/gpu/test_cuda_graph.py -k "config_changes or hf_guard or kernel_apply" -x' \
+  --name graph-config-recapture --expect '^RSINFER_GPU_TEST_OK$' \
   --max-wait-s 1800 --log-out .ossrun-artifacts/graph-config-recapture.log
 ```
 

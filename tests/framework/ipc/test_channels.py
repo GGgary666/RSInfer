@@ -57,7 +57,7 @@ class Directory:
     def channels(self, zctx: zmq.Context[zmq.Socket[bytes]], host: str, proc: ProcId = READER,
                  tun: IpcTunables = TUN) -> Channels:
         def allocate(name: str) -> str:
-            ring = f"agx-test-{name}-{uuid.uuid4().hex[:8]}"
+            ring = f"rsinfer-test-{name}-{uuid.uuid4().hex[:8]}"
             self.allocated.append(ring)
             return ring
 
@@ -165,7 +165,7 @@ def test_a_writer_does_not_reconnect_to_a_dead_reader_again_and_again(zctx: zmq.
     """A killed reader leaves its ring behind until the node agent removes it. The writer sees
     the reader is gone before attaching, and counts no connection however often it is asked."""
     q = SPAWN.Queue()
-    ring = f"agx-test-{uuid.uuid4().hex[:12]}"
+    ring = f"rsinfer-test-{uuid.uuid4().hex[:12]}"
     child = SPAWN.Process(target=read_forever, args=(q, "host-a", "host-a", ring))
     child.start()
     try:

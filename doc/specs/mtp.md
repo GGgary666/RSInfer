@@ -113,8 +113,8 @@ CUDA 上默认不开 `speculative_use_rejection_sampling`，用 target-only 的�
 
 ### 2.5 checkpoint 和部署
 
-- `deploy/agxinfer.py checkpoint` 能写随机的 `mtp.*`（给本机的 4 层用）。
-- `deploy/agxinfer.py serve --speculative-algorithm eagle`（和 SGLang 同名）。
+- `deploy/rsinfer.py checkpoint` 能写随机的 `mtp.*`（给本机的 4 层用）。
+- `deploy/rsinfer.py serve --speculative-algorithm eagle`（和 SGLang 同名）。
 
 ## 3. 和 SGLang 不一样的地方（预期的）
 

@@ -1,5 +1,5 @@
 """Serving throughput over HTTP, the same load against any OpenAI-compatible server: this engine
-(``deploy/agxinfer.py serve``) or a native SGLang serving the same checkpoint.
+(``deploy/rsinfer.py serve``) or a native SGLang serving the same checkpoint.
 
 Run manually; this is not a pytest timing assertion. Per concurrency level, that many clients
 each send requests one after another (``/v1/completions``, streamed, greedy, ``ignore_eos``, so
@@ -8,8 +8,8 @@ from a seed: no two share a prefix worth caching, also not across levels (a serv
 cache would otherwise answer a later level's prompts from an earlier level's), and two servers
 under test get the same prompts.
 
-    uv run python tests/gpu/bench_serving.py --url http://127.0.0.1:8000 --name agxinfer \\
-        --output run/bench/agxinfer.json
+    uv run python tests/gpu/bench_serving.py --url http://127.0.0.1:8000 --name rsinfer \\
+        --output run/bench/rsinfer.json
 
 Reported per level: output tokens per second over the whole level (all requests, wall clock),
 and per request the time to the first token, the time per output token after the first (from
@@ -124,7 +124,7 @@ def main() -> None:
         print("BENCH_LEVEL " + json.dumps({"name": args.name, **measured}), flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print("AGXINFER_SERVING_BENCH_OK", flush=True)
+    print("RSINFER_SERVING_BENCH_OK", flush=True)
 
 
 if __name__ == "__main__":

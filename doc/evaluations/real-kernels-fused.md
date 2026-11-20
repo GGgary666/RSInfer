@@ -134,11 +134,11 @@ GEMM 之外的部分从 7–8 ms 降到 3.5 ms。两次测量之间 GEMM 自己�
 同一天、同一个 checkpoint、同一个 tokenizer、同一版 `tests/gpu/bench_serving.py`，两边先后各跑一遍。
 
 - SGLang：`e838360` 默认配置，命令和第一批相同（`--attention-backend flashinfer --context-length 4096 --max-running-requests 32`）。
-- agxinfer：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --token-budget 4096`。graph 桶用默认的，就是 SGLang 录的那 8 档。
+- RSInfer：`deploy/qwen38.py serve --cuda-graph auto --overlap --max-rows 32 --max-context 4096 --token-budget 4096`。graph 桶用默认的，就是 SGLang 录的那 8 档。
 
 decode（prompt 32 token，生成 256 个，每个客户端 4 个请求）：
 
-| 并发 | SGLang token/s | agxinfer token/s | 比例 | 第一批的比例 | SGLang 每 token | agxinfer 每 token |
+| 并发 | SGLang token/s | RSInfer token/s | 比例 | 第一批的比例 | SGLang 每 token | RSInfer 每 token |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 171.0 | 168.7 | 98.7% | 96.4% | 5.80 ms | 5.86 ms |
 | 4 | 656.8 | 647.2 | 98.5% | 95.5% | 6.01 ms | 6.12 ms |
@@ -148,15 +148,15 @@ decode（prompt 32 token，生成 256 个，每个客户端 4 个请求）：
 
 prefill（prompt 2000 token，生成 8 个，每个客户端 8 个请求）：
 
-| 并发 | SGLang token/s | agxinfer token/s | 比例 | 第一批的比例 | SGLang 首 token | agxinfer 首 token |
+| 并发 | SGLang token/s | RSInfer token/s | 比例 | 第一批的比例 | SGLang 首 token | RSInfer 首 token |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 19235 | 18187 | 94.6% | 93.5% | 62 ms | 70 ms |
 | 4 | 31449 | 31117 | 98.9% | 94.5% | 162 ms | 171 ms |
 | 8 | 35861 | 35640 | 99.4% | 93.9% | 257 ms | 265 ms |
 
 - SGLang 这次的数字和第一批那次相差不到 3%：16 并发的 decode 是 2426 对 2366，4 并发的 prefill 是 31449 对 30801，其余在 1% 以内。
-- decode 的首 token 时间：SGLang 17 / 25 / 31 / 45 / 81 ms，agxinfer 22 / 20 / 31 / 49 / 86 ms。
-- **1 并发的 prefill 每个请求仍然多 8 ms。** 设备上的 kernel 时间已经持平，launch 还比 SGLang 少，所以这 8 ms 不在设备上。agxinfer 的 prefill 是 eager，每步 162 次 launch 从 Python 逐个发出；SGLang 的 prefill 是从它的 prefill graph 回放的。并发高了以后设备一直有活，这一项被盖住。具体是 host 上的哪一段，我没有再拆。
+- decode 的首 token 时间：SGLang 17 / 25 / 31 / 45 / 81 ms，RSInfer 22 / 20 / 31 / 49 / 86 ms。
+- **1 并发的 prefill 每个请求仍然多 8 ms。** 设备上的 kernel 时间已经持平，launch 还比 SGLang 少，所以这 8 ms 不在设备上。RSInfer 的 prefill 是 eager，每步 162 次 launch 从 Python 逐个发出；SGLang 的 prefill 是从它的 prefill graph 回放的。并发高了以后设备一直有活，这一项被盖住。具体是 host 上的哪一段，我没有再拆。
 
 进程内的 microbench（`tests/gpu/bench_cuda_graph.py --max-context 256 4096 --repeats 2`，每步毫秒，`max_context` 4096）：
 
