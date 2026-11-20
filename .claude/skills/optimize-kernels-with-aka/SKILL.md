@@ -21,6 +21,8 @@ description: 从 agxInfer 的真实推理负载选取算子，向 AKA 异步委�
 uv pip install --python .venv/bin/python -r .claude/skills/optimize-kernels-with-aka/requirements.txt
 ```
 
+需要在本机阅读 SDK 源码时，从仓库根目录执行 `git submodule update --init -- third_party/aka`。升级 SDK 时，在同一 PR 更新 `third_party/aka` 指针、`requirements.txt` 和下方接口文档链接，使三处指向同一提交。
+
 `local` 在执行主机上运行契约，GPU 题需要在有相应设备和工具链的主机运行。配置当前可用的研究 agent。自建命令契约时，在 `contract/contract.json` 的 `config` 里写明 `command`、`instructions` 和 `delivery`。验证器从 `candidate/` 加载实现，完成正确性和计时后打印一行 `AKA_TASK_RESULT=` 加 JSON，包含 `verdict`、`complete` 和带名称、数值、单位的 `metrics`。详见[固定版本的任务接口](https://github.com/alibaba/atrex-kernel-agent/blob/e6e2926d5251c7b815597af165d6396c42e4001c/docs/task-execution.md)。
 
 ```python

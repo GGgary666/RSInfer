@@ -1,0 +1,5 @@
+[submodule "third_party/aka"]
+	path = third_party/aka
+	url = https://github.com/alibaba/atrex-kernel-agent.git
+	branch = aka-for-rsi
+	shallow = true

@@ -2,7 +2,7 @@
 
 一个为“AI 自我改进”而设计的大模型推理引擎。
 
-**算子优化开发工具**　agxInfer 使用 Atrex Kernel Agent（AKA）委托算子优化。上游分支为 [alibaba/atrex-kernel-agent · aka-for-rsi](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi)，当前开发套件固定在 [`e6e2926d`](https://github.com/alibaba/atrex-kernel-agent/commit/e6e2926d5251c7b815597af165d6396c42e4001c)。安装、提交任务和接回候选见 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)。
+**算子优化开发工具**　agxInfer 使用 Atrex Kernel Agent（AKA）委托算子优化。在 [third_party](third_party) 中点击 `aka` 可查看当前版本使用的确切提交，后续开发在上游 [aka-for-rsi 分支](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi) 进行。安装、提交任务和接回候选见 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)。
 
 ## 动机
 
