@@ -46,6 +46,7 @@ v0.1、v0.2 本身就是对 v0 架构的检验：如果演进的某一步不得�
 
 ## 文档
 
+- [doc/quickstart.md](doc/quickstart.md)：**快速上手与热更新实操指南**（一键起停 DS1017、OpenAI API 调用、改配置/改代码热生效闭环、进程日志位置、`sleep`/`wake` 与一键评测）。
 - [doc/modules.html](doc/modules.html)：**设计的真源**。单元全景图、单元清单、单元模型与重载、边与组合规则、两个思想实验、已定的决定和待讨论的问题。
 - [doc/roadmap.md](doc/roadmap.md)：做的顺序和每一步的验收。
 - [doc/specs/](doc/specs/)：框架本体七个组件的规格。
@@ -77,7 +78,7 @@ v0.1、v0.2 本身就是对 v0 架构的检验：如果演进的某一步不得�
 ./deploy/serve_ds1017.sh stop
 ```
 
-通用单机 CLI（支持 Qwen3.8 / DS1017 / CPU 调试）详见 [deploy/README.md](deploy/README.md)，热改开发约定与排障见 [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md)。
+完整实操步骤（含热改代码 Demo、日志路径与常见问题）见 [doc/quickstart.md](doc/quickstart.md)；通用单机 CLI（支持 Qwen3.8 / DS1017 / CPU 调试）详见 [deploy/README.md](deploy/README.md)，热改开发约定与排障见 [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md)。
 
 ### 2. DS1017 物理机一键评测（`tests/gpu/ds1017_bench/`）
 

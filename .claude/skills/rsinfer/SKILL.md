@@ -172,6 +172,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 ### `doc/`
 
+- `doc/quickstart.md`：快速上手与热更新实操指南（一键起停 DS1017、OpenAI API、配置/代码热改 Demo、进程日志路径、`sleep`/`wake` 与一键评测）。
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
 - `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、投机解码（`mtp.md`：照 SGLang 的 MTP 和 EAGLE 链式验证，2026-11-13）、v1 多卡和多机的讨论记录（`v1-distributed.md`：未定，2026-11-13）、v1 的盘点和计划（`v1-ds1017.md`：DS 1017 的结构、权重和状态的大小、能对照的实现、阶段，2026-11-14）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。

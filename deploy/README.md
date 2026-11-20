@@ -3,7 +3,7 @@
 `deploy/` 放的是不属于 pytest 的部署工具。用户同意为它新开这个顶层目录。
 
 - `rsinfer.py`：命令行。2026-11-11 取代了 `qwen38.py`：命令按"引擎的生命周期"和"改跑着的引擎"分开，不再绑死一个模型。
-- `serve_ds1017.sh`：DS1017（4×SM100，DP4/EP4）的一键启动与热改封装。会自动按当前 Python 的 `torch.version.cuda` 对齐多版本 CUDA 工具链（`CUDA_HOME`、`nvcc`、`LD_LIBRARY_PATH`、`TRITON_PTXAS_PATH`）并从 `nvidia.cu13` 补齐 `CPATH`，支持 `serve` / `status` / `chat` / `complete` / `control` / `sleep` / `wake` / `stop`。
+- `serve_ds1017.sh`：DS1017（4×SM100，DP4/EP4）的一键启动与热改封装。会自动按当前 Python 的 `torch.version.cuda` 对齐多版本 CUDA 工具链（`CUDA_HOME`、`nvcc`、`LD_LIBRARY_PATH`、`TRITON_PTXAS_PATH`）并从 `nvidia.cu13` 补齐 `CPATH`，支持 `serve` / `status` / `chat` / `complete` / `control` / `sleep` / `wake` / `stop`。完整实操示例（含改配置/改代码热更新 Demo 与进程日志路径）见 [../doc/quickstart.md](../doc/quickstart.md)。
 - `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
   - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`，显式点名某个后端时只用它自己的 kernel）、`--yoco-clip`（默认 0 关闭，给 140 启用 YoCo compact 有界重放）与 `--yoco-mask`；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；完整模型默认开启前缀缓存（仅截层后无 `kv.paged` 时关闭）；不支持 `--dummy`（它的矩阵按 FP8/FP4 字节和 scale 存，`initialize_dummy_weights` 只填浮点张量；随机权重用 `checkpoint` 生成）。
