@@ -9,7 +9,7 @@
 [English](README.md) | [简体中文](README_zh.md)
 
 [![技术报告](https://img.shields.io/badge/技术报告-PDF-b31b1b.svg)](doc/RSInfer_Technical_Report.pdf)
-[![快速上手](https://img.shields.io/badge/快速上手-实操指南-0f766e.svg)](doc/quickstart.md)
+[![快速上手](https://img.shields.io/badge/快速上手-实操指南-0f766e.svg)](doc/quickstart_zh.md)
 [![TLA+ 形式化验证](https://img.shields.io/badge/变更协议-TLA%2B%20验证-1d4ed8.svg)](tests/framework/formal/README.md)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
@@ -111,8 +111,8 @@ RSInfer 在官方 131K YoCo Prefill 与稳态 Decode 全档位超越原版 **Dee
 
 **复现图 6 中的 RSInfer 曲线。** 将 `RSINFER_MODEL` 设为 DS1017 权重目录，在四卡机器上切换到对应版本，从仓库根目录运行以下命令。
 
-- **(a) Prefill** — [`optimized-deepinfer` 的 `ae1ae75`](https://github.com/open-agent-infra/RSInfer/blob/ae1ae7540bc2f39df5471d2eed0b8b3b8d8d38df/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。先[安装 AKA 算子包](https://github.com/open-agent-infra/RSInfer/blob/ae1ae7540bc2f39df5471d2eed0b8b3b8d8d38df/tests/gpu/ds1017_bench/README.md)，再分别运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` 和 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`。
-- **(b) Decode** — [`exp/agentx-opt` 的 `67cbf3c`](https://github.com/open-agent-infra/RSInfer/blob/67cbf3cbfd6fc47e857855043a7136fe6ea42ce6/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"`，覆盖每卡并发 4 到 256 的全部七档。
+- **(a) Prefill** — [`optimized-deepinfer` 的 `87567b2`](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。先[安装 AKA 算子包](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README_zh.md)，再分别运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` 和 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`。
+- **(b) Decode** — [`exp/agentx-opt` 的 `9f321de`](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"`，覆盖每卡并发 4 到 256 的全部七档。 [Decode 评测指南](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README_zh.md)。
 
 ![AgentX 多轮与子 Agent 轨迹评测](doc/figures/fig7_agentx_pareto.png)
 
@@ -152,7 +152,7 @@ RSInfer 在官方 131K YoCo Prefill 与稳态 Decode 全档位超越原版 **Dee
 
 ## 快速上手
 
-完整实操教程（含改调度策略代码热重载 + 查看日志 + 热回退完整 Demo、`sleep`/`wake` 与常见问题）请看 **[doc/quickstart.md](doc/quickstart.md)**。
+完整实操教程（含改调度策略代码热重载 + 查看日志 + 热回退完整 Demo、`sleep`/`wake` 与常见问题）请看 **[doc/quickstart_zh.md](doc/quickstart_zh.md)**。
 
 ### 1. 4×SM100 一键起停与热更新（`deploy/`）
 
@@ -204,7 +204,7 @@ ls run/rsinfer/host-a/snapshots/.run/*/log
 ./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --gpus 0,1,2,3 /path/to/agentx_eval 32
 ```
 
-数据准备与完整参数见 [tests/gpu/ds1017_bench/README.md](tests/gpu/ds1017_bench/README.md)。
+数据准备与完整参数见 [tests/gpu/ds1017_bench/README_zh.md](tests/gpu/ds1017_bench/README_zh.md)。
 
 ### 3. 本地类型检查、测试与 TLA+ 形式化验证
 
@@ -236,7 +236,7 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 ### 文档索引
 
 - [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf)：完整技术报告（架构设计、形式化验证、跨代模型演进、SM100 评测与自举缺陷分类）。
-- [doc/quickstart.md](doc/quickstart.md)：快速上手与热更新实操指南（一键启停、OpenAI API、热改代码 Demo、日志路径与评测）。
+- [doc/quickstart_zh.md](doc/quickstart_zh.md)：快速上手与热更新实操指南（一键启停、OpenAI API、热改代码 Demo、日志路径与评测）。
 - [doc/modules.html](doc/modules.html)：**设计真源**（可交互单元全景图、单元清单、边规则与场景演示）。
 - [doc/specs/](doc/specs/)：框架本体七个组件规格、变更协议、CUDA Graph、前缀缓存、MTP 与 DS1017 规格。
 - [deploy/README.md](deploy/README.md)：`deploy/rsinfer.py` 完整命令与参数参考。
