@@ -110,6 +110,11 @@ RSInfer beats both stock **DeepInfer** and strengthened **DeepInfer (Local Engra
 
 ![DeepSeek-V4.1 Official 4xSM100 Sweeps](doc/figures/fig6_ds1017_sweeps.png)
 
+**Reproducing the RSInfer curves in Figure 6.** Set `RSINFER_MODEL` to the DS1017 checkpoint directory. From the repository root on a four-GPU host, use the revision and commands for each panel below.
+
+- **(a) Prefill** — [`optimized-deepinfer` at `87567b2`](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/run_rsinfer_official.sh). [Install the AKA kernels](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README.md), then run `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` and `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`.
+- **(b) Decode** — [`exp/agentx-opt` at `9f321de`](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/run_rsinfer_official.sh). Run `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"` to sweep all seven per-GPU concurrencies from 4 to 256. [Decode benchmark guide](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README.md).
+
 ![AgentX Multi-Turn and Subagent Evaluation](doc/figures/fig7_agentx_pareto.png)
 
 | Benchmark (`DeepSeek-V4.1-Flash-1017`, 4×SM100 `DP4+EP4`) | RSInfer | vs. DeepInfer | vs. DeepInfer (Local Engram) |
@@ -185,7 +190,7 @@ ls run/rsinfer/host-a/snapshots/.run/*/log
 
 For general single-host usage (`Qwen3.8-27B`, single-GPU, or CPU debugging via `deploy/rsinfer.py`), see [deploy/README.md](deploy/README.md).
 
-### 2. Local One-Command GPU Benchmarks (`tests/gpu/ds1017_bench/`)
+### 2. Benchmarking the `master` baseline (`tests/gpu/ds1017_bench/`)
 
 Benchmark scripts automatically stage temporary probes into disposable `.runs/bench-*` directories (cleaned on exit), keeping the git working tree untouched:
 
