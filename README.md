@@ -8,7 +8,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-[![Technical Report](https://img.shields.io/badge/Technical%20Report-PDF-b31b1b.svg)](doc/RSInfer_Technical_Report.pdf)
+![Technical Report](https://img.shields.io/badge/Technical%20Report-Coming%20Soon-lightgrey.svg)
 [![Quick Start](https://img.shields.io/badge/Quick%20Start-Guide-0f766e.svg)](doc/quickstart.md)
 [![TLA+ Verified](https://img.shields.io/badge/Protocol-TLA%2B%20Verified-1d4ed8.svg)](tests/framework/formal/README.md)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
@@ -261,7 +261,7 @@ As major trunk capabilities (such as PD disaggregation and multi-node support) l
 
 ### Documentation Map
 
-- [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf): Full Technical Report (architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy).
+- **Technical Report** (*Coming Soon*): Architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy.
 - [doc/quickstart.md](doc/quickstart.md): Step-by-step serve, OpenAI API, live hot-reload demo, log inspection, and benchmark guide.
 - [doc/modules.html](doc/modules.html): Interactive unit architecture map, edge rules, and change scenarios (design source of truth).
 - [doc/specs/](doc/specs/): Specifications for the 7 framework-core components, change protocol, CUDA graphs, prefix caching, MTP, and DS1017.

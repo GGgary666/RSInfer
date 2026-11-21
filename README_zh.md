@@ -8,7 +8,7 @@
 
 [English](README.md) | [简体中文](README_zh.md)
 
-[![技术报告](https://img.shields.io/badge/技术报告-PDF-b31b1b.svg)](doc/RSInfer_Technical_Report.pdf)
+![技术报告](https://img.shields.io/badge/技术报告-Coming%20Soon-lightgrey.svg)
 [![快速上手](https://img.shields.io/badge/快速上手-实操指南-0f766e.svg)](doc/quickstart_zh.md)
 [![TLA+ 形式化验证](https://img.shields.io/badge/变更协议-TLA%2B%20验证-1d4ed8.svg)](tests/framework/formal/README.md)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
@@ -261,7 +261,7 @@ master  (通用微内核底座 + Qwen3.8 / DS-V4.1 参考样例 + 共享基础�
 
 ### 文档索引
 
-- [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf)：完整技术报告（架构设计、形式化验证、跨代模型演进、SM100 评测与自举缺陷分类）。
+- **技术报告**（*Coming Soon*）：架构设计、形式化验证、跨代模型演进、SM100 评测与自举缺陷分类。
 - [doc/quickstart_zh.md](doc/quickstart_zh.md)：快速上手与热更新实操指南（一键启停、OpenAI API、热改代码 Demo、日志路径与评测）。
 - [doc/modules.html](doc/modules.html)：**设计真源**（可交互单元全景图、单元清单、边规则与场景演示）。
 - [doc/specs/](doc/specs/)：框架本体七个组件规格、变更协议、CUDA Graph、前缀缓存、MTP 与 DS1017 规格。
