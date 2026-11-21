@@ -112,8 +112,26 @@ RSInfer beats both stock **DeepInfer** and strengthened **DeepInfer (Local Engra
 
 **Reproducing the RSInfer curves in Figure 6.** Set `RSINFER_MODEL` to the DS1017 checkpoint directory. From the repository root on a four-GPU host, use the revision and commands for each panel below.
 
-- **(a) Prefill** — [`optimized-deepinfer` at `87567b2`](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/run_rsinfer_official.sh). [Install the AKA kernels](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README.md), then run `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` and `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`.
-- **(b) Decode** — [`exp/agentx-opt` at `9f321de`](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/run_rsinfer_official.sh). Run `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"` to sweep all seven per-GPU concurrencies from 4 to 256. [Decode benchmark guide](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README.md).
+**(a) Prefill** · `optimized-deepinfer`
+
+Build and install the AKA kernels in the serving environment before running the sweep. [Benchmark guide](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README.md)
+
+```bash
+git switch --detach 87567b2
+uv build --wheel third_party/aka-ds1017-kernels --out-dir dist
+python -m pip install --no-deps dist/aka_ds1017_kernels-0.1.0-py3-none-any.whl
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536
+```
+
+**(b) Decode** · `exp/agentx-opt`
+
+The default sweep covers all seven per-GPU concurrencies from 4 to 256. [Benchmark guide](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README.md)
+
+```bash
+git switch --detach 9f321de
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"
+```
 
 ![AgentX Multi-Turn and Subagent Evaluation](doc/figures/fig7_agentx_pareto.png)
 

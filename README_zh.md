@@ -112,8 +112,26 @@ RSInfer 在官方 131K YoCo Prefill 与稳态 Decode 全档位超越原版 **Dee
 
 **复现图 6 中的 RSInfer 曲线。** 将 `RSINFER_MODEL` 设为 DS1017 权重目录，在四卡机器上切换到对应版本，从仓库根目录运行以下命令。
 
-- **(a) Prefill** — [`optimized-deepinfer` 的 `87567b2`](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。先[安装 AKA 算子包](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README_zh.md)，再分别运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` 和 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`。
-- **(b) Decode** — [`exp/agentx-opt` 的 `9f321de`](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"`，覆盖每卡并发 4 到 256 的全部七档。 [Decode 评测指南](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README_zh.md)。
+**(a) Prefill** · `optimized-deepinfer`
+
+先在运行服务的 Python 环境中构建并安装 AKA 算子包，再运行评测。 [评测指南](https://github.com/open-agent-infra/RSInfer/blob/87567b2e2960b3017bbcb5f5cbed9b9778a318ee/tests/gpu/ds1017_bench/README_zh.md)
+
+```bash
+git switch --detach 87567b2
+uv build --wheel third_party/aka-ds1017-kernels --out-dir dist
+python -m pip install --no-deps dist/aka_ds1017_kernels-0.1.0-py3-none-any.whl
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536
+```
+
+**(b) Decode** · `exp/agentx-opt`
+
+默认覆盖每卡并发从 4 到 256 的全部七档。 [评测指南](https://github.com/open-agent-infra/RSInfer/blob/9f321de350336549fb594ee127937c3cc443c796/tests/gpu/ds1017_bench/README_zh.md)
+
+```bash
+git switch --detach 9f321de
+./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"
+```
 
 ![AgentX 多轮与子 Agent 轨迹评测](doc/figures/fig7_agentx_pareto.png)
 
