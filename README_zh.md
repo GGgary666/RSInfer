@@ -109,6 +109,11 @@ RSInfer 在官方 131K YoCo Prefill 与稳态 Decode 全档位超越原版 **Dee
 
 ![DeepSeek-V4.1 官方 4xSM100 Prefill 与 Decode 扫描](doc/figures/fig6_ds1017_sweeps.png)
 
+**复现图 6 中的 RSInfer 曲线。** 将 `RSINFER_MODEL` 设为 DS1017 权重目录，在四卡机器上切换到对应版本，从仓库根目录运行以下命令。
+
+- **(a) Prefill** — [`optimized-deepinfer` 的 `ae1ae75`](https://github.com/open-agent-infra/RSInfer/blob/ae1ae7540bc2f39df5471d2eed0b8b3b8d8d38df/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。先[安装 AKA 算子包](https://github.com/open-agent-infra/RSInfer/blob/ae1ae7540bc2f39df5471d2eed0b8b3b8d8d38df/tests/gpu/ds1017_bench/README.md)，再分别运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile expanded 4096 8192 16384` 和 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --model "$RSINFER_MODEL" --aka-profile validated 32768 65536`。
+- **(b) Decode** — [`exp/agentx-opt` 的 `67cbf3c`](https://github.com/open-agent-infra/RSInfer/blob/67cbf3cbfd6fc47e857855043a7136fe6ea42ce6/tests/gpu/ds1017_bench/run_rsinfer_official.sh)。运行 `./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode --model "$RSINFER_MODEL"`，覆盖每卡并发 4 到 256 的全部七档。
+
 ![AgentX 多轮与子 Agent 轨迹评测](doc/figures/fig7_agentx_pareto.png)
 
 | 评测项（`DeepSeek-V4.1-Flash-1017`，4×SM100 `DP4+EP4`） | RSInfer | 对比 DeepInfer | 对比 DeepInfer (Local Engram) |
@@ -184,7 +189,7 @@ ls run/rsinfer/host-a/snapshots/.run/*/log
 
 通用单机命令行（支持 `Qwen3.8-27B`、单卡与 CPU 调试）详见 [deploy/README.md](deploy/README.md)。
 
-### 2. 物理机一键基准评测（`tests/gpu/ds1017_bench/`）
+### 2. 在物理机上评测 `master` 基线（`tests/gpu/ds1017_bench/`）
 
 评测脚本会自动在临时隔离目录 `.runs/bench-*` 上施加探针、跑完自动清理，不污染 git 工作树：
 
