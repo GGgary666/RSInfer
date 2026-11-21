@@ -1,6 +1,6 @@
 <div align="center">
 
-# RSInfer
+<img src="doc/figures/rsinfer_logo.png" alt="RSInfer" width="400" />
 
 ### 面向“AI 自我改进”的原生大模型推理引擎
 
@@ -24,9 +24,10 @@
 
 ### 核心亮点
 
+- **微内核架构，“一切皆可热插拔单元”：** RSInfer 将极简、领域无关的微内核框架本体（`engine/framework.toml`）与所有推理能力彻底解耦。调度策略、模型定义、注意力后端与算子全部封装为可热重载的**逻辑单元**，权重、KV 池与 NCCL 通信组则常驻在长寿命**状态单元**中。面对任意源码或配置改动，`core.deps` 会自动推导出**最小安全变更集合**（需要重载的单元、需要重录的 CUDA Graph 以及是否排空流量），在不重启进程、不丢显存的前提下完成秒级热更新。
 - **32×–98× 更快的热变更：** 单张 SM100 跑 `Qwen3.8-27B` 时，原地热改代码/配置仅需 **1.0–2.2 秒**（对比 SGLang/vLLM 64–104 秒重启）。在 4×SM100 跑 `DeepSeek-V4.1-Flash-1017`（552B MoE + 196B Engram，475.2 GiB 权重）的 6 小时自主优化会话中，Agent 完成 **95 次热更新、0 次重启**，代码热重载中位耗时 **5.18 秒**（比冷启动快 **63×–216×**），单场会话节省 **8–31 小时**重启等待。
 - **自主 RSI 全程零框架本体改动：** 无论是 `Qwen3.8-27B` 上 11 轮自主演化（约 75 次热 `apply`），还是 4×SM100 `DeepSeek-V4.1-Flash-1017` 上三条基准线的数十次连续优化（含单场 95 次热更新），所有改进全部落在可热重载的**单元（Unit）**中，**0 行改动**触及领域无关的微内核框架本体（`engine/framework.toml`）。
-- **前沿 SM100 实测性能：** 单卡 `Qwen3.8-27B` 上，Agent 演化后的 RSInfer 达到原生 SGLang Decode 吞吐的 **104.5%**、前缀缓存 TTFT 最高降低 **2.95×**、EAGLE/MTP 投机解码快 **+6.4%–10.8%**；4×SM100 `DeepSeek-V4.1-Flash-1017` 上，官方 131K Prefill 与 Decode 扫描全档位超越原版及本地 Engram 版 DeepInfer，其中 Prefill 最高提升 **+13.0% / +9.9%**、Decode 最高提升 **+11.5%**；在真实多轮 **AgentX** 轨迹上，131K 验证集输出吞吐提升 **+25.6%–26.5%**，256K 盲测集提升 **+19.0%–31.8%**，中位与 P99 TTFT 最高缩短 **4.1×** 与 **2.7×**。
+- **前沿 SM100 实测性能：** 单卡 `Qwen3.8-27B` 上，Agent 演化后的 RSInfer 达到原生 SGLang Decode 吞吐的 **104.5%**、前缀缓存 TTFT 最高降低 **2.95×**、EAGLE/MTP 投机解码快 **+6.4–10.8%**；4×SM100 `DeepSeek-V4.1-Flash-1017` 上，官方 131K Prefill 与 Decode 扫描全档位超越原版及本地 Engram 版 DeepInfer，其中 Prefill 最高提升 **+13.0% / +9.9%**、Decode 最高提升 **+11.5%**；在真实多轮 **AgentX** 轨迹上，131K 验证集输出吞吐提升 **+25.6–26.5%**，256K 盲测集提升 **+19.0–31.8%**，中位与 P99 TTFT 最高缩短 **4.1×** 与 **2.7×**。
 - **形式化验证与可信评测：** 分布式变更、回滚与进程代次协议经 **4 份 TLA+ 规约**（43 组 TLC 配置、17 个故障变异体、14 个可达性见证）及 **59 个真实实现回放测试**校验；叠加运行时 `O(1)` CUDA Graph 守卫与外置冷启动真值评测门禁。
 
 > **算子优化开发工具（AKA）：** RSInfer 使用 Atrex Kernel Agent（AKA）异步委托单算子深度优化。在 [third_party](third_party) 中点击 `aka` 可查看当前版本使用的确切提交，后续开发在上游 [aka-for-rsi 分支](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi) 进行。安装、提交任务和接回候选见 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)。
@@ -78,13 +79,13 @@ RSInfer 用 6 种边类型（`data`、`call`、`state`、`derive`、`ctrl`、`de
 
 | 原则 | 核心约束 |
 |---|---|
-| **P1 — 数据驱动描述** | 并行网格、拓扑部署、权重量化排布（`WeightDecl`）与逐层缓存布局（`StateDecl`：子页压缩比、字节形状、生命周期）全为声明式数据，不写死类型。 |
-| **P2 — 开放记录** | 跨进程每步消息（`StepPlan` / `StepResult`）为可扩展列式二进制映射（`dict[str, bytes]`），接入 MTP 投机解码或 YoCo 重放无需修改传输层。 |
-| **P3 — Rank 索引接口** | 执行与账本接口统一按 rank 与调度域（`sched.domains`）索引，自然统一单卡 TP 与异构 `DP4 + EP4`。 |
-| **P4 — 能力声明** | 单元在 `unit.toml` 静态声明支持的状态动作（`drain`、`refit`）、图可捕获性、原生库与进程外 `[unit] build` 构建钩子。 |
-| **P5 — 联合约束协议** | 多池准入与前缀复用通过“各账本提议约束 → 取交集”完成，统一管理分页 KV、Mamba/GDN 槽位与 SWA 滑窗环。 |
-| **P6 — 统一 ChangeSet** | 代码补丁、在线配置切换、启动、`sleep`/`wake` 与在线 EPLB 重排均走同一条事务变更管线。 |
-| **P7 — 严格位置透明** | 框架与单元代码禁止在端点标识中写死 `localhost`、PID 或本机路径（`ProcId = (HostId, role, index)`），由 CI 静态 AST 扫描强制守护。 |
+| **P1：数据驱动描述** | 并行网格、拓扑部署、权重量化排布（`WeightDecl`）与逐层缓存布局（`StateDecl`：子页压缩比、字节形状、生命周期）全为声明式数据，不写死类型。 |
+| **P2：开放记录** | 跨进程每步消息（`StepPlan` / `StepResult`）为可扩展列式二进制映射（`dict[str, bytes]`），接入 MTP 投机解码或 YoCo 重放无需修改传输层。 |
+| **P3：Rank 索引接口** | 执行与账本接口统一按 rank 与调度域（`sched.domains`）索引，自然统一单卡 TP 与异构 `DP4 + EP4`。 |
+| **P4：能力声明** | 单元在 `unit.toml` 静态声明支持的状态动作（`drain`、`refit`）、图可捕获性、原生库与进程外 `[unit] build` 构建钩子。 |
+| **P5：联合约束协议** | 多池准入与前缀复用通过“各账本提议约束 → 取交集”完成，统一管理分页 KV、Mamba/GDN 槽位与 SWA 滑窗环。 |
+| **P6：统一 ChangeSet** | 代码补丁、在线配置切换、启动、`sleep`/`wake` 与在线 EPLB 重排均走同一条事务变更管线。 |
+| **P7：严格位置透明** | 框架与单元代码禁止在端点标识中写死 `localhost`、PID 或本机路径（`ProcId = (HostId, role, index)`），由 CI 静态 AST 扫描强制守护。 |
 
 ---
 
@@ -113,10 +114,10 @@ RSInfer 在官方 131K YoCo Prefill 与稳态 Decode 全档位超越原版 **Dee
 
 | 评测项（`DeepSeek-V4.1-Flash-1017`，4×SM100 `DP4+EP4`） | RSInfer | 对比 DeepInfer | 对比 DeepInfer (Local Engram) |
 |---|---:|---:|---:|
-| **官方 131K YoCo Prefill**（`4K–64K`，含 AKA 算子） | **70,128 → 88,438 tok/s/GPU** | **+7.2% 至 +13.0%** | **+2.3% 至 +9.9%** |
-| **官方 131K YoCo Decode**（每卡 `D=4..256`，最高 1,024 并发） | **471.5 → 11,621.1 tok/s/GPU** | **+2.9% 至 +11.5%** | **+3.8% 至 +11.5%** |
-| **AgentX 131K 验证集**（`C=16/24/48`，328 请求） | **880 / 979 / 1,058 out tok/s** | **+25.6% 至 +26.5%**（P50 TTFT 快 **2.32×–2.57×**） | — |
-| **AgentX 256K 盲测集**（`C=8..32`，256 请求） | **560 → 998 out tok/s**（总吞吐 119.4K） | **+19.0% 至 +31.8%**（P50 TTFT 快 **1.74×–4.05×**） | — |
+| **官方 131K YoCo Prefill**（`4K–64K`，含 AKA 算子） | **70,128 → 88,438 tok/s/GPU** | **+7.2–13.0%** | **+2.3–9.9%** |
+| **官方 131K YoCo Decode**（每卡 `D=4..256`，最高 1,024 并发） | **471.5 → 11,621.1 tok/s/GPU** | **+2.9–11.5%** | **+3.8–11.5%** |
+| **AgentX 131K 验证集**（`C=16/24/48`，328 请求） | **880 / 979 / 1,058 out tok/s** | **+25.6–26.5%**（P50 TTFT 快 **2.32×–2.57×**） | — |
+| **AgentX 256K 盲测集**（`C=8..32`，256 请求） | **560 → 998 out tok/s**（总吞吐 119.4K） | **+19.0–31.8%**（P50 TTFT 快 **1.74×–4.05×**） | — |
 
 <details>
 <summary><b>展开更多实验细节：Qwen3.8-27B 单卡对比、AgentX 分位延迟、DS-V4.1 自主演化曲线与 TLA+ 形式化验证</b></summary>
@@ -212,7 +213,38 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 
 ---
 
-## 里程碑、分支与文档导航
+## 基于 RSInfer 开发与演进：RSI 分支树
+
+`master` 的定位是一个干净的**通用底座加上两个端到端模型样例**（单卡混合架构 `Qwen3.8-27B` 与 4 卡 `DeepSeek-V4.1-Flash-1017`）。极致推理性能高度绑定具体的 `(模型、硬件、业务负载)` 组合，如果把所有模型的特化代码和 Agent 演化出的启发式都堆进同一个分支，`master` 很快会膨胀成难以维护的巨无霸。
+
+我们更希望围绕 `master` 长出一棵**分支树**：想接入新模型，或针对自己的硬件与流量做深度优化，直接从 `master` fork 并拉出独立分支，在自己的分支里跑 RSI 闭环即可，就像本仓库里已有的两个优化分支所演示的那样：
+
+```text
+master  (通用微内核底座 + Qwen3.8 / DS-V4.1 参考样例 + 共享基础设施能力)
+ ├── optimized-deepinfer     # 参考分支：集成 AKA 发现的 SM100 Prefill 算子（支持 --aka-profile / --aka-warmup）
+ ├── exp/agentx-opt          # 参考分支：面向 AgentX 多轮高并发的词表并行 LM Head、多流重叠与占用率调度
+ ├── your-fork / model-X     # 社区分支：接入你的新模型，并在目标硬件上持续 RSI
+ └── your-fork / workload-Y  # 社区分支：针对特定线上流量演化调度策略与定制算子
+```
+
+### 分支演进与 `master` 主干的分工
+
+| 改动类型 | 建议去向 | 典型内容 |
+|---|---|---|
+| **新模型接入与场景特化 RSI** | **留在各自的 Fork / 分支** | 接入新模型架构或定制权重变体；面向特定硬件 SKU 的 Triton/TileLang/CUDA/AKA 算子特化；针对特定流量的调度、批处理与重叠策略 |
+| **通用基础设施与重大系统能力** | **持续合入 `master` 主干** | **Prefill/Decode（PD）分离**、**多机多卡并行（`DP16+EP16`）**、**弹性 EP 扩缩容与组内容错**等重型基础能力（避免社区重复造轮子），以及框架本体修复、形式化验证与通用单元抽象 |
+
+后续 PD 分离、多机等基础能力合入 `master` 后，各个社区分支只需按需 rebase 主干即可直接复用，同时保持各自的模型与负载特化不受干扰。
+
+### 三步开启你的 RSI 分支
+
+1. **从 `master` fork 并新建分支**：参考 `engine/models/` 与 `deploy/models/` 中 `Qwen3.8-27B` / `DS-V4.1` 的单元组织方式，接入目标模型或定位待优化单元。
+2. **在运行中的引擎上闭环迭代**：拉起常驻引擎后，按 [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md)（算子搜索可结合 [AKA 使用指南](.claude/skills/optimize-kernels-with-aka/SKILL.md)）让 Coding Agent 或工程师以 `control apply --source .` 秒级热改验证，并在干净冷启动下复测确认收益。
+3. **独立维护你的演化路径，通用能力回馈主干**：各自维护并分享特定模型或负载的 RSI 分支；通用底座改进欢迎提交 PR 合入 `master`，惠及整棵分支树。
+
+---
+
+## 路线图与文档导航
 
 ### 里程碑与路线图
 
@@ -221,12 +253,6 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 | **v0** | ✅ 已完成 | 1×SM100 `Qwen3.8-27B`（64 层混合 GatedDeltaNet + Paged GQA、Radix GDN 前缀缓存、EAGLE/MTP 投机解码、全套变更协议验证、自主演化超越 SGLang） |
 | **v1** | ✅ 已完成 | 4×SM100 `DeepSeek-V4.1-Flash-1017`（`DP4+EP4`、4-stream mHC、Sparse MLA + SWA + YoCo、384+32 NVFP4 MoE + 在线 EPLB、NVLink Engram、AKA 算子，在 32K/131K 扫描与 AgentX 131K/256K 全面超越 DeepInfer） |
 | **v2** | 🚧 规划中 | 弹性 EP 扩缩容与组内故障隔离、多机 `DP16+EP16` 与 Prefill/Decode 分离、独立打包的 `rsi.evalsvc` / `rsi.lineage` 谱系服务 |
-
-### 主要分支
-
-- `master`：主干版本，包含 `Qwen3.8-27B` 与 `DeepSeek-V4.1-Flash-1017`、一键启停脚本（`deploy/serve_ds1017.sh`）及本地评测脚本。
-- `optimized-deepinfer`：集成 AKA 优化的 SM100 Prefill 算子（评测脚本支持 `--aka-profile auto|official|validated|expanded --aka-warmup`）。
-- `exp/agentx-opt`：面向 AgentX 高并发多轮场景的优化分支（词表并行 LM Head、多流 Decode 重叠、占用率感知调度）。
 
 ### 文档索引
 

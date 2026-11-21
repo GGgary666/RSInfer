@@ -1,6 +1,6 @@
 <div align="center">
 
-# RSInfer
+<img src="doc/figures/rsinfer_logo.png" alt="RSInfer" width="400" />
 
 ### An RSI-Native LLM Serving Engine for Live, Compositional, and Safe Self-Improvement
 
@@ -18,18 +18,19 @@
 
 ---
 
-**RSInfer** is a production-grade LLM serving engine architected from first principles for **Recursive Self-Improvement (RSI)** — where AI agents (and human systems engineers) continuously profile, rewrite, and optimize kernels, schedulers, and serving stacks directly on live GPU engines without paying cold-start taxes or risking silent corruption.
+**RSInfer** is a production-grade LLM serving engine built from first principles for **Recursive Self-Improvement (RSI)**. AI agents and systems engineers can continuously profile, rewrite, and optimize kernels, schedulers, and serving stacks directly on live GPU engines without paying cold-start taxes or risking silent corruption.
 
 ![RSInfer at a Glance](doc/figures/fig1_headline.png)
 
 ### Key Highlights
 
+- **Microkernel Design, Everything Is a Hot-Pluggable Unit:** RSInfer keeps a minimal, domain-agnostic microkernel core (`engine/framework.toml`) separate from all serving logic. Schedulers, models, attention backends, and kernels are packaged as hot-reloadable **Logic Units**, while weights, KV pools, and NCCL communicators live in long-lived **State Units**. For any code or config edit, `core.deps` automatically derives the **minimal safe change set** (which units reload, which CUDA graphs recapture, and whether traffic must drain), allowing live updates to finish in seconds while GPU state stays resident.
 - **32×–98× Faster Live Mutations:** In-place code and configuration updates finish in **1.0–2.2 s** on 1×SM100 (`Qwen3.8-27B`) vs. 64–104 s restarts in SGLang/vLLM. On 4×SM100 serving `DeepSeek-V4.1-Flash-1017` (552B MoE + 196B Engram, 475.2 GiB checkpoint), an autonomous agent ran **95 live updates with zero restarts** in 6 hours at **5.18 s** median code-reload latency (**63×–216×** faster than cold boots), saving **8–31 hours** in a single session.
-- **Zero Framework-Core Edits During Autonomous RSI:** All autonomous optimization trajectories — 11 rounds (~75 live `apply`s) on `Qwen3.8-27B` and all three `DeepSeek-V4.1-Flash-1017` benchmark campaigns (including 95 live `apply`s on 4×SM100) — landed entirely inside reloadable **Units** with **zero edits** to the domain-agnostic microkernel (`engine/framework.toml`).
-- **Frontier SM100 Serving Performance:** On 1×SM100 `Qwen3.8-27B`, agent-evolved RSInfer reaches **104.5%** of native SGLang decode throughput, **up to 2.95×** lower prefix-cached TTFT, and **+6.4%–10.8%** higher EAGLE/MTP throughput. On 4×SM100 `DeepSeek-V4.1-Flash-1017`, RSInfer outperforms DeepInfer and DeepInfer (Local Engram) at every point of the official 131K sweep (up to **+13.0% / +9.9%** prefill and **+11.5%** decode), and on real multi-turn **AgentX** traces delivers **+25.6%–26.5%** output throughput on the 131K validation split and **+19.0%–31.8%** on the 256K blind holdout while cutting median and P99 TTFT by up to **4.1×** and **2.7×**.
+- **Zero Framework-Core Edits During Autonomous RSI:** All autonomous optimization trajectories (11 rounds and ~75 live `apply`s on `Qwen3.8-27B`, plus all three `DeepSeek-V4.1-Flash-1017` benchmark campaigns including 95 live `apply`s on 4×SM100) landed entirely inside reloadable **Units**, with **zero edits** to the microkernel core (`engine/framework.toml`).
+- **Frontier SM100 Serving Performance:** On 1×SM100 `Qwen3.8-27B`, agent-evolved RSInfer reaches **104.5%** of native SGLang decode throughput, **up to 2.95×** lower prefix-cached TTFT, and **+6.4–10.8%** higher EAGLE/MTP throughput. On 4×SM100 `DeepSeek-V4.1-Flash-1017`, RSInfer outperforms DeepInfer and DeepInfer (Local Engram) at every point of the official 131K sweep (up to **+13.0% / +9.9%** prefill and **+11.5%** decode), and on real multi-turn **AgentX** traces delivers **+25.6–26.5%** output throughput on the 131K validation split and **+19.0–31.8%** on the 256K blind holdout while cutting median and P99 TTFT by up to **4.1×** and **2.7×**.
 - **Formally Verified & Audit-Proof:** Distributed commit, rollback, and incarnation protocols are checked by **4 TLA+ specifications** (43 TLC configurations, 17 bug mutants, 14 witnesses) paired with **59 Python trace-replay tests**, runtime `O(1)` CUDA Graph guards, and clean cold-start evaluation gates.
 
-> **Asynchronous Kernel Research (AKA):** RSInfer delegates isolated operator search to [Atrex Kernel Agent (AKA)](third_party) (upstream development on [aka-for-rsi](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi)). See the [AKA Optimization Guide](.claude/skills/optimize-kernels-with-aka/SKILL.md) for setup, task submission, and candidate integration.
+> **Asynchronous Kernel Research via AKA:** RSInfer delegates isolated operator search to [Atrex Kernel Agent (AKA)](third_party) (upstream development on [aka-for-rsi](https://github.com/alibaba/atrex-kernel-agent/tree/aka-for-rsi)). See the [AKA Optimization Guide](.claude/skills/optimize-kernels-with-aka/SKILL.md) for setup, task submission, and candidate integration.
 
 ---
 
@@ -37,7 +38,7 @@
 
 More and more work asks AI agents to improve AI infrastructure itself: write faster kernels, redesign scheduling policies, and evolve entire inference engines. Today's serving engines (vLLM, SGLang, DeepInfer, etc.) were not designed for this:
 
-- **Every tiny edit forces a full restart.** Changing a 10-line scheduling policy or a kernel wrapper tears down processes, re-initializes CUDA and communicators, reloads tens to hundreds of gigabytes of weights (1–20 minutes), and recaptures CUDA graphs — throttling every single agent iteration.
+- **Every tiny edit forces a full restart.** Changing a 10-line scheduling policy or a kernel wrapper tears down processes, re-initializes CUDA and communicators, reloads tens to hundreds of gigabytes of weights (1–20 minutes), and recaptures CUDA graphs, throttling every single agent iteration.
 - **Nobody knows the true blast radius.** Swapping a kernel without recapturing CUDA graphs, or replacing weights without invalidating cached scales or KV states, silently produces wrong outputs with zero runtime exceptions.
 - **In-situ measurements are untrustworthy.** Numbers benchmarked inside a repeatedly mutated process drift with mutation history and allocator fragmentation; unconstrained agents can also subtly game benchmarks (e.g., skipping EOS checks or slicing the vocabulary).
 - **Improvements do not compose.** Without deterministic system identity and atomic transitions, one optimization rarely serves as a reliable, verifiable starting point for the next.
@@ -57,10 +58,10 @@ Build an inference engine **architected from the ground up to "safely change any
 
 ## Core Ideas & Architecture
 
-- **Every module is a "Unit."** A Unit is the smallest unit of management and hot-reloading; OS processes are merely containers for units. Change a scheduling policy, and only that unit reloads — no process restarts.
-- **A domain-agnostic microkernel core.** The framework core (`engine/framework.toml`, ~10K LoC — 24.6% of `engine/`) has no built-in concept of tokens, schedulers, KV caches, or TP. All serving capabilities live in **44 hot-reloadable Units**, composed cleanly like in-process microservices.
+- **Every module is a "Unit."** A Unit is the smallest unit of management and hot-reloading; OS processes are merely containers for units. Change a scheduling policy, and only that unit reloads, with no process restarts.
+- **A domain-agnostic microkernel core.** The framework core (`engine/framework.toml`, ~10K LoC, 24.6% of `engine/`) has no built-in concept of tokens, schedulers, KV caches, or TP. All serving capabilities live in **44 hot-reloadable Units**, composed cleanly like in-process microservices.
 - **Long-lived State Units outlive stateless Logic Units.** 10 **State Units** hold GPU HBM pools, weights, NCCL communicators, and ledgers across reloads; 34 **Logic Units** (models, layers, kernels, schedulers, frontends) reload in seconds without dropping hundreds of gigabytes of weights or KV cache.
-- **The framework derives the exact cost of every edit.** From *what changed*, `core.deps` automatically computes which units must reload, which CUDA graphs must be recaptured, and whether traffic must drain — touching only what is truly affected.
+- **The framework derives the exact cost of every edit.** From *what changed*, `core.deps` automatically computes which units must reload, which CUDA graphs must be recaptured, and whether traffic must drain, touching only what is truly affected.
 
 ![RSInfer Process and Unit Architecture](doc/figures/fig2_arch_map.png)
 
@@ -78,13 +79,13 @@ To let one unchanged unit contract span single-GPU hybrid linear-attention model
 
 | Principle | Invariant |
 |---|---|
-| **P1 — Data-Driven Description** | Parallel meshes, placement topologies, weight formats (`WeightDecl`), and per-layer cache layouts (`StateDecl`: sub-page ratios, byte shapes, lifetimes) are declarative data, not hardcoded types. |
-| **P2 — Open Records** | Per-step cross-process payloads (`StepPlan` / `StepResult`) are extensible columnar binary maps (`dict[str, bytes]`), enabling MTP speculation or YoCo replay with zero transport schema edits. |
-| **P3 — Rank-Indexed Interfaces** | Execution and ledger interfaces are indexed per rank and scheduling domain (`sched.domains`), unifying TP (`comm.size=1` / identical plans) and heterogeneous `DP4 + EP4`. |
-| **P4 — Capability Declarations** | Units statically declare state actions (`drain`, `refit`), graph capturability, native libraries, and out-of-process `[unit] build` hooks in `unit.toml`. |
-| **P5 — Joint Constraint Protocols** | Multi-pool admission and prefix reuse follow a "propose constraints → intersect" protocol across paged KV, Mamba/GDN recurrent slots, and SWA ring buffers. |
-| **P6 — Unified ChangeSet** | Agent code patches, live config toggles, startup, `sleep`/`wake`, and runtime reconfigurations (such as online EPLB) all flow through one transactional pipeline. |
-| **P7 — Strict Location Transparency** | No framework or unit module may hardcode `localhost`, OS PIDs, or host-local paths in endpoint IDs (`ProcId = (HostId, role, index)`), statically enforced in CI. |
+| **P1: Data-Driven Description** | Parallel meshes, placement topologies, weight formats (`WeightDecl`), and per-layer cache layouts (`StateDecl`: sub-page ratios, byte shapes, lifetimes) are expressed as declarative data. |
+| **P2: Open Records** | Per-step cross-process payloads (`StepPlan` / `StepResult`) are extensible columnar binary maps (`dict[str, bytes]`), enabling MTP speculation or YoCo replay with zero transport schema edits. |
+| **P3: Rank-Indexed Interfaces** | Execution and ledger interfaces are indexed per rank and scheduling domain (`sched.domains`), unifying TP (`comm.size=1` / identical plans) and heterogeneous `DP4 + EP4`. |
+| **P4: Capability Declarations** | Units statically declare state actions (`drain`, `refit`), graph capturability, native libraries, and out-of-process `[unit] build` hooks in `unit.toml`. |
+| **P5: Joint Constraint Protocols** | Multi-pool admission and prefix reuse follow a "propose constraints → intersect" protocol across paged KV, Mamba/GDN recurrent slots, and SWA ring buffers. |
+| **P6: Unified ChangeSet** | Agent code patches, live config toggles, startup, `sleep`/`wake`, and runtime reconfigurations (such as online EPLB) all flow through one transactional pipeline. |
+| **P7: Strict Location Transparency** | No framework or unit module may hardcode `localhost`, OS PIDs, or host-local paths in endpoint IDs (`ProcId = (HostId, role, index)`), statically enforced in CI. |
 
 ---
 
@@ -113,10 +114,10 @@ RSInfer beats both stock **DeepInfer** and strengthened **DeepInfer (Local Engra
 
 | Benchmark (`DeepSeek-V4.1-Flash-1017`, 4×SM100 `DP4+EP4`) | RSInfer | vs. DeepInfer | vs. DeepInfer (Local Engram) |
 |---|---:|---:|---:|
-| **Official 131K YoCo Prefill** (`4K–64K`, +AKA Kernels) | **70,128 → 88,438 tok/s/GPU** | **+7.2% to +13.0%** | **+2.3% to +9.9%** |
-| **Official 131K YoCo Decode** (`D=4..256`/GPU, up to 1,024 seqs) | **471.5 → 11,621.1 tok/s/GPU** | **+2.9% to +11.5%** | **+3.8% to +11.5%** |
-| **AgentX 131K Validation** (`C=16/24/48`, 328 reqs) | **880 / 979 / 1,058 out tok/s** | **+25.6% to +26.5%** (P50 TTFT **2.32×–2.57×** faster) | — |
-| **AgentX 256K Blind Holdout** (`C=8..32`, 256 reqs) | **560 → 998 out tok/s** (119.4K total) | **+19.0% to +31.8%** (P50 TTFT **1.74×–4.05×** faster) | — |
+| **Official 131K YoCo Prefill** (`4K–64K`, +AKA Kernels) | **70,128 → 88,438 tok/s/GPU** | **+7.2–13.0%** | **+2.3–9.9%** |
+| **Official 131K YoCo Decode** (`D=4..256`/GPU, up to 1,024 seqs) | **471.5 → 11,621.1 tok/s/GPU** | **+2.9–11.5%** | **+3.8–11.5%** |
+| **AgentX 131K Validation** (`C=16/24/48`, 328 reqs) | **880 / 979 / 1,058 out tok/s** | **+25.6–26.5%** (P50 TTFT **2.32×–2.57×** faster) | — |
+| **AgentX 256K Blind Holdout** (`C=8..32`, 256 reqs) | **560 → 998 out tok/s** (119.4K total) | **+19.0–31.8%** (P50 TTFT **1.74×–4.05×** faster) | — |
 
 <details>
 <summary><b>More Results: Qwen3.8-27B on 1×SM100, AgentX Percentile Latencies, DS-V4.1 Evolution Trajectories, and TLA+ Verification</b></summary>
@@ -147,7 +148,7 @@ RSInfer beats both stock **DeepInfer** and strengthened **DeepInfer (Local Engra
 
 ## Quick Start
 
-For a full hands-on walkthrough — including a live code hot-reload & rollback demo, process log locations, `sleep`/`wake`, and troubleshooting — see **[doc/quickstart.md](doc/quickstart.md)**.
+For a full hands-on walkthrough (live code hot-reload & rollback demo, process log locations, `sleep`/`wake`, and troubleshooting), see **[doc/quickstart.md](doc/quickstart.md)**.
 
 ### 1. One-Command 4×SM100 Serving & Live Hot-Reload (`deploy/`)
 
@@ -212,7 +213,38 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 
 ---
 
-## Milestones, Branches & Documentation
+## Develop & Evolve: A Tree of RSI Branches
+
+`master` is intentionally kept lean as a **general-purpose base plus two end-to-end reference models** (`Qwen3.8-27B` and `DeepSeek-V4.1-Flash-1017`). Optimal kernels, batching policies, and memory layouts depend tightly on the specific `(model, hardware, workload)` tuple. Pushing every model-specific tweak and agent-discovered heuristic into a single branch would turn `master` into a bloated monolith that slows everyone down.
+
+Our development model is a **growing tree of specialized RSI branches**. If you want to onboard a new model or optimize for your own hardware and traffic, fork `master` and run your own RSI loop on a dedicated branch, following the same pattern as our own optimization branches in this repository:
+
+```text
+master  (general microkernel base + Qwen3.8 & DS-V4.1 examples + shared serving infra)
+ ├── optimized-deepinfer     # Reference RSI branch: AKA SM100 prefill kernels (--aka-profile / --aka-warmup)
+ ├── exp/agentx-opt          # Reference RSI branch: AgentX concurrency (vocab-parallel LM head, multi-stream overlap, occupancy scheduling)
+ ├── your-fork / model-X     # Community branch: onboard Model X and evolve on your target GPUs
+ └── your-fork / workload-Y  # Community branch: tailor schedulers and kernels to your production traffic
+```
+
+### What Lives in Your Branch vs. `master`
+
+| Scope | Where it belongs | Examples |
+|---|---|---|
+| **Model onboarding & workload-specific RSI** | **Your fork / RSI branch** | Adding a new model architecture or checkpoint variant; hardware-specific Triton, TileLang, CUDA, or AKA kernels; traffic-tuned scheduling, overlap, and batching heuristics |
+| **Shared serving infrastructure** | **Merged into `master`** | Major foundational capabilities so the community avoids duplicating work: **Prefill/Decode (PD) disaggregation**, **multi-node serving (`DP16+EP16`)**, **elastic EP & fault containment**, framework-core fixes, formal verification, and shared unit abstractions |
+
+As major trunk capabilities (such as PD disaggregation and multi-node support) land on `master`, downstream RSI branches can rebase to pick them up while keeping their specialized optimizations intact.
+
+### Starting Your Own RSI Branch
+
+1. **Fork and branch from `master`.** Use `Qwen3.8-27B` or `DeepSeek-V4.1-Flash-1017` under `engine/models/` and `deploy/models/` as templates for unit boundaries and config wiring.
+2. **Iterate live on a running engine.** Start the engine once, point your coding agent (or edit directly) following [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md) and the optional [AKA Optimization Guide](.claude/skills/optimize-kernels-with-aka/SKILL.md), and apply changes in seconds via `control apply --source .`. Verify candidate wins on clean cold-started runs before promoting them.
+3. **Maintain specialized lineages independently; upstream shared infra.** Keep model- or traffic-specific optimizations in your branch (and feel free to share your RSI lineage), while contributing general-purpose infrastructure improvements back to `master` via PR.
+
+---
+
+## Roadmap & Documentation
 
 ### Milestones & Roadmap
 
@@ -222,20 +254,14 @@ uv run python tests/framework/formal/run.py --bootstrap --replay
 | **v1** | ✅ Done | 4×SM100 `DeepSeek-V4.1-Flash-1017` (`DP4+EP4`, 4-stream mHC, Sparse MLA + SWA + YoCo, 384+32 NVFP4 MoE + online EPLB, NVLink Engram, AKA kernels, surpassing DeepInfer on 32K/131K sweeps & AgentX 131K/256K) |
 | **v2** | 🚧 Roadmap | Elastic EP rank resizing & intra-group fault containment, multi-node `DP16+EP16` & disaggregated Prefill/Decode, standalone `rsi.evalsvc` / `rsi.lineage` daemon |
 
-### Key Branches
-
-- `master` — Primary baseline with `Qwen3.8-27B` and `DeepSeek-V4.1-Flash-1017`, one-command launcher (`deploy/serve_ds1017.sh`), and local benchmark scripts.
-- `optimized-deepinfer` — Integrates AKA-discovered SM100 prefill kernels (`--aka-profile auto|official|validated|expanded --aka-warmup`).
-- `exp/agentx-opt` — AgentX multi-turn concurrency optimizations (vocab-parallel LM head, multi-stream decode overlap, and occupancy-aware scheduling).
-
 ### Documentation Map
 
-- [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf) — Full Technical Report (architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy).
-- [doc/quickstart.md](doc/quickstart.md) — Step-by-step serve, OpenAI API, live hot-reload demo, log inspection, and benchmark guide.
-- [doc/modules.html](doc/modules.html) — Interactive unit architecture map, edge rules, and change scenarios (design source of truth).
-- [doc/specs/](doc/specs/) — Specifications for the 7 framework-core components, change protocol, CUDA graphs, prefix caching, MTP, and DS1017.
-- [deploy/README.md](deploy/README.md) — Complete `deploy/rsinfer.py` CLI reference (`serve`, `control`, `sleep`/`wake`, `checkpoint`).
-- [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md) — Repository directory map and agent workflow for live-engine development & `# PROBE` debugging.
+- [doc/RSInfer_Technical_Report.pdf](doc/RSInfer_Technical_Report.pdf): Full Technical Report (architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy).
+- [doc/quickstart.md](doc/quickstart.md): Step-by-step serve, OpenAI API, live hot-reload demo, log inspection, and benchmark guide.
+- [doc/modules.html](doc/modules.html): Interactive unit architecture map, edge rules, and change scenarios (design source of truth).
+- [doc/specs/](doc/specs/): Specifications for the 7 framework-core components, change protocol, CUDA graphs, prefix caching, MTP, and DS1017.
+- [deploy/README.md](deploy/README.md): Complete `deploy/rsinfer.py` CLI reference (`serve`, `control`, `sleep`/`wake`, `checkpoint`).
+- [.claude/skills/rsinfer/SKILL.md](.claude/skills/rsinfer/SKILL.md): Repository directory map and agent workflow for live-engine development & `# PROBE` debugging.
 
 ---
 
