@@ -23,7 +23,9 @@ What is ours (stage2-contract.md §4):
   cache holds most of it, then to the one with most free rows; the order policy orders each
   domain's waiting requests. All domains step together: a step is one plan to every rank, an empty
   one to a domain with nothing to run, because ranks that share experts compute each layer
-  together. A domain that refused a step (``Resync``) did not run it while the others did: its
+  together. With ``sched.independent_domains``, ranks share no per-step collective across domains
+  and a step retires as soon as its domain answers. Prefix copies and pauses synchronize domains.
+  A domain that refused a step (``Resync``) did not run it while the others did: its
   requests stay where they were.
 - **Resync.** A step every rank answered with ``Resync`` did not run. The steps sent after it are
   refused too, so the next plan waits for them and goes out with nothing in flight, as a full
@@ -68,7 +70,7 @@ import sys
 import time
 from array import array
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
@@ -242,6 +244,8 @@ class Flight:
     """Per domain, request ids in this step that do not yet have ``home`` recorded on every rank of
     their domain."""
     replica: Replica | None = None
+    domain: int | None = None
+    """Set when the step was issued to a single scheduling domain (``sched.independent_domains``)."""
 
 
 class Outbox:
@@ -288,6 +292,7 @@ class Scheduler:
                  prefill_occupancy_target: Callable[[], int] = lambda: 0,
                  balance_prefill: Callable[[], bool] = lambda: False,
                  prefix_peer: Callable[[], bool] = lambda: False,
+                 independent_domains: Callable[[], bool] = lambda: False,
                  settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
         if not plans or len(plans) != len(results):
             raise ValueError("one plan writer and one result reader per rank")
@@ -321,8 +326,10 @@ class Scheduler:
         self.prefill_occupancy_target = prefill_occupancy_target
         self.balance_prefill = balance_prefill
         self.prefix_peer = prefix_peer
+        self.independent_domains = independent_domains
         self.replica_attempted: set[int] = set()
         self._last_retire_at: float = 0.0
+        self._domain_retire_at: list[float] = [0.0] * len(self.domains)
         self._decode_step_s: float = 0.012
         self._prefill_tok_s: float = 56000.0
         self._decode_streak: int = 0
@@ -332,7 +339,11 @@ class Scheduler:
         self.full = True
         """The next plan resets the workers' persistent batch: it cannot know what an earlier
         instance of this unit sent them."""
+        self.domain_full: list[bool] = [True] * len(self.domains)
         self.removed: list[int] = []
+        self.domain_removed: list[list[int]] = [[] for _ in self.domains]
+        self._domain_retired: list[int] = [-1] * len(self.domains)
+        self._wait_rr: int = 0
         self.capacity: dict[int, dict[str, int]] = {}
         self.fault: Fault | None = None
         self.fault_identity = ""
@@ -381,12 +392,7 @@ class Scheduler:
             self._wait()
         return self._epoch() if self.table.last_retired != before else None
 
-    def quiesce(self) -> int | None:
-        """Every step sent is answered, every token queued for a frontend written (or its route
-        given up). With a failed worker the steps it never answered are not waited for. A step
-        without an answer within ``sched.quiesce_timeout_s`` fails the pause: the change is not
-        made, and the engine goes on serving."""
-        deadline = self.clock() + self.settings.quiesce_timeout_s
+    def _wait_flights(self, deadline: float) -> None:
         while self.flights and self.fault is None:
             self._flush()
             if not self._collect():
@@ -397,6 +403,16 @@ class Scheduler:
                 missing = [r for r in range(len(self.results)) if r not in head.answers]
                 raise TimeoutError(f"step {head.epoch} has no answer from rank(s) {missing} after "
                                    f"{self.settings.quiesce_timeout_s} s; the engine goes on serving")
+
+    def quiesce(self) -> int | None:
+        """Every step sent is answered, every token queued for a frontend written (or its route
+        given up). With a failed worker the steps it never answered are not waited for. A step
+        without an answer within ``sched.quiesce_timeout_s`` fails the pause: the change is not
+        made, and the engine goes on serving."""
+        deadline = self.clock() + self.settings.quiesce_timeout_s
+        self._wait_flights(deadline)
+        if self.fault is None and not self.sync_epochs():
+            self._wait_flights(deadline)
         while self.routes:
             self._flush_routes()
             if self.routes:
@@ -436,6 +452,22 @@ class Scheduler:
         running = sum(1 for r in live if r.row is not None)
         return running, len(live) - running, 0 if self.fault is not None else len(self.flights)
 
+    def sync_epochs(self) -> bool:
+        """Align all domains to the same retired epoch before a change pauses the workers."""
+        if self.fault is not None or len(self.domains) <= 1:
+            return True
+        target = self.table.last_retired
+        if target < 1 or all(r == target for r in self._domain_retired):
+            return True
+        if self.flights:
+            return False
+        epoch = max(self.table.last_submitted, 0) + 1
+        batch = self.settings.max_batch
+        steps = [_Step(epoch, domain * batch) for domain in range(len(self.domains))]
+        self._send_plan(steps)
+        self._flush()
+        return False
+
     def flush_ledgers(self) -> None:
         """What the workers' stores hold may be gone or stale: every domain's prefix cache goes."""
         for ledger in self.ledgers:
@@ -470,9 +502,47 @@ class Scheduler:
         if raw is not None:
             self._take_requests(raw)
 
+    def _is_independent(self) -> bool:
+        return self.independent_domains() and len(self.domains) > 1
+
+    def _domain_can_plan(self, domain: int) -> bool:
+        if any(f.domain is None for f in self.flights):
+            return False
+        dom_flights = [f for f in self.flights if f.domain == domain]
+        if len(dom_flights) >= max(1, self.depth()):
+            return False
+        return not (self.domain_full[domain] and dom_flights)
+
     def _wait_result(self, timeout: float) -> None:
-        head = self.flights[0] if self.flights else None
-        rank = next((r for r in range(len(self.results)) if head is None or r not in head.answers), 0)
+        if not self.flights:
+            raw = self.results[0].read(timeout=timeout)
+            if raw is not None:
+                self._take_result(0, raw)
+                self._retire_ready()
+            return
+        if len(self.domains) > 1 and any(f.domain is not None for f in self.flights):
+            waiting_ranks: list[int] = []
+            for d, ranks in enumerate(self.domains):
+                head = next((f for f in self.flights if f.domain == d), None)
+                if head is not None:
+                    waiting_ranks.extend(r for r in ranks if r not in head.answers)
+            for r in waiting_ranks:
+                raw = self.results[r].read(timeout=0)
+                if raw is not None:
+                    self._take_result(r, raw)
+                    self._retire_ready()
+                    return
+            if not waiting_ranks:
+                return
+            rank = waiting_ranks[self._wait_rr % len(waiting_ranks)]
+            self._wait_rr += 1
+            raw = self.results[rank].read(timeout=min(timeout, 0.0005))
+            if raw is not None:
+                self._take_result(rank, raw)
+                self._retire_ready()
+            return
+        head = self.flights[0]
+        rank = next((r for r in range(len(self.results)) if r not in head.answers), 0)
         raw = self.results[rank].read(timeout=timeout)
         if raw is not None:
             self._take_result(rank, raw)
@@ -496,8 +566,9 @@ class Scheduler:
                 if request is not None and not request.finished() and request.route is not None:
                     self._error(request, f"step {epoch} never came back from the workers; "
                                          "the request's state on the device is unknown")
-            for ledger in self.ledgers:
+            for d, ledger in enumerate(self.ledgers):
                 ledger.retire(epoch, ran=False)
+                self._domain_retired[d] = max(self._domain_retired[d], epoch)
             for rid in self.table.retire(epoch, ran=False):
                 self._reap(rid)
             self._note(f"took over: step {epoch} was abandoned, its requests ended")
@@ -623,18 +694,23 @@ class Scheduler:
                 lost.add(rid)
         if restarted:
             self._note(f"{restarted} request(s) admitted from the prefix cache start over from position 0")
+        self.domain_full[domain] = True
+        if not self._is_independent():
+            self.domain_full = [True] * len(self.domains)
         self.full = True
         for f in self.flights:  # not given up: on their way to the new worker, which refuses them
-            if f not in void and rank not in f.answers:
+            if f not in void and rank not in f.answers and f.domain in (None, domain):
                 f.refused_by.add(rank)
         if len(self.domains) > 1:
             # What the other domains ran of these steps counts: only this rank's answer is given up,
             # as if its worker had refused them (its domain's requests on them end below).
-            for f in void:
+            global_void = [f for f in void if f.domain is None]
+            for f in global_void:
                 f.answers[rank] = Resync(why)
                 f.refused_by.add(rank)
-            void = []
-            self.recheck = True
+            void = [f for f in void if f.domain is not None]
+            if global_void:
+                self.recheck = True
         if not lost:
             self._note(f"{why}; no request was on it")
             return
@@ -646,6 +722,7 @@ class Scheduler:
         for f in void:
             self.flights.remove(f)
             ledger.retire(f.epoch, ran=False)
+            self._domain_retired[domain] = max(self._domain_retired[domain], f.epoch)
             for rid in self.table.retire(f.epoch, ran=False):
                 self._reap(rid)
         for outbox in self.plans:
@@ -653,14 +730,38 @@ class Scheduler:
         self._note(f"{why}: {len(lost)} request(s) ended" + (f", step(s) {sorted(tags)} given up" if tags else ""))
 
     def _retire_ready(self) -> None:
-        while self.fault is None and self.flights and len(self.flights[0].answers) == len(self.results):
-            flight = self.flights.popleft()
-            try:
-                self._retire(flight)
-            except Exception as e:  # noqa: BLE001 - half-retired: the state is unknown
-                self._fail(flight.epoch, None, f"retiring step {flight.epoch} failed: {type(e).__name__}: {e}")
+        while self.fault is None and self.flights:
+            if self.flights[0].domain is None:
+                if len(self.flights[0].answers) < len(self.results):
+                    break
+                flight = self.flights.popleft()
+                try:
+                    self._retire(flight)
+                except Exception as e:  # noqa: BLE001 - half-retired: the state is unknown
+                    self._fail(flight.epoch, None, f"retiring step {flight.epoch} failed: {type(e).__name__}: {e}")
+                continue
+            retired_any = False
+            for d, ranks in enumerate(self.domains):
+                head = next((f for f in self.flights if f.domain == d), None)
+                if head is None or len(head.answers) < len(ranks):
+                    continue
+                if any(g.domain is None and g.epoch < head.epoch for g in self.flights):
+                    continue
+                self.flights.remove(head)
+                retired_any = True
+                try:
+                    self._retire(head)
+                except Exception as e:  # noqa: BLE001 - half-retired: the state is unknown
+                    self._fail(head.epoch, None, f"retiring step {head.epoch} failed: {type(e).__name__}: {e}")
+                if self.fault is not None:
+                    return
+            if not retired_any:
+                break
 
     def _retire(self, flight: Flight) -> None:
+        if flight.domain is not None:
+            self._retire_domain(flight, flight.domain)
+            return
         answers = [flight.answers[r] for r in range(len(self.results))]
         if flight.replica is not None:
             ran_copy = all(isinstance(a, Sampled) and not (len(a.rows) or len(a.tokens) or len(a.counts))
@@ -668,19 +769,23 @@ class Scheduler:
             self._finish_replica(flight.replica, ran_copy)
             self._note(f"prefix copy {flight.replica.source}->{flight.replica.destination}, "
                        f"{len(flight.replica.tokens)} tokens, {self.clock()-flight.since:.3f}s, acknowledged={ran_copy}")
-            for ledger in self.ledgers:
+            for d, ledger in enumerate(self.ledgers):
                 ledger.retire(flight.epoch, ran=ran_copy)
+                self._domain_retired[d] = max(self._domain_retired[d], flight.epoch)
             if not ran_copy:
                 self.full = True
+                self.domain_full = [True] * len(self.domains)
             for rid in self.table.retire(flight.epoch, ran=ran_copy):
                 self._reap(rid)
             return
         everywhere = set(range(len(self.domains)))
         if all(isinstance(a, Resync) for a in answers):
-            for ledger in self.ledgers:
+            for d, ledger in enumerate(self.ledgers):
                 ledger.retire(flight.epoch, ran=False)
+                self._domain_retired[d] = max(self._domain_retired[d], flight.epoch)
             ready = self.table.retire(flight.epoch, ran=False)
             self.full = True
+            self.domain_full = [True] * len(self.domains)
             for later in self.flights:
                 later.void |= everywhere
             self._note(f"step {flight.epoch} not run: {cast(Resync, answers[0]).reason or 'Resync'}")
@@ -766,6 +871,7 @@ class Scheduler:
                                                        if self._domain(row) == domain} if advanced else None))
             else:
                 ledger.retire(flight.epoch, ran=False)
+            self._domain_retired[domain] = max(self._domain_retired[domain], flight.epoch)
         # A row of a domain that did not run the step computed nothing.
         ret_adv = ({**advanced, **{row: 0 for row in flight.rows if self._domain(row) in stayed}}
                    if (advanced or stayed) else None)
@@ -781,6 +887,86 @@ class Scheduler:
         for rid in ready:
             self._reap(rid)
 
+    def _retire_domain(self, flight: Flight, domain: int) -> None:
+        ranks = self.domains[domain]
+        mine = [flight.answers[r] for r in ranks]
+        refused = {r for r in ranks if isinstance(flight.answers[r], Resync)}
+        if len(refused) == len(ranks) or (
+            refused and refused <= flight.refused_by and all(isinstance(a, (Resync, Sampled)) for a in mine)
+        ):
+            self.ledgers[domain].retire(flight.epoch, ran=False)
+            self._domain_retired[domain] = max(self._domain_retired[domain], flight.epoch)
+            ready = self.table.retire(flight.epoch, ran=False)
+            if refused and len(refused) < len(ranks):
+                self._stayed(flight, {domain}, {domain}, refused)
+            else:
+                self.domain_full[domain] = True
+                self.full = True
+                for later in self.flights:
+                    if later.domain in (None, domain):
+                        later.void.add(domain)
+                self._note(f"step {flight.epoch} not run on domain {domain}: "
+                           f"{cast(Resync, mine[0]).reason or 'Resync'}")
+            for rid in ready:
+                self._reap(rid)
+            return
+        if domain in flight.void:
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, None, f"step {flight.epoch} ran on domain {domain} after its workers "
+                                           "refused the step before it, without a full delta")
+            return
+        if not all(isinstance(a, Sampled) for a in mine):
+            kinds = {r: type(flight.answers[r]).__name__ for r in ranks}
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, None, f"ranks disagree whether step {flight.epoch} ran: {kinds}")
+            return
+        sampled = cast(Sampled, mine[0])
+        if any(msgspec.msgpack.encode(a) != msgspec.msgpack.encode(sampled) for a in mine[1:]):
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, None, f"ranks sampled different tokens in step {flight.epoch}")
+            return
+        kept = self._kept(flight, domain, sampled)
+        if kept is None:
+            base = domain * self.settings.max_batch
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, ranks[0], f"step {flight.epoch} sampled rows "
+                                               f"{sorted(int(x) + base for x in sampled.rows.values())}, not its rows "
+                                               f"{sorted(row for row in flight.rows if self._domain(row) == domain)}")
+            return
+        ran = {domain: kept}
+        r_seq, c_seq, t_seq = kept
+        merged = Sampled(Column.of("i32", r_seq), Column.of("i32", c_seq), Column.of("i64", t_seq))
+        advanced = self._advanced(flight, merged, ran)
+        if advanced is None:
+            self.flights.appendleft(flight)
+            self._fail(flight.epoch, 0, f"step {flight.epoch} accepted more than its {self.settings.draft_tokens} "
+                                        "draft tokens in a row, or none")
+            return
+        now = self.clock()
+        last_at = self._domain_retire_at[domain]
+        started = max(flight.since, last_at) if last_at > 0 else flight.since
+        gpu_s = max(now - started, 1e-4)
+        self._domain_retire_at[domain] = now
+        if flight.prefills:
+            tok = sum(flight.counts.get(row, 0) for row in flight.prefills)
+            if tok >= 512 and gpu_s > 1e-3:
+                rate = min(max(tok / gpu_s, 5000.0), 250000.0)
+                self._prefill_tok_s = 0.7 * self._prefill_tok_s + 0.3 * rate
+        else:
+            self._decode_step_s = 0.8 * self._decode_step_s + 0.2 * min(gpu_s, 0.2)
+        events = self.table.sample(flight.epoch, self.identity(), merged)
+        self.ledgers[domain].retire(flight.epoch, advanced=({flight.rows[row]: n for row, n in advanced.items()}
+                                                            if advanced else None))
+        self._domain_retired[domain] = max(self._domain_retired[domain], flight.epoch)
+        ready = self.table.retire(flight.epoch, advanced=advanced or None)
+        for row in flight.prefills:
+            request = self.table.get(flight.rows[row])
+            if request is not None and not request.finished():
+                self._ledger(request).commit(request.input.request, request.prompt_tokens)
+        self._emit(events, flight.epoch)
+        for rid in ready:
+            self._reap(rid)
+
     def _stayed(self, flight: Flight, stayed: set[int], split: set[int], refused: set[int]) -> None:
         """The domains ``stayed`` did not run ``flight`` (the others did): their requests are where
         they were, and they get a full delta. In a domain of ``split`` a replaced rank's new worker
@@ -792,9 +978,12 @@ class Scheduler:
             if self._domain(row) in split and request is not None and not request.finished() and request.computed > 0:
                 self._error(request, f"rank(s) {sorted(refused)} were replaced and refused step {flight.epoch}, "
                                      "which the others ran: the request's state differs between ranks")
+        for d in stayed:
+            self.domain_full[d] = True
         self.full = True
         for later in self.flights:
-            later.void |= stayed
+            if later.domain is None or later.domain in stayed:
+                later.void |= stayed
         if len(self.domains) == 1:
             self._note(f"step {flight.epoch} not run: refused by the new worker(s) of rank(s) {sorted(refused)}")
         else:
@@ -860,11 +1049,21 @@ class Scheduler:
     def _check_timeout(self) -> None:
         if self.fault is not None or not self.flights:
             return
-        head = self.flights[0]
-        if self.clock() - head.since > self.settings.step_timeout_s:
-            missing = [r for r in range(len(self.results)) if r not in head.answers]
-            self._fail(head.epoch, missing[0] if missing else None,
-                       f"no answer to step {head.epoch} from rank(s) {missing} after {self.settings.step_timeout_s} s")
+        now = self.clock()
+        if self.flights[0].domain is None:
+            head = self.flights[0]
+            if now - head.since > self.settings.step_timeout_s:
+                missing = [r for r in range(len(self.results)) if r not in head.answers]
+                self._fail(head.epoch, missing[0] if missing else None,
+                           f"no answer to step {head.epoch} from rank(s) {missing} after {self.settings.step_timeout_s} s")
+            return
+        for d, ranks in enumerate(self.domains):
+            head = next((f for f in self.flights if f.domain == d), None)
+            if head is not None and now - head.since > self.settings.step_timeout_s:
+                missing = [r for r in ranks if r not in head.answers]
+                self._fail(head.epoch, missing[0] if missing else None,
+                           f"no answer to step {head.epoch} from rank(s) {missing} after {self.settings.step_timeout_s} s")
+                return
 
     def _check_ledger(self) -> None:
         """A ledger without capacity while requests hold rows was rebuilt under them (a change
@@ -909,7 +1108,10 @@ class Scheduler:
         for outbox in self.plans:
             outbox.queue.clear()
         self.full = True
+        self.domain_full = [True] * len(self.domains)
         self.removed.clear()
+        for dr in self.domain_removed:
+            dr.clear()
         self.home.clear()
         self.result_gens = [r.generation for r in self.results]
         self.plan_gens = [o.writer.generation for o in self.plans]
@@ -1081,10 +1283,13 @@ class Scheduler:
                 computed = memoryview(packed).cast("q")
         else:
             computed = ()
+        last_step = (self._domain_retired[self._domain(request.row)]
+                     if request.row is not None else self.table.last_retired)
         for ledger in targets:
-            ledger.release(rid, self.table.last_retired, computed)
+            ledger.release(rid, last_step, computed)
         if request.row is not None:
             self.removed.append(request.row)
+            self.domain_removed[self._domain(request.row)].append(request.row)
         self.home.pop(rid, None)
         self.turned_away.pop(rid, None)
         self.replica_attempted.discard(rid)
@@ -1123,15 +1328,20 @@ class Scheduler:
         self._flush_routes()
 
     def _plan(self) -> bool:
-        if self.fault is not None or self.settings.asleep or not self._ready or \
-                len(self.flights) >= max(1, self.depth()):
+        if self.fault is not None or self.settings.asleep or not self._ready:
             return False
         if self.capacity_wanted:
             return False  # after a change: plan with the workers' capacity of now, not an older one
-        if self.full and self.flights:
-            return False  # a full delta goes out once every step sent before it is answered
-        if self.flights and self.flights[-1].replica is not None:
-            return False  # publish the replica before routing another request
+        if self._is_independent():
+            if not any(self._domain_can_plan(d) for d in range(len(self.domains))):
+                return False
+        else:
+            if len(self.flights) >= max(1, self.depth()):
+                return False
+            if self.full and self.flights:
+                return False  # a full delta goes out once every step sent before it is answered
+            if self.flights and self.flights[-1].replica is not None:
+                return False  # publish the replica before routing another request
         try:
             planned = self._plan_step()
         except PolicyError as e:
@@ -1274,67 +1484,146 @@ class Scheduler:
         finally:
             replica.release_source()
 
-    def _replicate_prefix(self, views: Sequence[_View], kinds: Mapping[int, tuple[Kind, Request, int]]) -> bool:
-        """Copy a pinned common prefix to an idle domain while requests compete on its owner."""
+    def _replica_candidates(self, views: Sequence[_View], kinds: Mapping[int, tuple[Kind, Request, int]]
+                            ) -> Iterator[tuple[int, int, Request, int]]:
         if not self.prefix_peer() or len(views) < 2:
-            return False
-        epoch = max(self.table.last_submitted, 0) + 1
+            return
         for source, view in enumerate(views):
             if not view.waiting or len(view.waiting) + len(view.prefilling) + len(view.decoding) < 2:
                 continue
-            pin = getattr(self.ledgers[source], "pin_replica", None)
-            if pin is None:
+            if getattr(self.ledgers[source], "pin_replica", None) is None:
                 continue
             for target, vacant in enumerate(views):
                 if target == source or vacant.waiting or vacant.free_rows != self.settings.max_batch:
                     continue
                 ledger = self.ledgers[target]
-                stage = getattr(ledger, "stage_replica", None)
-                if stage is None:
+                if getattr(ledger, "stage_replica", None) is None:
                     continue
                 for candidate in view.waiting:
                     rid, prefix = candidate.request, candidate.planned
                     if not prefix or rid in self.replica_attempted:
                         continue
                     _, request, _ = kinds[rid]
-                    prompt = request.prompt_tokens
-                    salt = request.input.cache_salt
-                    extent = self._extent(len(prompt), request.input.max_tokens)
-                    if ledger.match(rid, prompt, salt) >= prefix:
-                        continue
-                    lease = pin(rid, prompt, salt)
-                    if lease is None:
-                        continue
-                    if lease.node.depth != prefix:
-                        lease.release()
-                        continue
-                    try:
-                        items = stage(rid, prompt, salt, prefix, extent)
-                    except BaseException:
-                        lease.release()
-                        raise
-                    if items is None:
-                        lease.release()
-                        continue
-                    replica = Replica(source, target, prompt[:prefix], salt, lease.release)
-                    previous = self.flights[-1].epoch if self.flights else None
-                    try:
-                        counts = {kind: len(ids) for kind, ids in lease.items.items()}
-                        commands = {source: lease.items, target: items}
-                        steps = [_Step(epoch, d * self.settings.max_batch,
-                                       prefix_copy=PrefixCopy(source, target, counts, commands.get(d, {})))
-                                 for d in range(len(views))]
-                        self._send_plan(steps, replica=replica)
-                    except BaseException:
-                        self._finish_replica(replica, False)
-                        raise
-                    if previous is not None:
-                        self._note(f"prefix copy step {epoch} queued after step {previous}")
-                    self.replica_attempted.add(rid)
-                    return True
+                    if ledger.match(rid, request.prompt_tokens, request.input.cache_salt) < prefix:
+                        yield source, target, request, prefix
+
+    def _replicate_prefix(self, views: Sequence[_View], kinds: Mapping[int, tuple[Kind, Request, int]]) -> bool:
+        """Copy a pinned common prefix to an idle domain while requests compete on its owner."""
+        epoch = max(self.table.last_submitted, 0) + 1
+        for source, target, request, prefix in self._replica_candidates(views, kinds):
+            rid, prompt, salt = request.input.request, request.prompt_tokens, request.input.cache_salt
+            pin = getattr(self.ledgers[source], "pin_replica")
+            stage = getattr(self.ledgers[target], "stage_replica")
+            lease = pin(rid, prompt, salt)
+            if lease is None:
+                continue
+            if lease.node.depth != prefix:
+                lease.release()
+                continue
+            try:
+                items = stage(rid, prompt, salt, prefix, self._extent(len(prompt), request.input.max_tokens))
+            except BaseException:
+                lease.release()
+                raise
+            if items is None:
+                lease.release()
+                continue
+            replica = Replica(source, target, prompt[:prefix], salt, lease.release)
+            previous = self.flights[-1].epoch if self.flights else None
+            try:
+                counts = {kind: len(ids) for kind, ids in lease.items.items()}
+                commands = {source: lease.items, target: items}
+                steps = [_Step(epoch, d * self.settings.max_batch,
+                               prefix_copy=PrefixCopy(source, target, counts, commands.get(d, {})))
+                         for d in range(len(views))]
+                self._send_plan(steps, replica=replica)
+            except BaseException:
+                self._finish_replica(replica, False)
+                raise
+            if previous is not None:
+                self._note(f"prefix copy step {epoch} queued after step {previous}")
+            self.replica_attempted.add(rid)
+            return True
         return False
 
+    def _rollback_step(self, step: _Step) -> None:
+        ledger = self.ledgers[step.base // self.settings.max_batch]
+        for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
+            ledger.cancel(rid, step.epoch)
+        for request in step.admitted:
+            request.row = None
+            request.computed = 0
+
+    def _plan_independent(self) -> bool:
+        self._defer_until = None
+        tokens, samples = self._in_flight()
+        kinds, views = self._view(tokens, samples)
+        if not kinds:
+            self._coalesce_since = None
+            self._decode_streak = 0
+            return False
+        if self.prefix_peer() and len(views) >= 2:
+            if not self.flights:
+                if self._replicate_prefix(views, kinds):
+                    return True
+            elif next(self._replica_candidates(views, kinds), None) is not None:
+                return False
+        now = self.clock()
+        any_decoding = any(v.decoding for v in views)
+        any_waiting = any(v.waiting for v in views)
+        coalesce_s = self.prefill_coalesce_s()
+        if (not self.flights and coalesce_s > 0 and len(views) > 1 and not any_decoding
+                and any_waiting and not all(v.waiting or v.prefilling for v in views)):
+            if self._coalesce_since is None:
+                self._coalesce_since = now
+            if now < self._coalesce_since + coalesce_s:
+                self._defer_until = self._coalesce_since + coalesce_s
+                return False
+        else:
+            self._coalesce_since = None
+
+        batch = self.settings.max_batch
+        planned_any = False
+        for domain in range(len(self.domains)):
+            if not self._domain_can_plan(domain):
+                continue
+            if planned_any:
+                tokens, samples = self._in_flight()
+                kinds, views = self._view(tokens, samples)
+                if not kinds:
+                    break
+            view = views[domain]
+            if not (view.waiting or view.prefilling or view.decoding):
+                continue
+            epoch = max(self.table.last_submitted, 0) + 1
+            step = _Step(epoch, domain * batch)
+            try:
+                free = ([row for row in range(step.base, step.base + batch)
+                         if row not in {r.row for r in self.table.entries() if r.row is not None}]
+                        if view.waiting else [])
+                takes = self._decide(view.waiting, view.prefilling, view.decoding, view.free_rows)
+                if self.settings.draft_tokens and any(kinds[t.request][0] != "decoding" for t in takes):
+                    takes = [t for t in takes if kinds[t.request][0] != "decoding"]
+                refused = self._carry_out(step, takes, kinds, tokens, free)
+                if not step.rows and refused:
+                    takes = self._decide([], view.prefilling, view.decoding, view.free_rows)
+                    self._carry_out(step, takes, kinds, tokens, free)
+                if not step.rows:
+                    self._rollback_step(step)
+                    continue
+                self._send_domain_plan(domain, step)
+            except BaseException:
+                self._rollback_step(step)
+                raise
+            planned_any = True
+        if planned_any:
+            self._coalesce_since = None
+            self._idle_gc_armed = True
+        return planned_any
+
     def _plan_step(self) -> bool:
+        if self._is_independent():
+            return self._plan_independent()
         self._defer_until = None
         tokens, samples = self._in_flight()
         kinds, views = self._view(tokens, samples)
@@ -1438,21 +1727,11 @@ class Scheduler:
                         self._carry_out(step, takes, kinds, tokens, free)
                 if not any(step.rows for step in built):
                     for step in built:
-                        ledger = self.ledgers[step.base // batch]
-                        for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
-                            ledger.cancel(rid, epoch)
-                        for request in step.admitted:
-                            request.row = None
-                            request.computed = 0
+                        self._rollback_step(step)
                 return built
             except BaseException:
                 for step in built:
-                    ledger = self.ledgers[step.base // batch]
-                    for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
-                        ledger.cancel(rid, epoch)
-                    for request in step.admitted:
-                        request.row = None
-                        request.computed = 0
+                    self._rollback_step(step)
                 raise
 
         steps = try_build(hold_prefill)
@@ -1464,12 +1743,7 @@ class Scheduler:
             self._send_plan(steps)
         except BaseException:  # nothing of this step went out: give back what it took
             for step in steps:
-                ledger = self.ledgers[step.base // batch]
-                for rid in {*step.rows.values(), *(r.input.request for r in step.admitted)}:
-                    ledger.cancel(rid, epoch)
-                for request in step.admitted:
-                    request.row = None
-                    request.computed = 0
+                self._rollback_step(step)
             raise
         self._coalesce_since = None
         self._idle_gc_armed = True
@@ -1603,11 +1877,47 @@ class Scheduler:
                                    frozenset(row for step in steps for row in step.speculative),
                                    unhomed=unhomed, replica=replica))
         self.full = False
+        self.domain_full = [False] * len(self.domains)
         self.removed.clear()
+        for dr in self.domain_removed:
+            dr.clear()
 
-    def _record(self, step: _Step) -> OpenRecord:
+    def _send_domain_plan(self, domain: int, step: _Step) -> None:
+        """Send one step to the ranks of a single scheduling domain."""
+        epoch = step.epoch
+        full = self.domain_full[domain]
+        if full:
+            step.added, step.assign = [], {}
+            for request in self.table.entries():
+                if request.row is not None and not request.finished() and self._domain(request.row) == domain:
+                    step.added.append(AddedRow(request.row, request.input.request, request.input.sampling))
+                    step.assign_all(request.row, self._ledger(request).items(request.input.request))
+        record = self._record(step, full=full, removed_rows=self.domain_removed[domain])
+        rows = dict(step.rows)
+        counts = dict(step.counts)
+        self.table.start_step(epoch, rows, counts)
+        now = self.clock()
+        ranks = self.domains[domain]
+        for rank in ranks:
+            self.plans[rank].put(encode_record(OpenRecord(record.schema, record.epoch, record.sections, rank)),
+                                 now, epoch)
+        unhomed: list[list[int]] = [[] for _ in self.domains]
+        unhomed[domain] = [rid for rid in step.rows.values()
+                           if rid not in self.home or len(self.home[rid]) < len(ranks)]
+        self.flights.append(Flight(epoch, rows, counts, frozenset(step.samples), now,
+                                   frozenset(step.prefill_rows), frozenset(step.speculative),
+                                   unhomed=unhomed, domain=domain))
+        self.domain_full[domain] = False
+        self.domain_removed[domain].clear()
+        self.removed = [r for r in self.removed if self._domain(r) != domain]
+        self.full = any(self.domain_full)
+
+    def _record(self, step: _Step, *, full: bool | None = None,
+                removed_rows: Sequence[int] | None = None) -> OpenRecord:
         """A domain's part of a step, its rows as its ranks number them."""
         base = step.base
+        is_full = self.full if full is None else full
+        rem_source = self.removed if removed_rows is None else removed_rows
         phase: Literal["prefill", "decode", "mixed"] = (
             "decode" if not step.prefills else "prefill" if not step.decodes else "mixed")
         counts = [1 if row in step.speculative else n for row, n in step.counts.items()]
@@ -1624,10 +1934,10 @@ class Scheduler:
                          [StateTrack(kind, Column.of("i32", [t[0] - base for t in ts]), Column.of("i32", [t[1] for t in ts]),
                                      Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()],
                          step.prefix_copy)
-        removed = [] if self.full else [row - base for row in self.removed
-                                        if base <= row < base + self.settings.max_batch]
+        removed = [] if is_full else [row - base for row in rem_source
+                                      if base <= row < base + self.settings.max_batch]
         delta = RowDelta([AddedRow(a.row - base, a.request, a.sampling) for a in step.added],
-                         Column.of("i32", removed), self.full)
+                         Column.of("i32", removed), is_full)
         return (RecordBuilder(STEP_PLAN, step.epoch).add(RowDelta.SECTION, delta)
                 .add(BatchPlan.SECTION, batch).add(StateOps.SECTION, state).build())
 

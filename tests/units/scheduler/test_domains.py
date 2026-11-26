@@ -233,3 +233,68 @@ def test_balance_prefill_and_coordinated_prefill_interval() -> None:
         b.run_until(b.finished(1, 2, 3, 4))
         check(b, [*first, *later])
         assert served(b, 0) & {3, 4} and served(b, 1) & {3, 4}
+
+
+def test_independent_domains_retire_while_a_peer_is_busy() -> None:
+    cfg = {**TWO, "sched.independent_domains": True}
+    reqs = [request(1, list(range(1, 30)), 4), request(2, [7, 8, 9], 8)]
+    with bed(overlap=True, delay_s=0.002, token_budget=64, config=cfg) as b:
+        b.client.send([reqs[0]])
+        b.run_until(lambda: bool(b.workers[0].fixture.plans_seen))
+        # Delay domain 0 while domain 1 serves request 2 independently.
+        b.workers[0].fixture.delay_s = 0.08
+        b.client.send([reqs[1]])
+        b.run_until(b.finished(2))
+        assert b.client.outputs[1].finished is None  # domain 1 finished while domain 0 is still running
+        b.workers[0].fixture.delay_s = 0.002
+        b.run_until(b.finished(1))
+        check(b, reqs)
+        assert served(b, 0) == {1} and served(b, 1) == {2}
+
+
+def test_independent_domains_keep_speculative_rows_in_order() -> None:
+    spec_cfg = {**TWO, "sched.independent_domains": True, "spec.algorithm": "eagle", "spec.num_draft_tokens": 4}
+    sreqs = [request(1, [5, 6, 7, 8, 9], 17), request(2, list(range(1, 30)), 9), request(3, [3, 1, 4], 21)]
+    with bed(delay_s=0.001, overlap=True, config=spec_cfg) as b:
+        b.client.send(sreqs)
+        b.run_until(b.finished(1, 2, 3))
+        check(b, sreqs)
+
+
+def test_peer_prefix_copy_waits_for_independent_steps_to_retire() -> None:
+    peer_cfg = {**TWO, "alloc.radix_cache": True, "sched.prefix_peer": True, "sched.independent_domains": True}
+    prefix = list(range(64))
+    with bed(overlap=True, config=peer_cfg, token_budget=128) as b:
+        b.client.send([request(1, [*prefix, 100, 101], 1)])
+        b.run_until(b.finished(1))
+        b.run_until(b.idle)
+        scheduler = b.engine.loop
+        b.engine.table.add(request(2, [200, 201, 202], 4)).unwrap()
+        assert scheduler._plan()
+        (pending,) = scheduler.flights
+        assert pending.domain == 0 and pending.replica is None
+        b.engine.table.add(request(3, [*prefix, 102, 103], 4)).unwrap()
+        # With an in-flight independent flight, _plan() pauses new admissions to drain for replica.
+        assert not scheduler._plan()
+        b.run_until(lambda: not scheduler.flights)
+        # Once drained, the next _plan() issues the global barrier replica flight (domain=None).
+        assert scheduler._plan()
+        (copy,) = scheduler.flights
+        assert copy.domain is None and copy.replica is not None
+        assert (copy.replica.source, copy.replica.destination) == (0, 1)
+        b.run_until(lambda: b.engine.ledgers[1].match(3, [*prefix, 102, 103]) == len(prefix))
+
+
+def test_independent_domains_align_epochs_before_pause() -> None:
+    cfg = {**TWO, "sched.independent_domains": True}
+    with bed(overlap=True, token_budget=64, config=cfg) as b:
+        b.client.send([request(10, list(range(1, 20)), 4)])
+        b.run_until(b.finished(10))
+        b.run_until(b.idle)
+        sched = b.engine.loop
+        assert len(set(sched._domain_retired)) == 2
+        assert not sched.sync_epochs()
+        b.run_until(lambda: not sched.flights)
+        assert sched.sync_epochs()
+        assert len(set(sched._domain_retired)) == 1
+        assert all(w.fixture.epoch == sched.table.last_retired for w in b.workers)

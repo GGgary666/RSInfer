@@ -61,6 +61,8 @@ class Drain:
             return True
         if any(self.loop.occupancy()):
             return False
+        if not self.loop.sync_epochs():
+            return False
         self.loop.held = self.gate
         return True
 

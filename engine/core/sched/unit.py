@@ -58,10 +58,11 @@ class Unit:
             prefill_occupancy_target=lambda: int(config["sched.prefill_occupancy_target"]),
             balance_prefill=lambda: bool(config["sched.balance_prefill"]),
             prefix_peer=lambda: bool(config["sched.prefix_peer"]),
+            independent_domains=lambda: bool(config["sched.independent_domains"]),
             settings=settings)
         for key in ("sched.overlap", "sched.overlap_lead_s", "sched.prefill_coalesce_s",
                     "sched.prefill_interval", "sched.prefill_occupancy_target", "sched.balance_prefill",
-                    "sched.prefix_peer"):
+                    "sched.prefix_peer", "sched.independent_domains"):
             ctx.on_config(key, lambda value: None)  # read when planning: no reload needed
         ctx.on_action("drain", Drain(self.loop))  # a change applies to an empty engine
         ctx.provide("proc.loop@1", self.loop)
