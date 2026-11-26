@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
-from deploy.models import ds1017, glm53_native, qwen3, qwen38  # noqa: E402
+from deploy.models import ds1017, glm53, glm53_native, qwen3, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
 
 if TYPE_CHECKING:
@@ -690,6 +690,7 @@ def parser() -> argparse.ArgumentParser:
                                  "it runs. Every command finds its engine through a run directory (--run).")
     sub = ap.add_subparsers(dest="command", required=True, metavar="COMMAND")
     _serve_options(sub.add_parser("serve", help="start an engine for a model"))
+    glm53.add_parser(sub)
     st = sub.add_parser("status", help="whether the run directory's engine runs, and how it is")
     _run_option(st)
     st.add_argument("--json", action="store_true", help="also the control plane's whole status")
@@ -764,6 +765,8 @@ def main(argv: list[str]) -> int:
             config = json.loads((run / "config.json").read_text())
             return asyncio.run(glm53_native.save_prefix(control_address(run), config["comm.size"],
                                                          args.out.resolve(), args.timeout))
+        case "glm53":
+            return glm53.run_command(args)
         case "stop":
             return cmd_stop(args)
         case "status":
