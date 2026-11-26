@@ -26,9 +26,12 @@ class Planner:
 
     async def plan(self, inp: PlanInput) -> Result[ActionPlan]:
         with ExitStack() as held:  # the trees are read lazily while planning, across the awaits below
-            new_tree = read_tree(held.enter_context(self._host.analysing(inp.new.files)))
-            base_tree = read_tree(held.enter_context(self._host.analysing(inp.base.files))) \
-                if inp.base.files else None
+            new_root = held.enter_context(self._host.analysing(inp.new.files))
+            new_tree = await asyncio.to_thread(read_tree, new_root)
+            base_tree = None
+            if inp.base.files:
+                base_root = held.enter_context(self._host.analysing(inp.base.files))
+                base_tree = await asyncio.to_thread(read_tree, base_root)
             return await self._plan(inp, new_tree, base_tree)
 
     async def _plan(self, inp: PlanInput, new_tree: Tree, base_tree: Tree | None) -> Result[ActionPlan]:
@@ -46,7 +49,7 @@ class Planner:
             return Failed(missing)
         w = World(cs=inp.cs, base=inp.base, new=inp.new, base_tree=base_tree, new_tree=new_tree, running=intro,
                   control=self._host.introspect_self(), framework=self._framework)
-        return plan(w)
+        return await asyncio.to_thread(plan, w)
 
 
 class Unit:

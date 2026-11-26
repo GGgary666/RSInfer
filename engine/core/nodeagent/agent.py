@@ -116,7 +116,6 @@ class NodeAgent:
         self.procs: dict[ProcId, _Proc] = {}
         self._materialized: dict[Identity, float] = {}
         self._materializing: set[Identity] = set()
-        self._runs = itertools.count()
         self._shm = itertools.count()
         self._lifecycle: dict[ProcId, asyncio.Lock] = {}
         """Spawn and Stop of one ProcId run one at a time: a repeated request sees the first one's result."""
@@ -252,8 +251,8 @@ class NodeAgent:
         if not snapshot.is_dir():
             return fail(COMPONENT, "spawn", f"identity {spec.identity} is not materialized",
                         subject=str(spec.proc), code="agent.not_materialized")
-        run_dir = self.run_root / f"{spec.proc.role}-{spec.proc.index}-{next(self._runs)}"
-        run_dir.mkdir(parents=True)
+        self.run_root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix=f"{spec.proc.role}-{spec.proc.index}-", dir=self.run_root))
         spec_path = run_dir / "spec.msgpack"
         spec_path.write_bytes(msgspec.msgpack.encode(spec))
         log = open(run_dir / "log", "wb")  # noqa: SIM115 - owned by the child

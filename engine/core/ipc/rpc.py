@@ -96,7 +96,10 @@ class RpcServer:
     async def serve(self, handler: AsyncHandler) -> None:
         """Serve forever; each request runs in its own task."""
         while True:
-            ident, data = await self._sock.recv_multipart()
+            parts = await self._sock.recv_multipart()
+            if len(parts) != 2:
+                continue
+            ident, data = parts
             task = asyncio.create_task(self._handle(ident, data, handler))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -231,9 +234,12 @@ class SyncRpcServer:
         served = 0
         wait_ms = int(timeout_s * 1000)
         while self._sock.poll(wait_ms, zmq.POLLIN):
-            ident, data = self._sock.recv_multipart()
-            frame, msg = _decode_request(self._registry, data)
+            parts = self._sock.recv_multipart()
             wait_ms = 0
+            if len(parts) != 2:
+                continue
+            ident, data = parts
+            frame, msg = _decode_request(self._registry, data)
             if frame is None:
                 continue
             if isinstance(msg, Ok):

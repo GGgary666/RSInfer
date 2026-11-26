@@ -8,6 +8,7 @@ import os
 import signal
 import threading
 import time
+from unittest.mock import Mock, patch
 
 import msgspec
 import zmq
@@ -140,6 +141,23 @@ def test_sync_server_serves_at_its_own_safe_points() -> None:
     r = client.call(server.address, Ping(1), timeout=0.3)  # nobody polls now
     assert isinstance(r, Failed) and r.has_code("ipc.timeout")
     server.close()
+
+
+def test_sync_server_discards_an_unexpected_frame_envelope() -> None:
+    zctx: zmq.Context[zmq.Socket[bytes]] = zmq.Context()
+    server = SyncRpcServer(zctx, registry(), ep("host-a", "worker"), BIND)
+    socket = Mock()
+    socket.poll.side_effect = [True, False]
+    socket.recv_multipart.return_value = [b"sender", b"", b"body"]
+    handle = Mock()
+    try:
+        with patch.object(server, "_sock", socket):
+            assert server.poll(handle) == 0
+        handle.assert_not_called()
+        socket.send_multipart.assert_not_called()
+    finally:
+        server.close()
+        zctx.term()
 
 
 def test_pubsub_is_at_most_once_and_filters_topics() -> None:

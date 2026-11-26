@@ -71,13 +71,16 @@ def test_a_participant_still_preparing_withdraws_when_the_coordinator_vanishes(t
     async def main() -> None:
         async with engine(tmp_path, coordinator_timeout_s=LEASE, keepalive_interval_s=BEAT) as e:
             old = e.coord.identity
-            e.planner.script = slow_prepare(slices=200)
+            # At 5 ms per toy step, 200 slices leave only one lease of serving time.
+            # Leave time for the initial coordinator messages to renew that lease.
+            slices = 400
+            e.planner.script = slow_prepare(slices=slices)
             e.coord.faults.add("vanish_during_prepare")
             assert (await e.coord.submit(e.code_change())).status == "aborted"
             await assert_rolled_back(e, old, "change.coordinator_lost")
             for p in ALL:
                 assert e.ops(p) == ["op prepare", "op abort"]
-                assert 0 < len(e.slices(p)) < 200  # it withdrew in the middle
+                assert 0 < len(e.slices(p)) < slices  # it withdrew in the middle
                 reasons = [d.reason for d in (await e.status(p)).diagnostics if d.code == "change.coordinator_lost"]
                 assert "while preparing" in reasons[-1]
 

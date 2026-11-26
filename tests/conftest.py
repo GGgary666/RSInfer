@@ -15,7 +15,7 @@ def _isolate_imports() -> Generator[None]:
     points packages at its snapshots and loads unit code from them only."""
     path = list(sys.path)
     modules = dict(sys.modules)
-    package_paths = {name: list(p) for name, m in sys.modules.items()
+    package_paths = {name: list(p) for name, m in modules.items()
                      if isinstance(p := getattr(m, "__path__", None), list)}
     events.clear()
     yield

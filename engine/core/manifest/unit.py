@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from core.change.coordinator import PlanInput
@@ -19,7 +20,8 @@ class Checker:
 
     async def check(self, inp: PlanInput) -> Result[None]:
         with self._host.analysing(inp.new.files) as root:
-            errors, warnings = check_tree(root, inp.new.topology, self._framework)
+            # Static AST analysis can exceed the host heartbeat interval.
+            errors, warnings = await asyncio.to_thread(check_tree, root, inp.new.topology, self._framework)
         if errors:
             return Failed([*errors, *warnings])
         return Ok(None, warnings)
