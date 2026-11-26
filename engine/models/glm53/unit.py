@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from core.contracts.model import Assembly
@@ -32,7 +33,8 @@ class Glm53:
         self.draft_layer, self.hidden_size, self.dtype = len(cfg.attention), cfg.hidden, "bf16"
         self.weight_plan = Weights(cfg, self.group.size, self.group.rank, dfc=self.layers.dfc,
                                    draft=bool(draft_tokens), rotate=rotate,
-                                   shared_expert_dp=self.layers.shared_expert_dp)
+                                   shared_expert_dp=self.layers.shared_expert_dp,
+                                   refresh_projections=self.layers.refresh_projections)
         states = cfg.states(self.group.size, page, draft_tokens)
         self.assembly = Assembly([SERVICE] * len(states), states, self.weight_plan.decls)
         self.stores = {KV: self.kv, KDA: self.kda}
@@ -142,11 +144,16 @@ class Glm53:
     def draft_forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden: torch.Tensor,
                       last_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         w, a, f = self.parameters[self.draft_layer]
-        emb = F.embedding(input_ids, w[EMBED]).masked_fill(positions[:, None] == 0, 0)
+        emb = F.embedding(input_ids, w[EMBED])
         if self.rotate:
             hidden = F.linear(hidden, self.top[ROT])
-        joined = torch.cat((self.layers.rms(emb, w["enorm.weight"]), self.layers.rms(hidden, w["hnorm.weight"])),
-                           dim=-1)
+        if self.layers.fused_eh_norm_fn is not None:
+            joined = self.layers.fused_eh_norm_fn(
+                positions, emb, hidden, w["enorm.weight"], w["hnorm.weight"], self.cfg.eps)
+        else:
+            emb = emb.masked_fill(positions[:, None] == 0, 0)
+            joined = torch.cat((self.layers.rms(emb, w["enorm.weight"]), self.layers.rms(hidden, w["hnorm.weight"])),
+                               dim=-1)
         residual = F.linear(joined, w["eh_proj.weight"])
         h = self.layers.rms(residual, w["input_layernorm.weight"])
         h = self.layers.sparse_attention(h, positions, a, self.cache[self.draft_layer])
@@ -154,7 +161,17 @@ class Glm53:
         h = self.layers.moe(h, f)
         h, _ = self.layers.add_rms(h.index_select(0, last_index), residual.index_select(0, last_index),
                                    w["shared_head.norm.weight"])
-        return F.linear(h, w["shared_head.head.weight"]), h
+        head = w["shared_head.head.weight"]
+        if self.layers.local_draft_argmax and self.group.size > 1 and self.cfg.vocab % self.group.size == 0:
+            shard = self.cfg.vocab // self.group.size
+            v_start = self.group.rank * shard
+            vals, idx = F.linear(h, head[v_start:v_start + shard]).max(dim=-1)
+            local_pair = torch.stack((vals.float(), (idx + v_start).float()), dim=-1).contiguous()
+            gathered = local_pair.new_empty((self.group.size, local_pair.shape[0], 2))
+            dist.all_gather_into_tensor(gathered, local_pair, group=self.group.device_group)
+            best_rank = gathered[:, :, 0].argmax(dim=0, keepdim=True)
+            return gathered[:, :, 1].gather(0, best_rank).squeeze(0).to(torch.int64), h
+        return F.linear(h, head), h
 
 
 class Unit:

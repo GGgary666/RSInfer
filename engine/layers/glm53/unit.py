@@ -25,7 +25,9 @@ SERVICE = "layers.glm53@1"
 class GlmLayers:
     def __init__(self, group: Any, page: int, cfg: Config, states: Any = None, draft_tokens: int = 0,
                  context: int = 0, *, sequence_prefill: bool = False, index_prefill: bool = False,
-                 shared_expert_dp: bool = False, prefill_matmul_reduce_scatter: bool = False) -> None:
+                 shared_expert_dp: bool = False, prefill_matmul_reduce_scatter: bool = False,
+                 mla_fused_proj: bool = False, fused_eh_norm: bool = False,
+                 local_draft_argmax: bool = False, mtp_share_index: bool = False) -> None:
         load_ops = import_module("vllm_ascend.utils").enable_custom_op
         if not load_ops():
             raise RuntimeError("GLM-5.3-Flash requires the Ascend custom operator library")
@@ -62,6 +64,16 @@ class GlmLayers:
             prefill_matmul_reduce_scatter and group.size in (2, 4, 8)
             and os.environ.get("HCCL_OP_EXPANSION_MODE", "").upper() == "AIV"
             and hasattr(self.npu, "npu_mm_reduce_scatter_base"))
+        self.mla_fused_proj = mla_fused_proj
+        self.fused_eh_norm_fn = (
+            import_module("vllm_ascend.ops.triton.linearnorm.fused_eh_norm").fused_eh_norm
+            if fused_eh_norm else None)
+        self.local_draft_argmax = local_draft_argmax
+        self.mtp_share_index = mtp_share_index
+        self._draft_topk_buf: dict[int, torch.Tensor] = {}
+        self._draft_topk_mode = ""
+        self._draft_topk_bucket = 0
+        self._projection_weights: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.index_shard: IndexShard | None = None
         if self.dfc:
             self.npu.npu.config.allow_internal_format = True
@@ -76,7 +88,8 @@ class GlmLayers:
         contract = "\0".join(comm).encode()
         return hashlib.sha256(source.read_bytes() + source.with_name("metadata.py").read_bytes()
                               + bytes((self.dfc, self.sequence_prefill, self.index_prefill, self.shared_expert_dp,
-                                       self.prefill_matmul_reduce_scatter))
+                                       self.prefill_matmul_reduce_scatter, self.mla_fused_proj,
+                                       self.fused_eh_norm_fn is not None, self.local_draft_argmax, self.mtp_share_index))
                               + contract).hexdigest()
 
     @property
@@ -90,7 +103,15 @@ class GlmLayers:
         self.graph_scans.clear()
         self.graph_sparse.clear()
         self.graph_verify.clear()
+        self._projection_weights.clear()
+        self._draft_topk_buf.clear()
+        self._draft_topk_mode = ""
+        self._draft_topk_bucket = 0
         self.scans, self.sparse, self.verify = (), None, None
+
+    def set_draft_topk_mode(self, mode: str, bucket: int = 0) -> None:
+        self._draft_topk_mode = mode if self.mtp_share_index else ""
+        self._draft_topk_bucket = bucket if self.mtp_share_index else 0
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         backend = "cann-dfc" if self.dfc else "cann"
@@ -99,6 +120,8 @@ class GlmLayers:
     def prepare(self, batch: PersistentBatch, plan: BatchPlan, key: PlanKey) -> None:
         rows = rows_of(plan)
         device = batch.binding.buffers()["last_token"].device
+        self._draft_topk_mode = ""
+        self._draft_topk_bucket = 0
         self.shard_prefill = (self.sequence_prefill and plan.phase == "prefill"
                               and sum(r.count for r in rows) >= self.group.size)
         self.verify = None
@@ -260,13 +283,25 @@ class GlmLayers:
         return self.npu.npu_mm_reduce_scatter_base(
             x.contiguous(), weight.t(), self.comm_name, self.group.size, comm_mode="aiv")
 
+    def _packed_projection(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        key = (id(left), id(right))
+        parts = self._projection_weights.get(key)
+        if parts is None:
+            parts = self._projection_weights[key] = (left, right, torch.cat((left, right), dim=0))
+        return parts[2]
+
+    def refresh_projections(self) -> None:
+        """Refresh the tensors referenced by captured graphs after an in-place checkpoint load."""
+        for left, right, packed in self._projection_weights.values():
+            packed[:len(left)].copy_(left)
+            packed[len(left):].copy_(right)
+
     def linear_attention(self, layer: int, x: torch.Tensor, w: Mapping[str, torch.Tensor],
                          state: Mapping[str, torch.Tensor], *, sharded: bool = False) -> torch.Tensor:
         cfg = self.cfg
         heads = cfg.kda_heads // self.group.size
         width = heads * cfg.kda_dim
-        projected = F.linear(x, w["input.weight"])
-        qkv, beta, f, g = projected.split((3 * width, heads, cfg.kda_dim, cfg.kda_dim), dim=-1)
+        qkv, beta, f, g = F.linear(x, w["input.weight"]).split((3 * width, heads, cfg.kda_dim, cfg.kda_dim), dim=-1)
         raw_gate = F.linear(f, w["forget_gate.f_b_proj.weight"])
         output_gate = F.linear(g, w["g_b_proj.weight"]).reshape(-1, heads, cfg.kda_dim)
         conv, temporal = state["conv"], state["temporal"]
@@ -321,21 +356,41 @@ class GlmLayers:
         cfg, m = self.cfg, self.sparse
         assert m is not None
         heads = cfg.mla_heads // self.group.size
-        q_c = self.rms(F.linear(x, w["q_a_proj.weight"]), w["q_a_layernorm.weight"])
+        p = "indexer."
+        if self.mla_fused_proj:
+            qkv_w = self._packed_projection(w["q_a_proj.weight"], w["kv_a_proj_with_mqa.weight"])
+            q_a, kv_a = F.linear(x, qkv_w).split((cfg.q_rank, cfg.kv_rank), dim=-1)
+        else:
+            q_a = F.linear(x, w["q_a_proj.weight"])
+            kv_a = F.linear(x, w["kv_a_proj_with_mqa.weight"])
+        q_c = self.rms(q_a, w["q_a_layernorm.weight"])
         q = F.linear(q_c, w["q_b_proj.weight"]).view(-1, heads, cfg.q_dim)
-        kv = self.rms(F.linear(x, w["kv_a_proj_with_mqa.weight"]), w["kv_a_layernorm.weight"])
+        kv = self.rms(kv_a, w["kv_a_layernorm.weight"])
+        if self.mla_fused_proj:
+            idx_w = self._packed_projection(w[p + "wk_weights.weight"], w[p + "index_kpool_compress_gate"])
+            keys, weights, gate = F.linear(x.float(), idx_w).split((cfg.index_dim, cfg.index_heads, cfg.index_dim), dim=-1)
+        else:
+            projected = F.linear(x.float(), w[p + "wk_weights.weight"])
+            keys, weights = projected.split((cfg.index_dim, cfg.index_heads), dim=-1)
+            gate = F.linear(x.float(), w[p + "index_kpool_compress_gate"])
         state["kv"].index_copy_(0, m.kv_slots, kv.unsqueeze(1))
         cache = state["kv"].view(-1, m.page, 1, cfg.kv_rank)
         index_cache = state["index"].view(-1, m.page // cfg.pool, 1, cfg.index_dim)
-        p = "indexer."
-        projected = F.linear(x.float(), w[p + "wk_weights.weight"])
-        keys, weights = projected.split((cfg.index_dim, cfg.index_heads), dim=-1)
         keys = F.layer_norm(keys.contiguous(), (cfg.index_dim,), w[p + "k_norm.weight"], w[p + "k_norm.bias"], 1e-6)
-        gate = F.linear(x.float(), w[p + "index_kpool_compress_gate"])
         weights = weights.to(q.dtype) * (cfg.index_dim * cfg.index_heads) ** -0.5
         self.compress(state["tail"], index_cache, keys, gate, w[p + "index_kpool_compress_ape"], positions,
                       m.ends, m.seen, m.tail_slots, m.tail_table, m.pool_slots, cfg.pool)
-        indices = self.sparse_indices(q_c, positions, weights, w[p + "wq_b.weight"], index_cache, m)
+        if self._draft_topk_mode == "reuse":
+            indices = self._draft_topk_buf[self._draft_topk_bucket]
+        else:
+            indices = self.sparse_indices(q_c, positions, weights, w[p + "wq_b.weight"], index_cache, m)
+            if self._draft_topk_mode == "save":
+                bucket = self._draft_topk_bucket
+                buf = self._draft_topk_buf.get(bucket)
+                if buf is None or buf.shape != indices.shape or buf.dtype != indices.dtype:
+                    buf = torch.empty_like(indices)
+                    self._draft_topk_buf[bucket] = buf
+                buf.copy_(indices)
         uk, uv = w["kv_b_proj.weight"].view(heads, cfg.q_dim + cfg.v_dim, cfg.kv_rank).split(
             (cfg.q_dim, cfg.v_dim), dim=1)
         absorbed = torch.bmm(q.transpose(0, 1), uk).transpose(0, 1).contiguous()
@@ -439,4 +494,8 @@ class Unit:
                                       sequence_prefill=config["glm53.sequence_prefill"],
                                       index_prefill=config["glm53.index_prefill"],
                                       shared_expert_dp=config["glm53.shared_expert_dp"],
-                                      prefill_matmul_reduce_scatter=config["glm53.prefill_matmul_reduce_scatter"]))
+                                      prefill_matmul_reduce_scatter=config["glm53.prefill_matmul_reduce_scatter"],
+                                      mla_fused_proj=config["glm53.mla_fused_proj"],
+                                      fused_eh_norm=config["glm53.fused_eh_norm"],
+                                      local_draft_argmax=config["glm53.local_draft_argmax"],
+                                      mtp_share_index=config["glm53.mtp_share_index"]))

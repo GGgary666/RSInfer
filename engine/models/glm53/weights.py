@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
 
@@ -34,10 +34,12 @@ class Weights:
     """A declaration and the checkpoint pieces needed to fill it on this rank."""
 
     def __init__(self, cfg: Config, world: int, rank: int, *, dfc: bool = False,
-                 draft: bool = False, rotate: bool = False, shared_expert_dp: bool = False) -> None:
+                 draft: bool = False, rotate: bool = False, shared_expert_dp: bool = False,
+                 refresh_projections: Callable[[], None] | None = None) -> None:
         self.cfg, self.world, self.rank = cfg, world, rank
         self.dfc = dfc
         self.shared_expert_dp = shared_expert_dp
+        self.refresh_projections = refresh_projections
         self.nz: set[str] = set()
         self.decls: list[WeightDecl] = []
         self.sources: dict[str, LoadPart] = {}
@@ -237,4 +239,7 @@ class Weights:
                     # Convert on the NPU with the explicit format operator, then copy equal layouts.
                     packed = npu.npu_format_cast(staged.pop(p.dst).to(target.device), FRACTAL_NZ)
                     target.copy_(packed)
-        return {name for name, keys in self.required.items() if keys <= seen}
+        loaded = {name for name, keys in self.required.items() if keys <= seen}
+        if self.refresh_projections is not None and len(loaded) == len(self.required):
+            self.refresh_projections()
+        return loaded

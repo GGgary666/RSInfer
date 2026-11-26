@@ -41,6 +41,10 @@ from core.contracts.records import BatchPlan
 KIND = "gdn.slots"
 
 
+def _draft_token(out: torch.Tensor) -> torch.Tensor:
+    return out if out.ndim == 1 else out.argmax(dim=-1)
+
+
 def on_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
     if device.type != "cuda":
         return values.to(device)
@@ -115,12 +119,12 @@ class Speculative:
         sampled = self.sampler.sample(logits, self.batch.sampling(rows),
                                       [p + n - 1 for p, n in zip(positions, num_tokens, strict=True)]).to(torch.int64)
         nexts = [int(x) for x in plan.next_tokens.values()]
-        tails = torch.where(on_device(torch.tensor(nexts, dtype=torch.int64), sampled.device) >= 0,
-                            on_device(torch.tensor(nexts, dtype=torch.int64), sampled.device), sampled)
+        nexts_dev = on_device(torch.tensor(nexts, dtype=torch.int64), sampled.device)
+        tails = torch.where(nexts_dev >= 0, nexts_dev, sampled)
         shifted = torch.roll(input_ids, -1)  # each row's inputs one on; the last of each row is its tail
         shifted[last_index] = tails
         draft_logits, draft_hidden = self.plans.draft(self.batch, plan, shifted, pos, hidden, last_index)
-        self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
+        self._keep(rows, _draft_token(draft_logits), draft_hidden)
         self.batch.record(rows, sampled)
         self.batch.speculated(rows, [p + n for p, n in zip(positions, num_tokens, strict=True)])
         return sampled, logits
@@ -142,10 +146,13 @@ class Speculative:
         drafts = tables["spec.drafts"][idx].clone()
         hidden = tables["spec.hidden"][idx].clone()
         token = drafts[:, 0]
+        set_step = getattr(self.plans, "set_draft_step", None)
         for i in range(d - 2):  # draft_forward: topk 1, each argmax the next one's input
+            if set_step is not None:
+                set_step(i)
             logits, hidden = self.plans.draft(batch, view(rows, [1] * bs, [s + i for s in starts], "decode"),
                                               token, start + i, hidden, lanes)
-            token = logits.argmax(dim=-1)
+            token = _draft_token(logits)
             drafts[:, i + 1] = token
         steps = torch.arange(d, device=device)
         positions_all = (start[:, None] + steps).flatten()
@@ -181,7 +188,7 @@ class Speculative:
         # verify step does (an extend), and replays on its metadata when it was replayed.
         draft_logits, draft_hidden = self.plans.draft(batch, view(rows, [d] * bs, starts, "decode", d), tokens.flatten(),
                                                       positions_all, target_hidden, lanes * d + accept - 1)
-        self._keep(rows, draft_logits.argmax(dim=-1), draft_hidden)
+        self._keep(rows, _draft_token(draft_logits), draft_hidden)
         done = Accepted(rows, starts, lengths, event)
         self.pending = done
         return tokens, accept, done

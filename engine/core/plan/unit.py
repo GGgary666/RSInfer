@@ -94,6 +94,8 @@ class Plans:
         with the draft model's extend after it."""
         self.draft_graphs: dict[int, DraftGraphPlan] = {}
         """With speculation of more than two tokens, the draft model's decode forward."""
+        self.draft_reuse_graphs: dict[int, DraftGraphPlan] = {}
+        self._draft_step = 0
         self.replayed: VerifyGraphPlan | None = None
         """The verify graph the step in progress replayed: its draft extend replays on its metadata."""
         self.deps: Dependencies | None = None
@@ -149,10 +151,14 @@ class Plans:
         every = torch.arange(input_ids.shape[0], device=input_ids.device)
         return self.eager.model.forward_hidden(input_ids, positions, every)
 
+    def set_draft_step(self, step: int) -> None:
+        self._draft_step = step
+
     def draft(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor, hidden: Tensor,
               last_index: Tensor) -> tuple[Tensor, Tensor]:
         """The draft model's forward: replayed for a speculative step's decode forwards and its extend
         (a decode view with ``draft_tokens``, after ``verify``), eager for a prefill's extend."""
+        draft_step, self._draft_step = self._draft_step, 0
         if view.phase == "decode" and view.draft_tokens:
             graph, self.replayed = self.replayed, None
             if graph is not None and graph.extend is not None:
@@ -162,7 +168,10 @@ class Plans:
         elif view.phase == "decode":
             fits = [b for b in self.draft_graphs if b >= len(view.rows)]
             if fits and self.deps is not None and self.deps.valid():
-                return self.draft_graphs[min(fits)].run(batch, view, input_ids, positions, hidden)
+                bucket = min(fits)
+                if draft_step > 0 and bucket in self.draft_reuse_graphs:
+                    return self.draft_reuse_graphs[bucket].run(batch, view, input_ids, positions, hidden)
+                return self.draft_graphs[bucket].run(batch, view, input_ids, positions, hidden)
             if self.required:
                 raise StaleGraph(f"no ready draft graph holds {len(view.rows)} rows, and graphs are required")
         for backend in self.attention:
@@ -185,9 +194,11 @@ class Plans:
         if self.idle_graph is not None:
             self.idle_graph.close()
             self.idle_graph = None
-        for graph in [*self.graphs.values(), *self.verify_graphs.values(), *self.draft_graphs.values()]:
+        for graph in [*self.graphs.values(), *self.verify_graphs.values(), *self.draft_graphs.values(),
+                      *self.draft_reuse_graphs.values()]:
             graph.close()
-        self.graphs, self.verify_graphs, self.draft_graphs, self.deps, self.replayed = {}, {}, {}, None, None
+        self.graphs, self.verify_graphs, self.draft_graphs, self.draft_reuse_graphs, self.deps, self.replayed = (
+            {}, {}, {}, {}, None, None)
         for backend in self.eager.backends:
             backend.release_graphs()
         device_api.empty_cache()
@@ -278,6 +289,10 @@ class Unit:
                                   else GraphPlan(size, device, self.backends) for size in sorted(sizes, reverse=True)}
         drafts: dict[int, DraftGraphPlan] = ({size: DraftGraphPlan(size, self.model.hidden_size, hidden.dtype, device, attention)
                                               for size in graphs} if steps > 2 and hidden is not None else {})
+        share_index = any(getattr(b, "mtp_share_index", False) for b in attention)
+        draft_reuse: dict[int, DraftGraphPlan] = (
+            {size: DraftGraphPlan(size, self.model.hidden_size, hidden.dtype, device, attention, reuse_index=True)
+             for size in graphs} if steps > 3 and hidden is not None and share_index else {})
         seconds: dict[str, float] = {}
         before = 0
         try:
@@ -304,6 +319,8 @@ class Unit:
                     graph.extend.capture(self.batch, self.model, stores, recorder)
                 if size in drafts:
                     drafts[size].capture(self.batch, self.model, stores, recorder)
+                if size in draft_reuse:
+                    draft_reuse[size].capture(self.batch, self.model, stores, recorder)
                 seconds[str(size)] = round(time.perf_counter() - started, 3)
             capture_idle = getattr(self.model, "capture_idle", None)
             if not steps and capture_idle is not None:
@@ -319,7 +336,7 @@ class Unit:
             if self.plans.idle_graph is not None:
                 self.plans.idle_graph.close()
                 self.plans.idle_graph = None
-            for graph in [*graphs.values(), *drafts.values()]:
+            for graph in [*graphs.values(), *drafts.values(), *draft_reuse.values()]:
                 graph.close()
             for backend in self.backends:
                 backend.release_graphs()
@@ -335,6 +352,7 @@ class Unit:
         if steps:
             self.plans.verify_graphs = dict(sorted(graphs.items()))
             self.plans.draft_graphs = dict(sorted(drafts.items()))
+            self.plans.draft_reuse_graphs = dict(sorted(draft_reuse.items()))
         else:
             self.plans.graphs = dict(sorted(graphs.items()))
         return "", {"seconds": seconds, "kept_bytes": kept, "idle_experts": self.plans.idle_graph is not None}

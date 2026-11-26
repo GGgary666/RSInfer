@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import cast
 
 import torch
 
 from core.contracts.plan import PersistentBatch
 from layers.glm53.metadata import IndexShard, Row, SparseStep, Verify, device_metadata, pad_decode
-from models.glm53_config import KDA, KV
+from layers.glm53.unit import GlmLayers
+from models.glm53.weights import EMBED, HEAD, PREFIX, Weights
+from models.glm53_config import KDA, KV, Config
 
 
 class Batch:
@@ -62,3 +65,21 @@ def test_prefill_index_shards_keep_request_boundaries_and_prefix_lengths() -> No
 
     empty = IndexShard.prepare(rows, 4, rank=7, size=8, device=cpu)
     assert len(empty.ends) == len(empty.pooled) == empty.max_pool == 0
+
+
+def test_refit_refreshes_packed_projections_at_their_captured_addresses() -> None:
+    layers = GlmLayers.__new__(GlmLayers)
+    layers._projection_weights = {}
+    config = cast(Config, SimpleNamespace(hidden=3, vocab=4, attention=(), mlp=()))
+    weights = Weights(config, 1, 0, refresh_projections=layers.refresh_projections)
+    tensors = {decl.name: torch.zeros(decl.shape) for decl in weights.decls}
+    left, right = tensors[EMBED], tensors[HEAD][:2]
+    packed = layers._packed_projection(left, right)
+    address = packed.data_ptr()
+
+    for value in (1, 4, 1):  # Refit abort reloads the old contents through the same loader.
+        incoming = [(name if name == HEAD else PREFIX + name, torch.full_like(tensor, value + i))
+                    for i, (name, tensor) in enumerate(tensors.items())]
+        assert weights.load_weights(incoming, tensors) == set(tensors)
+        assert layers._packed_projection(left, right).data_ptr() == address
+        torch.testing.assert_close(packed, torch.cat((left, right)))

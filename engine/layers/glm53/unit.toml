@@ -19,3 +19,7 @@ config = ["state.kv.page_size", "model.path", "model.hf_config", "spec.algorithm
 "glm53.index_prefill" = { type = "bool", default = false, binding = "startup", doc = "Shard sparse prefill index queries across the tensor parallel ranks." }
 "glm53.shared_expert_dp" = { type = "bool", default = false, binding = "startup", doc = "Keep a full shared expert on each DFC rank and run it on that rank's token shard." }
 "glm53.prefill_matmul_reduce_scatter" = { type = "bool", default = false, binding = "startup", doc = "Fuse BF16 prefill attention output projections with TP reduce-scatter on Ascend AIV." }
+"glm53.mla_fused_proj" = { type = "bool", default = false, binding = "startup", doc = "Fuse MLA q_a/kv_a projections and indexer FP32 input projections." }
+"glm53.fused_eh_norm" = { type = "bool", default = false, binding = "startup", doc = "Fuse draft position-0 embedding masking, enorm, hnorm, and concatenation in Triton." }
+"glm53.local_draft_argmax" = { type = "bool", default = false, binding = "startup", doc = "Compute sharded draft head argmax locally and all-gather only (val, idx) pairs." }
+"glm53.mtp_share_index" = { type = "bool", default = false, binding = "startup", doc = "Reuse draft step-0 sparse top-k indices across subsequent MTP decode draft steps." }

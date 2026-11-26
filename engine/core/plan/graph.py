@@ -269,14 +269,29 @@ class DraftGraphPlan:
     metadata before its replay too). The rows padded with the padding row, as a decode graph's."""
 
     def __init__(self, size: int, hidden_size: int, dtype: torch.dtype, device: torch.device,
-                 backends: Sequence[Backend]) -> None:
-        self.size, self.backends = size, list(backends)
+                 backends: Sequence[Backend], *, reuse_index: bool = False) -> None:
+        self.size, self.backends, self.reuse_index = size, list(backends), reuse_index
         self.inputs = torch.zeros(size, dtype=torch.int64, device=device)
         self.positions = torch.zeros_like(self.inputs)
         self.hidden = torch.zeros(size, hidden_size, dtype=dtype, device=device)
         self.last_index = torch.arange(size, device=device)
         self.output: tuple[torch.Tensor, torch.Tensor] | None = None
         self.graph: Any = None
+
+    def _set_topk_mode(self, active: bool) -> None:
+        """Select the model's sparse index path while recording the draft graph."""
+        for backend in self.backends:
+            fn = getattr(backend, "set_draft_topk_mode", None)
+            if fn is None:
+                continue
+            if not active:
+                fn("", 0)
+            elif self.reuse_index:
+                fn("reuse", self.size)
+            elif getattr(backend, "mtp_share_index", False):
+                fn("save", self.size)
+            else:
+                fn("", 0)
 
     def run(self, batch: PersistentBatch, view: BatchPlan, input_ids: Tensor, positions: Tensor,
             hidden: Tensor) -> tuple[Tensor, Tensor]:
@@ -306,10 +321,14 @@ class DraftGraphPlan:
     def padded(self, batch: PersistentBatch, model: Any, stores: Sequence[Any]) -> tuple[torch.Tensor, torch.Tensor]:
         for store in stores:
             store.clear(store.scratch())
-        for backend in self.backends:
-            getattr(backend, "prepare_draft", backend.prepare)(batch, padding_row(), PlanKey("decode", self.size))
-        with torch.no_grad():  # as VerifyGraphPlan.padded
-            return model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
+        self._set_topk_mode(True)
+        try:
+            for backend in self.backends:
+                getattr(backend, "prepare_draft", backend.prepare)(batch, padding_row(), PlanKey("decode", self.size))
+            with torch.no_grad():  # as VerifyGraphPlan.padded
+                return model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
+        finally:
+            self._set_topk_mode(False)
 
     def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
         """As ``GraphPlan.capture``, with the same check: one lane is the padding row alone, one token,
@@ -318,11 +337,15 @@ class DraftGraphPlan:
             expected = self.padded(batch, model, stores)[0].clone()
             for store in stores:
                 store.clear(store.scratch())
-        with torch.no_grad(), recorder.capture() as graph:
-            self.output = model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
-        self.graph = graph
-        with recorder.warmup():
-            graph.replay()
+        self._set_topk_mode(True)
+        try:
+            with torch.no_grad(), recorder.capture() as graph:
+                self.output = model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
+            self.graph = graph
+            with recorder.warmup():
+                graph.replay()
+        finally:
+            self._set_topk_mode(False)
         assert self.output is not None
         if self.size == 1:
             torch.testing.assert_close(self.output[0], expected, rtol=1e-3, atol=1e-3, msg=lambda m: (
@@ -367,6 +390,9 @@ class DraftExtendGraphPlan:
 
     def _forward(self, model: Any) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.verify.output is not None, "the verify graph is recorded first"
+        for backend in self.backends:
+            if (fn := getattr(backend, "set_draft_topk_mode", None)) is not None:
+                fn("", 0)
         return model.draft_forward(self.inputs, self.verify.positions, self.verify.output[1], self.last_index)
 
     def capture(self, batch: PersistentBatch, model: Any, stores: Sequence[Any], recorder: Any) -> None:
