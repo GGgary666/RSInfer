@@ -10,12 +10,16 @@ services = ["ledger@1", "ledger.domains@1"]
 [state]
 drain_on_reload = true
 
+[capabilities]
+actions = ["save_prefix"]
+
 [reads]
 config = ["state.kv.page_size", "spec.algorithm", "spec.num_draft_tokens", "sched.domains"]
 
 [config]
 "alloc.states" = { type = "list", default = [], binding = "startup", doc = "The model's StateDecl records, as the worker's storage units get them: request pages and request slots." }
-"alloc.radix_cache" = { type = "bool", default = true, binding = "startup", doc = "Share complete KV pages with matching GDN or DS sliding-window state checkpoints; false disables prefix reuse." }
+"alloc.radix_cache" = { type = "bool", default = true, binding = "startup", doc = "Share complete KV pages and matching slot checkpoints for hybrid models; false disables prefix reuse." }
 "alloc.mamba_track_interval" = { type = "int", default = 256, binding = "startup", doc = "SGLang's --mamba-track-interval: a decoding request keeps its slot state for the prefix cache every this many tokens (rounded to the checkpoint grid)." }
 "alloc.mamba_max_states_per_path" = { type = "int", default = -1, binding = "startup", doc = "SGLang's --mamba-max-states-per-path: slot states the prefix cache keeps on one path from the root; -1, no limit." }
 "alloc.prefix_replay_tokens" = { type = "int", default = 1, binding = "startup", doc = "Leave at least this many prompt tokens to compute after a cache hit. DS1017 bounded replay needs its full retained suffix." }
+"alloc.prefix_checkpoint" = { type = "str", default = "", binding = "startup", doc = "Radix index to restore from the worker's MemCache checkpoint." }

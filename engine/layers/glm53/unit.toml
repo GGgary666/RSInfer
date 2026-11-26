@@ -1,0 +1,21 @@
+[unit]
+id = "layers.glm53"
+kind = "logic"
+process = ["worker"]
+entry = "layers.glm53.unit:Unit"
+
+[provides]
+services = ["layers.glm53@1"]
+
+[requires]
+services = ["comm.group@1", "state.gdn.slots@1"]
+
+[reads]
+config = ["state.kv.page_size", "model.path", "model.hf_config", "spec.algorithm", "spec.num_draft_tokens",
+          "batch.max_context_len"]
+
+[config]
+"glm53.sequence_prefill" = { type = "bool", default = false, binding = "startup", doc = "Shard prefill residuals and expert routing across the tensor parallel ranks." }
+"glm53.index_prefill" = { type = "bool", default = false, binding = "startup", doc = "Shard sparse prefill index queries across the tensor parallel ranks." }
+"glm53.shared_expert_dp" = { type = "bool", default = false, binding = "startup", doc = "Keep a full shared expert on each DFC rank and run it on that rank's token shard." }
+"glm53.prefill_matmul_reduce_scatter" = { type = "bool", default = false, binding = "startup", doc = "Fuse BF16 prefill attention output projections with TP reduce-scatter on Ascend AIV." }

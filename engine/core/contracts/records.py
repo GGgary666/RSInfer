@@ -130,6 +130,15 @@ class StateTrack(msgspec.Struct, frozen=True):
     upto: Column
 
 
+class PrefixCopy(msgspec.Struct, frozen=True):
+    """A maintenance step copying the same model shard between scheduling domains."""
+
+    source_domain: int
+    destination_domain: int
+    counts: dict[str, int]
+    items: dict[str, list[int]]
+
+
 class StateOps(msgspec.Struct, frozen=True):
     """Every state kind's part of a step plan, in one section."""
 
@@ -137,6 +146,7 @@ class StateOps(msgspec.Struct, frozen=True):
     assign: list[StateAssign] = []
     copy: list[StateCopy] = []
     track: list[StateTrack] = []
+    prefix_copy: PrefixCopy | None = None
 
 
 # ------------------------------------------------------------------ worker -> scheduler

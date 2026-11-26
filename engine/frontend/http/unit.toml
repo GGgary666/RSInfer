@@ -21,6 +21,7 @@ actions = ["drain"]  # the engine's gate for changes (doc/specs/empty-apply.md)
 "frontend.scheduler" = { type = "dict", default = {}, binding = "startup", doc = "Scheduler ProcId, looked up through the supervisor (again when it is replaced) unless requests_address is set." }
 "frontend.max_tokens" = { type = "int", default = 4096, binding = "startup" }
 "frontend.max_requests" = { type = "int", default = 1024, binding = "startup" }
+"frontend.reasoning_end" = { type = "str", default = "", binding = "startup", doc = "Chat generation starts in reasoning mode and this text marks the start of the answer." }
 "frontend.io_timeout_s" = { type = "float", default = 2.0, binding = "startup" }
 "frontend.response_timeout_s" = { type = "float", default = 120.0, binding = "startup", doc = "Maximum silence between scheduler responses; request cleanup still sends cancellation." }
 "frontend.start_timeout_s" = { type = "float", default = 15.0, binding = "startup" }

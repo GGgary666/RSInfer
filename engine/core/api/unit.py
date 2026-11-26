@@ -106,7 +106,9 @@ class Api:
         source = "config" if change.config and not files and change.topology is None else "apply"
         return ChangeSet(base=change.base or coord.identity, files=files, config=dict(change.config),
                          deps=dict(change.deps), topology=change.topology, artifacts=dict(change.artifacts),
-                         source=source, meta=change.meta)
+                         source=source, meta=change.meta, state=change.state,
+                         state_only=bool(change.state) and not (files or change.config or change.topology
+                                                               or change.deps or change.artifacts))
 
     async def _check(self, change: ApiChange) -> Result[msgspec.Struct]:
         cs = self._changeset(change)

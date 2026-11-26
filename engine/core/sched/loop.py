@@ -83,6 +83,7 @@ from core.contracts.records import (
     AddedRow,
     BatchPlan,
     Capacity,
+    PrefixCopy,
     Resync,
     RowDelta,
     Sampled,
@@ -125,6 +126,7 @@ class Request(Protocol):
     def input(self) -> Any: ...
     computed: int
     """Tokens computed so far; at admission, the prefix the cache holds (``Admitted.prefix``)."""
+    cached_tokens: int
 
     @property
     def output_ids(self) -> Sequence[int]: ...
@@ -203,6 +205,15 @@ class PolicyError(Exception):
     """A policy's decision the loop does not carry out."""
 
 
+@dataclass(frozen=True)
+class Replica:
+    source: int
+    destination: int
+    tokens: Sequence[int]
+    salt: str
+    release_source: Callable[[], None]
+
+
 @dataclass
 class Flight:
     epoch: int
@@ -230,6 +241,7 @@ class Flight:
     unhomed: list[list[int]] = field(default_factory=list[list[int]])
     """Per domain, request ids in this step that do not yet have ``home`` recorded on every rank of
     their domain."""
+    replica: Replica | None = None
 
 
 class Outbox:
@@ -275,6 +287,7 @@ class Scheduler:
                  prefill_interval: Callable[[], int] = lambda: 0,
                  prefill_occupancy_target: Callable[[], int] = lambda: 0,
                  balance_prefill: Callable[[], bool] = lambda: False,
+                 prefix_peer: Callable[[], bool] = lambda: False,
                  settings: Settings = Settings(), clock: Callable[[], float] = time.monotonic) -> None:
         if not plans or len(plans) != len(results):
             raise ValueError("one plan writer and one result reader per rank")
@@ -307,6 +320,8 @@ class Scheduler:
         self.prefill_interval = prefill_interval
         self.prefill_occupancy_target = prefill_occupancy_target
         self.balance_prefill = balance_prefill
+        self.prefix_peer = prefix_peer
+        self.replica_attempted: set[int] = set()
         self._last_retire_at: float = 0.0
         self._decode_step_s: float = 0.012
         self._prefill_tok_s: float = 56000.0
@@ -602,7 +617,7 @@ class Scheduler:
                     or request.computed == 0:
                 continue
             if ledger.restart(rid):
-                request.computed = 0
+                request.computed = request.cached_tokens = 0
                 restarted += 1
             else:
                 lost.add(rid)
@@ -647,6 +662,19 @@ class Scheduler:
 
     def _retire(self, flight: Flight) -> None:
         answers = [flight.answers[r] for r in range(len(self.results))]
+        if flight.replica is not None:
+            ran_copy = all(isinstance(a, Sampled) and not (len(a.rows) or len(a.tokens) or len(a.counts))
+                           for a in answers) and not flight.void
+            self._finish_replica(flight.replica, ran_copy)
+            self._note(f"prefix copy {flight.replica.source}->{flight.replica.destination}, "
+                       f"{len(flight.replica.tokens)} tokens, {self.clock()-flight.since:.3f}s, acknowledged={ran_copy}")
+            for ledger in self.ledgers:
+                ledger.retire(flight.epoch, ran=ran_copy)
+            if not ran_copy:
+                self.full = True
+            for rid in self.table.retire(flight.epoch, ran=ran_copy):
+                self._reap(rid)
+            return
         everywhere = set(range(len(self.domains)))
         if all(isinstance(a, Resync) for a in answers):
             for ledger in self.ledgers:
@@ -874,6 +902,9 @@ class Scheduler:
         fault = self.fault
         assert fault is not None
         self.fault, self.fault_identity = None, ""
+        for flight in self.flights:
+            if flight.replica is not None:
+                self._finish_replica(flight.replica, False)
         self.flights.clear()
         for outbox in self.plans:
             outbox.queue.clear()
@@ -970,6 +1001,9 @@ class Scheduler:
         req_arr = cast(Sequence[int], events.requests.values())
         if not req_arr:
             return
+        cached = {rid: r.cached_tokens for rid in req_arr if (r := self.table.get(rid)) is not None and r.cached_tokens}
+        if cached:
+            events = msgspec.structs.replace(events, cached=cached)
         first_req = self.table.get(req_arr[0])
         single_route = first_req.route if first_req is not None else None
         if single_route is not None:
@@ -994,7 +1028,8 @@ class Scheduler:
             starts, flat = ragged("i64", outputs.values())
             self._send(route, TokenEvents(events.identity, Column.of("i64", outputs), starts, flat,
                                           {r: f for r, f in events.finished.items() if r in outputs},
-                                          {r: e for r, e in events.errors.items() if r in outputs}), epoch)
+                                          {r: e for r, e in events.errors.items() if r in outputs},
+                                          {r: n for r, n in cached.items() if r in outputs}), epoch)
 
     def _send(self, route: StreamAddress, events: TokenEvents, epoch: int) -> None:
         outbox = self.routes.get(route)
@@ -1052,6 +1087,7 @@ class Scheduler:
             self.removed.append(request.row)
         self.home.pop(rid, None)
         self.turned_away.pop(rid, None)
+        self.replica_attempted.discard(rid)
         self.table.reap(rid)
 
     # ------------------------------------------------------------------ planning
@@ -1094,6 +1130,8 @@ class Scheduler:
             return False  # after a change: plan with the workers' capacity of now, not an older one
         if self.full and self.flights:
             return False  # a full delta goes out once every step sent before it is answered
+        if self.flights and self.flights[-1].replica is not None:
+            return False  # publish the replica before routing another request
         try:
             planned = self._plan_step()
         except PolicyError as e:
@@ -1181,7 +1219,7 @@ class Scheduler:
             room[domain] -= 1
             queued[domain] += len(prompt)
             return domain, 0
-        matches = {d: self.ledgers[d].match(rid, prompt) for d in open_}
+        matches = {d: self.ledgers[d].match(rid, prompt, request.input.cache_salt) for d in open_}
         domain = (max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], -queued[d], room[d], -d))
                   if balance else max(open_, key=lambda d: (d != self.turned_away.get(rid), matches[d], room[d], -d)))
         room[domain] -= 1
@@ -1230,6 +1268,72 @@ class Scheduler:
         peak_tok = max(per_dom, default=0)
         return started + max(self._decode_step_s, peak_tok / max(self._prefill_tok_s, 1.0))
 
+    def _finish_replica(self, replica: Replica, committed: bool) -> None:
+        try:
+            cast(Any, self.ledgers[replica.destination]).finish_replica(replica.tokens, replica.salt, committed)
+        finally:
+            replica.release_source()
+
+    def _replicate_prefix(self, views: Sequence[_View], kinds: Mapping[int, tuple[Kind, Request, int]]) -> bool:
+        """Copy a pinned common prefix to an idle domain while requests compete on its owner."""
+        if not self.prefix_peer() or len(views) < 2:
+            return False
+        epoch = max(self.table.last_submitted, 0) + 1
+        for source, view in enumerate(views):
+            if not view.waiting or len(view.waiting) + len(view.prefilling) + len(view.decoding) < 2:
+                continue
+            pin = getattr(self.ledgers[source], "pin_replica", None)
+            if pin is None:
+                continue
+            for target, vacant in enumerate(views):
+                if target == source or vacant.waiting or vacant.free_rows != self.settings.max_batch:
+                    continue
+                ledger = self.ledgers[target]
+                stage = getattr(ledger, "stage_replica", None)
+                if stage is None:
+                    continue
+                for candidate in view.waiting:
+                    rid, prefix = candidate.request, candidate.planned
+                    if not prefix or rid in self.replica_attempted:
+                        continue
+                    _, request, _ = kinds[rid]
+                    prompt = request.prompt_tokens
+                    salt = request.input.cache_salt
+                    extent = self._extent(len(prompt), request.input.max_tokens)
+                    if ledger.match(rid, prompt, salt) >= prefix:
+                        continue
+                    lease = pin(rid, prompt, salt)
+                    if lease is None:
+                        continue
+                    if lease.node.depth != prefix:
+                        lease.release()
+                        continue
+                    try:
+                        items = stage(rid, prompt, salt, prefix, extent)
+                    except BaseException:
+                        lease.release()
+                        raise
+                    if items is None:
+                        lease.release()
+                        continue
+                    replica = Replica(source, target, prompt[:prefix], salt, lease.release)
+                    previous = self.flights[-1].epoch if self.flights else None
+                    try:
+                        counts = {kind: len(ids) for kind, ids in lease.items.items()}
+                        commands = {source: lease.items, target: items}
+                        steps = [_Step(epoch, d * self.settings.max_batch,
+                                       prefix_copy=PrefixCopy(source, target, counts, commands.get(d, {})))
+                                 for d in range(len(views))]
+                        self._send_plan(steps, replica=replica)
+                    except BaseException:
+                        self._finish_replica(replica, False)
+                        raise
+                    if previous is not None:
+                        self._note(f"prefix copy step {epoch} queued after step {previous}")
+                    self.replica_attempted.add(rid)
+                    return True
+        return False
+
     def _plan_step(self) -> bool:
         self._defer_until = None
         tokens, samples = self._in_flight()
@@ -1238,6 +1342,8 @@ class Scheduler:
             self._coalesce_since = None
             self._decode_streak = 0
             return False
+        if self._replicate_prefix(views, kinds):
+            return True
         now = self.clock()
         any_decoding = any(v.decoding for v in views)
         any_waiting = any(v.waiting for v in views)
@@ -1392,16 +1498,17 @@ class Scheduler:
                 # Where it would start now (an admission before it in this step may have evicted
                 # part of its prefix): a chunk that reaches no page does not run, and admitting it
                 # would only evict from the cache (Antigravity, #59; PrefillAdder checks first too).
-                if self._chunk(request, ledger.match(rid, request.prompt_tokens), take.tokens) <= 0:
+                salt = request.input.cache_salt
+                if self._chunk(request, ledger.match(rid, request.prompt_tokens, salt), take.tokens) <= 0:
                     continue
-                got = ledger.admit(rid, request.prompt_tokens, extent, step.epoch)
+                got = ledger.admit(rid, request.prompt_tokens, extent, step.epoch, salt)
                 if got is None:
                     refused = True
                     self.turned_away[rid] = step.base // self.settings.max_batch
                     continue
                 self.turned_away.pop(rid, None)
                 request.row = free.pop(0)
-                request.computed = planned = got.prefix  # the cached prefix is computed
+                request.computed = request.cached_tokens = planned = got.prefix
                 step.admitted.append(request)
                 step.added.append(AddedRow(request.row, rid, request.input.sampling))
                 step.assign_all(request.row, got.items)
@@ -1467,7 +1574,7 @@ class Scheduler:
             n = (planned + n) // align * align - planned
         return self.ledgers[0].prefill_end(planned, planned + n, len(request.prompt_tokens)) - planned
 
-    def _send_plan(self, steps: Sequence[_Step]) -> None:
+    def _send_plan(self, steps: Sequence[_Step], *, replica: Replica | None = None) -> None:
         """One step: each domain's part to its ranks, an empty one to a domain with nothing to run."""
         epoch = steps[0].epoch
         if self.full:
@@ -1494,7 +1601,7 @@ class Scheduler:
         self.flights.append(Flight(epoch, rows, counts, frozenset(row for step in steps for row in step.samples), now,
                                    frozenset(row for step in steps for row in step.prefill_rows),
                                    frozenset(row for step in steps for row in step.speculative),
-                                   unhomed=unhomed))
+                                   unhomed=unhomed, replica=replica))
         self.full = False
         self.removed.clear()
 
@@ -1515,7 +1622,8 @@ class Scheduler:
                          [StateCopy(kind, when, Column.of("i32", [src for src, _ in cs]),
                                     Column.of("i32", [dst for _, dst in cs])) for (kind, when), cs in step.copies.items()],
                          [StateTrack(kind, Column.of("i32", [t[0] - base for t in ts]), Column.of("i32", [t[1] for t in ts]),
-                                     Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()])
+                                     Column.of("i32", [t[2] for t in ts])) for kind, ts in step.track.items()],
+                         step.prefix_copy)
         removed = [] if self.full else [row - base for row in self.removed
                                         if base <= row < base + self.settings.max_batch]
         delta = RowDelta([AddedRow(a.row - base, a.request, a.sampling) for a in step.added],
@@ -1559,6 +1667,7 @@ class _Step:
     next_tokens: list[int] = field(default_factory=list[int])
     prefills: int = 0
     decodes: int = 0
+    prefix_copy: PrefixCopy | None = None
 
     def assign_all(self, row: int, items: Mapping[str, list[int]]) -> None:
         for kind, ids in items.items():

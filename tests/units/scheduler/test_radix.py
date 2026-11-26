@@ -9,6 +9,7 @@ import pytest
 
 from core.contracts.state import StateDecl
 from core.state.alloc.radix import GDN, KV, SWA, RadixLedger, RadixTree
+from state.prefix_checkpoint import PrefixNode
 
 PAGE = 16
 DECLS = [StateDecl(KV, 0, {"k": ((PAGE, 1, 8), "bf16")}, "request", tokens_per_item=PAGE),
@@ -37,6 +38,78 @@ def run(led: RadixLedger, rid: int, prompt: list[int], step: int, upto: int, *, 
     out["reserved"] = r
     led.retire(step)
     return out
+
+
+def test_dense_attention_shares_pages_inside_a_radix_node_without_slot_state() -> None:
+    led = RadixLedger(DECLS[:1])
+    led.set_capacity({KV: 8})
+    prompt = list(range(3 * PAGE + 5))
+    run(led, 1, prompt, 1, len(prompt), admit=len(prompt))
+    original_pages = led.items(1)[KV]
+    led.commit(1, prompt)
+    led.release(1, 1, prompt)
+    branch = [*prompt[:2 * PAGE], 1000, 1001]
+    assert led.match(2, branch) == 2 * PAGE
+    assert led.match(3, prompt) == 3 * PAGE
+    assert led.match(4, prompt[:2 * PAGE]) == PAGE  # the last prompt token must still run
+    admitted = led.admit(2, branch, len(branch), 2)
+    assert admitted is not None and admitted.prefix == 2 * PAGE
+    assert admitted.items[KV][:2] == original_pages[:2]
+    step = led.reserve(2, len(branch), 2)
+    assert step is not None and not step.restore and not step.track
+    led.retire(2, ran=False)
+    led.release(2, 2, branch)
+    assert led.check() == [] and led.tree.held()[1] == []
+
+
+def test_hybrid_prefix_checkpoint_preserves_salted_paths_and_accounts_for_saved_slots() -> None:
+    original = ledger()
+    prompt = list(range(4 * PAGE + 7))
+    other = [*prompt[:PAGE], *range(100, 100 + 3 * PAGE + 7)]
+    for rid, tokens, salt in ((1, prompt, "pool"), (2, other, "pool"), (3, prompt, "isolated")):
+        entry = original.admit(rid, tokens, len(tokens), rid, salt)
+        assert entry is not None and entry.prefix == 0
+        assert original.reserve(rid, len(tokens), rid) is not None
+        original.retire(rid)
+        original.commit(rid, tokens)
+        original.release(rid, rid, tokens)
+    assert not original.check()
+
+    restored = RadixLedger(DECLS)
+    restored.restore_nodes = original.save_prefix()
+    restored.set_capacity({KV: 64, GDN: 20})
+    assert not restored.check()
+    assert restored.match(4, prompt, "pool") == 4 * PAGE
+    assert restored.match(5, other, "pool") == 4 * PAGE
+    assert restored.match(6, prompt, "isolated") == 4 * PAGE
+    assert restored.match(7, prompt, "new salt") == 0
+    admitted = restored.admit(8, prompt, len(prompt), 8, "pool")
+    assert admitted is not None and admitted.prefix == 4 * PAGE
+    reserved = restored.reserve(8, len(prompt), 8)
+    assert reserved is not None and GDN in reserved.restore
+    source, target = reserved.restore[GDN]
+    assert source != target and target == admitted.items[GDN][0]
+    assert not restored.check()
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_peer_prefix_publication_requires_copy_acknowledgement(accepted: bool) -> None:
+    source, destination = ledger(), ledger()
+    prefix = list(range(4 * PAGE))
+    prompt = prefix + [1024]
+    pages = [8, 3, 9, 0]
+    source.load_prefix([PrefixNode(-1, array("q", prefix).tobytes(), pages, 10, b"peer", 1)])
+    lease = source.pin_replica(1, prompt, "peer")
+    assert lease is not None and lease.items == {KV: pages, GDN: [10]}
+    assert destination.stage_replica(1, prompt, "peer", len(prefix), len(prompt) + 16) is not None
+    assert destination.match(1, prompt, "peer") == 0
+    assert not source.check() and not destination.check()
+    destination.finish_replica(prefix, "peer", accepted)
+    lease.release()
+    assert source.match(1, prompt, "peer") == len(prefix)
+    assert destination.match(1, prompt, "peer") == (len(prefix) if accepted else 0)
+    assert destination.match(2, prompt, "independent") == 0
+    assert not source.check() and not destination.check()
 
 
 def test_a_prompt_computed_once_is_where_the_next_one_starts_from_its_last_checkpoint() -> None:
@@ -149,7 +222,7 @@ def test_at_most_the_slots_over_five_requests_are_admitted() -> None:
 
 def test_a_bad_configuration_is_refused() -> None:
     with pytest.raises(ValueError, match="alloc.radix_cache = false"):
-        RadixLedger([DECLS[0]])
+        RadixLedger([DECLS[1]])
     with pytest.raises(ValueError, match="mamba_max_states_per_path"):
         RadixLedger(DECLS, max_states_per_path=0)
     # As SGLang's (Antigravity, #59): a page of 96 would keep a state at 96, where the GDN

@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 import anyio
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.contracts.columns import Column
@@ -61,6 +61,8 @@ class OpenAICompletionRequest(BaseModel):
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
     seed: int | None = Field(default=None, ge=-(2**63), lt=2**63)
+    reasoning_effort: str | None = None
+    cache_salt: str | None = None
 
 
 @dataclass
@@ -71,6 +73,28 @@ class UserReply:
     reason: FinishReason | None = None
     error: str | None = None
     error_status: int = 503
+    reasoning: str = ""
+
+
+@dataclass
+class ReasoningStream:
+    end: str
+    pending: str = ""
+    closed: bool = False
+
+    def push(self, text: str, final: bool) -> tuple[str, str]:
+        if self.closed:
+            return text, ""
+        text = self.pending + text
+        reasoning, end, answer = text.partition(self.end)
+        if end:
+            self.closed = True
+            self.pending = ""
+            return answer, reasoning
+        keep = 0 if final else next(
+            (i for i in range(min(len(text), len(self.end) - 1), 0, -1) if text.endswith(self.end[:i])), 0)
+        self.pending = text[-keep:] if keep else ""
+        return "", text[:-keep] if keep else text
 
 
 @dataclass
@@ -79,6 +103,9 @@ class RequestState:
     prompt_tokens: int
     identity: str
     completion_tokens: int = 0
+    cached_tokens: int = 0
+    reported_prefix: bool = False
+    reasoning: ReasoningStream | None = None
     identities: list[str] = field(default_factory=list[str])
     last_epoch: int = -1
     finished: bool = False
@@ -91,11 +118,13 @@ class RequestState:
 class FrontendManager:
     def __init__(self, model: str, tokenizer: Tokenizer, detokenizer: Detokenizer, channel: Channel,
                  identity: Callable[[], str], *, max_tokens: int = 4096, max_requests: int = 1024,
-                 response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False) -> None:
+                 response_timeout_s: float = 120.0, paused: Callable[[], bool] = lambda: False,
+                 reasoning_end: str = "") -> None:
         self.model, self.tokenizer, self.detokenizer, self.channel = model, tokenizer, detokenizer, channel
         self._model_json = json.dumps(model, ensure_ascii=False)
         self.identity, self.max_tokens, self.max_requests = identity, max_tokens, max_requests
         self.response_timeout_s = response_timeout_s
+        self.reasoning_end = reasoning_end
         self.uid_counter = secrets.randbits(30) << 32
         self.ack_map: dict[int, list[UserReply]] = {}
         self.event_map: dict[int, asyncio.Event] = {}
@@ -115,6 +144,8 @@ class FrontendManager:
         process resumes, after the change committed or was undone (Codex, #42)."""
         self.entering = 0
         """Requests between the gate and ``states``: a change that closes the gate waits for them too."""
+        self.prefix_queries = 0
+        self.prefix_hits = 0
 
     def open_requests(self) -> int:
         return len(self.states) + self.entering
@@ -219,6 +250,11 @@ class FrontendManager:
             state.last_epoch = epoch
             if events.identity not in state.identities:
                 state.identities.append(events.identity)
+            if not state.reported_prefix:
+                state.cached_tokens = events.cached.get(uid, 0)
+                self.prefix_queries += state.prompt_tokens
+                self.prefix_hits += state.cached_tokens
+                state.reported_prefix = True
             state.completion_tokens += len(new_tokens)
             reason = events.finished.get(uid)
             piece = state.decoder.push(new_tokens, final=reason is not None)
@@ -226,7 +262,9 @@ class FrontendManager:
                 reason = "stop"
                 await self._send_abort(uid, state, "stop string matched")
             state.finished = reason is not None
-            self._ack(UserReply(uid, piece.text, state.finished, reason))
+            content, reasoning = (state.reasoning.push(piece.text, state.finished) if state.reasoning is not None
+                                  else (piece.text, ""))
+            self._ack(UserReply(uid, content, state.finished, reason, reasoning=reasoning))
 
     async def submit(self, request: OpenAICompletionRequest, *, chat: bool) -> int:
         self.entering += 1  # before the gate: a change closing it now still sees this request
@@ -252,8 +290,9 @@ class FrontendManager:
         if chat:
             if not request.messages:
                 raise HTTPException(400, "messages must not be empty")
+            effort = {} if request.reasoning_effort is None else {"reasoning_effort": request.reasoning_effort}
             prompt = await asyncio.to_thread(self.tokenizer.chat,
-                                            [Message(m.role, m.content) for m in request.messages])
+                                            [Message(m.role, m.content) for m in request.messages], **effort)
         else:
             if request.prompt is None:
                 raise HTTPException(400, "prompt is required")
@@ -266,10 +305,13 @@ class FrontendManager:
         self.uid_counter += 1
         self.ack_map[uid], self.event_map[uid] = [], asyncio.Event()
         identity = self.identity()
-        self.states[uid] = RequestState(self.detokenizer.open(stops), len(prompt), identity, identities=[identity])
+        self.states[uid] = RequestState(
+            self.detokenizer.open(stops), len(prompt), identity, identities=[identity],
+            reasoning=ReasoningStream(self.reasoning_end) if chat and self.reasoning_end else None)
         new = NewRequest(uid, Column.of("i64", prompt),
                          SamplingParams(request.temperature, request.top_p, request.top_k, request.seed),
-                         request.max_tokens, [] if request.ignore_eos else list(self.tokenizer.stop_token_ids))
+                         request.max_tokens, [] if request.ignore_eos else list(self.tokenizer.stop_token_ids),
+                         request.cache_salt or "")
         try:
             sent = await self.channel.send(Requests(new=[new]))
         except asyncio.CancelledError:
@@ -326,10 +368,11 @@ class FrontendManager:
         if not self.states:
             gc.collect(0)
 
-    def usage(self, uid: int) -> dict[str, int]:
+    def usage(self, uid: int) -> dict[str, Any]:
         state = self.states[uid]
         return dict(prompt_tokens=state.prompt_tokens, completion_tokens=state.completion_tokens,
-                    total_tokens=state.prompt_tokens + state.completion_tokens)
+                    total_tokens=state.prompt_tokens + state.completion_tokens,
+                    prompt_tokens_details={"cached_tokens": state.cached_tokens})
 
     async def stream_completions(self, uid: int, chat: bool) -> AsyncGenerator[bytes]:
         first_chunk = True
@@ -349,8 +392,14 @@ class FrontendManager:
                         txt = json.dumps(ack.incremental_output, ensure_ascii=False)
                         yield f'{cmpl_prefix}{now}{model_mid}"text": {txt}}}]}}\n\n'.encode()
                     else:
-                        dlt = (f'{{"content": {json.dumps(ack.incremental_output, ensure_ascii=False)}}}'
-                               if ack.incremental_output else "{}")
+                        if ack.reasoning:
+                            fields = {"reasoning_content": ack.reasoning}
+                            if ack.incremental_output:
+                                fields["content"] = ack.incremental_output
+                            dlt = json.dumps(fields, ensure_ascii=False)
+                        else:
+                            dlt = (f'{{"content": {json.dumps(ack.incremental_output, ensure_ascii=False)}}}'
+                                   if ack.incremental_output else "{}")
                         yield f'{chat_prefix}{now}{model_mid}"delta": {dlt}}}]}}\n\n'.encode()
                     continue
                 delta: dict[str, str] = {}
@@ -359,6 +408,8 @@ class FrontendManager:
                 first_chunk = False
                 if ack.incremental_output:
                     delta["content"] = ack.incremental_output
+                if ack.reasoning:
+                    delta["reasoning_content"] = ack.reasoning
                 reason = ack.reason if ack.reason in ("stop", "length") else ("stop" if ack.finished else None)
                 choice: dict[str, Any] = {"index": 0, "finish_reason": reason}
                 choice.update({"delta": delta} if chat else {"text": ack.incremental_output})
@@ -407,6 +458,13 @@ def create_app(manager: FrontendManager) -> FastAPI:
             raise HTTPException(503, manager.failure)
         return {"status": "ok"}
 
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> str:
+        return (f"rsinfer:prefix_cache_queries_total {manager.prefix_queries}\n"
+                f"rsinfer:prefix_cache_hits_total {manager.prefix_hits}\n"
+                "rsinfer:external_prefix_cache_queries_total 0\n"
+                "rsinfer:external_prefix_cache_hits_total 0\n")
+
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         return {"object": "list", "data": [{"id": manager.model, "object": "model",
@@ -423,15 +481,18 @@ def create_app(manager: FrontendManager) -> FastAPI:
             return StreamingResponse(manager.stream_completions(uid, chat), media_type="text/event-stream",
                                      headers=headers)
 
-        async def collect() -> tuple[str, UserReply]:
+        async def collect() -> tuple[str, str, UserReply]:
             chunks: list[str] = []
+            reasoning: list[str] = []
             async for ack in manager.wait_for_ack(uid):
                 if ack.error:
                     raise HTTPException(ack.error_status, ack.error, headers={"Retry-After": str(RETRY_AFTER_S)}
                                         if ack.error_status == 503 else None)
                 chunks.append(ack.incremental_output)
+                if ack.reasoning:
+                    reasoning.append(ack.reasoning)
                 if ack.finished:
-                    return "".join(chunks), ack
+                    return "".join(chunks), "".join(reasoning), ack
             raise HTTPException(503, "scheduler ended without a final result")
 
         task = asyncio.create_task(collect())
@@ -441,10 +502,16 @@ def create_app(manager: FrontendManager) -> FastAPI:
                 if await request.is_disconnected():
                     await manager.abort_user(uid)
                     raise HTTPException(499, "client disconnected")
-            content, last = task.result()
+            content, reasoning, last = task.result()
             reason = last.reason if last.reason in ("stop", "length") else "stop"
             choice: dict[str, Any] = {"index": 0, "finish_reason": reason}
-            choice.update({"message": {"role": "assistant", "content": content}} if chat else {"text": content})
+            if chat:
+                message = {"role": "assistant", "content": content}
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+                choice["message"] = message
+            else:
+                choice["text"] = content
             return JSONResponse({"id": f"{'chatcmpl' if chat else 'cmpl'}-{uid}",
                                  "object": "chat.completion" if chat else "text_completion",
                                  "created": int(time.time()), "model": manager.model, "choices": [choice],

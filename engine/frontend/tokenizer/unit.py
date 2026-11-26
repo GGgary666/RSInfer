@@ -72,10 +72,12 @@ class HFTokenizer:
             ids.insert(0, self.bos)
         return ids
 
-    def chat(self, messages: Sequence[Message]) -> list[int]:
+    def chat(self, messages: Sequence[Message], *, reasoning_effort: str | None = None) -> list[int]:
+        kwargs = self.template_kwargs if reasoning_effort is None else {
+            **self.template_kwargs, "reasoning_effort": reasoning_effort}
         prompt = self.tokenizer.apply_chat_template(
             [{"role": m.role, "content": m.content} for m in messages],
-            tokenize=False, add_generation_prompt=True, **self.template_kwargs)
+            tokenize=False, add_generation_prompt=True, **kwargs)
         return self.encode(str(prompt))
 
     def decode(self, tokens: Sequence[int]) -> str:

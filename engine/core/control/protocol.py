@@ -12,7 +12,7 @@ from typing import Any
 import msgspec
 
 from core.change.eventlog import ChangeRecord
-from core.change.types import ChangeMeta, ChangeResult, ChangeSet
+from core.change.types import ChangeMeta, ChangeResult, ChangeSet, StateRequest
 from core.common.ids import Identity
 from core.common.result import Diagnostic
 from core.supervisor.protocol import ProcIntrospection, UnitBrief
@@ -76,6 +76,7 @@ class ApiChange(msgspec.Struct, frozen=True):
     base: Identity | None = None
     """``None``: the identity running now."""
     meta: ChangeMeta = ChangeMeta()
+    state: list[StateRequest] = []
 
 
 class ApiCheck(msgspec.Struct, frozen=True):

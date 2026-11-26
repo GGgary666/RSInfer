@@ -78,12 +78,12 @@ class Ledger(Protocol):
         """Whether a request of ``tokens`` tokens fits the whole capacity, i.e. can ever be admitted."""
         ...
 
-    def match(self, request: int, prompt: Sequence[int]) -> int:
+    def match(self, request: int, prompt: Sequence[int], salt: str = "") -> int:
         """How much of ``prompt`` the prefix cache holds now: where the request would start. Takes
         nothing."""
         ...
 
-    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int) -> Admitted | None:
+    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int, salt: str = "") -> Admitted | None:
         """Take every kind's items for ``tokens`` tokens (prompt and output), the cached prefix of
         ``prompt`` included, all or nothing, for a request first planned in ``step``. ``None``:
         some kind did not have them, and nothing is held."""

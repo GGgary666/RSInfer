@@ -8,9 +8,11 @@ entry = "worker.comm.unit:Unit"
 services = ["comm.group@1"]
 
 [config]
-"comm.size" = { type = "int", default = 1, binding = "startup", doc = "Ranks of the communication group (the workers that compute a step together: expert parallel); 1: this worker is alone and nothing is set up" }
+"comm.size" = { type = "int", default = 1, binding = "startup", doc = "Total communication ranks. Each group from comm.domains covers part of this world. With one rank no communicator is needed." }
+"comm.domains" = { type = "int", default = 1, binding = "startup", doc = "Split the communication ranks into this many independent equal-sized contiguous groups" }
+"comm.prefix_peer" = { type = "bool", default = false, binding = "startup", doc = "Join an HCCL group across domains for each model shard, for peer prefix transfers." }
 "comm.rendezvous" = { type = "str", default = "", binding = "startup", doc = "Where the group's ranks find each other, as torch.distributed's init_method: tcp://host:port (rank 0 listens there) or file:///path on a file system they share; needed when comm.size > 1" }
-"comm.device_backend" = { type = "str", default = "gloo", binding = "startup", doc = "How tensors travel between the ranks: nccl (each rank on a card of its own), or gloo (through host memory; ranks that share a card, or the CPU)" }
+"comm.device_backend" = { type = "str", default = "gloo", binding = "startup", doc = "Device collectives for dedicated accelerator ranks: hccl on Ascend, nccl on CUDA. Gloo uses host memory." }
 "comm.timeout_s" = { type = "float", default = 1800.0, binding = "startup", doc = "How long a rank waits for the others, at start and in a step" }
 
 [state]

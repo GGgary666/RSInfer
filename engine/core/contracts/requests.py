@@ -32,6 +32,7 @@ class NewRequest(msgspec.Struct, frozen=True):
     sampling: SamplingParams = SamplingParams()
     max_tokens: int = 256
     stop_token_ids: list[int] = []
+    cache_salt: str = ""
 
 
 class AbortRequest(msgspec.Struct, frozen=True):
@@ -63,3 +64,5 @@ class TokenEvents(msgspec.Struct, frozen=True):
     finished: dict[int, FinishReason] = {}
     errors: dict[int, str] = {}
     """Requests the scheduler refused, with why; they also appear in ``finished`` (``abort``)."""
+    cached: dict[int, int] = {}
+    """Prompt tokens reused at admission, by request ID."""

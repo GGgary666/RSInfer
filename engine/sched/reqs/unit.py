@@ -37,6 +37,7 @@ class Request:
     finished_reason: FinishReason | None = None
     finished_len: int | None = None
     computed: int = 0
+    cached_tokens: int = 0
     row: int | None = None
     route: StreamAddress | None = None
     prompt_tokens: Sequence[int] = field(default_factory=tuple)

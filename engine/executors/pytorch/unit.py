@@ -35,7 +35,7 @@ import torch
 
 from core.contracts.columns import Column
 from core.contracts.plan import Plan, PlanKey, PlanService
-from core.contracts.records import BatchPlan, Capacity, Resync, RowDelta, Sampled, StateOps, StepStats
+from core.contracts.records import BatchPlan, Capacity, PrefixCopy, Resync, RowDelta, Sampled, StateOps, StepStats
 from executors.pytorch.spec import Speculative, spec_draft_tokens
 from platforms.base import StaleGraph
 
@@ -158,7 +158,8 @@ class PyTorchExecutor:
 
     def __init__(self, platform: Any, batch: Any, plans: PlanService, sampler: Any, stores: dict[str, Any],
                  spec: Speculative | None = None, idle: Callable[[], None] | None = None,
-                 stepped: Callable[[], None] | None = None) -> None:
+                 stepped: Callable[[], None] | None = None,
+                 copy_prefix: Callable[[PrefixCopy, bool], bool] | None = None) -> None:
         self.platform, self.batch, self.plans, self.sampler, self.stores = platform, batch, plans, sampler, stores
         self.spec = spec
         """Speculation (doc/specs/mtp.md); ``None`` off."""
@@ -166,6 +167,7 @@ class PyTorchExecutor:
         """The model's part in a step this rank has no rows in (``model.idle``); ``None``: none."""
         self.stepped = stepped
         """What the model does after each forward, outside any graph (``model.stepped``); ``None``: nothing."""
+        self.copy_prefix = copy_prefix
         self.last_end: Mark | None = None
         """The end of the device work of the step submitted last."""
         self.row_index: torch.Tensor | None = None
@@ -203,6 +205,8 @@ class PyTorchExecutor:
             raise ValueError("a speculative plan reached a worker with speculation off (spec.algorithm)")
         if not len(plan.rows):
             return self._empty(epoch, delta, plan, state, start)
+        if state.prefix_copy is not None:
+            raise ValueError("a prefix copy requires its own maintenance step")
         check_plan(plan)
         reason = self.batch.check(delta, plan)
         if reason:
@@ -231,7 +235,13 @@ class PyTorchExecutor:
         if not reason:
             self.batch.apply(delta, state)
         try:
-            if self.idle is not None:
+            if state.prefix_copy is not None:
+                if self.copy_prefix is None:
+                    raise ValueError("this model cannot transfer a cached prefix")
+                if not self.copy_prefix(state.prefix_copy, not reason):
+                    return Resync("a peer prefix copy was refused")
+                self.platform.synchronize(0)
+            elif self.idle is not None:
                 self.idle()
         except BaseException:
             self.batch.invalidate()
@@ -384,6 +394,8 @@ class PyTorchExecutor:
             else:
                 tokens = torch.empty(next_token_ids.shape, dtype=next_token_ids.dtype, pin_memory=True)
                 tokens.copy_(next_token_ids, non_blocking=True)
+        if device.type == "npu":
+            tokens = tokens.cpu()
         self._copies(state, "after")
         end, previous = self._mark(device), self.last_end
         self.last_end = end
@@ -427,4 +439,5 @@ class Unit:
                 eager_idle()
 
         ctx.provide("executor@1", PyTorchExecutor(ctx.platform, batch, plans, sampler, stores, spec,
-                                                  idle if eager_idle is not None else None, getattr(model, "stepped", None)))
+                                                  idle if eager_idle is not None else None, getattr(model, "stepped", None),
+                                                  getattr(model, "copy_prefix", None)))

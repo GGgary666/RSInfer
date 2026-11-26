@@ -55,7 +55,7 @@ class ByteTokenizer:
     def encode(self, text: str) -> list[int]:
         return list(text.encode())
 
-    def chat(self, messages: Sequence[Message]) -> list[int]:
+    def chat(self, messages: Sequence[Message], *, reasoning_effort: str | None = None) -> list[int]:
         return self.encode("".join(f"{m.role}: {m.content}\n" for m in messages) + "assistant: ")
 
     def decode(self, tokens: Sequence[int]) -> str:

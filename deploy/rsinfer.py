@@ -43,13 +43,13 @@ from typing import TYPE_CHECKING, Any
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
-from deploy.models import ds1017, qwen3, qwen38  # noqa: E402
+from deploy.models import ds1017, glm53_native, qwen3, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
 
 if TYPE_CHECKING:
     from core.common.ids import UnitId
 
-RECIPES: tuple[types.ModuleType, ...] = (qwen3, qwen38, ds1017)
+RECIPES: tuple[types.ModuleType, ...] = (qwen3, qwen38, ds1017, glm53_native)
 HOST = "host-a"
 SCHED = {"host": HOST, "role": "sched", "index": 0}
 SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
@@ -225,11 +225,11 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     cfg = read_config(model)
     recipe = recipe_for(cfg)
     args.device = args.device or getattr(recipe, "DEFAULT_DEVICE", "cuda")
-    if args.device == "npu" and recipe is not qwen3:
+    if args.device == "npu" and recipe not in (qwen3, glm53_native):
         raise SystemExit(f"{recipe.NAME} has no native Ascend recipe")
     args.page_size = args.page_size or recipe.PAGE_SIZE
     if args.cuda_graph is None:
-        args.cuda_graph = "off"
+        args.cuda_graph = "required" if recipe is glm53_native else "off"
     workers = worker_units(args.source, recipe)
     if args.layers:
         cfg = cut(cfg, args.layers)
@@ -251,7 +251,10 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     args.rank_gpus = rank_gpus(args)
     ranks = len(args.rank_gpus)
     mesh = {"dp": ranks} if ranks > 1 else {"tp": 1}
-    worker_env = dict(getattr(recipe, "WORKER_ENV", {})) if cuda else {}
+    if recipe is glm53_native:
+        mesh = glm53_native.mesh(args)
+    worker_env = (glm53_native.worker_env(args.glm_moe_backend) if recipe is glm53_native and ascend
+                  else dict(getattr(recipe, "WORKER_ENV", {})) if cuda else {})
     topology = Topology(
         hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))],
         mesh=Mesh(mesh),
@@ -636,7 +639,7 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     d.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
     d.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")
     d.add_argument("--cuda-graph", "--acl-graph", choices=("auto", "off", "required"),
-                   help="decode graphs (plan.cuda_graph)")
+                   help="decode graphs (plan.cuda_graph); native GLM defaults to required")
     d.add_argument("--graph-buckets", type=int, nargs="*", default=[],
                    help="rows of each decode graph (default: SGLang's sizes up to min(--max-rows, 64); powers of "
                         "two up to 8 while the captured attention is the fixed-extent one)")
@@ -693,6 +696,10 @@ def parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="stop the run directory's engine")
     _run_option(stop)
     stop.add_argument("--timeout", type=float, default=60.0, help="seconds before what is left is killed")
+    cache = sub.add_parser("cache-save", help="save native GLM prefixes to MemCache for a restart")
+    _run_option(cache)
+    cache.add_argument("--out", type=Path, required=True, help="path for the restart's prefix manifest")
+    cache.add_argument("--timeout", type=float, default=300.0)
     for name, text in (("sleep", "give the device memory back (holder.sleep); requests are refused"),
                        ("wake", "load the weights again and serve")):
         p = sub.add_parser(name, help=text)
@@ -750,6 +757,13 @@ def main(argv: list[str]) -> int:
     match args.command:
         case "serve":
             return cmd_serve(args)
+        case "cache-save":
+            run = args.run.resolve()
+            if engine_record(run).get("recipe") != glm53_native.NAME:
+                raise SystemExit("cache-save needs a running native GLM engine")
+            config = json.loads((run / "config.json").read_text())
+            return asyncio.run(glm53_native.save_prefix(control_address(run), config["comm.size"],
+                                                         args.out.resolve(), args.timeout))
         case "stop":
             return cmd_stop(args)
         case "status":

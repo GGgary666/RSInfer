@@ -69,6 +69,29 @@ def test_a_domain_with_nothing_to_run_gets_an_empty_plan() -> None:
         assert set(rows_run(b, 1)) == {0} and set(rows_run(b, 0)) == {1}
 
 
+def test_peer_prefix_copy_can_queue_behind_an_in_flight_step() -> None:
+    cfg = {**TWO, "alloc.radix_cache": True, "sched.prefix_peer": True}
+    prefix = list(range(64))
+    with bed(overlap=True, config=cfg, token_budget=128) as b:
+        b.client.send([request(1, [*prefix, 100, 101], 1)])
+        b.run_until(b.finished(1))
+        b.run_until(b.idle)
+        scheduler = b.engine.loop
+        b.engine.table.add(request(2, [200, 201, 202], 4)).unwrap()
+        assert scheduler._plan()
+        (pending,) = scheduler.flights
+        assert pending.rows and pending.replica is None
+
+        shared = [*prefix, 102, 103]
+        b.engine.table.add(request(3, shared, 4)).unwrap()
+        assert scheduler._plan()
+        submitted, copy = scheduler.flights
+        assert submitted is pending and copy.epoch == pending.epoch + 1
+        assert not copy.rows and copy.replica is not None
+        assert (copy.replica.source, copy.replica.destination) == (0, 1)
+        assert b.engine.ledgers[1].match(3, shared) == 0
+
+
 def test_a_domain_composes_its_own_step() -> None:
     """One domain computes a long prompt in chunks while the other already decodes: the budget of
     prompt tokens and the choice between prompts and decodes are each domain's."""

@@ -1,0 +1,16 @@
+[unit]
+id = "models.glm53"
+kind = "logic"
+process = ["worker"]
+entry = "models.glm53.unit:Unit"
+
+[provides]
+services = ["model@1"]
+
+[requires]
+services = ["comm.group@1", "layers.glm53@1", "state.weights@1", "state.holder@1", "state.kv.paged@1",
+            "state.gdn.slots@1", "state.glm53_cache@1"]
+
+[reads]
+config = ["model.path", "model.hf_config", "model.dtype", "batch.max_context_len", "state.kv.page_size",
+           "state.kv.dtype", "spec.algorithm", "spec.num_draft_tokens", "comm.domains", "sched.domains"]

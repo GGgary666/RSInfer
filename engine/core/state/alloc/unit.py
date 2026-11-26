@@ -13,12 +13,14 @@ its own.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import msgspec
 
 from core.contracts.ledger import Admitted, Reserved
 from core.contracts.state import StateDecl
+from state.prefix_checkpoint import PrefixCheckpoint
 
 from .pool import Pool
 from .radix import RadixLedger
@@ -58,10 +60,10 @@ class JointLedger:
     def fits(self, tokens: int) -> bool:
         return self.ready and all(pool.count(tokens) <= pool.capacity for pool in self.pools.values())
 
-    def match(self, request: int, prompt: Sequence[int]) -> int:
+    def match(self, request: int, prompt: Sequence[int], salt: str = "") -> int:
         return 0
 
-    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int) -> Admitted | None:
+    def admit(self, request: int, prompt: Sequence[int], tokens: int, step: int, salt: str = "") -> Admitted | None:
         given: dict[str, list[int]] = {}
         for kind, pool in self.pools.items():
             admitted = pool.admit(request, [], 0, tokens, step)
@@ -128,6 +130,41 @@ def check_page_size(declarations: Sequence[StateDecl], page_size: int) -> None:
                              f"state.kv.page_size is {page_size}")
 
 
+class SavePrefix:
+    def __init__(self, ledgers: Sequence[JointLedger | RadixLedger], page: int) -> None:
+        self.ledgers, self.page = ledgers, page
+        self.path: Path | None = None
+
+    def prepare(self, args: dict[str, Any]) -> None:
+        if any(not isinstance(ledger, RadixLedger) for ledger in self.ledgers):
+            raise ValueError("saving a prefix checkpoint requires alloc.radix_cache")
+        self.path = Path(args["path"])
+
+    def execute(self, args: dict[str, Any]) -> None:
+        ledgers = [ledger for ledger in self.ledgers if isinstance(ledger, RadixLedger)]
+        domains = [ledger.save_prefix() for ledger in ledgers]
+        if not any(domains):
+            raise ValueError("there are no reusable prefixes to save")
+        checkpoint = PrefixCheckpoint(str(args["nonce"]), int(args["world"]), self.page,
+                                      ledgers[0].slot_kind or "", domains)
+        assert self.path is not None
+        staged = self.path.with_suffix(".part")
+        try:
+            staged.touch(mode=0o600, exist_ok=False)
+            staged.write_bytes(msgspec.json.encode(checkpoint))
+            staged.replace(self.path)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    def commit(self) -> None:
+        self.path = None
+
+    def abort(self) -> None:
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+        self.path = None
+
+
 class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         declarations = msgspec.convert(config["alloc.states"], list[StateDecl])
@@ -151,5 +188,16 @@ class Unit:
         # One ledger per scheduling domain: a domain's ranks hold its requests' items, and what one
         # domain's prefix cache keeps is on its own ranks only.
         ledgers = [ledger() for _ in range(domains)]
+        # Only the first allocator in a scheduler process can seed the bootstrap manifest.
+        path = config["alloc.prefix_checkpoint"] if ctx.instance.generation == 1 else ""
+        if path:
+            checkpoint = PrefixCheckpoint.load(Path(path))
+            if checkpoint.page != config["state.kv.page_size"] or len(checkpoint.domains) != domains:
+                raise ValueError("prefix checkpoint page size or scheduling domains changed")
+            for led, nodes in zip(ledgers, checkpoint.domains, strict=True):
+                if not isinstance(led, RadixLedger) or (led.slot_kind or "") != checkpoint.slot_kind:
+                    raise ValueError("prefix checkpoint state kinds changed")
+                led.restore_nodes = nodes
+        ctx.on_action("save_prefix", SavePrefix(ledgers, config["state.kv.page_size"]))
         ctx.provide("ledger@1", ledgers[0])
         ctx.provide("ledger.domains@1", ledgers)

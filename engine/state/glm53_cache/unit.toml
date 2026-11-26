@@ -1,0 +1,23 @@
+[unit]
+id = "state.glm53_cache"
+kind = "state"
+process = ["worker"]
+entry = "state.glm53_cache.unit:Unit"
+
+[provides]
+services = ["state.glm53_cache@1"]
+
+[requires]
+services = ["state.kv.paged@1", "state.gdn.slots@1", "state.weights@1", "comm.group@1"]
+
+[capabilities]
+actions = ["save_prefix"]
+
+[reads]
+config = ["alloc.prefix_checkpoint", "holder.sleep"]
+
+[config]
+"glm53.memcache_config" = { type = "str", default = "", binding = "startup", doc = "Ascend MemCache client configuration for native GLM prefix checkpoints." }
+
+[state]
+drain_on_reload = false
