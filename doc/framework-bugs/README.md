@@ -3,6 +3,18 @@
 - 日期：2026-11-10
 - 为什么有这个目录：AGENTS.md 规定默认在跑着的引擎上热改（`apply`），开发本身就是对热更新机制的测试。发现机制本身的问题，在这里留一份报告；做法见 `.claude/skills/rsinfer/SKILL.md`「在跑着的引擎上热改」。
 
+## Ascend 与 CANN 案例
+
+| 现象 | 对应复验记录 |
+| --- | --- |
+| 启动时缺少 TBE，或同一运行目录重启失败 | [worker 的 Python 路径](2026-11-26-ascend-runtime-python-path.md) · [旧进程目录冲突](2026-11-26-run-directory-restart.md) |
+| 启动提交中断或静态分析期间心跳超时 | [RPC 帧处理](2026-11-26-rpc-unexpected-frame-count.md) · [GLM 控制面心跳](2026-11-26-manifest-analysis-delays-heartbeats.md) |
+| ACL Graph 录制失败，或 refit 后回放仍用旧权重 | [MTP 录图模式](2026-11-26-acl-graph-inference-mode.md) · [GLM 合并权重](2026-11-26-glm53-packed-weights-refit.md) |
+| HCCL 子组重建卡住，或同域 rank 采样不一致 | [子组创建顺序](2026-11-26-hccl-subgroup-rejoin.md) · [AIV 确定性规约](2026-11-26-ascend-aiv-rank-sampling.md) |
+| 热更后缓存读取失败，或 AISBench 记录了旧配置 | [重复导入前缀清单](2026-11-26-glm53-prefix-restore-after-hot-apply.md) · [评测 identity 与配置](2026-11-26-aisbench-launch-metadata-after-apply.md) |
+
+新故障可从出错的 rank、执行阶段及变更事务开始定位。 [Ascend 推理诊断](../../.claude/skills/rsinfer-ascend-debug/SKILL.md)
+
 ## 报什么
 
 热更新机制本身的问题，包括：

@@ -1,10 +1,10 @@
-# RSInfer quickstart and live updates
+# NVIDIA SM100 quickstart and live updates
 
 [English](quickstart.md) | [简体中文](quickstart_zh.md)
 
 Start DeepSeek-V4.1-Flash (DS1017) on four SM100 GPUs with DP4/EP4, send a request, and change the running scheduler. For the general single-host CLI, including Qwen3.8, single-GPU serving, and CPU debugging, see the [deployment guide](../deploy/README.md) (Chinese).
 
-For Ascend 910C preflight, live updates, CANN profiling and AISBench comparisons, see the [NPU development guide](2026-11-26-ascend-npu-workflow.md) (Chinese).
+For Ascend 910C, start with the [deployment, tuning and validation index](README.md) (Chinese).
 
 ## 1. Set up the environment
 
@@ -83,21 +83,26 @@ Preview the change to `sched.overlap`, apply it, and restore the original settin
 
 ### 3.3 Reload scheduler code and check its logs
 
-The [FCFS scheduling policy](../engine/policies/fcfs/unit.py) runs in `sched-0`. Reloading it takes seconds. The four GPU workers keep their weights and captured graphs. Start this example with a clean copy of the policy file so the revert in step 4 restores it.
+The [FCFS scheduling policy](../engine/policies/fcfs/unit.py) runs in `sched-0`. Reloading it takes seconds. The four GPU workers keep their weights and captured graphs. Run the example from the source tree that matches the running identity. Keep that tree available for the final restore.
 
 **1. Log a call to `Fcfs.order` on stderr.**
 
 ```bash
-python - <<'PY'
+RSI_BASE=$(pwd -P)
+RSI_PROBE=$(mktemp -d)
+cp -a "$RSI_BASE/engine" "$RSI_PROBE/engine"
+python - "$RSI_PROBE/engine/policies/fcfs/unit.py" <<'PY'
+import sys
 from pathlib import Path
-p = Path("engine/policies/fcfs/unit.py")
+p = Path(sys.argv[1])
 s = p.read_text()
 s = s.replace(
     "class Fcfs:\n    def order(self, waiting: Sequence[Candidate]) -> list[int]:\n",
     "import sys\n\n\nclass Fcfs:\n    def order(self, waiting: Sequence[Candidate]) -> list[int]:\n"
     "        if waiting:\n"
-    "            print(f'[hot-reload-demo] ordering {len(waiting)} req(s)', file=sys.stderr, flush=True)\n",
+    "            print(f'[hot-reload-demo] ordering {len(waiting)} req(s)', file=sys.stderr, flush=True)  # PROBE\n",
 )
+assert s != p.read_text(), "Fcfs.order did not match the expected source"
 p.write_text(s)
 PY
 ```
@@ -106,13 +111,13 @@ PY
 
 ```bash
 # Check the workspace source and unit manifests.
-./deploy/serve_ds1017.sh control check --source .
+./deploy/serve_ds1017.sh control check --source "$RSI_PROBE"
 
 # The plan should reload policies.fcfs on sched-0.
-./deploy/serve_ds1017.sh control apply --source . --dry-run
+./deploy/serve_ds1017.sh control apply --source "$RSI_PROBE" --dry-run
 
 # Apply the change to the running engine.
-./deploy/serve_ds1017.sh control apply --source . --intent "demo fcfs hot reload"
+./deploy/serve_ds1017.sh control apply --source "$RSI_PROBE" --wait-empty 120 --intent "demo fcfs hot reload"
 ```
 
 **3. Send a request and inspect the scheduler log.**
@@ -126,11 +131,13 @@ grep "hot-reload-demo" run/rsinfer/host-a/snapshots/.run/sched-0-*/log | tail -n
 
 A line such as `[hot-reload-demo] ordering 1 req(s)` confirms the running scheduler executed the new code.
 
-**4. Restore the policy file and apply it to the running engine.**
+**4. Reapply the source that served the baseline request.**
 
 ```bash
-git checkout -- engine/policies/fcfs/unit.py
-./deploy/serve_ds1017.sh control apply --source . --intent "revert demo"
+./deploy/serve_ds1017.sh control check --source "$RSI_BASE"
+./deploy/serve_ds1017.sh control apply --source "$RSI_BASE" --dry-run
+./deploy/serve_ds1017.sh control apply --source "$RSI_BASE" --wait-empty 120 --intent "revert demo"
+./deploy/serve_ds1017.sh chat "Hello!" --max-tokens 16
 ```
 
 ### 3.4 In-flight requests and the framework boundary

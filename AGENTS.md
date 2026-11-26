@@ -2,7 +2,7 @@
 
 给在本仓库工作的 agent：规矩、怎么验证。项目是什么见 [README.md](README.md)。
 
-**动手前先读 [`.claude/skills/rsinfer/SKILL.md`](.claude/skills/rsinfer/SKILL.md)**：东西在哪（目录地图），以及怎么在跑着的引擎上热改（Claude Code 会把它当 skill 自动加载）。
+**动手前先读 [RSInfer skill](.claude/skills/rsinfer/SKILL.md) 中和任务相关的目录地图与热改流程。** 涉及 Ascend / CANN 时，从 [Ascend 技能入口](.claude/skills/rsinfer/SKILL.md#ascend-910c-开发与验证) 选用对应技能。部署命令和实测记录见 [Ascend 文档导航](doc/README.md)。
 
 ## 框架改动
 

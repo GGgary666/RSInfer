@@ -43,7 +43,7 @@
 
 最终一轮在运行中的实例排空后提交，身份为 `c573f7c95f782354`，16 个 worker PID 保持。检查与计划 4.096 秒，prepare 0.711 秒，排空 0.009 秒，暂停 0.021 秒，execute 7.161 秒，commit 2.508 秒。 [最终评分与事务](../../../ascend-a3-results/2026-11-26/acl-graph/rsi-iter/evals/final_verified)
 
-整机使用 `--glm-dp-size 2 --glm-moe-backend dfc --glm-prefix-peer --overlap --acl-graph required`，prefill 预算为 8192。与下列配置组合。 [部署指南](../../deploy/README.md#rsinfer-原生-glm-53-flash)
+整机使用 `--glm-dp-size 2 --glm-moe-backend dfc --glm-prefix-peer --overlap --acl-graph required`，prefill 预算为 8192。与下列配置组合。 [原生 GLM 部署](../../deploy/ascend.md#rsinfer-原生-glm-53-flash) · [复现 AISBench 输入与精度验收](../2026-11-26-ascend-npu-workflow.md#glm-aisbench-对照)
 
 ```text
 --set sched.independent_domains=true \

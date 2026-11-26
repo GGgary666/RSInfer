@@ -1,10 +1,10 @@
-# RSInfer 快速上手与热更新实操指南
+# NVIDIA SM100 快速上手与热更新
 
 [English](quickstart.md) | [简体中文](quickstart_zh.md)
 
 本文面向刚拿到仓库、希望在 GPU 物理机上快速拉起 RSInfer、体验**不重启热改配置与代码**、查看进程日志以及运行一键评测的开发者。以 4×SM100 上的 DeepSeek-V4.1-Flash（DS1017，DP4/EP4）为例；通用单机 CLI（含 Qwen3.8、单卡与 CPU 调试）详见 [deploy/README.md](../deploy/README.md)。
 
-在 Ascend 910C 上开发时，设备检查、原生热更、CANN 性能采集和 AISBench 对照见 [NPU 调优与验证](2026-11-26-ascend-npu-workflow.md)。
+在 Ascend 910C 上开发，请从 [部署、调优与验证索引](README.md) 进入。
 
 ## 1. 环境准备
 
@@ -47,7 +47,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 ## 3. 在跑着的引擎上玩热变更（`control` / `apply`）
 
-RSInfer 将每个模块建模为独立单元；改单元代码或配置时，控制面会自动推导最小影响面，只重载受影响的单元，**无需重启进程，也不丢失已加载的权重和 KV/SWA 状态**。
+控制面根据变更计划重载受影响的单元。下例修改调度策略，在提交前可预演确认哪些进程和状态会受影响。
 
 ### 3.1 查看运行态拓扑、单元与变更日志
 
@@ -83,21 +83,26 @@ RSInfer 将每个模块建模为独立单元；改单元代码或配置时，控
 
 ### 3.3 热改单元代码与查看进程日志（完整闭环 Demo）
 
-下面以调度策略单元 [engine/policies/fcfs/unit.py](../engine/policies/fcfs/unit.py) 为例演示一次完整的代码热更新与热回退：它运行在 `sched-0` 进程里，热重载只需秒级，4 个 GPU worker 既不重拉权重也不重录 CUDA Graph。
+从与运行中 identity 对应的源码根目录执行，在临时副本中给 `sched-0` 的策略加探针。保留这份基线源码供最后恢复。 [FCFS 调度策略](../engine/policies/fcfs/unit.py)
 
 **第 1 步：给 `Fcfs.order` 加一行 stderr 日志**
 
 ```bash
-python - <<'PY'
+RSI_BASE=$(pwd -P)
+RSI_PROBE=$(mktemp -d)
+cp -a "$RSI_BASE/engine" "$RSI_PROBE/engine"
+python - "$RSI_PROBE/engine/policies/fcfs/unit.py" <<'PY'
+import sys
 from pathlib import Path
-p = Path("engine/policies/fcfs/unit.py")
+p = Path(sys.argv[1])
 s = p.read_text()
 s = s.replace(
     "class Fcfs:\n    def order(self, waiting: Sequence[Candidate]) -> list[int]:\n",
     "import sys\n\n\nclass Fcfs:\n    def order(self, waiting: Sequence[Candidate]) -> list[int]:\n"
     "        if waiting:\n"
-    "            print(f'[hot-reload-demo] ordering {len(waiting)} req(s)', file=sys.stderr, flush=True)\n",
+    "            print(f'[hot-reload-demo] ordering {len(waiting)} req(s)', file=sys.stderr, flush=True)  # PROBE\n",
 )
+assert s != p.read_text(), "Fcfs.order did not match the expected source"
 p.write_text(s)
 PY
 ```
@@ -106,13 +111,13 @@ PY
 
 ```bash
 # 静态检查工作区源码树与单元清单
-./deploy/serve_ds1017.sh control check --source .
+./deploy/serve_ds1017.sh control check --source "$RSI_PROBE"
 
 # 预演变更计划（可以看到只重载 sched-0 上的 policies.fcfs）
-./deploy/serve_ds1017.sh control apply --source . --dry-run
+./deploy/serve_ds1017.sh control apply --source "$RSI_PROBE" --dry-run
 
 # 真正热应用到运行中的引擎
-./deploy/serve_ds1017.sh control apply --source . --intent "demo fcfs hot reload"
+./deploy/serve_ds1017.sh control apply --source "$RSI_PROBE" --wait-empty 120 --intent "demo fcfs hot reload"
 ```
 
 **第 3 步：发请求并查看进程日志确认新代码已生效**
@@ -126,11 +131,13 @@ grep "hot-reload-demo" run/rsinfer/host-a/snapshots/.run/sched-0-*/log | tail -n
 
 看到 `[hot-reload-demo] ordering 1 req(s)`，说明热更新已经在运行中的调度器上生效。
 
-**第 4 步：一键热回退（仓库恢复干净，引擎仍不重启）**
+**第 4 步　重新应用基线源码并复验请求**
 
 ```bash
-git checkout -- engine/policies/fcfs/unit.py
-./deploy/serve_ds1017.sh control apply --source . --intent "revert demo"
+./deploy/serve_ds1017.sh control check --source "$RSI_BASE"
+./deploy/serve_ds1017.sh control apply --source "$RSI_BASE" --dry-run
+./deploy/serve_ds1017.sh control apply --source "$RSI_BASE" --wait-empty 120 --intent "revert demo"
+./deploy/serve_ds1017.sh chat "Hello!" --max-tokens 16
 ```
 
 ### 3.4 在途请求处理与框架边界

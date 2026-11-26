@@ -1,38 +1,30 @@
 ---
 name: optimize-kernels-with-aka
-description: 从 RSInfer 的真实推理负载选取算子，向 AKA 异步委托 kernel 研究，重连并导出已验收候选，在原服务调用点评估正确性、开销和端到端收益。适用于新建研究任务，也适用于接手已有 task ID 或接入一个已有候选。
+description: 已定位 RSInfer 算子且需要 AKA 搜索、有现成 task ID 或待接回的候选时，建立或接手研究任务。Ascend 使用目标主机的本地 command 契约，按真实服务调用验收。
 ---
 
-# 用 AKA 优化 RSInfer 的服务路径
+# 用 AKA 优化 RSInfer 算子
 
-你对用户指定负载的正确性和性能负责。AKA 研究 agent 可以改实现、编译、profile、按冻结契约验收候选。你决定优化边界、怎样接回、哪些负载值得采用。有 task ID 时先检查现有任务；已有候选时可以直接从接入开始。
+从真实 worker 取当前实现、调用次数、代表性 shape/stride、精度、状态和布局。用它作 baseline，将候选起点放入 seed。参考、输入生成器、计时与判定放入独立的 `contract/`。多 rank 算子的验证器还需复现各 rank 的输入和通信组。以同一输入复测 baseline，确认抽取后的输出与开销可代表服务调用。 [Ascend 算子接入](../rsinfer-ascend-kernel/SKILL.md)
 
-## 从真实调用点抽题
+## 在 Ascend 主机建立契约
 
-Ascend 910C 的候选先在真实 worker 上用 CANN profiler 定位并核对芯片、算子布局和状态契约。需要交给 AKA 研究时，在同一 910C 软件栈上运行冻结契约，并把结果带回 RSInfer 的热更与端到端对照。 [NPU 调优与验证](../../../doc/2026-11-26-ascend-npu-workflow.md)
+在选定的研究 Python 环境使用仓库固定的 SDK。缺少时从 RSInfer 根目录执行 `python -m pip install -r .claude/skills/optimize-kernels-with-aka/requirements.txt`。需要查 SDK 源码时运行 `git submodule update --init -- third_party/aka`。升级时同步更新依赖、子模块指针和任务接口链接。 [SDK 版本](requirements.txt)
 
-- 用用户关心的指标记录当前 RSInfer revision 和负载基线。在服务中确认走了哪个实现、每步调用几次、时间花在哪里。若消除上游重复计算或修正派发就能解决问题，直接改调用路径。
-- 选一个有参考实现或已有正确性测试的调用点。把当前实际实现作为 baseline，把最有希望的可用实现作为 seed。将独立的参考、输入生成器、验证器和计时代码放在冻结契约中，候选源码单独存放。先用相同输入验证抽出的 baseline 能复现服务调用的语义和时延量级。
-- 记录会改变结论的实参。例如投影输出切片的行步长、分页 KV 与逻辑索引、量化 scale 的布局、调用方提供的输出缓冲区。多 rank 算子还要涵盖各 rank 的输入分布、通信与结果归并。按实际命中频率选 case；当两个阶段的接口或调优取舍不同，再拆成两题。保留逐 case 结果，便于分形状派发。
+- 选 `execution={"backend": "local"}`。在执行主机加载该设备的 CANN 环境，验证器内核对 `torch_npu`、OPP、实际可见 die 和后端。对 Ascend 异步调用先预热，在计时区间两端同步设备，分别记录算子耗时和含适配的调用耗时。
+- 在 `contract/contract.json` 中设 `"adapter": "command"`。`config.command` 为 argv，例如 `["python", "{contract}/verify.py", "{candidate}"]`，其中 `python` 应是上述环境的解释器。`config.instructions` 写明输入输出、状态更新与误差，`config.delivery` 写候选入口。验证器加载传入目录中的实现，在冻结的 case 上核对结果和时延。 [固定版本的任务接口](https://github.com/alibaba/atrex-kernel-agent/blob/e6e2926d5251c7b815597af165d6396c42e4001c/docs/task-execution.md)
+- 验证器向 stdout 写一行 `AKA_TASK_RESULT=` 加 JSON。给出 `verdict`、`complete` 与 `metrics`，每项指标的 `name`、`value`、`unit` 与提交目标对齐。保留逐 case 结果、设备和软件版本。
 
-## 异步提交与接手
+## 提交或接手
 
-从 RSInfer 仓库根目录安装本技能固定的 SDK，使用已配好算子测试依赖的开发环境。
-
-```sh
-uv pip install --python .venv/bin/python -r .claude/skills/optimize-kernels-with-aka/requirements.txt
-```
-
-需要在本机阅读 SDK 源码时，从仓库根目录执行 `git submodule update --init -- third_party/aka`。升级 SDK 时，在同一 PR 更新 `third_party/aka` 指针、`requirements.txt` 和下方接口文档链接，使三处指向同一提交。
-
-`local` 在执行主机上运行契约，GPU 题需要在有相应设备和工具链的主机运行。配置当前可用的研究 agent。自建命令契约时，在 `contract/contract.json` 的 `config` 里写明 `command`、`instructions` 和 `delivery`。验证器从 `candidate/` 加载实现，完成正确性和计时后打印一行 `AKA_TASK_RESULT=` 加 JSON，包含 `verdict`、`complete` 和带名称、数值、单位的 `metrics`。详见[固定版本的任务接口](https://github.com/alibaba/atrex-kernel-agent/blob/e6e2926d5251c7b815597af165d6396c42e4001c/docs/task-execution.md)。
+在含 `contract/`、`baseline/`、`seed/` 的实验目录执行。在所选研究 agent 已配置时可异步启动任务。下例用 Codex，`latency_us` 需与验证器输出一致。
 
 ```python
-from pathlib import Path
 import json
+from pathlib import Path
+
 import aka
 
-# Run inside the extracted experiment, alongside contract/, baseline/ and seed/.
 root = Path("aka-tasks").resolve()
 job = aka.submit(
     contract="contract", baseline="baseline", seed="seed",
@@ -43,16 +35,10 @@ job = aka.submit(
 Path("aka-job.json").write_text(json.dumps({"root": str(root), "task_id": job.id}))
 ```
 
-让 metric 名与 harness 输出一致。任务输入相同可复用 key；真实布局、基线或验收规则改变时，冻结新题并使用新 key。需要研究某个瓶颈时把现象和 profile 目标写入 notes。研究侧用任务绑定的 `aka execution` 执行实验。
+已有任务用记录中的 `task_id` 和 `root` 调用 `aka.job(task_id, root=root)` 重连。通过 `job.events()` 和 `job.results()` 查看进展。从 `results["candidates"]` 选已验收的 ID，用 `job.export(candidate_id, destination)` 导出。重复提交相同任务可复用 key，形状、基线或验证规则变化时另建 key。
 
-在另一进程读取 `aka-job.json`，用 `aka.job(record["task_id"], root=record["root"])` 重连。通过 `job.events()` 和 `job.results()` 查看进展，按目标 case 选择 `results["candidates"]` 中已验收记录的 `id`，用 `job.export(candidate_id, destination)` 导出。一起保存 RSInfer revision、契约 ID、候选 ID 和接入改动。已发布候选可以在研究继续时试接。
+## 回接与验收
 
-## 在服务里兑现收益
+已有候选可从此处开始。在原 worker 通过热更验证宿主和扩展能同进程加载，检查目标阶段实际命中。用同样的激活、分页状态与 stride 对比基线，计入重排、拷贝、分配、同步和通信。若回接需要改绑定或实现，重新执行该契约。 [引擎内检查](../rsinfer/SKILL.md#在引擎里做检查排查和验证)
 
-在原调用点接入候选，验证它与宿主及其他扩展能在同一进程加载，且目标请求确实走到该实现。按仓库的 RSInfer skill 热改并检查实际 worker；用一次性探针记录形状、阶段和派发，计时窗口移除探针。
-
-发现接口不合适时可以直接改绑定、kernel 或调用方。例如让 TopK 写进已有的带步长输出视图，让 attention 直接读分页 KV。把必要的重排、拷贝、分配、同步和额外 launch 计入调用点对比。扩展单独运行通过、同进程加载失败时，先区分 Python 模块名、原生动态链接符号和绑定类型注册，再修实际发生冲突的一层。对接入后修改过的源码重新运行原算子验证。
-
-用相同输入、硬件、路由与计时边界比较原实现和接入版。分别给出独立 kernel、含适配的实际调用、用户负载三层结果。端到端收益小于预期时，先核对命中率、调用次数、拷贝与计算通信重叠。输出有差异时，先测基线自对照，再用真实激活或逐算子替换定位差异，并按既定容差判断。
-
-给出采用范围及其证据，可按阶段或形状保留现有派发。用 `job.feedback(candidate_id, value)` 回传实际命中、收益或回退原因。若服务暴露题包遗漏的语义或成本，把可复现输入带回下一轮。
+分别记录裸算子、含适配的调用和用户负载结果。按实际收益选择形状和阶段，保留回退路径。用 `job.feedback(candidate_id, value)` 回传采用范围或回退依据，同时记录 RSInfer revision、契约 ID、候选 ID 和测量产物。 [服务对照与验收](../rsinfer-ascend-optimize/SKILL.md#验收并记录)

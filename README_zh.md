@@ -9,14 +9,14 @@
 [English](README.md) | [简体中文](README_zh.md)
 
 ![技术报告](https://img.shields.io/badge/技术报告-Coming%20Soon-lightgrey.svg)
-[![快速上手](https://img.shields.io/badge/快速上手-实操指南-0f766e.svg)](doc/quickstart_zh.md)
+[![快速上手](https://img.shields.io/badge/快速上手-实操指南-0f766e.svg)](#快速上手)
 [![TLA+ 形式化验证](https://img.shields.io/badge/变更协议-TLA%2B%20验证-1d4ed8.svg)](tests/framework/formal/README.md)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
 </div>
 
-Ascend 910C 的 Qwen3 原生推理与 GLM-5.3-Flash MemCache 部署见 [Ascend 部署指南](deploy/README.md#ascend-910c)。
+**Ascend 910C / CANN** · [部署、调优与验证文档](doc/README.md)
 
 ---
 
@@ -173,61 +173,13 @@ git switch --detach 9f321de
 
 ## 快速上手
 
-完整实操教程（含改调度策略代码热重载 + 查看日志 + 热回退完整 Demo、`sleep`/`wake` 与常见问题）请看 **[doc/quickstart_zh.md](doc/quickstart_zh.md)**。
+| 平台或任务 | 操作指南 |
+| --- | --- |
+| Ascend 910C / CANN | [启动原生 Qwen3、GLM 或 vLLM Ascend 对照](deploy/ascend.md) · [采集性能与验收请求](doc/2026-11-26-ascend-npu-workflow.md) |
+| NVIDIA SM100 | [DS1017 启动与热更](doc/quickstart_zh.md) · [DS1017 / AgentX 评测](tests/gpu/ds1017_bench/README_zh.md) |
+| 通用单机 CLI 与 CPU 调试 | [部署命令](deploy/README.md#命令) |
 
-### 1. 4×SM100 一键起停与热更新（`deploy/`）
-
-`deploy/serve_ds1017.sh` 会自动按当前 Python 的 `torch.version.cuda` 对齐多版本 `CUDA_HOME`、`nvcc`、`LD_LIBRARY_PATH`、`TRITON_PTXAS_PATH` 与 `nvidia.cu13` 的 `CPATH`：
-
-```bash
-source /path/to/venv/bin/activate
-export RSINFER_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
-
-# 后台一键启动 4×SM100 DS1017（DP4/EP4，默认端口 8000，运行目录 run/rsinfer）
-./deploy/serve_ds1017.sh serve --gpus 0,1,2,3
-./deploy/serve_ds1017.sh status
-
-# 流式对话或标准 OpenAI API 请求
-./deploy/serve_ds1017.sh chat "用三句话介绍一下什么是推理引擎热更新。" --max-tokens 128
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":32,"temperature":0}'
-
-# 在跑着的引擎上直接热改配置或代码（不重启、不重载权重）
-./deploy/serve_ds1017.sh control apply --config '{"sched.overlap": false}' --dry-run
-./deploy/serve_ds1017.sh control check --source .
-./deploy/serve_ds1017.sh control apply --source . --dry-run
-./deploy/serve_ds1017.sh control apply --source . --intent "说明本次改动"
-
-# 查看各进程日志（<run>/host-a/snapshots/.run/<role>-<index>-<seq>/log）
-ls run/rsinfer/host-a/snapshots/.run/*/log
-
-# 临时让出/恢复显存，或彻底停服
-./deploy/serve_ds1017.sh sleep --wait-empty
-./deploy/serve_ds1017.sh wake
-./deploy/serve_ds1017.sh stop
-```
-
-通用单机命令行（支持 `Qwen3.8-27B`、单卡与 CPU 调试）详见 [deploy/README.md](deploy/README.md)。
-
-### 2. 在物理机上评测 `master` 基线（`tests/gpu/ds1017_bench/`）
-
-评测脚本会自动在临时隔离目录 `.runs/bench-*` 上施加探针、跑完自动清理，不污染 git 工作树：
-
-```bash
-# 官方 131K YoCo Prefill（64K 单点；不传数字则跑 4K–64K 全档）
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --gpus 0,1,2,3 65536
-
-# 官方 131K YoCo Decode（每卡 D=256；不传数字则跑 4–256 全档）
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode  --gpus 0,1,2,3 256
-
-# AgentX 多轮回放基准
-./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --gpus 0,1,2,3 /path/to/agentx_eval 32
-```
-
-数据准备与完整参数见 [tests/gpu/ds1017_bench/README_zh.md](tests/gpu/ds1017_bench/README_zh.md)。
-
-### 3. 本地类型检查、测试与 TLA+ 形式化验证
+### 本地类型检查、测试与 TLA+ 形式化验证
 
 ```bash
 uv sync --python 3.12 --extra cpu
@@ -282,7 +234,8 @@ master  (通用微内核底座 + Qwen3.8 / DS-V4.1 参考样例 + 共享基础�
 ### 文档索引
 
 - **技术报告**（*Coming Soon*）：架构设计、形式化验证、跨代模型演进、SM100 评测与自举缺陷分类。
-- [doc/quickstart_zh.md](doc/quickstart_zh.md)：快速上手与热更新实操指南（一键启停、OpenAI API、热改代码 Demo、日志路径与评测）。
+- [Ascend / CANN 文档导航](doc/README.md) 将部署、调优、算子接入、验收和故障记录对应到四个项目 skill。
+- [NVIDIA SM100 快速上手](doc/quickstart_zh.md) 提供 DS1017 起停、热更、日志与评测步骤。
 - [doc/modules.html](doc/modules.html)：**设计真源**（可交互单元全景图、单元清单、边规则与场景演示）。
 - [doc/specs/](doc/specs/)：框架本体七个组件规格、变更协议、CUDA Graph、前缀缓存、MTP 与 DS1017 规格。
 - [deploy/README.md](deploy/README.md)：`deploy/rsinfer.py` 完整命令与参数参考。

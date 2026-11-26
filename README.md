@@ -9,12 +9,14 @@
 [English](README.md) | [简体中文](README_zh.md)
 
 ![Technical Report](https://img.shields.io/badge/Technical%20Report-Coming%20Soon-lightgrey.svg)
-[![Quick Start](https://img.shields.io/badge/Quick%20Start-Guide-0f766e.svg)](doc/quickstart.md)
+[![Quick Start](https://img.shields.io/badge/Quick%20Start-Guide-0f766e.svg)](#quick-start)
 [![TLA+ Verified](https://img.shields.io/badge/Protocol-TLA%2B%20Verified-1d4ed8.svg)](tests/framework/formal/README.md)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776ab.svg)](pyproject.toml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 
 </div>
+
+**Ascend 910C / CANN** · [Deployment, tuning and validation (Chinese)](doc/README.md)
 
 ---
 
@@ -171,61 +173,13 @@ git switch --detach 9f321de
 
 ## Quick Start
 
-For a full hands-on walkthrough (live code hot-reload & rollback demo, process log locations, `sleep`/`wake`, and troubleshooting), see **[doc/quickstart.md](doc/quickstart.md)**.
+| Platform or task | Guide |
+| --- | --- |
+| Ascend 910C / CANN | [Start native Qwen3, native GLM or the vLLM Ascend reference](deploy/ascend.md) · [Profile and validate a workload](doc/2026-11-26-ascend-npu-workflow.md) (Chinese) |
+| NVIDIA SM100 | [Serve DS1017 and try a live update](doc/quickstart.md) · [Run the DS1017 and AgentX benchmarks](tests/gpu/ds1017_bench/README.md) |
+| General single-host CLI and CPU debugging | [Deployment CLI](deploy/README.md#命令) (Chinese) |
 
-### 1. One-Command 4×SM100 Serving & Live Hot-Reload (`deploy/`)
-
-`deploy/serve_ds1017.sh` automatically aligns `CUDA_HOME`, `nvcc`, `LD_LIBRARY_PATH`, `TRITON_PTXAS_PATH`, and `nvidia.cu13` `CPATH` to the active Python's `torch.version.cuda`:
-
-```bash
-source /path/to/venv/bin/activate
-export RSINFER_MODEL=/path/to/DeepSeek-V4.1-Flash-1017
-
-# Start 4xSM100 DS1017 (DP4/EP4, detached, port 8000, run dir run/rsinfer)
-./deploy/serve_ds1017.sh serve --gpus 0,1,2,3
-./deploy/serve_ds1017.sh status
-
-# Streamed chat / completions or standard OpenAI HTTP API
-./deploy/serve_ds1017.sh chat "Explain live hot-reloading in three sentences." --max-tokens 128
-curl -s http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"DeepSeek-V4.1-Flash","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":32,"temperature":0}'
-
-# Live-apply config or code edits without restarting or reloading weights
-./deploy/serve_ds1017.sh control apply --config '{"sched.overlap": false}' --dry-run
-./deploy/serve_ds1017.sh control check --source .
-./deploy/serve_ds1017.sh control apply --source . --dry-run
-./deploy/serve_ds1017.sh control apply --source . --intent "describe your change"
-
-# Inspect per-process logs (<run>/host-a/snapshots/.run/<role>-<index>-<seq>/log)
-ls run/rsinfer/host-a/snapshots/.run/*/log
-
-# Temporarily release / restore GPU memory, or stop the engine
-./deploy/serve_ds1017.sh sleep --wait-empty
-./deploy/serve_ds1017.sh wake
-./deploy/serve_ds1017.sh stop
-```
-
-For general single-host usage (`Qwen3.8-27B`, single-GPU, or CPU debugging via `deploy/rsinfer.py`), see [deploy/README.md](deploy/README.md).
-
-### 2. Benchmarking the `master` baseline (`tests/gpu/ds1017_bench/`)
-
-Benchmark scripts automatically stage temporary probes into disposable `.runs/bench-*` directories (cleaned on exit), keeping the git working tree untouched:
-
-```bash
-# Official 131K YoCo Prefill (64K point; omit numbers for full 4K–64K sweep)
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh prefill --gpus 0,1,2,3 65536
-
-# Official 131K YoCo Decode (D=256/GPU; omit numbers for full 4–256 sweep)
-./tests/gpu/ds1017_bench/run_rsinfer_official.sh decode  --gpus 0,1,2,3 256
-
-# AgentX multi-turn replay benchmark
-./tests/gpu/ds1017_bench/run_agentx.sh run-rsinfer --gpus 0,1,2,3 /path/to/agentx_eval 32
-```
-
-See [tests/gpu/ds1017_bench/README.md](tests/gpu/ds1017_bench/README.md) for dataset preparation and full options.
-
-### 3. Local Type Checking, Unit Tests & TLA+ Formal Verification
+### Local Type Checking, Unit Tests & TLA+ Formal Verification
 
 ```bash
 uv sync --python 3.12 --extra cpu
@@ -280,7 +234,8 @@ As major trunk capabilities (such as PD disaggregation and multi-node support) l
 ### Documentation Map
 
 - **Technical Report** (*Coming Soon*): Architecture, formal verification, model evolution, SM100 evaluation, and dogfooding bug taxonomy.
-- [doc/quickstart.md](doc/quickstart.md): Step-by-step serve, OpenAI API, live hot-reload demo, log inspection, and benchmark guide.
+- [Ascend / CANN documentation](doc/README.md) maps deployment, profiling, operator integration, validation and incident reports to the four project skills.
+- [NVIDIA SM100 quickstart](doc/quickstart.md) covers DS1017 serving, live updates, logs and benchmarks.
 - [doc/modules.html](doc/modules.html): Interactive unit architecture map, edge rules, and change scenarios (design source of truth).
 - [doc/specs/](doc/specs/): Specifications for the 7 framework-core components, change protocol, CUDA graphs, prefix caching, MTP, and DS1017.
 - [deploy/README.md](deploy/README.md): Complete `deploy/rsinfer.py` CLI reference (`serve`, `control`, `sleep`/`wake`, `checkpoint`).
