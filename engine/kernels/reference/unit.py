@@ -8,7 +8,7 @@ from typing import Any
 
 from core.contracts.kernels import Definition, Implementation, KernelFn, Solution, Tolerance
 from kernels.reference import ops, spec
-from kernels.reference.paged import PagedDecode, PagedExtend
+from kernels.reference.paged import PagedDecode, PagedExtend, block_paged
 
 LOOSE = Tolerance(atol=2e-2, rtol=2e-2)
 """For bf16 results: two units in the last place, which is up to 1.6% of a value. A reference
@@ -19,6 +19,7 @@ TIGHT = Tolerance(atol=1e-5, rtol=1e-5)
 """For fp32 results: another exp / log / rsqrt, not another accumulation order in bf16."""
 
 DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
+    ("norm.rms@1", "RMSNorm scaled by weight, optionally returning the residual sum", ops.rms_norm, LOOSE, False),
     ("norm.gemma_rms@1", "GemmaRMSNorm: fp32 RMS norm scaled by 1 + weight, optional residual add (the caller "
      "gives up x and residual: a solution may write its results over them)", ops.gemma_rms_norm, LOOSE, False),
     ("norm.rms_gated@1", "RMSNormGated (rms_norm_ref): RMS norm, weight, silu(z)", ops.rms_norm_gated, LOOSE,
@@ -26,6 +27,8 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
     ("attn.qk_norm_rope_gate@1", "an attention layer's projection before it attends: GemmaRMSNorm of q and k per "
      "head, neox RoPE on the first rotary_dim of each head, the output gate taken apart from q",
      ops.fused_qk_gemma_rmsnorm_rope_gate, LOOSE, False),
+    ("attn.qk_rope@1", "NeoX rotary embeddings for query and key from the step's cosine and sine",
+     ops.qk_rope, LOOSE, False),
     ("act.silu_and_mul@1", "SiluAndMul: silu(x[..., :d]) * x[..., d:]", ops.silu_and_mul, LOOSE, False),
     ("act.sigmoid_mul@1", "the attention output gate: x * sigmoid(gate) (the caller gives up x: a solution may "
      "write its result over it)", ops.fused_sigmoid_mul, LOOSE, False),
@@ -41,6 +44,8 @@ DEFINITIONS: tuple[tuple[str, str, KernelFn, Tolerance, bool], ...] = (
      "list of token slots", PagedExtend, LOOSE, True),
     ("attn.paged_decode@1", "an operator planned per step: attention of one token per row over its list of "
      "token slots", PagedDecode, LOOSE, True),
+    ("attn.block_paged@1", "Grouped attention over physical pages and host sequence lengths",
+     block_paged, LOOSE, False),
     ("gdn.conv1d_fn@1", "varlen causal conv1d with SiLU, from and into the conv state pool", ops.causal_conv1d_fn,
      LOOSE, True),
     ("gdn.qkvzba_conv1d_update@1", "a decode step's projections [q|k|v|z] and [b|a] taken apart, and the "
@@ -77,6 +82,7 @@ others run one torch op over the whole batch (ops module docstring)."""
 
 
 HOST_DEPENDENT = frozenset({"attn.extend@1", "attn.decode@1", "attn.paged_extend@1", "attn.paged_decode@1",
+                            "attn.block_paged@1",
                             "gdn.conv1d_fn@1", "gdn.chunk_delta_rule@1", "sample.seeded@1", "spec.accept@1"})
 """The references that read lengths or offsets on the host (a loop over sequences, a seed per row):
 a graph would freeze what they read, so these are not capturable; the others are."""

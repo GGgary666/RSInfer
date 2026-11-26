@@ -1,0 +1,15 @@
+[unit]
+id = "models.qwen3"
+kind = "logic"
+process = ["worker"]
+entry = "models.qwen3.unit:Unit"
+
+[provides]
+services = ["model@1"]
+
+[requires]
+services = ["state.weights@1", "state.holder@1", "state.kv.paged@1", "layers.linear@1", "layers.embedding@1",
+            "layers.norm@1", "layers.rope@1", "layers.activation@1", "layers.attn@1"]
+
+[reads]
+config = ["model.path", "model.hf_config", "model.dtype", "batch.max_context_len", "state.kv.page_size", "state.kv.dtype"]

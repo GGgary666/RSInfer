@@ -16,4 +16,4 @@ services = ["kernels.catalog@1", "state.kv.paged@1"]
 "attn.decode_backend" = { type = "str", default = "", binding = "startup", doc = "For decode steps (SGLang's --decode-attention-backend); empty: attn.backend" }
 
 [reads]
-config = ["model.dtype", "spec.algorithm"]
+config = ["model.dtype", "spec.algorithm", "state.kv.page_size"]

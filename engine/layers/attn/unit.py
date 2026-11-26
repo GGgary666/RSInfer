@@ -32,6 +32,7 @@ import torch
 from core.contracts.plan import GRAPH, AttentionBackend, PersistentBatch, PlanKey
 from core.contracts.records import BatchPlan
 from core.contracts.state import StateDecl
+from layers.attn.blocks import BLOCK_PAGED, BlockAttnBackend
 from layers.attn.paged import DEFINITIONS as PAGED
 from layers.attn.paged import KV_INDICES, PagedAttnBackend
 from layers.solutions import PHASES, Kernels
@@ -159,7 +160,7 @@ class TorchNativeAttnBackend:
 class AttnBackend:
     """``layers.attn@1``: each phase's backend."""
 
-    def __init__(self, kernels: Kernels, kv: Any, dtype: str, speculative: bool = False) -> None:
+    def __init__(self, kernels: Kernels, kv: Any, dtype: str, speculative: bool = False, page_size: int = 16) -> None:
         self.kernels = kernels
         self.dtype = dtype
         self.speculative = speculative
@@ -168,8 +169,10 @@ class AttnBackend:
         """The activations' dtype (``model.dtype``): some kernels take bf16 / fp16 only, and some
         read the cache as if it had the queries' dtype."""
         self.native, self.paged = TorchNativeAttnBackend(kernels, kv), PagedAttnBackend(kernels, kv)
-        self.backends: dict[str, TorchNativeAttnBackend | PagedAttnBackend] = {phase: self.native for phase in PHASES}
-        self.active: TorchNativeAttnBackend | PagedAttnBackend = self.native
+        self.blocks = BlockAttnBackend(kernels, kv, page_size)
+        self.backends: dict[str, TorchNativeAttnBackend | PagedAttnBackend | BlockAttnBackend] = {
+            phase: self.native for phase in PHASES}
+        self.active: TorchNativeAttnBackend | PagedAttnBackend | BlockAttnBackend = self.native
         """The backend of the last ``prepare``: the step's ``forward`` is its."""
 
     @property
@@ -180,6 +183,7 @@ class AttnBackend:
     def release_graphs(self) -> None:
         self.native.release_graphs()
         self.paged.release_graphs()
+        self.blocks.metadata = None
 
     def resolve(self, states: Sequence[StateDecl]) -> Mapping[str, Mapping[str, str]]:
         shape_k, dtype_k = next(d.tensors["k"] for d in states if d.kind == KIND)
@@ -189,6 +193,11 @@ class AttnBackend:
                  "kv_as_q": int(dtype_k == self.dtype)}
         calls: dict[str, dict[str, dict[str, int]]] = {}
         for phase in PHASES:
+            block_shape = {**shape, "page_size": shape_k[0], "decode": int(phase == "decode")}
+            if not self.speculative and self._blocked(phase, block_shape):
+                self.backends[phase] = self.blocks
+                calls[phase] = {"kv.store@1": block_shape, BLOCK_PAGED: block_shape}
+                continue
             paged = self._paged(phase, shape)
             self.backends[phase] = self.paged if paged else self.native
             calls[phase] = {"kv.store@1": {}, (PAGED if paged else NATIVE)[phase]: shape}
@@ -197,6 +206,15 @@ class AttnBackend:
             if paged:
                 calls[phase][KV_INDICES] = {}
         return self.kernels.resolve(calls, shared=frozenset({"kv.store@1", KV_INDICES}))
+
+    def _blocked(self, phase: str, shape: Mapping[str, int]) -> bool:
+        backend = self.kernels.backends[phase]
+        if backend == "reference":
+            return False
+        try:
+            return not self.kernels.catalog.select(BLOCK_PAGED, shape, backend).fallback
+        except LookupError:
+            return False
 
     def _paged(self, phase: str, shape: Mapping[str, int]) -> bool:
         """Whether ``phase`` runs the paged kernels. A named backend that has neither family fails in
@@ -226,7 +244,8 @@ class Unit:
     def __init__(self, ctx: Any, config: Any) -> None:
         kernels = Kernels(ctx.use("kernels.catalog@1"), config, "attn")
         ctx.provide("layers.attn@1", AttnBackend(kernels, ctx.use("state.kv.paged@1"), config["model.dtype"],
-                                                 speculative=bool(config["spec.algorithm"])))
+                                                 speculative=bool(config["spec.algorithm"]),
+                                                 page_size=config["state.kv.page_size"]))
 
 
 if TYPE_CHECKING:

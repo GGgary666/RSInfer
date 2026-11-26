@@ -31,6 +31,17 @@ class Rope:
         self.max_context = max_context
         self.caches: dict[tuple[int, float, str], torch.Tensor] = {}
 
+    def step(self, positions: torch.Tensor, head_dim: int, max_position: int, base: float,
+             dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self.cos_sin_cache(head_dim, max_position, base, positions.device, max_position - 1)
+        cos, sin = cache.index_select(0, positions).to(dtype).chunk(2, dim=-1)
+        return cos, sin
+
+    def qk(self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+           ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = {"head_dim": q.shape[-1], "fp32": int(q.dtype == torch.float32)}
+        return self.catalog.call("attn.qk_rope@1", shape, q, k, cos, sin)
+
     def cos_sin_cache(self, rotary_dim: int, max_position: int, base: float, device: torch.device,
                       needed_max_pos: int) -> torch.Tensor:
         key = (rotary_dim, base, str(device))

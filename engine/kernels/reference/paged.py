@@ -30,9 +30,34 @@ layout on the host: they are not capturable.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from collections.abc import Mapping
 
 import torch
+
+
+def block_paged(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, blocks: torch.Tensor, ends: Sequence[int],
+                lengths: Sequence[int], scale: float, causal: bool) -> torch.Tensor:
+    """Grouped attention over a table of physical KV pages, with right-aligned causal queries."""
+    out: list[torch.Tensor] = []
+    start = 0
+    page_size = k.shape[1]
+    for row, (end, length) in enumerate(zip(ends, lengths, strict=True)):
+        ids = blocks[row, : -(-length // page_size)].long()
+        key = k.index_select(0, ids).flatten(0, 1)[:length].transpose(0, 1).to(q.dtype)
+        val = v.index_select(0, ids).flatten(0, 1)[:length].transpose(0, 1).to(q.dtype)
+        query = q[start:end].transpose(0, 1)
+        mask = None
+        if causal:
+            mask = (torch.arange(length, device=q.device)[None, :]
+                    <= torch.arange(length - end + start, length, device=q.device)[:, None])
+        result = torch.nn.functional.scaled_dot_product_attention(
+            query.unsqueeze(0), key.unsqueeze(0), val.unsqueeze(0), attn_mask=mask, scale=scale,
+            enable_gqa=query.shape[0] != key.shape[0])
+        out.append(result.squeeze(0).transpose(0, 1))
+        start = end
+    return torch.cat(out, dim=0)
 from torch.nn.functional import scaled_dot_product_attention
 
 

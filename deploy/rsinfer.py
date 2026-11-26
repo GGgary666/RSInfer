@@ -43,13 +43,13 @@ from typing import TYPE_CHECKING, Any
 REPO = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(REPO), str(REPO / "engine")]
 
-from deploy.models import ds1017, qwen38  # noqa: E402
+from deploy.models import ds1017, qwen3, qwen38  # noqa: E402
 from deploy.models.hf import cut, read_config  # noqa: E402
 
 if TYPE_CHECKING:
     from core.common.ids import UnitId
 
-RECIPES: tuple[types.ModuleType, ...] = (qwen38, ds1017)
+RECIPES: tuple[types.ModuleType, ...] = (qwen3, qwen38, ds1017)
 HOST = "host-a"
 SCHED = {"host": HOST, "role": "sched", "index": 0}
 SPEC_ALGORITHMS = {"EAGLE": "eagle", "NEXTN": "eagle"}
@@ -77,7 +77,8 @@ def worker_units(source: Path, recipe: types.ModuleType) -> list[UnitId]:
     from core.sourcetree import read_tree
 
     others = frozenset().union(*(r.WORKER_ONLY for r in RECIPES if r is not recipe))
-    return [u for u in read_tree(source.resolve() / "engine").role_units(None, "worker") if u not in others]
+    excluded = others - recipe.WORKER_ONLY
+    return [u for u in read_tree(source.resolve() / "engine").role_units(None, "worker") if u not in excluded]
 
 
 # ------------------------------------------------------------------ the run directory
@@ -162,35 +163,36 @@ def _is_engine(argv: list[str]) -> bool:
 # ------------------------------------------------------------------ serve
 
 
-def worker_gpu(requested: int | None) -> int:
-    """The physical GPU the topology places the worker on. The node agent sets each engine
-    process's ``CUDA_VISIBLE_DEVICES`` from the topology alone, so without ``--gpu`` the caller's
-    own ``CUDA_VISIBLE_DEVICES`` decides here, or every engine of a machine lands on GPU 0."""
+def worker_gpu(requested: int | None, visibility: str = "CUDA_VISIBLE_DEVICES") -> int:
+    """The worker's physical device. Resolve the caller's visibility before making the topology."""
     if requested is not None:
+        if requested < 0:
+            raise SystemExit("a device index must be non-negative")
         return requested
-    first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    first = os.environ.get(visibility, "").split(",")[0].strip()
     if not first:
         return 0
     if not first.isdigit():
-        raise SystemExit(f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}: give the worker's GPU "
-                         "by index with --gpu")
+        raise SystemExit(f"{visibility}={os.environ[visibility]!r}: give the worker's physical index with --gpu/--npu")
     return int(first)
 
 
 def rank_gpus(args: argparse.Namespace) -> list[int]:
-    """The physical GPU of each worker (rank): ``--gpus`` names one a rank; else ``--ranks`` workers on
-    the one ``--gpu`` gives (or on the CPU: the numbers are then not used)."""
+    """The physical accelerator of each worker. CPU workers ignore the placement index."""
     if args.gpus:
         try:
             gpus = [int(g) for g in args.gpus.split(",")]
         except ValueError:
-            raise SystemExit(f"--gpus {args.gpus!r}: physical GPU indices separated by commas") from None
-        if args.gpu is not None or args.ranks not in (1, len(gpus)) or args.device != "cuda":
-            raise SystemExit("--gpus names one GPU a worker: not with --gpu, another --ranks, or --device cpu")
+            raise SystemExit(f"{args.gpus!r}: use physical device indices separated by commas") from None
+        if min(gpus) < 0 or len(set(gpus)) != len(gpus):
+            raise SystemExit("accelerator indices must be distinct and non-negative")
+        if args.gpu is not None or args.ranks not in (1, len(gpus)) or args.device == "cpu":
+            raise SystemExit("--gpus/--npus requires accelerator placement and one index per worker")
         return gpus
     if args.ranks < 1:
         raise SystemExit("--ranks must be at least 1")
-    return [worker_gpu(args.gpu) if args.device == "cuda" else 0] * args.ranks
+    visibility = "ASCEND_RT_VISIBLE_DEVICES" if args.device == "npu" else "CUDA_VISIBLE_DEVICES"
+    return [0 if args.device == "cpu" else worker_gpu(args.gpu, visibility)] * args.ranks
 
 
 def worker(rank: int) -> dict[str, Any]:
@@ -222,32 +224,43 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     model = Path(args.model).resolve()
     cfg = read_config(model)
     recipe = recipe_for(cfg)
+    args.device = args.device or getattr(recipe, "DEFAULT_DEVICE", "cuda")
+    if args.device == "npu" and recipe is not qwen3:
+        raise SystemExit(f"{recipe.NAME} has no native Ascend recipe")
     args.page_size = args.page_size or recipe.PAGE_SIZE
+    if args.cuda_graph is None:
+        args.cuda_graph = "off"
     workers = worker_units(args.source, recipe)
     if args.layers:
         cfg = cut(cfg, args.layers)
     weights = "" if args.dummy else str((args.weights or model).resolve())
-    if weights and not list(Path(weights).glob("*.safetensors")):
+    if weights and not (Path(weights).is_file() or next(Path(weights).glob("*.safetensors"), None)):
+        if recipe is qwen3:
+            raise SystemExit(f"no *.safetensors in {weights}; use --dummy for a random-weight Qwen3")
         print(f"no *.safetensors in {weights}: dummy weights", file=sys.stderr)
         weights = ""
     args.dummy = not weights
     run = args.run.resolve()
     run.mkdir(parents=True, exist_ok=True)
     cuda = args.device == "cuda"
+    ascend = args.device == "npu"
     host = HostId(HOST)
     graphs = cuda and args.cuda_graph != "off"
     # Several workers are data parallel: each has requests of its own (a scheduling domain). Whether
     # they also share the model between them (expert parallel) is the model family's (its recipe).
     args.rank_gpus = rank_gpus(args)
     ranks = len(args.rank_gpus)
+    mesh = {"dp": ranks} if ranks > 1 else {"tp": 1}
+    worker_env = dict(getattr(recipe, "WORKER_ENV", {})) if cuda else {}
     topology = Topology(
         hosts=[HostSpec(host, args.control_host, str(run / HOST / "snapshots"))],
-        mesh=Mesh({"tp": 1} if ranks == 1 else {"dp": ranks}),
+        mesh=Mesh(mesh),
         placement=[RankPlacement(rank, host, gpu) for rank, gpu in enumerate(args.rank_gpus)],
         roles=[RoleSpec("frontend", [], hosts=[host]), RoleSpec("sched", [], hosts=[host], leads_epochs=True),
-               RoleSpec("worker", workers, per_rank=True, platform="cuda_graph" if graphs else "torch_eager",
+               RoleSpec("worker", workers, per_rank=True,
+                        platform="ascend" if ascend else "cuda_graph" if graphs else "torch_eager",
                         platform_options={"cuda": 1} if cuda else {},
-                        env=dict(getattr(recipe, "WORKER_ENV", {})) if cuda else {})])
+                        env=worker_env)])
     config: dict[str, Any] = {
         # frontend
         "frontend.model": args.served_model_name or recipe.SERVED_NAME,
@@ -281,16 +294,18 @@ def plan(args: argparse.Namespace) -> tuple[Path, Path, dict[str, float], types.
     # A change's execution may read the weights again (a wake), as start-up does: it gets as long
     # as start-up, and not less than the engine's own limit.
     tunables = {"supervisor.checkin_timeout_s": float(args.timeout), "change.prepare_timeout_s": float(args.timeout),
-                "change.execute_timeout_s": max(float(args.timeout), ChangeTunables().execute_timeout_s)}
+                "change.execute_timeout_s": max(float(args.timeout), ChangeTunables().execute_timeout_s),
+                **args.control_tunables}
     return topo_file, config_file, tunables, recipe
 
 
 def serve_command(args: argparse.Namespace, topo: Path, config: Path, tunables: dict[str, float]) -> list[str]:
     graphs = args.device == "cuda" and args.cuda_graph != "off"
+    platform = "ascend" if args.device == "npu" else "cuda_graph" if graphs else "torch_eager"
     return [sys.executable, "-m", "core.control", "serve", "--source", str(args.source.resolve()), "--topology", str(topo),
             "--state-dir", str(args.run.resolve() / "control"), "--host", HOST, "--bind", args.control_host,
             "--config", str(config), "--spawn-agents", "--platform",
-            json.dumps({"name": "cuda_graph" if graphs else "torch_eager"}), "--tunables", json.dumps(tunables),
+            json.dumps({"name": platform}), "--tunables", json.dumps(tunables),
             "--proc-tunables", json.dumps(args.proc_tunables)]
 
 
@@ -608,12 +623,9 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     for recipe in RECIPES:
         recipe.add_arguments(s.add_argument_group(f"{recipe.NAME} models"))
     d = s.add_argument_group("device and memory")
-    d.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    d.add_argument("--gpu", type=int, help="the worker's CUDA device, by physical index (default: the first of "
-                   "CUDA_VISIBLE_DEVICES, else 0)")
-    d.add_argument("--gpus", help="several workers, one on each of these CUDA devices (physical indices separated by "
-                   "commas): each serves requests of its own (data parallel), and a model family that splits its "
-                   "weights over them does (DS 1017: its experts and Engram tables)")
+    d.add_argument("--device", choices=("npu", "cuda", "cpu"), help="Qwen3 defaults to npu")
+    d.add_argument("--gpu", "--npu", type=int, help="the worker's physical accelerator index")
+    d.add_argument("--gpus", "--npus", help="one worker per physical accelerator index, comma-separated")
     d.add_argument("--ranks", type=int, default=1, help="that many workers on one device (--gpu, or the CPU): for "
                    "trying several ranks where there is one card")
     d.add_argument("--mem-fraction", type=float, default=0.85, help="device share of weights and states "
@@ -623,8 +635,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
     d.add_argument("--kv-dtype", default="auto", help="state.kv.dtype (SGLang's --kv-cache-dtype)")
     d.add_argument("--max-slots", type=int, default=0, help="GDN slots (0: by holder.state_ratio)")
     d.add_argument("--cpu-bytes", type=int, default=1 << 30, help="state memory on a CPU device")
-    d.add_argument("--cuda-graph", choices=("auto", "off", "required"), default="off",
-                   help="decode graphs (plan.cuda_graph); auto and required run the worker on cuda_graph")
+    d.add_argument("--cuda-graph", "--acl-graph", choices=("auto", "off", "required"),
+                   help="decode graphs (plan.cuda_graph)")
     d.add_argument("--graph-buckets", type=int, nargs="*", default=[],
                    help="rows of each decode graph (default: SGLang's sizes up to min(--max-rows, 64); powers of "
                         "two up to 8 while the captured attention is the fixed-extent one)")
@@ -656,6 +668,8 @@ def _serve_options(s: argparse.ArgumentParser) -> None:
                    help="any other config key (a JSON value, or a string); may repeat")
     e.add_argument("--proc-tunables", type=json.loads, default={}, metavar="JSON",
                    help="process host.*, ipc.* and change.* tunables, e.g. {\"ipc.shm_capacity\":16777216}")
+    e.add_argument("--control-tunables", type=json.loads, default={}, metavar="JSON",
+                   help="control plane tunables, e.g. {\"supervisor.heartbeat_timeout_s\":30}")
     e.add_argument("--timeout", type=int, default=3600, help="seconds for start-up and for a response; "
                    "above 3600, also for a change's execution (a wake reads the weights again)")
     e.add_argument("--detach", action="store_true", help="run in the background: return once the engine is up")

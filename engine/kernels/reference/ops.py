@@ -84,6 +84,15 @@ def gemma_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
     return x if residual is None else (x, residual)
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
+             residual: torch.Tensor | None = None) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if residual is not None:
+        residual = x = x + residual
+    fp32 = x.float()
+    normed = (fp32 * torch.rsqrt(fp32.square().mean(dim=-1, keepdim=True) + eps)).to(x.dtype) * weight
+    return normed if residual is None else (normed, residual)
+
+
 def rms_norm_gated(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, z: torch.Tensor | None = None,
                    eps: float = 1e-6, group_size: int | None = None, norm_before_gate: bool = True,
                    upcast: bool = True) -> torch.Tensor:
@@ -130,6 +139,11 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_
     if is_neox_style:
         return torch.cat((o1, o2), dim=-1)
     return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+
+def qk_rope(query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+    return _apply_rotary_emb(query, cos, sin, True), _apply_rotary_emb(key, cos, sin, True)
 
 
 def rope(positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor, head_size: int, rotary_dim: int,
@@ -727,6 +741,10 @@ def sample(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence
     runner passes ``positions`` for decode, ``seq_lens - 1`` for extend). ``int32`` tokens."""
     if all(0 <= t < SAMPLING_EPS or k == 1 for t, k in zip(temperatures, top_ks)):  # sampling_info.is_all_greedy
         return torch.argmax(logits, dim=-1).to(torch.int32)
+    if logits.device.type == "npu":
+        # Gumbel-max requires FP64. Run the stochastic reference on the host.
+        host_positions = positions.cpu() if isinstance(positions, torch.Tensor) else positions
+        return sample(logits.cpu(), temperatures, top_ps, top_ks, seeds, host_positions).to(logits.device)
     temps = [1.0 if 0 <= t < SAMPLING_EPS else float(t) for t in temperatures]
     ks = [1 if 0 <= t < SAMPLING_EPS else (TOP_K_ALL if k == -1 else int(k)) for t, k in zip(temperatures, top_ks)]
     device = logits.device

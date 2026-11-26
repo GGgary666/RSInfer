@@ -1,0 +1,8 @@
+[unit]
+id = "kernels.ascend"
+kind = "logic"
+process = ["worker"]
+entry = "kernels.ascend.unit:Unit"
+
+[requires]
+services = ["kernels.catalog@1"]

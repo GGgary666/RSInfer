@@ -14,6 +14,9 @@ class Norm:
     def __init__(self, catalog: Any) -> None:
         self.catalog = catalog
 
+    def rms(self, x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None) -> Any:
+        return self.catalog.call("norm.rms@1", {"fp32": int(x.dtype == torch.float32)}, x, weight, eps, residual)
+
     def gemma_rms(self, x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
                   ) -> Any:
         """``normed``, or ``(normed, x + residual)`` with a residual. With a residual the kernel may
