@@ -185,7 +185,9 @@ class VerifyGraphPlan:
     def __init__(self, size: int, steps: int, device: torch.device, backends: Sequence[Backend]) -> None:
         self.size, self.steps, self.backends = size, steps, list(backends)
         self.inputs = torch.zeros(size * steps, dtype=torch.int64, device=device)
-        self.positions = torch.zeros_like(self.inputs)
+        self.padding_positions = (torch.arange(steps, device=device).repeat(size) if device.type == "npu"
+                                  else torch.zeros_like(self.inputs))
+        self.positions = self.padding_positions.clone()
         self.every = torch.arange(size * steps, device=device)
         self.output: tuple[torch.Tensor, torch.Tensor] | None = None
         self.graph: Any = None
@@ -204,7 +206,7 @@ class VerifyGraphPlan:
         self.positions[:tokens].copy_(positions)
         if tokens < len(self.inputs):
             self.inputs[tokens:].zero_()
-            self.positions[tokens:].zero_()
+            self.positions[tokens:].copy_(self.padding_positions[tokens:])
         self.graph.replay()
         assert self.output is not None
         logits, hidden = self.output
@@ -237,7 +239,8 @@ class VerifyGraphPlan:
             self.padded(batch, model, stores)
             for store in stores:
                 store.clear(store.scratch())
-        with torch.inference_mode(), recorder.capture() as graph:
+        # The verify outputs and their shared graph pool are used by the draft extend graph.
+        with torch.no_grad(), recorder.capture() as graph:
             self.output = model.forward_hidden(self.inputs, self.positions, self.every)
         self.graph = graph
         with recorder.warmup():
@@ -282,7 +285,7 @@ class DraftGraphPlan:
                 or any(t != 1 for t in view.num_tokens.values()):
             raise ValueError(f"a draft graph runs one token per row, at most its bucket of {self.size} rows")
         for backend in self.backends:
-            backend.prepare(batch, view, PlanKey("decode", self.size))
+            getattr(backend, "prepare_draft", backend.prepare)(batch, view, PlanKey("decode", self.size))
         self.inputs[:n].copy_(input_ids)
         self.positions[:n].copy_(positions)
         self.hidden[:n].copy_(hidden)
@@ -304,7 +307,7 @@ class DraftGraphPlan:
         for store in stores:
             store.clear(store.scratch())
         for backend in self.backends:
-            backend.prepare(batch, padding_row(), PlanKey("decode", self.size))
+            getattr(backend, "prepare_draft", backend.prepare)(batch, padding_row(), PlanKey("decode", self.size))
         with torch.no_grad():  # as VerifyGraphPlan.padded
             return model.draft_forward(self.inputs, self.positions, self.hidden, self.last_index)
 
@@ -373,7 +376,8 @@ class DraftExtendGraphPlan:
             for store in stores:
                 store.clear(store.scratch())
             for backend in self.backends:
-                backend.prepare(batch, verify_padding_row(self.verify.steps), PlanKey("decode", self.verify.size))
+                getattr(backend, "prepare_draft", backend.prepare)(
+                    batch, verify_padding_row(self.verify.steps), PlanKey("decode", self.verify.size))
             with torch.no_grad():
                 self._forward(model)
             for store in stores:
@@ -395,10 +399,10 @@ def eager_draft_padding_steps(batch: PersistentBatch, model: Any, backends: Sequ
     token = torch.zeros(1, dtype=torch.int64, device=device)
     with torch.no_grad():
         for backend in backends:
-            backend.prepare(batch, padding_row(), PlanKey("decode", 0))
+            getattr(backend, "prepare_draft", backend.prepare)(batch, padding_row(), PlanKey("decode", 0))
         model.draft_forward(token, torch.zeros_like(token), hidden, torch.arange(1, device=device))
         for backend in backends:
-            backend.prepare(batch, verify_padding_row(steps), PlanKey("decode", 0))
+            getattr(backend, "prepare_draft", backend.prepare)(batch, verify_padding_row(steps), PlanKey("decode", 0))
         tokens = torch.zeros(steps, dtype=torch.int64, device=device)
         model.draft_forward(tokens, torch.arange(steps, device=device), hidden.expand(steps, -1).contiguous(),
                             torch.zeros(1, dtype=torch.int64, device=device))

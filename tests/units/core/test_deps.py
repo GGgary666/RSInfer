@@ -374,7 +374,8 @@ def test_a_platform_change_restarts_the_role_processes(tmp_path: Path) -> None:
     cuda = replace(eager, roles=[replace(r, platform_options={"cuda": 1}) for r in eager.roles])
     assert [pa.proc for pa in only_restarts(Case(tmp_path / "2", topo=cuda).plan())] == [W0]
     bad = replace(base, roles=[replace(r, platform="tpu") for r in base.roles])
-    assert bad.check() == ["role worker names an unknown platform 'tpu'; known: ['fake', 'torch_eager', 'cuda_graph']"]
+    assert bad.check() == [
+        "role worker names an unknown platform 'tpu'; known: ['fake', 'torch_eager', 'cuda_graph', 'ascend']"]
 
 
 def only_restarts(p: ActionPlan | Failed) -> list[ProcActions]:

@@ -94,6 +94,13 @@ def child_env(environ: Mapping[str, str], spec: ProcSpec, code_root: Path) -> di
     env["PYTHONPATH"] = str(code_root)
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # snapshots are read-only
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in spec.gpus)
+    if spec.platform == "ascend":
+        env["ASCEND_RT_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"]
+        toolkit = env.get("ASCEND_HOME_PATH") or env.get("ASCEND_TOOLKIT_HOME")
+        if toolkit:
+            cann = Path(toolkit)
+            packages = (cann / "python" / "site-packages", cann / "opp" / "built-in" / "op_impl" / "ai_core" / "tbe")
+            env["PYTHONPATH"] = os.pathsep.join([str(code_root), *(str(p) for p in packages if p.is_dir())])
     return env
 
 

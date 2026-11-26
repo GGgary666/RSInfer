@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,6 +28,7 @@ from platforms.base import (
     GraphRecorder,
     Platform,
     PlatformInfo,
+    Stream,
     VirtualRange,
     check_extent,
     check_view,
@@ -39,6 +41,14 @@ DTYPES: dict[str, torch.dtype] = {
     "f32": torch.float32, "i32": torch.int32, "i64": torch.int64, "f64": torch.float64,
 }
 """The platform's dtype names and the torch dtypes they stand for."""
+
+
+def release_cached_memory(platform: Platform) -> None:
+    capabilities = platform.devices()[0].capabilities
+    if "npu" in capabilities:
+        import_module("torch_npu").npu.empty_cache()
+    elif "cuda" in capabilities:
+        torch.cuda.empty_cache()
 
 
 def _size(shape: tuple[int, ...], dtype: str) -> int:
@@ -159,7 +169,7 @@ class TorchEagerPlatform:
             raise ValueError(f"map beyond reserved size {vr.reserved}")
         vr.mapped += nbytes
 
-    def stream(self, device: int) -> TorchStream:
+    def stream(self, device: int) -> Stream:
         d = self._device(device)
         return TorchStream(device, torch.cuda.current_stream(d) if self._cuda else None)
 

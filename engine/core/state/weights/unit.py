@@ -28,6 +28,7 @@ import safetensors
 import torch
 
 from core.contracts.model import WeightDecl, WeightLoader
+from platforms.torch_eager import release_cached_memory
 from unit.runtime.registry import Registry
 
 
@@ -148,7 +149,7 @@ class WeightStore:
             # its blocks. A rollback after a failed reload then had the old weights pin the blocks
             # the failed attempt freed, and the old state pools no longer fit
             # (doc/framework-bugs/2026-11-13-a-weight-dtype-change-runs-out-of-memory-and-its-rollback-is-unconfirmed.md).
-            torch.cuda.empty_cache()
+            release_cached_memory(self.platform)
         for d in decls:
             moved |= existing
             if self.asleep:

@@ -107,6 +107,19 @@ def test_child_env_replaces_only_where_code_comes_from(tmp_path: Path) -> None:
     assert (env["CUDA_VISIBLE_DEVICES"], env["EXTRA"], env["HOME"]) == ("2,3", "1", "/home/u")
 
 
+def test_child_env_uses_physical_ascend_placement(tmp_path: Path) -> None:
+    w = proc("host-a", "worker", 0)
+    spec = ProcSpec(w, Identity("i"), ProcessPlan(w, Identity("i"), []), "tcp://control", "addr",
+                    env={"ASCEND_RT_VISIBLE_DEVICES": "3"}, gpus=[7], platform="ascend")
+    cann = tmp_path / "cann"
+    packages = cann / "python" / "site-packages"
+    packages.mkdir(parents=True)
+    env = child_env({"ASCEND_RT_VISIBLE_DEVICES": "1,2", "ASCEND_HOME_PATH": str(cann),
+                     "PYTHONPATH": "/old/engine"}, spec, tmp_path / "engine")
+    assert env["ASCEND_RT_VISIBLE_DEVICES"] == "7"
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(tmp_path / "engine"), str(packages)]
+
+
 def test_materialize_reuses_blobs_and_never_leaves_half_snapshots(tmp_path: Path) -> None:
     async def main() -> None:
         async with cluster(tmp_path, ["host-a"]) as c:

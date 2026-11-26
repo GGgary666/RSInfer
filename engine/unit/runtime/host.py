@@ -101,6 +101,10 @@ def make_platform(spec: ProcSpec) -> Platform:
         from platforms.cuda_graph import CudaGraphPlatform
 
         return CudaGraphPlatform()
+    if spec.platform == "ascend":
+        from platforms.ascend import AscendPlatform
+
+        return AscendPlatform()
     raise ValueError(f"unknown platform {spec.platform!r}")
 
 

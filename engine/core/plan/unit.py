@@ -98,6 +98,7 @@ class Plans:
         """The verify graph the step in progress replayed: its draft extend replays on its metadata."""
         self.deps: Dependencies | None = None
         """What every bucket was recorded over."""
+        self.device: torch.device | None = None
 
     def replay_idle(self) -> bool:
         if self.idle_graph is None or self.deps is None or not self.deps.valid():
@@ -141,7 +142,7 @@ class Plans:
             except StaleGraph:
                 if self.required:
                     raise
-        elif self.required and self.verify_graphs:
+        elif self.required:
             raise StaleGraph(f"no ready verify graph holds {len(view.rows)} rows, and graphs are required")
         for backend in self.eager.backends:
             backend.prepare(batch, view, PlanKey("decode", 0))
@@ -156,16 +157,17 @@ class Plans:
             graph, self.replayed = self.replayed, None
             if graph is not None and graph.extend is not None:
                 return graph.extend.run(view, input_ids, last_index)
-            if self.required and self.verify_graphs:
+            if self.required:
                 raise StaleGraph("a draft extend after a verify step that was not replayed, and graphs are required")
         elif view.phase == "decode":
             fits = [b for b in self.draft_graphs if b >= len(view.rows)]
             if fits and self.deps is not None and self.deps.valid():
                 return self.draft_graphs[min(fits)].run(batch, view, input_ids, positions, hidden)
-            if self.required and self.draft_graphs:
+            if self.required:
                 raise StaleGraph(f"no ready draft graph holds {len(view.rows)} rows, and graphs are required")
         for backend in self.attention:
-            backend.prepare(batch, view, PlanKey(phase_of(view), 0))
+            prepare = getattr(backend, "prepare_draft", backend.prepare)
+            prepare(batch, view, PlanKey(phase_of(view), 0))
         return self.eager.model.draft_forward(input_ids, positions, hidden, last_index)
 
     def commit(self, steps: Tensor, track_steps: Tensor) -> None:
@@ -178,7 +180,8 @@ class Plans:
         recorded into a pool of their own, cannot use them."""
         if not self.graphs and not self.verify_graphs and self.idle_graph is None:
             return
-        torch.cuda.synchronize()
+        device_api = torch.get_device_module(self.device)
+        device_api.synchronize(self.device)
         if self.idle_graph is not None:
             self.idle_graph.close()
             self.idle_graph = None
@@ -187,7 +190,7 @@ class Plans:
         self.graphs, self.verify_graphs, self.draft_graphs, self.deps, self.replayed = {}, {}, {}, None, None
         for backend in self.eager.backends:
             backend.release_graphs()
-        torch.cuda.empty_cache()
+        device_api.empty_cache()
 
 
 class Unit:
@@ -206,8 +209,9 @@ class Unit:
         self.stores = {kind: store for kind, store in model.stores.items()
                        if any(d.kind == kind for d in model.assembly.states)}
         self.plans = Plans(model, backends, required=mode == "required",
-                           attention=[b for n, b in zip(names, backends, strict=True) if n == "layers.attn@1"],
-                           gdn=[b for n, b in zip(names, backends, strict=True) if n == "layers.gdn@1"])
+                           attention=[b for n, b in zip(names, backends, strict=True)
+                                      if n == "layers.attn@1" or callable(getattr(b, "prepare_draft", None))],
+                           gdn=[b for b in backends if callable(getattr(b, "commit", None))])
         ctx.effect(lambda: self.plans.close, label="decode graphs")
         resolved = resolution(ctx.platform, model.assembly.states,
                               {name: b.resolve(model.assembly.states) for name, b in zip(names, backends, strict=True)})
@@ -219,7 +223,8 @@ class Unit:
                         fixed_extent=any(CAPTURE in self.catalog.describe(s).requires for s in captured))
         reason = ("disabled" if mode == "off" else
                   "asleep (holder.sleep)" if config["holder.sleep"] else
-                  "platform has no CUDA graph support" if "cuda_graph" not in resolved["device"] else
+                  "platform has no CUDA graph support" if not {"cuda_graph", "acl_graph"}.intersection(
+                      resolved["device"]) else
                   f"uncapturable decode kernels: {uncapturable}" if uncapturable else "")
         build: dict[str, Any] = {}
         if not reason:
@@ -248,6 +253,8 @@ class Unit:
         states = self.model.assembly.states
         self.batch.prepare(list(self.stores))
         device = self.batch.binding.buffers()["last_token"].device
+        self.plans.device = device
+        device_api = torch.get_device_module(device)
         stores = list(self.stores.values())
         # An eager step of the padding row first. It shows what the forward runs besides the
         # backends' kernels (norms, linears, ...): eager's choices, which a captured step shares, so
@@ -285,9 +292,9 @@ class Unit:
                     probe.close()
                     for backend in self.backends:
                         backend.release_graphs()
-            torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()  # count what the graphs keep, not what a cached block happened to hold
-            before = torch.cuda.memory_reserved(device)
+            device_api.synchronize(device)
+            device_api.empty_cache()  # count the retained graph allocations after releasing unused blocks
+            before = device_api.memory_reserved(device)
             # The largest first, into one pool: the smaller ones fit in what it took.
             for size, graph in graphs.items():
                 started = time.perf_counter()
@@ -301,14 +308,14 @@ class Unit:
             capture_idle = getattr(self.model, "capture_idle", None)
             if not steps and capture_idle is not None:
                 self.plans.idle_graph = capture_idle(recorder)
-            torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()
-            kept = torch.cuda.memory_reserved(device) - before
+            device_api.synchronize(device)
+            device_api.empty_cache()
+            kept = device_api.memory_reserved(device) - before
             if kept > budget:
                 raise MemoryError(f"the decode graphs keep {kept} bytes of device memory, more than "
                                   f"plan.graph_memory_bytes = {budget}")
         except BaseException:
-            torch.cuda.synchronize(device)
+            device_api.synchronize(device)
             if self.plans.idle_graph is not None:
                 self.plans.idle_graph.close()
                 self.plans.idle_graph = None
@@ -316,7 +323,7 @@ class Unit:
                 graph.close()
             for backend in self.backends:
                 backend.release_graphs()
-            torch.cuda.empty_cache()
+            device_api.empty_cache()
             raise
         # One generation per provider: a store counts its own over all its layers.
         layer = {kind: next(d.layer for d in states if d.kind == kind) for kind in self.stores}

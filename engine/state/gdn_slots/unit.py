@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from core.contracts.state import StateDecl
+from platforms.torch_eager import release_cached_memory
 
 KIND = "gdn.slots"
 
@@ -98,7 +99,7 @@ class MambaPool:
         # Freed buffers stay in PyTorch's cache, and the next allocation may take part of a freed
         # block: a new pool a little larger than the old one then fits neither there nor in what the
         # device has left. Give them back first (doc/framework-bugs/2026-11-10-gdn-ssm-dtype-rebuild-oom.md).
-        torch.cuda.empty_cache()
+        release_cached_memory(self.platform)
         n = len(decls)
         conv = self.platform.alloc(0, 0, shape=(n, self.size + 1, *conv_shape), dtype=conv_dtype)
         temporal = self.platform.alloc(0, 0, shape=(n, self.size + 1, *temporal_shape), dtype=ssm_dtype)

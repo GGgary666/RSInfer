@@ -23,6 +23,7 @@ from typing import Any
 import torch
 
 from core.contracts.state import StateDecl
+from platforms.torch_eager import release_cached_memory
 
 KIND = "kv.paged"
 
@@ -130,7 +131,7 @@ class KVPool:
         if changed:
             # As in state.gdn_slots: give the freed buffers (these, or those of a store the same
             # change rebuilds) back before allocating, or these allocations may split them.
-            torch.cuda.empty_cache()
+            release_cached_memory(self.platform)
         for d in changed:
             # The padded page (slot 0's page) absorbs dummy padded-token writes.
             bufs = {name: self.platform.alloc(0, 0, shape=((self.pages + 1) * shape[0], *shape[1:]), dtype=dtype)
