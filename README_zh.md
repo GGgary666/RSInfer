@@ -16,6 +16,8 @@
 
 </div>
 
+Ascend 910C 的 Qwen3 原生推理与 GLM-5.3-Flash MemCache 部署见 [Ascend 部署指南](deploy/README.md#ascend-910c)。
+
 ---
 
 **RSInfer** 是一个从第一性原理出发、为 **AI 递归自我改进（Recursive Self-Improvement, RSI）** 而设计的生产级大模型推理引擎。它让 AI Agent 与系统工程师可以在运行中的多卡 GPU 引擎上安全、秒级地热改算子、调度器与模型层，摆脱动辄数十分钟的冷启动税与静默状态损坏风险，同时在前沿硬件上保持甚至超越静态定制引擎的吞吐与延迟表现。

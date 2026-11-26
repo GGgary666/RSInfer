@@ -7,8 +7,89 @@
 - `models/`：每个模型家族一个 recipe，按模型目录的 `config.json` 选。`hf.py` 是几个 recipe 共用的读配置、截层。
   - `qwen38.py`：`Qwen3_5ForConditionalGeneration` / `Qwen3_5ForCausalLM`。
   - `ds1017.py`（2026-11-14）：`DeepseekV41ForCausalLM`，DeepSeek-V4.1 的文本模型（[../doc/specs/v1-ds1017.md](../doc/specs/v1-ds1017.md)）。它自己的参数有 `--ds-backend`（`dsv4.backend`：`auto`、`reference`、`tilelang`、`deepinfer`；`auto` 在装了 DeepInfer 那几个 kernel 库的 SM 10.0 卡上选 `deepinfer`，显式点名某个后端时只用它自己的 kernel）、`--yoco-clip`（默认 0 关闭，给 140 启用 YoCo compact 有界重放）与 `--yoco-mask`；`--page-size` 不给时是 128（DeepInfer 的 block，它的分页 indexer 要每页 64 或 128 个 latent；Qwen 不给时是 16）；完整模型默认开启前缀缓存（仅截层后无 `kv.paged` 时关闭）；不支持 `--dummy`（它的矩阵按 FP8/FP4 字节和 scale 存，`initialize_dummy_weights` 只填浮点张量；随机权重用 `checkpoint` 生成）。
-  - 两族模型的单元都提供 `model@1`，一个 worker 只装一族：`serve` 在拓扑里把 worker 的单元列出来，去掉别的 recipe 独有的（`WORKER_ONLY`）；`control apply --source` / `check --source` 按新工作区重算名单并在变化时更新拓扑。
+  - `qwen3.py` 对应 `Qwen3ForCausalLM`。原生 Ascend 路径默认使用 128 token 的 KV 页。
+  - 每个原生模型单元都提供 `model@1`，一个 worker 装一族模型。`serve` 根据 recipe 生成 worker 单元清单，`control apply --source` 和 `check --source` 会按新工作区更新清单。
 - 引擎进程只从引擎的快照和 Python 环境里 import（节点代理把每个进程的 `PYTHONPATH` 设成快照目录）。所以 `tilelang` 和 DeepInfer 的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）要装进跑引擎的那个 Python 环境里；用 `pip install --target` 放在一边的，引擎进程看不到，`kernels.tilelang` 就什么都不注册，层用参照 kernel。多版本 CUDA 主机上直接用 `deploy/serve_ds1017.sh` 即可自动对齐 `nvcc` 与 `CPATH`。
+
+## Ascend 910C
+
+在装有 CANN 和与 PyTorch 匹配的 `torch_npu` 的 Python 环境运行。当前机器的硬件验证使用 CANN 9.2.0、PyTorch 2.10.0 和 `torch_npu` 2.10.0.post7。
+
+### RSInfer 原生 Qwen3
+
+```sh
+export OMP_NUM_THREADS=1
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+python deploy/rsinfer.py serve /local/models/Qwen3-0.6B --npu 0 --port 18650 \
+  --max-context 4096 --max-rows 16 --token-budget 512 --mem-fraction 0.08 \
+  --run /tmp/rsinfer-qwen3 --detach
+python deploy/rsinfer.py complete 'The capital of France is' --run /tmp/rsinfer-qwen3
+python deploy/rsinfer.py control apply --source . --run /tmp/rsinfer-qwen3 --wait-empty 30 --dry-run
+python deploy/rsinfer.py control apply --source . --run /tmp/rsinfer-qwen3 --wait-empty 30
+```
+
+`--npu` 指定物理 die，`--npus 0,1` 在两个 die 各放一个完整模型，两者独立处理请求。省略设备编号时读取 `ASCEND_RT_VISIBLE_DEVICES` 的首项。Qwen3 默认是 NPU eager 执行，CPU 校验可用 `--device cpu`。权重支持 BF16 和 FP32。BF16 使用 CANN 的分页 attention、KV 写入、RMSNorm 和 SwiGLU，分配器可复用完整 KV 页。修改模型、算子和多数配置时可用 `control apply`，修改 `platforms.ascend` 或设备可见性时用 `stop` 和 `serve`。
+
+```sh
+python deploy/bench_ascend.py qwen --url http://127.0.0.1:18650 \
+  --tokenizer /local/models/Qwen3-0.6B/tokenizer.json --out /tmp/qwen-bench
+python deploy/rsinfer.py stop --run /tmp/rsinfer-qwen3
+```
+
+### RSInfer 原生 GLM-5.3-Flash
+
+`serve` 从 W8A8 权重识别模型，使用 RSInfer 的调度和状态单元。Python 环境需安装带 CANN 自定义算子的 `vllm_ascend` 和 `fla_npu`。每个 NPU die 一个 worker。原生 GLM 默认 `--acl-graph required`，prefill 走 eager，decode 需要可回放的图。下例使用单调度域的 TP8 和 EP8，启动前选取当前空闲的物理 die。
+
+```sh
+export OMP_NUM_THREADS=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0
+GLM_NATIVE_RUN=/tmp/rsinfer-glm53-native
+python deploy/rsinfer.py serve /local/models/GLM-5.3-Flash-w8a8 \
+  --npus 8,9,10,11,12,13,14,15 --max-context 65536 --max-rows 32 --max-slots 160 \
+  --token-budget 8192 --set state.kv.pages=3072 --mem-fraction 0.89 \
+  --speculative-algorithm EAGLE --speculative-num-steps 4 --speculative-num-draft-tokens 5 \
+  --acl-graph required --run "$GLM_NATIVE_RUN" --detach
+python deploy/rsinfer.py control apply --source . --run "$GLM_NATIVE_RUN" --wait-empty 30
+```
+
+`--glm-dp-size` 可按 `--npus` 的设备顺序划分调度域，每域独立做 TP 和 EP。16 个设备加 `--glm-dp-size 2` 可运行两个 TP8、EP8 域。示例中的 EAGLE 选项启用检查点自带的 MTP 层，每轮最多产生 4 个草稿 token，目标校验窗口包含 5 个位置。使用 `HCCL_OP_EXPANSION_MODE=AIV` 时，原生配方默认启用确定性规约。
+
+多域且启用 radix 缓存时，可添加 `--glm-prefix-peer`。共享前缀的请求在一个域竞争且另一域空闲时，同一 TP shard 的 rank 通过 HCCL 复制 KV、KPool 和 KDA 快照。复制完成才在目标域登记前缀，同一请求的缓存盐继续生效。可以一起使用 `--overlap`，复制排在已有步骤之后。跨重启仍由 MemCache 清单恢复。 [整机实测](../doc/rsi/2026-11-26-glm53-native.md#在途步骤后的前缀复制)
+
+`--glm-moe-backend dfc` 启用 CANN 的 fused dispatch、FFN 和 combine，需要每域至少两个 rank。该后端在完整 TP8 测试中提升了吞吐，启动需转换专家权重到 NZ 格式。 [DFC 实测](../doc/rsi/2026-11-26-glm53-native.md#moe-与-swiglu)
+
+DFC 可以通过 `--set glm53.sequence_prefill=true` 将 prefill 的 mHC 和专家路由按 token 分给 TP ranks。另加 `--set glm53.index_prefill=true` 将 DSA 查询分片后汇集选中的索引。两项都由运行时的真实请求长度和 TP 划分计算各 rank 工作量。 [序列并行与 DSA 实测](../doc/rsi/2026-11-26-glm53-native.md#dsa-查询分片)
+
+`--set glm53.shared_expert_dp=true` 让每个 DFC rank 装入一份完整共享专家，仅处理该 rank 的 token 分片。它降低共享专家的 TP 通信，增加每 rank 权重占用。切换该项会重装权重和重录图。 [共享专家实测](../doc/rsi/2026-11-26-glm53-native.md#共享专家按-token-分片)
+
+整机 16-die 的混合冷暖对照使用 `--glm-dp-size 2 --glm-moe-backend dfc --glm-prefix-peer --overlap`，并启用 `glm53.sequence_prefill`、`glm53.index_prefill`、`glm53.shared_expert_dp` 与 `glm53.prefill_matmul_reduce_scatter` 四个 `--set` 配置。最后一项在 Ascend AIV 上流水化 prefill 的注意力输出投影与 TP reduce-scatter。原 AISBench 会将 `--out` 末级目录名写入提示词。需要逐字对照已有结果时，在独立父目录下使用与对照相同的末级目录名，再核对生成的两个 `dataset/test.jsonl` 和暖机正文。 [逐字节对照与性能](../doc/rsi/2026-11-26-glm53-native.md#prefill-输出投影与-reduce-scatter-融合)
+
+各域的 TP 和 EP 通信都在域内时，可启用 `--set sched.independent_domains=true`。各域分别提交推理步骤，复制前缀和排空变更时同步。最新的整机评测同时启用 `glm53.mla_fused_proj`、`glm53.fused_eh_norm`、`glm53.local_draft_argmax` 和 `glm53.mtp_share_index`，原 AISBench 的 16K / 60K 吞吐为 103.55 / 153.75 tok/s。 [完整启动参数与实测](../doc/rsi/2026-11-26-glm53-native-rsi-iter.md)
+
+已运行独立 MemCache 池时，启动命令可添加 `--memcache-client-config`，指向 DRAM 为 0 的客户端配置。使用 `cache-save --run "$GLM_NATIVE_RUN" --out /tmp/glm53-prefix.json` 保存可复用的 KV 页、KPool 数据和 KDA 快照。关停 RSInfer 后，保留池并使用相同的模型、算子代码、MTP、HCCL 配置及 rank 划分启动，加入 `--prefix-manifest /tmp/glm53-prefix.json`。worker 在启动时导入该清单。恢复完成后调度器才接纳命中前缀的请求。 [原生 GLM 优化记录](../doc/rsi/2026-11-26-glm53-native.md)
+
+### vLLM Ascend GLM-5.3-Flash 对照
+
+`glm53` 使用当前机器的 vLLM Ascend 执行 W8A8 模型，默认 DP2 × TP8、EP、5-token MTP、ACL decode graph、8192 token prefill 批次和 32 个最大并发序列。32 序列配置按参考评测的四并发工作负载选定，可通过 `--max-seqs 64` 恢复参考配置的并发序列上限。传入参考目录的 `hooks` 可复用其启动与运行时调优。Qwen3 和 GLM 的原生路径由 `serve` 启动，支持 RSInfer 单元热更新。对照路径的 GLM 配置通过重启 vLLM 生效，MetaService 和 DRAM Pool 可在推理进程之间复用。
+
+```sh
+GLM_REF=/home/apulis-dev/userdata/gg/workspace/glm_53_flash/glm_53_flash_opt
+GLM_RUN=/tmp/rsinfer-glm53
+
+python deploy/rsinfer.py glm53 serve /local/models/GLM-5.3-Flash-w8a8 \
+  --run "$GLM_RUN" --hooks-dir "$GLM_REF/hooks" \
+  --memcache-meta-config "$GLM_REF/runtime/memcache/mmc-meta.conf" \
+  --memcache-pool-config "$GLM_REF/runtime/memcache/mmc-local-standalone.conf"
+python deploy/rsinfer.py glm53 status --run "$GLM_RUN"
+python deploy/rsinfer.py glm53 restart --run "$GLM_RUN" --max-batched-tokens 8192
+python deploy/bench_ascend.py glm53 --run "$GLM_RUN" \
+  --suite "$GLM_REF/aisbench-16k-60k-20261125-215405-77l2t7" \
+  --accuracy-check "$GLM_REF/scripts/accuracy_check.py" --out /tmp/glm53-bench
+python deploy/rsinfer.py glm53 stop --run "$GLM_RUN" --with-memcache
+```
+
+MetaService 配置和池配置应使用当前机器可达的地址及独立端口。运行目录内生成 `memcache/client.conf` 并将它的 DRAM 大小设置为 0。vLLM 的调度器和 workers 用它加入 `AscendStoreConnector`，池进程保留配置文件指定的 DRAM。使用外部池可传 `--memcache-client-config` 和 `--memcache-metrics-url`。
+
+`stop` 关闭推理进程，`--with-memcache` 同时回收该运行目录创建的池和 MetaService。健康的本地池可经历 12 次推理进程启动，达到上限后在下次启动前重建。`restart --refresh-memcache` 可显式重建池。首次启动和重启记录在运行目录的 `ready.json`，包括 MemCache 耗时、API 就绪和首请求耗时。认证密钥在权限为 0600 的 `api.key` 中。评测复用原有 16K 和 60K AISBench 生成逻辑，结果包含 TTFT、TPOT、吞吐、正确性和 MemCache 指标。
 
 ## 命令
 

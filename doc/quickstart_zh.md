@@ -4,6 +4,8 @@
 
 本文面向刚拿到仓库、希望在 GPU 物理机上快速拉起 RSInfer、体验**不重启热改配置与代码**、查看进程日志以及运行一键评测的开发者。以 4×SM100 上的 DeepSeek-V4.1-Flash（DS1017，DP4/EP4）为例；通用单机 CLI（含 Qwen3.8、单卡与 CPU 调试）详见 [deploy/README.md](../deploy/README.md)。
 
+在 Ascend 910C 上开发时，设备检查、原生热更、CANN 性能采集和 AISBench 对照见 [NPU 调优与验证](2026-11-26-ascend-npu-workflow.md)。
+
 ## 1. 环境准备
 
 激活已安装 PyTorch 与对应算子库（DeepGEMM、FlashMLA、TileKernels、DeepSelect、TileLang）的 Python 环境，并指定模型目录：

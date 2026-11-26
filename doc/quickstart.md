@@ -4,6 +4,8 @@
 
 Start DeepSeek-V4.1-Flash (DS1017) on four SM100 GPUs with DP4/EP4, send a request, and change the running scheduler. For the general single-host CLI, including Qwen3.8, single-GPU serving, and CPU debugging, see the [deployment guide](../deploy/README.md) (Chinese).
 
+For Ascend 910C preflight, live updates, CANN profiling and AISBench comparisons, see the [NPU development guide](2026-11-26-ascend-npu-workflow.md) (Chinese).
+
 ## 1. Set up the environment
 
 Activate a Python environment with PyTorch, DeepGEMM, FlashMLA, TileKernels, DeepSelect, and TileLang installed. Point the launcher at your checkpoint.

@@ -1,6 +1,6 @@
 ---
 name: rsinfer
-description: Working in the RSInfer repository - where each component, unit, test and document lives (the directory map), and how to develop on a running engine by hot-applying changes (check, apply --dry-run, apply, --wait-empty, --force), what a normal refusal looks like, how to swap weights on a running engine (weights.path, model.dtype), what to do when a rollback fails and status shows stale units (introspect, restart), and how to report a bug of the update mechanism in doc/framework-bugs/. Use before changing code, tests or docs in this repository, or when starting, changing or debugging a running engine.
+description: Use before changing RSInfer code, tests or docs, or starting, updating or debugging a running engine. Covers the repository map, live changes (check, apply, dry run, drain and rollback), weight swaps, recovery and framework bug reports. For Ascend 910C, covers CANN and torch_npu preflight, HCCL, profiling, accuracy checks, AISBench and MemCache verification.
 ---
 
 # RSInfer：目录地图与热改开发
@@ -28,6 +28,8 @@ description: Working in the RSInfer repository - where each component, unit, tes
 
 不安装成包（`[tool.uv] package = false`），靠 `pythonpath = ["engine", "."]` 导入。导入名是 `core.*`、`unit.*`、`platforms.*`，**不是** `engine.*`。运行时进程从按身份物化的快照目录加载这棵树（`doc/specs/nodeagent.md` §3）。
 
+Ascend 910C 原生路径由 `deploy/rsinfer.py serve --device npu` 启动并使用 `control apply`。Qwen3 的代码在 `models/qwen3/`、`kernels/ascend/` 和 `layers/attn/blocks.py`。GLM-5.3-Flash 的原生配方在 `deploy/models/glm53_native.py`，执行代码在 `models/glm53/` 和 `layers/glm53/`。`deploy/models/glm53.py` 管理 vLLM Ascend 基线，`deploy/memcache.py` 管理可复用的 MemCache 池，`deploy/bench_ascend.py` 跑 Qwen3 或参考 AISBench 负载。 [部署指南](../../../deploy/README.md#ascend-910c) · [NPU 调优与验证](../../../doc/2026-11-26-ascend-npu-workflow.md)
+
 | 路径 | 内容 | 规格 |
 |---|---|---|
 | `engine/framework.toml` | 哪些模块属于框架本体；改它们只能重启引擎，不能热重载 | `doc/specs/README.md` |
@@ -39,7 +41,7 @@ description: Working in the RSInfer repository - where each component, unit, tes
 | `engine/core/change/` | 变更事务：协调者、参与者、事件日志、blob 存储、队列；`build.py` 是单元构建步骤跑在里面的那个进程 | `change.md` |
 | `engine/core/control/` | 控制面进程（`python -m core.control serve`）、控制接口的消息和客户端（`python -m core.control.client`） | `control-plane.md` |
 | `engine/unit/runtime/` | 单元运行时：加载 / 重载 / 撤销、`ProcessHost`、注册表、静态 import 图 | `unit-runtime.md` |
-| `engine/platforms/` | 平台接口 `base.py`；CI 用的 `fake/`；真张量、只做 eager 的 `torch_eager/`（CPU 或进程自己的 CUDA 卡）；`cuda_graph/` 复用 torch 分配并提供进程 capture stream、warm-up、capture/replay/close。合法平台名 `PLATFORMS`（`__init__.py`），由拓扑角色的 `platform` 决定 | `platform.md`、`cuda-graph.md` |
+| `engine/platforms/` | 平台接口 `base.py`，CI 的 `fake/`，CPU/CUDA eager 的 `torch_eager/`，Ascend eager 的 `ascend/`，以及提供进程内 CUDA Graph 录制和回放的 `cuda_graph/`。合法平台名 `PLATFORMS`（`__init__.py`），由拓扑角色的 `platform` 决定 | `platform.md`、`cuda-graph.md` |
 
 控制面单元（单元，不属于框架本体，不在 `framework.toml` 里）：
 
@@ -88,7 +90,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 | `engine/kernels/deepinfer/` | `kernels.deepinfer`：DeepInfer 用的 kernel 库（DeepGEMM、FlashMLA、TileKernels、DeepSelect）接成 `ds.*` 的 solution，后端 `deepinfer`，调用方式照 DeepInfer 自己的模块。要 SM 10.0 的卡和这四个库装在跑引擎的环境里（SM100 上 DeepInfer 的环境）。都能录进 graph；路由专家录进 graph 的是固定行数的版本。和官方参照实现算术上不同的三处写在 `ops.py` 的开头。`tilelang_ops/` 是从 DeepInfer 搬来的 TileLang 算子（Apache 2.0，`LICENSE.deepinfer`，原样，去掉了测试）：融合的 norm/RoPE/cast/存缓存、装载、压缩、候选块、`convert_kv_index`。TileLang 的 kernel 按宽度编译，层给它们固定的宽度（`batch.max_context_len`），不然每步重编 |
 | `engine/core/state/holder/` | `core.state.holder`（`state.holder@1`）：按 SGLang 的分法定 KV 页数和 GDN 槽数（`mem_fraction_static`、`mamba_full_memory_ratio`、`max_mamba_cache_size`），启动时定，阶段 2 不在线扩容 |
 | `engine/worker/batch/` | 持久 batch `worker.batch`（`HybridReqToTokenPool` 的表） |
-| `engine/worker/comm/` | `worker.comm`（`comm.group@1`，2026-11-15）：这个 worker 在通信组里的位置。组里的 rank 每一步一起算（DS 1017 的专家和 Engram 表分在各 rank 上）。底下是 `torch.distributed`，照 DeepInfer 的建法：默认组走 gloo，按 `comm.rendezvous` 碰头；`comm.device_backend = nccl` 时另有一个卡上的组，DeepInfer 的 kernel 库要的就是它。`comm.size = 1`（默认）时什么都不建，所以每族模型的 worker 都装着它。一个进程只加入一次：改组的大小要换进程；一个 rank 死了，整个组要重启 |
+| `engine/worker/comm/` | `worker.comm`（`comm.group@1`）管理组内 rank 与设备通信。默认组用 Gloo、按 `comm.rendezvous` 会合。`comm.device_backend` 可选 `hccl` 或 `nccl` 另建对应设备组。`comm.size = 1` 时无需建组。进程只加入一次默认组，改组的大小或有 rank 退出时按组重启 |
 | `engine/executors/pytorch/` | `executors.pytorch`（`executor@1`）：worker 唯一的 executor，SGLang `ModelRunner` 的流程，在 `torch_eager` 和 `cuda_graph` 上都用它；plan 要求必须有图（`PlanService.required`）时，没有图能装下的 decode 步在状态写入前被拒绝；`spec.py` 是投机解码的一步（草稿、验证、接受、提交、草稿扩展，SGLang 的 `EAGLEWorkerV2` 链式那条路，doc/specs/mtp.md），`spec.*` 配置键也由这个单元声明和检查 |
 | `engine/core/plan/` | `core.plan`（`plan@1`）：eager（bucket 0）和 TP1 的 decode graph（`graph.py`：默认的桶、每个桶的固定输入、录制、依赖记录）。没配 `plan.graph_buckets` 时用 SGLang 的默认档位到 `min(batch.max_rows, 64)`；graph 里的 attention 是固定容量的那个（`kernels.torch_graph`）时仍是 2 的幂到 8。单元加载时录制（启动或暂停期），`plan.cuda_graph` 为 auto / off / required；没有 rebuild action，依赖变了由 `core.deps` 重载本单元。启动时让各 backend 按配置固定 kernel 并打一行 `core.plan: {json}`（含录了哪些桶、没录的原因、留下的显存） |
 | `engine/core/worker/` | worker 循环 `core.worker`（`proc.loop@1`）：读计划、交给 `executor@1`、按计划顺序回 `Sampled` / `Resync` / `StepFailure`，启动时和结果换了读端时报 `Capacity` |
@@ -99,14 +101,14 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 
 需要在 SM100 上跑 DS1017 端到端基准（Official Prefill / Decode、AgentX）时，见 [`tests/gpu/ds1017_bench/README.md`](../../../tests/gpu/ds1017_bench/README.md)；直接起停 4×SM100 服务与热改可用 [`deploy/serve_ds1017.sh`](../../../deploy/serve_ds1017.sh)。
 
-**两族模型**（2026-11-14）：`models.qwen38` 和 `models.ds1017` 都提供 `model@1`，一个 worker 只能装一族。
-- `deploy/rsinfer.py` 按 `config.json` 选配方（`deploy/models/qwen38.py`、`ds1017.py`），在拓扑里把 worker 的单元列出来，去掉另一族独有的（配方的 `WORKER_ONLY`）；`control apply --source` / `check --source` 会按新工作区重算这份名单并随变更带上更新后的拓扑，新增或删除 worker 单元照常生效。绕过 `rsinfer.py` 直接用 `core.control.client` 或自己写拓扑时也要自己维护名单，否则两个模型单元都会被装进去。
+**模型配方**。一个 worker 用一个模型单元提供 `model@1`。
+
+- `deploy/rsinfer.py` 按 `config.json` 选配方，按各配方的 `WORKER_ONLY` 筛选 worker 单元。`control apply --source` 和 `check --source` 按新工作区重算这份名单。直接用 `core.control.client` 或自行写拓扑时，按选定的配方维护名单。
 - `core.plan` 和 `executors.pytorch` 不再写死 Qwen 的状态种类和层：backend 和存储从模型拿（`model.backends`、`model.stores`）。
 - DS 的随机 checkpoint：`deploy/rsinfer.py checkpoint --config <含 config.json 的目录> --out <目录>`，格式和真 checkpoint 一样。
 
 **多个 worker**（2026-11-15，[doc/specs/v1-ds1017.md](../../../doc/specs/v1-ds1017.md) 阶段 3）：`rsinfer serve --gpus 0,1,2,3` 每张卡起一个 worker，`--ranks N` 在一张卡（或 CPU）上起 N 个（本地试多 rank 用）。
-- 每个 worker 是一个调度域（`sched.domains`），跑自己的请求。
-- 模型在不在各 worker 之间分，由配方定：DS 1017 把每层的路由专家和 Engram 表按 rank 的顺序分开（`comm.size`），每一步所有 rank 一起算；Qwen 不分，每个 worker 是完整的一份。
+- 配方设置 `sched.domains` 和切分方式。Qwen 各 worker 持有完整模型并独立调度。DS 1017 在 worker 间切分专家和 Engram 表。原生 GLM 的同一调度域内，各 TP rank 执行同一计划，专家分配到各 rank。
 - 一个变更里，同一个角色的进程是一起启动的（`core.change`）：通信组的 rank 在加载单元时要互相等。
 - **改 EP 的卡数（worker 个数、`comm.size`）要整引擎重启**（`stop` 再 `serve`），不在线扩缩（2026-11-16 约定）。协调者先等要重启的旧 rank 起来，再起新增的 rank，而通信组要所有 rank 一起加入，两边会互相等到 `comm.timeout_s`。只改 `comm.size` 不加进程时，已加入的进程在 `worker.comm` 重载时直接报错，变更撤回。
 - EPLB 搬过的专家在哪，记在权重存储里（`experts.placed`，2026-11-16）：重载模型或 `state.expert_placement`（改代码、改 `eplb.*` 而槽位数不变）都按它重建映射，只有权重重新装载（或 `refit`）才回到初始布局。关掉 EPLB 而槽位数不变时，kernel 仍按搬过的位置读，只是不再重排。
@@ -173,6 +175,7 @@ worker 里的执行层单元（阶段 2，eager 和 TP1 decode graph，`stage2-c
 ### `doc/`
 
 - `doc/quickstart.md`：快速上手与热更新实操指南（一键起停 DS1017、OpenAI API、配置/代码热改 Demo、进程日志路径、`sleep`/`wake` 与一键评测）。
+- `doc/2026-11-26-ascend-npu-workflow.md`：Ascend 910C 环境检查、CANN profiler、真实请求精度验证、AISBench 对照和 MemCache 重启验证。
 - `doc/modules.html`：**设计真源**。冲突时：`modules.html` > `v0-plan.md` > `discussion-summary.md`。
 - `doc/roadmap.md`：阶段和验收。
 - `doc/specs/`：框架本体七个组件的规格，以及控制面（`control-plane.md`：控制面进程和四个控制面单元）、变更只作用于空引擎（`empty-apply.md`：除了只改 live 键，每次变更前排空整个引擎，有请求时默认拒绝；取代 `state-changes.md` 的排空与版本迁移）、阶段 2 的单元契约（`stage2-contract.md`：单元清单、接口、分工、里程碑、分支和合并；草案）、投机解码（`mtp.md`：照 SGLang 的 MTP 和 EAGLE 链式验证，2026-11-13）、v1 多卡和多机的讨论记录（`v1-distributed.md`：未定，2026-11-13）、v1 的盘点和计划（`v1-ds1017.md`：DS 1017 的结构、权重和状态的大小、能对照的实现、阶段，2026-11-14）、CUDA Graph 实现方案（`cuda-graph.md`：TP1 decode graph、最小改动与 fail fast、暂停期重录、首版实现选择和验收矩阵）；前缀复用的计划（`prefix-cache.md`：照 SGLang `e838360` 的 radix cache 加 mamba `extra_buffer`，2026-11-13）；full attention 的 kernel 接入（`attn-kernel.md`：两族 kernel 和怎么选、paged operator 的约定、KV 槽列表和写入、decode graph 里的固定 buffer 和 padding lane；描述的是 #51 和 #53 的实现）；`README.md` 是总览和公共约定（标识、清单、信封、结果、测试约定）。
@@ -244,6 +247,16 @@ $A control status                               # 也可以是 introspect（单�
   - `--wait-empty [秒]`：前端关门（新请求回 503），等里面的跑完再 apply，默认最多 3600 秒，到了就失败、什么都不中止；
   - `--force`：立刻结束里面的请求（客户端收到 503），再 apply。
 - 改完用请求验证：`$A chat "..."`、`$A complete "..."`，或直接对前端发 HTTP；需要时对照冷启动的结果。
+
+### Ascend 910C 开发与验证
+
+使用已经加载匹配 CANN 和 `torch_npu` 的 Python 环境运行 CLI。先用 `npu-smi info` 和 `npu-smi info -m` 核对设备，再查看 `core.plan` 和 worker 日志确认实际走的实现。多 rank 时记录各 rank 的物理 die、调度域和 HCCL 组。
+
+- 开发中把性能探针放在临时 `--source` 工作区，经 `check`、`apply --dry-run` 和 `apply --wait-empty` 加载。`torch_npu.profiler` 以 Level1 和 PipeUtilization 分别采集 prefill 与稳定 decode，按 rank 查看计算、搬运、HCCL 和 launch 间隙。正式测量前撤掉探针。
+- 改算子前固定 dtype、stride、量化 scale、KV 槽位和有效长度。用同一请求对照张量、logits 与生成结果，有状态路径同时检查状态快照和续跑。原生热更用 identity、PID 和变更计划验证生效，改到 `platforms.ascend` 时按框架变更重启。
+- GLM 对照沿用同一套 16K/60K AISBench 与精度检查，记录吞吐、TTFT、TPOT、缓存条件和拓扑差异。MemCache 跨重启用新 worker PID、原池 PID、外部命中增量和正确输出验证。每轮采纳或拒绝的依据进 `doc/rsi/`。
+
+采集配置和诊断步骤见 [NPU 调优与验证](../../../doc/2026-11-26-ascend-npu-workflow.md)。
 
 ### 让出显存（sleep / wake）
 
