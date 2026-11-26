@@ -1,6 +1,42 @@
 # Ascend 910C 单机部署
 
-在仓库根目录使用已加载 CANN 的 Python。先用 `npu-smi info -m` 确认物理 die，用 `npu-smi info` 确认占用。下列模型目录、die 和端口是示例值，请换成本机资源。为每个服务使用独立运行目录。同一组 die 上的原生与对照服务顺序运行。 [环境预检](../doc/2026-11-26-ascend-npu-workflow.md#1-核对设备和运行环境) · [文档导航](../doc/README.md)
+从仓库根目录执行。先用 `npu-smi info -m` 确认物理 die，用 `npu-smi info` 确认占用。下列模型目录、die 和端口是示例值，请换成本机资源。为每个服务使用独立运行目录。同一组 die 上的原生与对照服务顺序运行。 [设备预检](../doc/2026-11-26-ascend-npu-workflow.md#1-核对设备和运行环境) · [文档导航](../doc/README.md)
+
+## 安装依赖
+
+910C 实测环境为 Linux aarch64、Python 3.12、CANN 9.2.0、PyTorch 2.10.0 和 TorchNPU 2.10.0.post7。准备 `uv`、主机驱动和固件，以及与设备匹配的 CANN Toolkit 和 OPP。在启动 worker 的 shell 加载所装版本的环境脚本。 [TorchNPU 配套表](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md) · [910C 实测环境](../doc/rsi/2026-11-26-ascend-a3.md)
+
+```sh
+. "${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit}/set_env.sh"
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+```
+
+### Qwen3 依赖
+
+`ascend` extra 安装 RSInfer 的 HTTP 前端、权重读取、TorchNPU 和 TBE 依赖。它从 PyTorch CPU 索引取得 2.10.0，由 TorchNPU 注册 NPU 后端。`ascend`、`cpu` 和 `gpu` 每个环境选一个。把示例中的临时环境路径换成部署使用的持久路径，后续启动和热更继续用这个 Python。
+
+```sh
+RSI_ASCEND_VENV="$(mktemp -d)/venv"
+UV_PROJECT_ENVIRONMENT="$RSI_ASCEND_VENV" uv sync --locked --python 3.12 --no-dev --extra ascend
+. "$RSI_ASCEND_VENV/bin/activate"
+python -c 'import torch, torch_npu, tbe; print(torch.__version__, torch_npu.__version__, tbe.__file__)'
+```
+
+### GLM 与 MemCache 依赖
+
+原生 GLM 和 vLLM 对照都使用带编译产物的 A3 环境。已有参考环境可以直接复用。新部署可从 `quay.io/ascend/vllm-ascend:v0.30.0rc2-a3` 开始。实测使用 vLLM 0.30.0、vLLM Ascend 0.30.0rc2、A3 FLA-NPU `26.9.1+deva4a7958` 和 Triton Ascend `3.6.0+dev20260923230212`。镜像提供 GLM 的 CANN 自定义算子和 OPP。 [A3 镜像构建配方](https://github.com/vllm-project/vllm-ascend/blob/v0.30.0rc2/Dockerfile.a3) · [A3 设备挂载方式](https://docs.vllm.ai/projects/ascend/en/v0.30.0/getting_started/installation.html)
+
+在这个环境里用一个继承镜像 Python 包的虚拟环境安装 RSInfer 基础依赖。下面的 `uv sync` 仅选择项目基础依赖，沿用镜像提供的 PyTorch、前端与算子。
+
+```sh
+RSI_GLM_VENV="$(mktemp -d)/venv"
+uv venv --system-site-packages --python "$(command -v python3)" "$RSI_GLM_VENV"
+. "$RSI_GLM_VENV/bin/activate"
+uv sync --locked --active --inexact --no-dev
+python -c 'import torch_npu, fastapi, jinja2, safetensors, transformers, uvicorn; import vllm_ascend.vllm_ascend_C, fla_npu.ops.ascendc'
+```
+
+启用外部池或使用 `--memcache-client-config` 时，worker 和池都要能加载 MemCache Hybrid 与 MemFabric Hybrid。参考镜像自带 1.3.0 配对。需要补装 SDK 时，在上面的 GLM 虚拟环境执行 `uv sync --locked --active --inexact --no-dev --extra ascend-memcache`。在各自的启动环境检查 `python -c 'from memcache_hybrid import DistributedObjectStore, MetaService'`。池地址与配置仍按下面的启动流程准备。 [MemCache 软件与配置](https://docs.vllm.ai/projects/ascend/en/v0.30.0/user_guide/feature_guide/kv_cache_pool_ascend_store.html)
 
 ## RSInfer 原生 Qwen3
 
@@ -24,7 +60,7 @@ python deploy/rsinfer.py complete 'The capital of France is' --run "$QWEN_RUN" -
 
 ## RSInfer 原生 GLM-5.3-Flash
 
-准备完整 W8A8 checkpoint，并在 worker 环境安装带自定义算子的 `vllm_ascend` 和 `fla_npu`。下面的命令使用一个 TP8/EP8 调度域，每个 die 一个 worker。函数保留启动参数，供预览、启动及缓存恢复复用。
+准备完整 W8A8 checkpoint，激活上面的 GLM 环境。下面的命令使用一个 TP8/EP8 调度域，每个 die 一个 worker。函数保留启动参数，供预览、启动及缓存恢复复用。
 
 ```sh
 GLM_MODEL=/path/to/GLM-5.3-Flash-w8a8

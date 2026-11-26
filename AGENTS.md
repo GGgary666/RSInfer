@@ -41,7 +41,7 @@
 ## 常用命令
 
 ```sh
-uv sync --python 3.12 --extra cpu    # CPU 版 torch（torch_eager、模型单元要）；SM100 上用 --extra gpu，两者互斥
+uv sync --locked --python 3.12 --extra cpu   # CPU 开发与测试；SM100 上选 --extra gpu
 uv run pyright                       # strict；检查 engine/ 和 tests/（含 formal）
 uv run pytest                        # 默认测试；不收集 tests/framework/formal；串行
 uv run pytest -n 8                   # 全量并行（pytest-xdist）：约 30 秒，串行约 165 秒
@@ -52,6 +52,7 @@ uv run pytest tests/framework/ipc -q # 只跑某个目录
 uv run python tests/framework/formal/run.py --bootstrap --replay [--java /path/to/java]
 ```
 
+- 910C 的 `ascend`、`cpu` 和 `gpu` extra 互斥。Qwen3、GLM 和 MemCache 的安装步骤见 [Ascend 依赖](deploy/ascend.md#安装依赖)。
 - 每次提交前跑 `uv run pyright` 和 `uv run pytest`（全量用 `-n 8` 并行；只跑一两个文件时别加 `-n`，起 worker 要 5 秒左右）。改了 `core.change`、`core.supervisor`、`core.nodeagent`、`unit.runtime.host` 或 `tests/framework/formal/` 时，也跑 formal 全流程。
 - `uv run pytest` 跳过 formal 靠的是 `pyproject.toml` 里 `addopts` 的 `--ignore=tests/framework/formal`；显式给出路径（`uv run pytest tests/framework/formal`）不受影响。`tests/gpu/`（要 GPU，手动跑）同样由 `addopts` 排除。
 - `pyproject.toml` 的 `timeout = 120` 是 pytest-timeout 给**单个测试**的上限，不是整个套件的。不要给 pytest 或 CI job 加总时长上限。

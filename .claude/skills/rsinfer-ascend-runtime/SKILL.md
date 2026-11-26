@@ -7,6 +7,7 @@ description: 在 Ascend 910C 配置 RSInfer worker 的 CANN/OPP 环境，启动�
 
 ## 确认 worker 环境
 
+- 原生 Qwen3 用锁定的 `ascend` extra。原生 GLM 和 vLLM 对照从 A3 自定义算子环境启动，可以用 `ascend-memcache` extra 补装缓存 SDK。 [Ascend 依赖安装](../../../deploy/ascend.md#安装依赖)
 - 在启动 worker 的同一个 Python / 容器中检查驱动、CANN Toolkit 和 OPP、自定义算子包、`torch` / `torch_npu` 及其导入路径。需要加载 CANN 时，使用当前安装的 `set_env.sh`。GLM 原生配方依赖带自定义算子的 `vllm_ascend` 和 `fla_npu`，检查 worker 的 `ASCEND_CUSTOM_OPP_PATH` 和实际加载的扩展。 [预检命令](../../../doc/2026-11-26-ascend-npu-workflow.md#1-核对设备和运行环境)
 - 用 `npu-smi info` 看设备健康和占用，`npu-smi info -m` 看物理 die 映射，`npu-smi info -l` 看拓扑。A3 的显示名可能只是 `Ascend910`，涉及编译目标或 API 支持时，用 `asys` 或 DSMI 核对具体 SoC。RSInfer 的 `--npu` / `--npus` 选物理 die，worker 内的设备序号受可见性映射控制。 [CANNBot 环境预检](https://gitcode.com/cann/cannbot-skills/blob/63f4f18a33dfb116125360ff8269c037b69f9958/ops/ascendc-env-check/SKILL.md)
 - 如果启动 shell 可以导入依赖而 worker 报 TBE 或 OPP 缺失，核对节点代理给该实例的 Python 搜索路径和启动环境。worker 从按 identity 物化的快照加载引擎。 [TBE 加载故障记录](../../../doc/framework-bugs/2026-11-26-ascend-runtime-python-path.md)

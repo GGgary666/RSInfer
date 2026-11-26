@@ -24,7 +24,7 @@ jobs:
           # These runners persist: uv's cache stays on their disk, nothing goes to GitHub's cache.
           enable-cache: false
           cache-local-path: ~/.cache/uv
-      - run: uv sync --python 3.12 --extra cpu
+      - run: uv sync --locked --python 3.12 --extra cpu
       - run: uv run pyright
       - id: scope
         name: does the change touch the framework?

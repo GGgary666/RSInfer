@@ -1,0 +1,4 @@
+# Client dependencies for the GLM 16K/60K comparison suite.
+ais-bench-benchmark==3.1.20260630
+# AISBench requires NumPy <2. PyArrow 26 wheels require NumPy 2 at import time.
+pyarrow<26

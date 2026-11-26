@@ -4,7 +4,7 @@
 
 | 任务 | 命令与实操 | 对应 skill |
 | --- | --- | --- |
-| 部署、核对物理 die 和调度域 | [设备预检](2026-11-26-ascend-npu-workflow.md#1-核对设备和运行环境) · [原生 GLM](../deploy/ascend.md#rsinfer-原生-glm-53-flash) · [vLLM Ascend 对照](../deploy/ascend.md#vllm-ascend-glm-53-flash-对照) | [环境与运行](../.claude/skills/rsinfer-ascend-runtime/SKILL.md) |
+| 部署、核对物理 die 和调度域 | [安装依赖](../deploy/ascend.md#安装依赖) · [设备预检](2026-11-26-ascend-npu-workflow.md#1-核对设备和运行环境) · [原生 GLM](../deploy/ascend.md#rsinfer-原生-glm-53-flash) · [vLLM Ascend 对照](../deploy/ascend.md#vllm-ascend-glm-53-flash-对照) | [环境与运行](../.claude/skills/rsinfer-ascend-runtime/SKILL.md) |
 | 估算上限，定位 TTFT、TPOT 或吞吐瓶颈 | [SOL 估算](../.claude/skills/rsinfer-ascend-optimize/references/ascend-sol.md) · [worker 性能采集](2026-11-26-ascend-npu-workflow.md#2-用实际-worker-采集性能) | [推理性能优化](../.claude/skills/rsinfer-ascend-optimize/SKILL.md) |
 | 接入 CANN 算子、验证融合或 tiling | [实际派发与正确性回归](2026-11-26-ascend-npu-workflow.md#3-接入候选与验证正确性) · [GLM 融合与回退案例](rsi/2026-11-26-glm53-native.md#融合-kda-输出-rmsnorm-对照) | [算子接入](../.claude/skills/rsinfer-ascend-kernel/SKILL.md) |
 | 排查错误 token、ACL Graph、HCCL 或热更故障 | [按症状查报告](framework-bugs/README.md#ascend-与-cann-案例) · [引擎内探针与恢复](../.claude/skills/rsinfer/SKILL.md#在引擎里做检查排查和验证) | [推理诊断](../.claude/skills/rsinfer-ascend-debug/SKILL.md) |

@@ -86,6 +86,17 @@ python deploy/bench_ascend.py qwen --url "$QWEN_URL" --tokenizer "$QWEN_MODEL/to
 
 ### GLM AISBench 对照
 
+实测用 AISBench Benchmark `3.1.20260630`。可以用已有的评测 Python，也可以在独立的 CPU 环境安装。套件读取 GSM8K 时依赖 PyArrow，评测清单将它限制在兼容 NumPy 1.x 的版本。对照双方使用同一个评测环境，并确认 `ais_bench` 和 Python 都来自该环境。 [评测依赖](../deploy/requirements-aisbench.txt) · [PyArrow 26 兼容性变更](https://arrow.apache.org/blog/2026/10/08/26.0.0-release/)
+
+```sh
+RSI_BENCH_VENV="$(mktemp -d)/venv"
+UV_PROJECT_ENVIRONMENT="$RSI_BENCH_VENV" uv sync --locked --python 3.12 --no-dev --extra cpu
+. "$RSI_BENCH_VENV/bin/activate"
+uv pip install -r deploy/requirements-aisbench.txt
+ais_bench --help
+python -c 'from ais_bench.benchmark.datasets import GSM8KDataset'
+```
+
 `ENGINE_RUN` 选择原生或 vLLM 的独立运行目录。`AISBENCH_SUITE` 指向同一外部套件，内含 `prepare.py`、`glm_bench_adapter.py`、`run_benchmark.py` 和 `summarize.py`。`ACCURACY_CHECK` 指向配套精度脚本。原 16K 冷组和 60K 暖组的生成器会把输出目录末级名写入提示词，对照可用 `baseline/glm-8192-32` 与 `candidate/glm-8192-32` 两个新目录，并比对两组测试集、暖机正文和 salt。
 
 ```sh

@@ -4,7 +4,7 @@
 
 ## Ascend 910C
 
-三种部署方式的启动参数、首请求和停服命令集中在 [Ascend 单机部署](ascend.md)。环境预检、调优和验证按任务查 [Ascend / CANN 文档导航](../doc/README.md)。
+先按模型 [安装 Ascend 依赖](ascend.md#安装依赖)，再查 [单机启动和停服命令](ascend.md)。环境预检、调优和验证按任务查 [Ascend / CANN 文档导航](../doc/README.md)。
 
 ### RSInfer 原生 Qwen3
 
